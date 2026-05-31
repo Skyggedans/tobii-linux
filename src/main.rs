@@ -110,6 +110,10 @@ fn main() -> Result<()> {
         return compare_decoded(inputs);
     }
 
+    if let Command::ExtractCalibration { path, json_path } = &opts.command {
+        return extract_calibration(path, json_path.as_deref());
+    }
+
     let Command::Replay { init_path } = &opts.command else {
         unreachable!();
     };
@@ -201,11 +205,25 @@ fn main() -> Result<()> {
 }
 
 enum Command {
-    Replay { init_path: String },
-    AnalyzeLog { path: String },
-    CompareLogs { inputs: Vec<LogInput> },
-    DecodeStream { path: String },
-    CompareDecoded { inputs: Vec<LogInput> },
+    Replay {
+        init_path: String,
+    },
+    AnalyzeLog {
+        path: String,
+    },
+    CompareLogs {
+        inputs: Vec<LogInput>,
+    },
+    DecodeStream {
+        path: String,
+    },
+    CompareDecoded {
+        inputs: Vec<LogInput>,
+    },
+    ExtractCalibration {
+        path: String,
+        json_path: Option<String>,
+    },
 }
 
 struct LogInput {
@@ -222,6 +240,7 @@ struct Options {
     decoded_csv_path: Option<String>,
     jsonl_path: Option<String>,
     print_decoded: bool,
+    dashboard: bool,
 }
 
 impl Options {
@@ -235,6 +254,7 @@ impl Options {
         let mut decoded_csv_path = None;
         let mut jsonl_path = None;
         let mut print_decoded = false;
+        let mut dashboard = false;
 
         if args.peek().map(String::as_str) == Some("analyze-log") {
             args.next();
@@ -248,6 +268,7 @@ impl Options {
                 decoded_csv_path: None,
                 jsonl_path: None,
                 print_decoded: false,
+                dashboard: false,
             });
         }
 
@@ -269,6 +290,7 @@ impl Options {
                 decoded_csv_path: None,
                 jsonl_path: None,
                 print_decoded: false,
+                dashboard: false,
             });
         }
 
@@ -284,6 +306,7 @@ impl Options {
                 decoded_csv_path: None,
                 jsonl_path: None,
                 print_decoded: false,
+                dashboard: false,
             });
         }
 
@@ -305,6 +328,43 @@ impl Options {
                 decoded_csv_path: None,
                 jsonl_path: None,
                 print_decoded: false,
+                dashboard: false,
+            });
+        }
+
+        if args.peek().map(String::as_str) == Some("extract-calibration") {
+            args.next();
+            let path = args.next().context(
+                "usage: extract-calibration <init_packets_ep.txt> [--json calibration.json]",
+            )?;
+            let mut json_path = None;
+
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => {
+                        json_path = Some(args.next().context("--json requires a path")?);
+                    }
+                    "-h" | "--help" => {
+                        println!(
+                            "usage: extract-calibration <init_packets_ep.txt> [--json calibration.json]"
+                        );
+                        std::process::exit(0);
+                    }
+                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
+                    other => anyhow::bail!("unexpected argument for extract-calibration: {other}"),
+                }
+            }
+
+            return Ok(Self {
+                command: Command::ExtractCalibration { path, json_path },
+                log_path: None,
+                max_init_packets: None,
+                max_stream_packets: None,
+                reconnect: false,
+                decoded_csv_path: None,
+                jsonl_path: None,
+                print_decoded: false,
+                dashboard: false,
             });
         }
 
@@ -344,6 +404,9 @@ impl Options {
                 "--print-decoded" => {
                     print_decoded = true;
                 }
+                "--dashboard" => {
+                    dashboard = true;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -357,6 +420,11 @@ impl Options {
             }
         }
 
+        anyhow::ensure!(
+            !(dashboard && jsonl_path.as_deref() == Some("-")),
+            "--dashboard cannot be combined with --jsonl - because both write to stdout"
+        );
+
         Ok(Self {
             command: Command::Replay {
                 init_path: init_path.unwrap_or_else(|| "init_packets_ep.txt".to_string()),
@@ -368,13 +436,14 @@ impl Options {
             decoded_csv_path,
             jsonl_path,
             print_decoded,
+            dashboard,
         })
     }
 }
 
 fn print_usage() {
     println!(
-        "usage:\n  cargo run -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -- analyze-log tobii_stream.bin\n  cargo run -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -- decode-stream tobii_stream.bin\n  cargo run -- compare-decoded [label:]path.bin [label:]path.bin ..."
+        "usage:\n  cargo run -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--dashboard] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -- analyze-log tobii_stream.bin\n  cargo run -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -- decode-stream tobii_stream.bin\n  cargo run -- compare-decoded [label:]path.bin [label:]path.bin ...\n  cargo run -- extract-calibration init_packets_ep.txt [--json calibration.json]"
     );
 }
 
@@ -463,16 +532,25 @@ fn read_stream(
                 reconnect_attempts = 0;
 
                 log_packet(log, EP_IN, data)?;
-                handle_live_decoded(read_count, data, live_csv, jsonl, opts.print_decoded)?;
-
-                println!(
-                    "STREAM/IN #{} len={} marker={:?} seq={:?} declared_len={:?}",
+                handle_live_decoded(
                     read_count,
-                    data.len(),
-                    marker(data),
-                    seq(data),
-                    declared_len(data)
-                );
+                    data,
+                    live_csv,
+                    jsonl,
+                    opts.print_decoded,
+                    opts.dashboard,
+                )?;
+
+                if !opts.dashboard {
+                    println!(
+                        "STREAM/IN #{} len={} marker={:?} seq={:?} declared_len={:?}",
+                        read_count,
+                        data.len(),
+                        marker(data),
+                        seq(data),
+                        declared_len(data)
+                    );
+                }
 
                 if let Some(max) = opts.max_stream_packets {
                     if read_count >= max {
@@ -482,7 +560,11 @@ fn read_stream(
                 }
             }
             Err(rusb::Error::Timeout) => {
-                println!("timeout");
+                if opts.dashboard {
+                    render_dashboard_status("timeout waiting for stream packet")?;
+                } else {
+                    println!("timeout");
+                }
             }
             Err(rusb::Error::NoDevice) if opts.reconnect => {
                 reconnect_attempts += 1;
@@ -496,6 +578,10 @@ fn read_stream(
                 anyhow::bail!("read error: NoDevice");
             }
             Err(e) => {
+                if opts.dashboard {
+                    render_dashboard_status(&format!("read error: {e:?}"))?;
+                    continue;
+                }
                 println!("read error: {:?}", e);
             }
         }
@@ -593,7 +679,8 @@ fn drain_in_limited(
                 if let Err(e) = log_packet(log, EP_IN, data) {
                     println!("  log error: {e}");
                 }
-                if let Err(e) = handle_live_decoded(0, data, live_csv, jsonl, print_decoded) {
+                if let Err(e) = handle_live_decoded(0, data, live_csv, jsonl, print_decoded, false)
+                {
                     println!("  decoded csv error: {e}");
                 }
 
@@ -740,6 +827,7 @@ fn handle_live_decoded(
     live_csv: &mut Option<DecodedCsv>,
     jsonl: &mut Option<JsonlOutput>,
     print_decoded: bool,
+    dashboard: bool,
 ) -> Result<()> {
     if marker(data) != Some(0x53) {
         return Ok(());
@@ -764,6 +852,10 @@ fn handle_live_decoded(
         print_live_decoded(&frame);
     }
 
+    if dashboard {
+        render_tracking_dashboard(&frame)?;
+    }
+
     Ok(())
 }
 
@@ -784,6 +876,95 @@ fn print_live_decoded(frame: &TrackingFrame) {
         fmt_live(frame.head_y),
         fmt_live(frame.head_z),
     );
+}
+
+fn render_tracking_dashboard(frame: &TrackingFrame) -> Result<()> {
+    print!("\x1b[2J\x1b[H");
+    println!("Tobii Eye Tracker 5 - TrackingFrame");
+    println!("==============================================================");
+    println!("packet        {:>18}", frame.packet);
+    println!("timestamp us  {:>18}", frame.ts_us);
+    println!(
+        "gaze valid    {:>18}",
+        if frame.gaze_valid { "yes" } else { "no" }
+    );
+    println!();
+
+    println!("Gaze");
+    dashboard_pair("  px", frame.gaze_x, frame.gaze_y);
+    dashboard_pair("  norm", frame.gaze_norm_x, frame.gaze_norm_y);
+    dashboard_bar("  x", frame.gaze_norm_x);
+    dashboard_bar("  y", frame.gaze_norm_y);
+    println!();
+
+    println!("Left Eye");
+    dashboard_pair("  px", frame.left_eye_x, frame.left_eye_y);
+    dashboard_pair("  norm", frame.left_eye_norm_x, frame.left_eye_norm_y);
+    dashboard_bar("  x", frame.left_eye_norm_x);
+    dashboard_bar("  y", frame.left_eye_norm_y);
+    println!();
+
+    println!("Right Eye");
+    dashboard_pair("  px", frame.right_eye_x, frame.right_eye_y);
+    dashboard_pair("  norm", frame.right_eye_norm_x, frame.right_eye_norm_y);
+    dashboard_bar("  x", frame.right_eye_norm_x);
+    dashboard_bar("  y", frame.right_eye_norm_y);
+    println!();
+
+    println!("Head");
+    println!(
+        "  x/y/z       {:>14} {:>14} {:>14}",
+        fmt_frame_value(frame.head_x),
+        fmt_frame_value(frame.head_y),
+        fmt_frame_value(frame.head_z)
+    );
+    println!();
+    println!("Press Ctrl+C to stop.");
+
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn render_dashboard_status(status: &str) -> Result<()> {
+    print!("\x1b[2J\x1b[H");
+    println!("Tobii Eye Tracker 5 - TrackingFrame");
+    println!("==============================================================");
+    println!("{status}");
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn dashboard_pair(label: &str, x: Option<f64>, y: Option<f64>) {
+    println!(
+        "{label:<8} x={:>12} y={:>12}",
+        fmt_frame_value(x),
+        fmt_frame_value(y)
+    );
+}
+
+fn dashboard_bar(label: &str, value: Option<f64>) {
+    const WIDTH: usize = 32;
+
+    let Some(value) = value else {
+        println!("{label:<8} [{}] {}", " ".repeat(WIDTH), "n/a");
+        return;
+    };
+
+    let value = value.clamp(0.0, 1.0);
+    let filled = (value * WIDTH as f64).round() as usize;
+    let empty = WIDTH.saturating_sub(filled);
+    println!(
+        "{label:<8} [{}{}] {:>7.3}",
+        "#".repeat(filled),
+        ".".repeat(empty),
+        value
+    );
+}
+
+fn fmt_frame_value(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -2004,6 +2185,218 @@ fn print_stream_changes(payloads: &[Vec<u8>]) {
 
         println!();
     }
+}
+
+#[derive(Clone, Debug)]
+struct CalibrationRecord {
+    offset: usize,
+    values: Vec<f32>,
+}
+
+fn extract_calibration(path: &str, json_path: Option<&str>) -> Result<()> {
+    let packets = read_init_packets(path)?;
+    let blob = calibration_blob(&packets);
+    anyhow::ensure!(
+        !blob.is_empty(),
+        "{path} does not contain large init blob packets"
+    );
+
+    let records = find_calibration_records(&blob);
+    let point_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.values.len() == 4)
+        .collect();
+
+    println!("input packets: {}", packets.len());
+    println!("large blob bytes: {}", blob.len());
+    println!(
+        "calibration-like records: {} total, {} four-float point records",
+        records.len(),
+        point_records.len()
+    );
+    println!();
+
+    println!("Records:");
+    println!(
+        "  {:>3} {:>8} {:>7} {:>12} {:>12} {:>12} {:>12}",
+        "#", "offset", "kind", "v0", "v1", "v2", "v3"
+    );
+    for (i, record) in records.iter().enumerate() {
+        println!(
+            "  {:>3} 0x{:06x} {:>7} {:>12} {:>12} {:>12} {:>12}",
+            i + 1,
+            record.offset,
+            format!("{}f", record.values.len()),
+            fmt_cal_value(record.values.first().copied()),
+            fmt_cal_value(record.values.get(1).copied()),
+            fmt_cal_value(record.values.get(2).copied()),
+            fmt_cal_value(record.values.get(3).copied()),
+        );
+    }
+
+    if !point_records.is_empty() {
+        println!();
+        println!("Likely calibration target/observed points:");
+        println!(
+            "  {:>3} {:>8} {:>10} {:>10} {:>12} {:>12} {:>10} {:>10}",
+            "#", "offset", "target_x", "target_y", "observed_x", "observed_y", "err_x", "err_y"
+        );
+        for (i, record) in point_records.iter().enumerate() {
+            let target_x = record.values[0];
+            let target_y = record.values[1];
+            let observed_x = record.values[2];
+            let observed_y = record.values[3];
+            println!(
+                "  {:>3} 0x{:06x} {:>10.4} {:>10.4} {:>12.4} {:>12.4} {:>10.4} {:>10.4}",
+                i + 1,
+                record.offset,
+                target_x,
+                target_y,
+                observed_x,
+                observed_y,
+                observed_x - target_x,
+                observed_y - target_y,
+            );
+        }
+    }
+
+    if let Some(json_path) = json_path {
+        write_calibration_json(json_path, &records)?;
+        println!();
+        println!("Wrote {json_path}");
+    }
+
+    Ok(())
+}
+
+fn calibration_blob(packets: &[InitPacket]) -> Vec<u8> {
+    let mut blob = Vec::new();
+
+    for packet in packets {
+        if packet.data.len() >= 512 {
+            blob.extend_from_slice(&packet.data[8..]);
+        }
+    }
+
+    blob
+}
+
+fn find_calibration_records(blob: &[u8]) -> Vec<CalibrationRecord> {
+    const MARKER: &[u8; 8] = b"\x01\0\0\0\0\0\0\0";
+    let mut records = Vec::new();
+    let search_start = blob.len().saturating_sub(8192);
+    let mut offset = search_start;
+
+    while offset + MARKER.len() <= blob.len() {
+        let Some(relative) = find_bytes(&blob[offset..], MARKER) else {
+            break;
+        };
+        let marker_offset = offset + relative;
+        let value_offset = marker_offset + MARKER.len();
+        let Some(next_relative) = find_bytes(&blob[value_offset..], MARKER) else {
+            break;
+        };
+        let next_marker = value_offset + next_relative;
+
+        if next_marker > value_offset && (next_marker - value_offset) % 4 == 0 {
+            let value_count = (next_marker - value_offset) / 4;
+            if matches!(value_count, 2 | 4) {
+                let mut values = Vec::with_capacity(value_count);
+                let mut plausible = true;
+
+                for chunk in blob[value_offset..next_marker].chunks_exact(4) {
+                    let value = f32::from_le_bytes(chunk.try_into().unwrap());
+                    if !value.is_finite() || !(-0.50..=1.50).contains(&value) {
+                        plausible = false;
+                        break;
+                    }
+                    values.push(value);
+                }
+
+                if plausible {
+                    records.push(CalibrationRecord {
+                        offset: marker_offset,
+                        values,
+                    });
+                }
+            }
+        }
+
+        offset = marker_offset + 1;
+    }
+
+    records
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn fmt_cal_value(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn write_calibration_json(path: &str, records: &[CalibrationRecord]) -> Result<()> {
+    let mut out = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create calibration JSON {path}"))?,
+    );
+
+    writeln!(out, "{{")?;
+    writeln!(out, "  \"records\": [")?;
+    for (i, record) in records.iter().enumerate() {
+        write!(
+            out,
+            "    {{\"offset\":{},\"kind\":\"{}f\",\"values\":[",
+            record.offset,
+            record.values.len()
+        )?;
+        for (j, value) in record.values.iter().enumerate() {
+            if j > 0 {
+                write!(out, ",")?;
+            }
+            write!(out, "{value:.8}")?;
+        }
+        write!(out, "]}}")?;
+        if i + 1 < records.len() {
+            writeln!(out, ",")?;
+        } else {
+            writeln!(out)?;
+        }
+    }
+    writeln!(out, "  ],")?;
+    writeln!(out, "  \"points\": [")?;
+
+    let points: Vec<_> = records
+        .iter()
+        .filter(|record| record.values.len() == 4)
+        .collect();
+    for (i, record) in points.iter().enumerate() {
+        let target_x = record.values[0];
+        let target_y = record.values[1];
+        let observed_x = record.values[2];
+        let observed_y = record.values[3];
+        write!(
+            out,
+            "    {{\"offset\":{},\"target\":{{\"x\":{target_x:.8},\"y\":{target_y:.8}}},\"observed\":{{\"x\":{observed_x:.8},\"y\":{observed_y:.8}}},\"error\":{{\"x\":{:.8},\"y\":{:.8}}}}}",
+            record.offset,
+            observed_x - target_x,
+            observed_y - target_y
+        )?;
+        if i + 1 < points.len() {
+            writeln!(out, ",")?;
+        } else {
+            writeln!(out)?;
+        }
+    }
+    writeln!(out, "  ]")?;
+    writeln!(out, "}}")?;
+    out.flush()?;
+
+    Ok(())
 }
 
 fn short_hex(bytes: &[u8]) -> String {
