@@ -1,0 +1,8 @@
+[package]
+name = "tobii5-init-replay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+rusb = "0.9"
