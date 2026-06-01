@@ -3,6 +3,7 @@ use rusb::{Context as UsbContext, UsbContext as _};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::{
     env, fs, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,6 +18,9 @@ const DEFAULT_LOG_PATH: &str = "tobii_stream.bin";
 const LOG_MAGIC: &[u8; 8] = b"TBI5LOG1";
 const STREAM_TLV_OFFSET: usize = 34;
 const GAZE_COORD_MAX: f64 = 1024.0;
+const DEFAULT_OPENTRACK_HOST: &str = "127.0.0.1";
+const DEFAULT_OPENTRACK_PORT: u16 = 4242;
+const OPENTRACK_HEAD_SCALE: f64 = 1000.0;
 
 const LIVE_FIELDS: &[LiveField] = &[
     LiveField::new("gaze0_x", 0x00021f40, 0, 0),
@@ -147,6 +151,10 @@ fn main() -> Result<()> {
         .as_deref()
         .map(JsonlOutput::create)
         .transpose()?;
+    let mut opentrack = opts
+        .opentrack_target()
+        .map(|(host, port)| OpentrackUdp::connect(&host, port))
+        .transpose()?;
 
     vendor_control_init(&mut h)?;
 
@@ -193,6 +201,7 @@ fn main() -> Result<()> {
                 &mut log,
                 &mut live_csv,
                 &mut jsonl,
+                &mut opentrack,
                 opts.print_decoded,
             );
         } else {
@@ -201,7 +210,15 @@ fn main() -> Result<()> {
     }
 
     println!("Init replay finished. Reading stream...");
-    read_stream(&ctx, h, &opts, &mut log, &mut live_csv, &mut jsonl)
+    read_stream(
+        &ctx,
+        h,
+        &opts,
+        &mut log,
+        &mut live_csv,
+        &mut jsonl,
+        &mut opentrack,
+    )
 }
 
 enum Command {
@@ -241,6 +258,8 @@ struct Options {
     jsonl_path: Option<String>,
     print_decoded: bool,
     dashboard: bool,
+    opentrack_host: Option<String>,
+    opentrack_port: Option<u16>,
 }
 
 impl Options {
@@ -255,6 +274,8 @@ impl Options {
         let mut jsonl_path = None;
         let mut print_decoded = false;
         let mut dashboard = false;
+        let mut opentrack_host = None;
+        let mut opentrack_port = None;
 
         if args.peek().map(String::as_str) == Some("analyze-log") {
             args.next();
@@ -269,6 +290,8 @@ impl Options {
                 jsonl_path: None,
                 print_decoded: false,
                 dashboard: false,
+                opentrack_host: None,
+                opentrack_port: None,
             });
         }
 
@@ -291,6 +314,8 @@ impl Options {
                 jsonl_path: None,
                 print_decoded: false,
                 dashboard: false,
+                opentrack_host: None,
+                opentrack_port: None,
             });
         }
 
@@ -307,6 +332,8 @@ impl Options {
                 jsonl_path: None,
                 print_decoded: false,
                 dashboard: false,
+                opentrack_host: None,
+                opentrack_port: None,
             });
         }
 
@@ -329,6 +356,8 @@ impl Options {
                 jsonl_path: None,
                 print_decoded: false,
                 dashboard: false,
+                opentrack_host: None,
+                opentrack_port: None,
             });
         }
 
@@ -365,6 +394,8 @@ impl Options {
                 jsonl_path: None,
                 print_decoded: false,
                 dashboard: false,
+                opentrack_host: None,
+                opentrack_port: None,
             });
         }
 
@@ -407,6 +438,17 @@ impl Options {
                 "--dashboard" => {
                     dashboard = true;
                 }
+                "--opentrack-host" => {
+                    opentrack_host = Some(args.next().context("--opentrack-host requires a host")?);
+                }
+                "--opentrack-port" => {
+                    opentrack_port = Some(
+                        args.next()
+                            .context("--opentrack-port requires a port")?
+                            .parse()
+                            .context("bad --opentrack-port value")?,
+                    );
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -437,13 +479,28 @@ impl Options {
             jsonl_path,
             print_decoded,
             dashboard,
+            opentrack_host,
+            opentrack_port,
         })
+    }
+
+    fn opentrack_target(&self) -> Option<(String, u16)> {
+        if self.opentrack_host.is_none() && self.opentrack_port.is_none() {
+            return None;
+        }
+
+        Some((
+            self.opentrack_host
+                .clone()
+                .unwrap_or_else(|| DEFAULT_OPENTRACK_HOST.to_string()),
+            self.opentrack_port.unwrap_or(DEFAULT_OPENTRACK_PORT),
+        ))
     }
 }
 
 fn print_usage() {
     println!(
-        "usage:\n  cargo run -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--dashboard] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -- analyze-log tobii_stream.bin\n  cargo run -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -- decode-stream tobii_stream.bin\n  cargo run -- compare-decoded [label:]path.bin [label:]path.bin ...\n  cargo run -- extract-calibration init_packets_ep.txt [--json calibration.json]"
+        "usage:\n  cargo run -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--dashboard] [--opentrack-host 127.0.0.1] [--opentrack-port 4242] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -- analyze-log tobii_stream.bin\n  cargo run -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -- decode-stream tobii_stream.bin\n  cargo run -- compare-decoded [label:]path.bin [label:]path.bin ...\n  cargo run -- extract-calibration init_packets_ep.txt [--json calibration.json]"
     );
 }
 
@@ -519,6 +576,7 @@ fn read_stream(
     log: &mut Option<PacketLog>,
     live_csv: &mut Option<DecodedCsv>,
     jsonl: &mut Option<JsonlOutput>,
+    opentrack: &mut Option<OpentrackUdp>,
 ) -> Result<()> {
     let mut buf = [0u8; 8192];
     let mut read_count = 0u64;
@@ -537,6 +595,7 @@ fn read_stream(
                     data,
                     live_csv,
                     jsonl,
+                    opentrack,
                     opts.print_decoded,
                     opts.dashboard,
                 )?;
@@ -668,6 +727,7 @@ fn drain_in_limited(
     log: &mut Option<PacketLog>,
     live_csv: &mut Option<DecodedCsv>,
     jsonl: &mut Option<JsonlOutput>,
+    opentrack: &mut Option<OpentrackUdp>,
     print_decoded: bool,
 ) {
     let mut buf = [0u8; 8192];
@@ -679,7 +739,8 @@ fn drain_in_limited(
                 if let Err(e) = log_packet(log, EP_IN, data) {
                     println!("  log error: {e}");
                 }
-                if let Err(e) = handle_live_decoded(0, data, live_csv, jsonl, print_decoded, false)
+                if let Err(e) =
+                    handle_live_decoded(0, data, live_csv, jsonl, opentrack, print_decoded, false)
                 {
                     println!("  decoded csv error: {e}");
                 }
@@ -799,6 +860,61 @@ impl JsonlOutput {
     }
 }
 
+struct OpentrackUdp {
+    socket: UdpSocket,
+    target: SocketAddr,
+    origin: Option<[f64; 3]>,
+}
+
+impl OpentrackUdp {
+    fn connect(host: &str, port: u16) -> Result<Self> {
+        let target = (host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("failed to resolve opentrack target {host}:{port}"))?
+            .next()
+            .with_context(|| format!("opentrack target {host}:{port} resolved to no addresses"))?;
+        let bind_addr = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind_addr).context("failed to create opentrack UDP socket")?;
+
+        println!("Sending OpenTrack UDP frames to {target}");
+
+        Ok(Self {
+            socket,
+            target,
+            origin: None,
+        })
+    }
+
+    fn send_frame(&mut self, frame: &TrackingFrame) -> Result<()> {
+        let Some(head) = frame.head_xyz() else {
+            return Ok(());
+        };
+        let origin = *self.origin.get_or_insert(head);
+
+        let x_cm = (head[0] - origin[0]) / OPENTRACK_HEAD_SCALE;
+        let y_cm = (head[1] - origin[1]) / OPENTRACK_HEAD_SCALE;
+        let z_cm = (head[2] - origin[2]) / OPENTRACK_HEAD_SCALE;
+
+        // OpenTrack "UDP over network" consumes pose axes in the same order
+        // as its plugin API: TX, TY, TZ, Yaw, Pitch, Roll.
+        let values = [x_cm, y_cm, z_cm, 0.0f64, 0.0, 0.0];
+        let mut packet = [0u8; 48];
+        for (i, value) in values.iter().enumerate() {
+            packet[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        self.socket
+            .send_to(&packet, self.target)
+            .context("failed to send OpenTrack UDP packet")?;
+
+        Ok(())
+    }
+}
+
 fn write_csv_value(out: &mut BufWriter<File>, value: Option<f64>) -> Result<()> {
     match value {
         Some(value) => write!(out, ",{value:.6}")?,
@@ -826,6 +942,7 @@ fn handle_live_decoded(
     data: &[u8],
     live_csv: &mut Option<DecodedCsv>,
     jsonl: &mut Option<JsonlOutput>,
+    opentrack: &mut Option<OpentrackUdp>,
     print_decoded: bool,
     dashboard: bool,
 ) -> Result<()> {
@@ -846,6 +963,10 @@ fn handle_live_decoded(
 
     if let Some(jsonl) = jsonl {
         jsonl.write_frame(&frame)?;
+    }
+
+    if let Some(opentrack) = opentrack {
+        opentrack.send_frame(&frame)?;
     }
 
     if print_decoded {
@@ -1042,6 +1163,10 @@ impl TrackingFrame {
         write_json_number(out, "z", self.head_z, false)?;
         write!(out, "}}}}")?;
         Ok(())
+    }
+
+    fn head_xyz(&self) -> Option<[f64; 3]> {
+        Some([self.head_x?, self.head_y?, self.head_z?])
     }
 }
 
