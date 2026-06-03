@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use rusb::{Context as UsbContext, UsbContext as _};
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
 
@@ -515,14 +516,111 @@ pub(crate) fn run_camera(opts: &Options) -> Result<()> {
     thread::sleep(Duration::from_millis(100));
     let _ = h.clear_halt(EP_VIDEO);
 
-    read_camera_frames(
-        &mut h,
-        out_prefix,
-        *max_frames,
-        frame_size,
-        fifo.as_deref(),
-        *frame_type,
-    )
+    let stream = fifo.is_some();
+    let mut fifo_writer = match fifo {
+        Some(path) => {
+            println!("Streaming raw {CAM_WIDTH}x{CAM_HEIGHT} frames to {path} (waiting for reader)...");
+            // Open the FIFO write-only WITHOUT O_CREAT (File::create uses it, and
+            // fs.protected_fifos blocks a root process on a FIFO it doesn't own in
+            // sticky /tmp). Blocks until a reader connects.
+            Some(BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .with_context(|| format!("failed to open fifo {path} (mkfifo it first)"))?,
+            ))
+        }
+        None => {
+            println!("Writing up to {max_frames} PGM frames as {out_prefix}NNN.pgm");
+            None
+        }
+    };
+    let max = *max_frames;
+    let mut saved = 0usize;
+    read_camera_frames(&mut h, frame_size, *frame_type, |frame| {
+        emit_frame(&mut fifo_writer, out_prefix, saved, frame)?;
+        saved += 1;
+        Ok(stream || saved < max)
+    })?;
+    println!("Saved {saved} frame(s)");
+    Ok(())
+}
+
+pub(crate) fn run_track(opts: &Options) -> Result<()> {
+    let Command::Track {
+        init_path,
+        skip_replay,
+        host,
+        port,
+    } = &opts.command
+    else {
+        unreachable!();
+    };
+
+    let target = (host.as_str(), *port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {host}:{port}"))?
+        .next()
+        .with_context(|| format!("{host}:{port} resolved to nothing"))?;
+    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .context("failed to create UDP socket")?;
+    println!("Loading face model...");
+    let mut tracker = crate::track::Tracker::new()?;
+
+    let ctx = UsbContext::new()?;
+    let mut h = open_tobii(&ctx)?;
+    vendor_control_init(&mut h)?;
+    if !*skip_replay {
+        let packets = read_init_packets(init_path)?;
+        println!("Replaying {} init packets...", packets.len());
+        let mut no_log: Option<PacketLog> = None;
+        for pkt in &packets {
+            let expected_seq = if marker(&pkt.data) == Some(0x51) {
+                seq(&pkt.data)
+            } else {
+                None
+            };
+            if h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000)).is_err() {
+                break;
+            }
+            if let Some(s) = expected_seq {
+                let _ = wait_for_response_seq(&mut h, s, &mut no_log);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    if h.kernel_driver_active(IFACE_VIDEO).unwrap_or(false) {
+        let _ = h.detach_kernel_driver(IFACE_VIDEO);
+    }
+    h.claim_interface(IFACE_VIDEO)
+        .context("failed to claim video streaming interface 2")?;
+    let frame_size = uvc_negotiate(&mut h, None)?;
+    thread::sleep(Duration::from_millis(100));
+    let _ = h.clear_halt(EP_VIDEO);
+
+    println!("Tracking head pose -> OpenTrack {target}. Sit still ~1s to calibrate, then move.");
+    let mut frames = 0u64;
+    read_camera_frames(&mut h, frame_size, Some(2), |frame| {
+        if let Some(pose) = tracker.process(frame, CAM_WIDTH, CAM_HEIGHT)? {
+            let mut packet = [0u8; 48];
+            for (i, v) in pose.iter().enumerate() {
+                packet[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            socket.send_to(&packet, target).ok();
+            frames += 1;
+            if frames % 8 == 0 {
+                eprint!(
+                    "\ryaw/pit/roll={:+5.1}/{:+5.1}/{:+5.1}  tx/ty/tz={:+5.1}/{:+5.1}/{:+5.1}   ",
+                    pose[3], pose[4], pose[5], pose[0], pose[1], pose[2]
+                );
+            }
+        }
+        Ok(true)
+    })
 }
 
 /// Run the UVC PROBE/COMMIT handshake on the video-streaming interface for
@@ -601,48 +699,20 @@ fn uvc_negotiate(h: &mut rusb::DeviceHandle<UsbContext>, interval: Option<u32>) 
     })
 }
 
+/// Read the camera stream and hand each assembled frame (passing `type_filter`)
+/// to `on_frame`. The callback returns `false` to stop. Frame assembly, the
+/// Tobii/UVC header stripping and the type histogram live here; what to do with
+/// a frame (PGM, FIFO, pose tracking) is the caller's.
 fn read_camera_frames(
     h: &mut rusb::DeviceHandle<UsbContext>,
-    out_prefix: &str,
-    max_frames: usize,
     frame_size: usize,
-    fifo: Option<&str>,
     type_filter: Option<u8>,
+    mut on_frame: impl FnMut(&[u8]) -> Result<bool>,
 ) -> Result<()> {
-    // Two output modes: stream fixed-size raw frames to a FIFO (for a CV
-    // consumer), or dump the first `max_frames` as PGM plus the raw bulk stream.
-    let stream = fifo.is_some();
-    let mut fifo_writer = match fifo {
-        Some(path) => {
-            println!("Streaming raw {CAM_WIDTH}x{CAM_HEIGHT} frames to {path} (waiting for reader)...");
-            // Open the existing FIFO write-only WITHOUT O_CREAT/O_TRUNC: File::create
-            // uses O_CREAT, which fs.protected_fifos blocks for a root process on a
-            // FIFO it doesn't own in a sticky /tmp. This blocks until a reader opens.
-            Some(BufWriter::new(
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .with_context(|| format!("failed to open fifo {path} (mkfifo it first)"))?,
-            ))
-        }
-        None => None,
-    };
-    let mut raw = if stream {
-        None
-    } else {
-        let raw_path = format!("{out_prefix}.raw");
-        println!("Dumping raw EP 0x82 bulk to {raw_path}; writing up to {max_frames} PGM frames");
-        Some(BufWriter::new(
-            File::create(&raw_path).with_context(|| format!("failed to create {raw_path}"))?,
-        ))
-    };
-
     let mut buf = vec![0u8; 1024 * 1024];
     let mut frame: Vec<u8> = Vec::with_capacity(frame_size.max(CAM_WIDTH * CAM_HEIGHT) + 4096);
     let mut last_fid: Option<u8> = None;
-    let mut saved = 0usize;
     let mut timeouts = 0u32;
-    // Tobii frame-type byte (the wide face camera is type 2; eye cameras differ).
     let mut cur_type = 0u8;
     let mut type_hist = [0u64; 256];
     let mut typed = 0u64;
@@ -654,9 +724,6 @@ fn read_camera_frames(
             Ok(0) => continue,
             Ok(n) => {
                 timeouts = 0;
-                if let Some(raw) = raw.as_mut() {
-                    raw.write_all(&buf[..n])?;
-                }
 
                 // Each bulk read is one UVC payload: a 2-byte header
                 // (buf[1]=bmHeaderInfo, bit0=FID, bit1=EOF) followed by image
@@ -670,15 +737,10 @@ fn read_camera_frames(
                 let fid = bfh & 0x01;
                 let eof = (bfh & 0x02) != 0;
 
-                // Flush the previous frame on FID change (its type is `cur_type`,
-                // not yet overwritten by this payload).
+                // Flush the previous frame on FID change (its type is `cur_type`).
                 let boundary = last_fid.is_some() && last_fid != Some(fid);
                 if boundary && !frame.is_empty() {
-                    if flush_camera_frame(
-                        &mut fifo_writer, out_prefix, &mut saved, &frame, type_filter, cur_type,
-                    )? && !stream
-                        && saved >= max_frames
-                    {
+                    if type_filter.is_none_or(|t| t == cur_type) && !on_frame(&frame)? {
                         break;
                     }
                     frame.clear();
@@ -700,10 +762,7 @@ fn read_camera_frames(
                 }
 
                 if eof && !frame.is_empty() {
-                    let stop = flush_camera_frame(
-                        &mut fifo_writer, out_prefix, &mut saved, &frame, type_filter, cur_type,
-                    )? && !stream
-                        && saved >= max_frames;
+                    let stop = type_filter.is_none_or(|t| t == cur_type) && !on_frame(&frame)?;
                     frame.clear();
                     last_fid = None;
                     if stop {
@@ -732,29 +791,7 @@ fn read_camera_frames(
             Err(e) => anyhow::bail!("EP 0x82 read error: {e:?}"),
         }
     }
-
-    println!("Saved {saved} PGM frame(s) as {out_prefix}NNN.pgm");
     Ok(())
-}
-
-/// Emit an assembled frame unless a `type_filter` excludes its camera id.
-/// Returns whether it was actually written (so PGM mode can count toward its
-/// `--frames` limit).
-fn flush_camera_frame(
-    fifo: &mut Option<BufWriter<File>>,
-    out_prefix: &str,
-    saved: &mut usize,
-    frame: &[u8],
-    type_filter: Option<u8>,
-    cur_type: u8,
-) -> Result<bool> {
-    if type_filter.is_none_or(|t| t == cur_type) {
-        emit_frame(fifo, out_prefix, *saved, frame)?;
-        *saved += 1;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 fn print_type_hist(hist: &[u64; 256], fps_total: f64) {

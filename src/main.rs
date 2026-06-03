@@ -1,4 +1,5 @@
 mod analysis;
+mod canonical;
 mod cli;
 mod dashboard;
 mod decode;
@@ -7,6 +8,7 @@ mod math;
 mod opentrack;
 mod protocol;
 mod sinks;
+mod track;
 
 use anyhow::Result;
 
@@ -27,5 +29,6 @@ fn main() -> Result<()> {
         }
         Command::Replay { .. } => device::run(&opts),
         Command::Camera { .. } => device::run_camera(&opts),
+        Command::Track { .. } => device::run_track(&opts),
     }
 }

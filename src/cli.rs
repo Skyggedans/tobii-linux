@@ -30,6 +30,12 @@ pub(crate) enum Command {
         frame_type: Option<u8>,
         interval: Option<u32>,
     },
+    Track {
+        init_path: String,
+        skip_replay: bool,
+        host: String,
+        port: u16,
+    },
     AnalyzeLog {
         path: String,
     },
@@ -161,6 +167,41 @@ impl Options {
             DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM;
         let mut opentrack_coupling_mode = CouplingMode::Rotation;
         let mut opentrack_auto_decouple = false;
+
+        if args.peek().map(String::as_str) == Some("track") {
+            args.next();
+            let mut track_init_path = "init_packets_ep.txt".to_string();
+            let mut skip_replay = false;
+            let mut host = DEFAULT_OPENTRACK_HOST.to_string();
+            let mut port = DEFAULT_OPENTRACK_PORT;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--no-replay" => skip_replay = true,
+                    "--opentrack-host" => {
+                        host = args.next().context("--opentrack-host requires a host")?;
+                    }
+                    "--opentrack-port" => {
+                        port = args
+                            .next()
+                            .context("--opentrack-port requires a port")?
+                            .parse()
+                            .context("bad --opentrack-port value")?;
+                    }
+                    "-h" | "--help" => {
+                        println!("usage: track [init_packets_ep.txt] [--no-replay] [--opentrack-host 127.0.0.1] [--opentrack-port 4242]");
+                        std::process::exit(0);
+                    }
+                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
+                    other => track_init_path = other.to_string(),
+                }
+            }
+            return Ok(Self::for_command(Command::Track {
+                init_path: track_init_path,
+                skip_replay,
+                host,
+                port,
+            }));
+        }
 
         if args.peek().map(String::as_str) == Some("camera") {
             args.next();
