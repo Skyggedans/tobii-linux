@@ -36,6 +36,13 @@ pub(crate) enum Command {
         host: String,
         port: u16,
     },
+    Probe {
+        init_path: String,
+    },
+    Head83 {
+        path: String,
+        occs: Vec<usize>,
+    },
     AnalyzeLog {
         path: String,
     },
@@ -200,6 +207,38 @@ impl Options {
                 skip_replay,
                 host,
                 port,
+            }));
+        }
+
+        if args.peek().map(String::as_str) == Some("head83") {
+            args.next();
+            let path = args.next().context("usage: head83 <log.bin> [occ,occ,...]")?;
+            let occs = match args.next() {
+                Some(spec) => spec
+                    .split(',')
+                    .map(|s| s.trim().parse::<usize>().context("bad occurrence in head83"))
+                    .collect::<Result<Vec<_>>>()?,
+                None => vec![0, 1, 4, 5, 6, 9],
+            };
+            anyhow::ensure!(occs.len() >= 3, "head83 needs at least 3 points");
+            return Ok(Self::for_command(Command::Head83 { path, occs }));
+        }
+
+        if args.peek().map(String::as_str) == Some("probe") {
+            args.next();
+            let mut probe_init_path = "init_packets_ep.txt".to_string();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-h" | "--help" => {
+                        println!("usage: probe [init_packets_ep.txt]  (checks if 0x83 + camera stream concurrently)");
+                        std::process::exit(0);
+                    }
+                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
+                    other => probe_init_path = other.to_string(),
+                }
+            }
+            return Ok(Self::for_command(Command::Probe {
+                init_path: probe_init_path,
             }));
         }
 

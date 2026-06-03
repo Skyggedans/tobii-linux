@@ -5,8 +5,10 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::LogInput;
 use crate::decode::{
-    decode_stream_payload_with_status, field_value, head_point, LiveField, TrackingFrame,
+    decode_stream_payload, decode_stream_payload_with_status, field_value, head_point, LiveField,
+    TrackingFrame,
 };
+use crate::track::{euler_deg, kabsch};
 use crate::math::{
     dot3, normalize_angle_deg, solve_3x3, vector_pitch_deg, vector_roll_xy_deg, vector_yaw_deg,
 };
@@ -1062,6 +1064,110 @@ pub(crate) fn compare_decoded(inputs: &[LogInput]) -> Result<()> {
     print_decoded_pair("eyes_left", "eyes_right", &logs, &candidates, 32);
 
     Ok(())
+}
+
+/// Research: reconstruct gaze-independent head pose from the 0x83 stream by a
+/// rigid (Kabsch) fit over the *rigid* head landmark points (occurrences that
+/// move with the head but not with gaze — identified as 5,6,9 + 0,1,4). This is
+/// how the Windows Stream Engine derives head pose without the camera.
+pub(crate) fn head83(path: &str, occs: &[usize]) -> Result<()> {
+    let payloads = main_stream_payloads(path)?;
+
+    // Per-frame rigid point sets, skipping frames without a face (all-zero pts).
+    let mut frames: Vec<Vec<[f64; 3]>> = Vec::new();
+    for payload in &payloads {
+        let values = decode_stream_payload(payload)?;
+        let mut pts = Vec::with_capacity(occs.len());
+        let mut ok = true;
+        for &o in occs {
+            match head_point(&values, o) {
+                Some(p) if p.iter().any(|v| v.abs() > 1e-6) => pts.push(p),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            frames.push(pts);
+        }
+    }
+    anyhow::ensure!(
+        frames.len() > 30,
+        "too few valid face frames in {path} ({})",
+        frames.len()
+    );
+
+    // Reference shape = mean of the first 30 valid frames (neutral pose).
+    let nref = 30.min(frames.len());
+    let mut reference = vec![[0.0; 3]; occs.len()];
+    for frame in &frames[..nref] {
+        for (i, p) in frame.iter().enumerate() {
+            for k in 0..3 {
+                reference[i][k] += p[k] / nref as f64;
+            }
+        }
+    }
+    let ref_centroid = centroid3(&reference);
+
+    // Per-frame pose: Kabsch rotation + centroid translation vs the reference.
+    let mut eul = Vec::with_capacity(frames.len());
+    let mut trans = Vec::with_capacity(frames.len());
+    for frame in &frames {
+        let r = kabsch(&reference, frame);
+        eul.push(euler_deg(&r));
+        let c = centroid3(frame);
+        trans.push([
+            c[0] - ref_centroid[0],
+            c[1] - ref_centroid[1],
+            c[2] - ref_centroid[2],
+        ]);
+    }
+
+    let label = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    println!(
+        "{label}: {} valid / {} packets, occ={:?}",
+        frames.len(),
+        payloads.len(),
+        occs
+    );
+    println!("  axis        min        max      range        std");
+    let names = ["rot0", "rot1", "rot2", "tx", "ty", "tz"];
+    for (i, name) in names.iter().enumerate() {
+        let series: Vec<f64> = if i < 3 {
+            eul.iter().map(|e| e[i]).collect()
+        } else {
+            trans.iter().map(|t| t[i - 3]).collect()
+        };
+        let (mn, mx, sd) = min_max_std(&series);
+        println!(
+            "  {name:5} {mn:10.2} {mx:10.2} {:10.2} {sd:10.2}",
+            mx - mn
+        );
+    }
+    Ok(())
+}
+
+fn centroid3(pts: &[[f64; 3]]) -> [f64; 3] {
+    let n = pts.len().max(1) as f64;
+    let mut c = [0.0; 3];
+    for p in pts {
+        for k in 0..3 {
+            c[k] += p[k] / n;
+        }
+    }
+    c
+}
+
+fn min_max_std(v: &[f64]) -> (f64, f64, f64) {
+    let mn = v.iter().copied().fold(f64::INFINITY, f64::min);
+    let mx = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64;
+    (mn, mx, var.sqrt())
 }
 
 pub(crate) type DecodedFields = BTreeMap<(u32, usize, usize), StreamFieldStats>;

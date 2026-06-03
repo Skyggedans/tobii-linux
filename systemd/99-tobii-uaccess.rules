@@ -1,0 +1,5 @@
+# Grant the logged-in user direct access to the Tobii Eye Tracker 5
+# (USB 2104:0313) so a user-level tobiid can claim it without root.
+# Install: sudo cp 99-tobii-uaccess.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="0313", TAG+="uaccess", MODE="0660"

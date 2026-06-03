@@ -70,7 +70,10 @@ pub(crate) fn main_stream_payloads(path: &str) -> Result<Vec<Vec<u8>>> {
 
 pub(crate) fn read_init_packets(path: &str) -> Result<Vec<InitPacket>> {
     let text = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    parse_init_packets(&text)
+}
 
+pub(crate) fn parse_init_packets(text: &str) -> Result<Vec<InitPacket>> {
     let mut packets = Vec::new();
 
     for (line_no, line) in text.lines().enumerate() {

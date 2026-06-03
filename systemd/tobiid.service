@@ -1,0 +1,17 @@
+[Unit]
+Description=Tobii Eye Tracker 5 daemon (head/gaze/presence broker)
+Documentation=https://github.com/  # tobii5-init-replay
+# Start after the user session is up so XDG_RUNTIME_DIR exists.
+After=default.target
+
+[Service]
+Type=simple
+# Dev build path; change to /usr/local/bin/tobiid once installed.
+ExecStart=%h/Work/tobii/target/release/tobiid
+Restart=on-failure
+RestartSec=2
+# The daemon claims the USB device; keep it lean.
+Nice=-5
+
+[Install]
+WantedBy=default.target

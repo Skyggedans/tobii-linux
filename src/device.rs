@@ -3,14 +3,19 @@ use rusb::{Context as UsbContext, UsbContext as _};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::ToSocketAddrs;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
 
 use crate::cli::{Command, Options};
 use crate::dashboard::render_dashboard_status;
+use crate::decode::{decode_stream_payload, TrackingFrame};
+use crate::engine::{GazeSample, PoseSample, Sample};
 use crate::opentrack::OpentrackUdp;
-use crate::protocol::{declared_len, marker, read_init_packets, seq, InitPacket};
-use crate::sinks::{handle_live_decoded, log_packet, DecodedCsv, JsonlOutput, PacketLog};
+use crate::protocol::{declared_len, marker, parse_init_packets, read_init_packets, seq, InitPacket};
+use crate::sinks::{handle_live_decoded, log_packet, now_us, DecodedCsv, JsonlOutput, PacketLog};
 
 pub(crate) const VID: u16 = 0x2104;
 
@@ -621,6 +626,253 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
         }
         Ok(true)
     })
+}
+
+/// Drive the camera head-pose pipeline for the FFI/library engine: own the
+/// device, run the tracker, and push pose samples to `tx` until `stop` is set.
+/// Init packets are embedded so the library is self-contained.
+pub(crate) fn run_pose_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Result<()> {
+    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
+    let mut tracker = crate::track::Tracker::new()?;
+    let ctx = UsbContext::new()?;
+    let mut h = open_tobii(&ctx)?;
+    vendor_control_init(&mut h)?;
+    let packets = parse_init_packets(INIT_PACKETS)?;
+    let mut no_log: Option<PacketLog> = None;
+    for pkt in &packets {
+        let expected_seq = if marker(&pkt.data) == Some(0x51) {
+            seq(&pkt.data)
+        } else {
+            None
+        };
+        if h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000)).is_err() {
+            break;
+        }
+        if let Some(s) = expected_seq {
+            let _ = wait_for_response_seq(&mut h, s, &mut no_log);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    if h.kernel_driver_active(IFACE_VIDEO).unwrap_or(false) {
+        let _ = h.detach_kernel_driver(IFACE_VIDEO);
+    }
+    h.claim_interface(IFACE_VIDEO)
+        .context("failed to claim video streaming interface 2")?;
+    let frame_size = uvc_negotiate(&mut h, None)?;
+    thread::sleep(Duration::from_millis(100));
+    let _ = h.clear_halt(EP_VIDEO);
+
+    read_camera_frames(&mut h, frame_size, Some(2), |frame| {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if let Some(p) = tracker.process(frame, CAM_WIDTH, CAM_HEIGHT)? {
+            let _ = tx.send(Sample::Pose(PoseSample {
+                timestamp_us: now_us() as i64,
+                pos_cm: [p[0], p[1], p[2]],
+                rot_deg: [p[3], p[4], p[5]],
+            }));
+        }
+        Ok(true)
+    })
+}
+
+/// Drive the 0x83 processed stream for the FFI/library engine: own the device,
+/// decode gaze + presence, and push gaze samples to `tx` until `stop` is set.
+/// The camera is *not* claimed here — doing so would throttle this stream.
+pub(crate) fn run_gaze_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Result<()> {
+    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
+    let ctx = UsbContext::new()?;
+    let mut h = open_tobii(&ctx)?;
+    vendor_control_init(&mut h)?;
+    let packets = parse_init_packets(INIT_PACKETS)?;
+    let mut no_log: Option<PacketLog> = None;
+    for pkt in &packets {
+        let expected_seq = if marker(&pkt.data) == Some(0x51) {
+            seq(&pkt.data)
+        } else {
+            None
+        };
+        if h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000)).is_err() {
+            break;
+        }
+        if let Some(s) = expected_seq {
+            let _ = wait_for_response_seq(&mut h, s, &mut no_log);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let mut buf = vec![0u8; 16384];
+    let mut packet_no = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(500)) {
+            Ok(n) if n > 0 => {
+                let data = &buf[..n];
+                if marker(data) != Some(0x53) {
+                    continue;
+                }
+                let decoded = decode_stream_payload(data)?;
+                if decoded.is_empty() {
+                    continue;
+                }
+                let frame = TrackingFrame::from_decoded(packet_no, &decoded);
+                packet_no += 1;
+                let _ = tx.send(Sample::Gaze(GazeSample {
+                    timestamp_us: frame.ts_us as i64,
+                    gaze_valid: frame.gaze_valid,
+                    gaze_norm: [
+                        frame.gaze_norm_x.unwrap_or(0.0),
+                        frame.gaze_norm_y.unwrap_or(0.0),
+                    ],
+                    present: frame.gaze_valid,
+                }));
+            }
+            Ok(_) => {}
+            Err(rusb::Error::Timeout) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Diagnostic: after the normal init (which starts the 0x83 processed stream),
+/// measure 0x83 alone, then bring up the camera (UVC) and check whether 0x83
+/// (gaze/head) and 0x82 (camera) deliver data *concurrently*. This is the gate
+/// for fusing the fast 0x83 translation with camera rotation.
+pub(crate) fn run_probe(opts: &Options) -> Result<()> {
+    let Command::Probe { init_path } = &opts.command else {
+        unreachable!();
+    };
+
+    let ctx = UsbContext::new()?;
+    let mut h = open_tobii(&ctx)?;
+    vendor_control_init(&mut h)?;
+    let packets = read_init_packets(init_path)?;
+    println!("Replaying {} init packets...", packets.len());
+    let mut no_log: Option<PacketLog> = None;
+    for pkt in &packets {
+        let expected_seq = if marker(&pkt.data) == Some(0x51) {
+            seq(&pkt.data)
+        } else {
+            None
+        };
+        if h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000)).is_err() {
+            break;
+        }
+        if let Some(s) = expected_seq {
+            let _ = wait_for_response_seq(&mut h, s, &mut no_log);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // Phase A: 0x83 only (camera not yet streaming).
+    let (a_pkts, a_stream, a_bytes) = sample_0x83(&h, Duration::from_secs(2));
+    let a_secs = 2.0;
+    println!(
+        "\n[A] 0x83 only:    {a_pkts} packets ({a_stream} stream/0x53), {a_bytes} bytes, {:.1} pkt/s",
+        a_pkts as f64 / a_secs
+    );
+
+    // Bring up the camera.
+    if h.kernel_driver_active(IFACE_VIDEO).unwrap_or(false) {
+        let _ = h.detach_kernel_driver(IFACE_VIDEO);
+    }
+    h.claim_interface(IFACE_VIDEO)
+        .context("failed to claim video streaming interface 2")?;
+    let frame_size = uvc_negotiate(&mut h, None)?;
+    thread::sleep(Duration::from_millis(100));
+    let _ = h.clear_halt(EP_VIDEO);
+    println!("Camera up (frame buffer {frame_size} bytes). Reading both endpoints for 6s...");
+
+    // Phase B: one dedicated reader thread per endpoint (a shared DeviceHandle
+    // is Send+Sync), so the low-rate 0x83 stream isn't starved by the camera.
+    let h = Arc::new(h);
+    let stop = Arc::new(AtomicBool::new(false));
+    let cam = {
+        let h = h.clone();
+        let stop = stop.clone();
+        let cap = frame_size.max(65536);
+        thread::spawn(move || {
+            let mut buf = vec![0u8; cap];
+            let (mut n, mut b) = (0u64, 0u64);
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(k) = h.read_bulk(EP_VIDEO, &mut buf, Duration::from_millis(200)) {
+                    if k > 0 {
+                        n += 1;
+                        b += k as u64;
+                    }
+                }
+            }
+            (n, b)
+        })
+    };
+
+    let mut buf83 = vec![0u8; 16384];
+    let (mut n83, mut s83, mut b83) = (0u64, 0u64, 0u64);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(6) {
+        if let Ok(n) = h.read_bulk(EP_IN, &mut buf83, Duration::from_millis(200)) {
+            if n > 0 {
+                n83 += 1;
+                b83 += n as u64;
+                if marker(&buf83[..n]) == Some(0x53) {
+                    s83 += 1;
+                }
+            }
+        }
+    }
+    let dt = start.elapsed().as_secs_f64();
+    stop.store(true, Ordering::Relaxed);
+    let (n82, b82) = cam.join().unwrap_or((0, 0));
+    println!(
+        "[B] 0x83 (gaze):  {n83} packets ({s83} stream/0x53), {b83} bytes, {:.1} pkt/s",
+        n83 as f64 / dt
+    );
+    println!(
+        "[B] 0x82 (cam):   {n82} reads, {b82} bytes, {:.1} read/s",
+        n82 as f64 / dt
+    );
+
+    let a_rate = a_pkts as f64 / a_secs;
+    let b_rate = n83 as f64 / dt;
+    println!("\n=== verdict ===");
+    if n82 == 0 {
+        println!("camera silent -> UVC/camera not delivering here.");
+    } else if b_rate >= a_rate * 0.5 {
+        println!(
+            "0x83 keeps {b_rate:.1}/{a_rate:.1} pkt/s with the camera on -> concurrent fusion is viable."
+        );
+    } else if b_rate < a_rate * 0.2 {
+        println!(
+            "0x83 throttled to {b_rate:.1} pkt/s (was {a_rate:.1}) once the camera streams -> the device \
+             will not run the processed pipeline and raw camera at the same time. Concurrent fusion is NOT viable; \
+             camera-mode and 0x83-mode are mutually exclusive."
+        );
+    } else {
+        println!(
+            "0x83 partly throttled: {b_rate:.1} pkt/s (was {a_rate:.1}) -> degraded but not dead."
+        );
+    }
+    Ok(())
+}
+
+/// Read EP 0x83 for `dur`, returning (packets, stream-marked, bytes).
+fn sample_0x83(h: &rusb::DeviceHandle<UsbContext>, dur: Duration) -> (u64, u64, u64) {
+    let mut buf = vec![0u8; 16384];
+    let (mut n, mut s, mut b) = (0u64, 0u64, 0u64);
+    let start = Instant::now();
+    while start.elapsed() < dur {
+        if let Ok(len) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(50)) {
+            if len > 0 {
+                n += 1;
+                b += len as u64;
+                if marker(&buf[..len]) == Some(0x53) {
+                    s += 1;
+                }
+            }
+        }
+    }
+    (n, s, b)
 }
 
 /// Run the UVC PROBE/COMMIT handshake on the video-streaming interface for

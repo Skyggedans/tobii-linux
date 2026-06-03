@@ -16,7 +16,13 @@ const NLM: usize = 468; // canonical landmarks (model emits 478 incl. iris)
 const ANGLE_SIGN: [f64; 3] = [1.0, 1.0, 1.0]; // pitch, yaw, roll
 const SEND_TRANSLATION: bool = true;
 const TRANS_SIGN: [f64; 3] = [-1.0, -1.0, -1.0]; // tx, ty, tz (camera y down, z fwd)
-const TRANS_GAIN: [f64; 3] = [2.0, 2.0, 2.0]; // solvePnP translation is metric cm
+const TRANS_GAIN: [f64; 3] = [1.0, 1.0, 1.0]; // solvePnP translation is metric cm
+// Report translation at a pivot (the neck) instead of the face origin, so pure
+// head rotation rotates in place instead of sliding. The pivot is offset from
+// the face origin in the canonical model frame: +y is down, +z is toward the
+// back of the head (nose points to -z). Raise these if rotations still slide.
+const PIVOT_NECK_DOWN_CM: f64 = 11.0;
+const PIVOT_NECK_BACK_CM: f64 = 6.0;
 const SMOOTH: f64 = 0.5;
 const CALIB_FRAMES: usize = 30;
 const CLAMP_DEG: f64 = 45.0;
@@ -369,10 +375,27 @@ pub(crate) struct Tracker {
     have: bool,
     cx: f32,
     cy: f32,
+    pivot: [f64; 3], // neck offset in model cm: [0, down, back]
+    debug: bool,
+    frame: u64,
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Tracker {
     pub(crate) fn new() -> Result<Self> {
+        let pivot = [
+            0.0,
+            env_f64("TOBII_PIVOT_DOWN", PIVOT_NECK_DOWN_CM),
+            env_f64("TOBII_PIVOT_BACK", PIVOT_NECK_BACK_CM),
+        ];
+        let debug = std::env::var("TOBII_POSE_DEBUG").is_ok();
+        eprintln!("tracker pivot = [down {:.1}, back {:.1}] cm", pivot[1], pivot[2]);
         Ok(Self {
             model: FaceModel::new()?,
             canonical: canonical_f64(),
@@ -382,6 +405,9 @@ impl Tracker {
             have: false,
             cx: 0.0,
             cy: 0.0,
+            pivot,
+            debug,
+            frame: 0,
         })
     }
 
@@ -450,7 +476,21 @@ impl Tracker {
         let e = euler_deg(&r);
         // Match MediaPipe's convention (yaw/roll negate vs our euler).
         let mp = [e[0], -e[1], -e[2]]; // pitch, yaw, roll
-        let raw = [t[0], t[1], t[2], mp[0], mp[1], mp[2]]; // translation in cm
+
+        // Translate the reported position to the neck pivot: t' = t + R*pivot.
+        // A pure head rotation about the neck then leaves t' ~constant (rotates
+        // in place) instead of swinging the face origin sideways.
+        let rp = matvec3(&r, &self.pivot);
+        let tp = [t[0] + rp[0], t[1] + rp[1], t[2] + rp[2]];
+        let raw = [tp[0], tp[1], tp[2], mp[0], mp[1], mp[2]]; // translation in cm
+
+        self.frame += 1;
+        if self.debug && self.frame % 8 == 0 {
+            eprintln!(
+                "yaw/pit={:+5.1}/{:+5.1}  t=[{:+5.1} {:+5.1} {:+5.1}]  t'=[{:+5.1} {:+5.1} {:+5.1}] cm",
+                mp[1], mp[0], t[0], t[1], t[2], tp[0], tp[1], tp[2]
+            );
+        }
 
         if self.origin.is_none() {
             self.accum.push(raw);

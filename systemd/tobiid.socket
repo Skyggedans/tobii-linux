@@ -1,0 +1,9 @@
+[Unit]
+Description=Tobii Eye Tracker 5 daemon socket
+
+[Socket]
+# %t = $XDG_RUNTIME_DIR (e.g. /run/user/1000); matches ipc::socket_path().
+ListenStream=%t/tobiid.sock
+
+[Install]
+WantedBy=sockets.target
