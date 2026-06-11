@@ -33,6 +33,7 @@ Produces in `target/release/`:
 |---|---|
 | `tobiid` | the daemon (claims the device, serves clients) |
 | `tobii-opentrack` | thin client: head pose → OpenTrack UDP |
+| `tobii-gaze-keys` | thin client: gaze at screen edge → Left/Right arrow key |
 | `tobii5-init-replay` | the CLI / analysis & diagnostics tool |
 | `libtobii.so` | C ABI (`tobii_*`) in the shape of the Tobii Stream Engine; a daemon client |
 
@@ -67,6 +68,33 @@ sudo udevadm control --reload && sudo udevadm trigger
 
 Check: `ls -l /dev/bus/usb/$(lsusb | awk '/2104:0313/{printf "%03d/%03d",$2,$4}')`
 should be group-readable/writable for you.
+
+**Recommended:** also install the rule that keeps the kernel `uvcvideo` driver
+off this device. We drive the IR camera over libusb, not V4L2; uvcvideo only
+races our init (a source of "works every other start" flakiness) and the device
+isn't a usable webcam anyway:
+
+```bash
+sudo cp systemd/99-tobii-no-uvcvideo.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger   # then re-plug
+```
+
+(`make install` installs both udev rules for you.) Verify it took effect:
+`ls /dev/video*` should no longer show a node for the tracker, and
+`lsusb -t` should list interface 2 of `2104:0313` with no `uvcvideo` driver.
+
+**Only for `tobii-gaze-keys`:** it injects key presses through `/dev/uinput`,
+which is root-only by default. To run it without `sudo`, hand the device to the
+`input` group and join that group:
+
+```bash
+sudo cp systemd/99-tobii-uinput.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
+sudo usermod -aG input "$USER"        # then log out/in for the group to apply
+```
+
+Check: `ls -l /dev/uinput` should show group `input` with mode `crw-rw----`, and
+`id -nG` should list `input`. (Skip this if you'll just run the tool with `sudo`.)
 
 ---
 
@@ -151,6 +179,9 @@ tracker runs in the daemon, not in the client):
 | `TOBII_PIVOT_DOWN` | `11.0` | neck pivot below the face origin (cm) — fixes yaw sliding |
 | `TOBII_PIVOT_BACK` | `6.0` | neck pivot behind the face origin (cm) — fixes pitch sliding |
 | `TOBII_POSE_DEBUG` | unset | log raw `t` vs pivoted `t'` and angles |
+| `TOBII_ROLL_EYELINE` | unset | `1` measures roll directly from the eye line (decoupled from yaw/pitch, symmetric by construction) instead of from the euler solve |
+| `TOBII_PREWARM` | unset | `head` or `gaze`: init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). Recommended for an always-on head-tracking service. |
+| `TOBII_NO_RESET` | unset | `1` skips the USB reset at init (a couple seconds faster; the reset rarely helps now that uvcvideo is kept off the device) |
 
 Raise the pivots if pure rotations still **slide**; lower them if they
 **over-shoot** (slide the other way). For a systemd unit:
@@ -185,10 +216,44 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   `tobii_device_process_callbacks`. Position in **mm**, rotation in **radians**
   (`[pitch, yaw, roll]`), gaze normalized `0..1`. Link against it and it talks
   to the daemon for you.
+- **`tobii-gaze-keys`** — subscribes to **gaze** (so it runs the daemon in gaze
+  mode, mutually exclusive with head pose). While you look at the left/right edge
+  of the screen **and hold a Super/Meta key**, it taps the **Left**/**Right**
+  arrow key once per second, via `/dev/uinput` (works under both X11 and Wayland).
+  Because Super stays physically held, the app sees **Super+Left / Super+Right** —
+  e.g. switching tiles/workspaces. Needs `/dev/uinput` + `/dev/input` access (§3).
+
+  ```bash
+  tobii-gaze-keys                                   # auto-calibrate, gated by Super
+  tobii-gaze-keys --margin 0.3 --interval-ms 800
+  tobii-gaze-keys --no-super                        # don't require Super
+  tobii-gaze-keys --left 0.2 --right 0.85           # fixed absolute thresholds
+  ```
+
+  By default it **auto-calibrates**: it learns the gaze-X range you actually reach
+  (look fully left and right once) and fires when gaze is within `--margin` of
+  either observed extreme — robust to a gaze stream that isn't centered/symmetric.
+  `--left`/`--right` switch to fixed absolute thresholds (`0`=left .. `1`=right);
+  `--interval-ms` is the min gap between repeated taps while gaze stays at an edge;
+  `--no-super` drops the Super requirement.
 - **`tobii5-init-replay track`** — standalone head→OpenTrack without the daemon
   (claims the device directly). Handy for isolating issues; same tracker code.
 - Diagnostics: `tobii5-init-replay probe` (camera-vs-0x83 concurrency),
   `… head83 <log.bin>` (research: head pose from 0x83 points).
+
+### Recenter (recalibrate the head rest pose)
+
+Sit in your neutral pose and trigger a recenter — the daemon recalibrates
+without restarting the device/stream. Three ways:
+
+```bash
+tobii-opentrack --recenter                 # one-shot client (bind to a hotkey)
+systemctl --user kill -s SIGUSR1 tobiid    # or signal the service
+kill -USR1 $(pgrep -x tobiid)              # or signal the process
+```
+
+Via `libtobii.so`: call `tobii_recenter(device)`. (Head mode only; gaze has no
+rest pose.)
 
 ---
 

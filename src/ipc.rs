@@ -14,6 +14,7 @@ pub const STREAM_PRESENCE: u8 = 1 << 2;
 
 // Frame tags.
 pub const TAG_SUBSCRIBE: u8 = 0x01; // client -> daemon: u8 streams
+pub const TAG_RECENTER: u8 = 0x02; // client -> daemon: reset the head rest pose
 pub const TAG_SUBSCRIBED: u8 = 0x10; // daemon -> client: u8 ok(1)/busy(0)
 pub const TAG_HEAD: u8 = 0x20; // i64 ts, 3xf32 pos(mm), 3xf32 rot(rad)
 pub const TAG_GAZE: u8 = 0x21; // i64 ts, u8 valid, 2xf32 xy(0..1)
@@ -101,6 +102,10 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 
 pub fn encode_subscribe(streams: u8) -> Vec<u8> {
     vec![TAG_SUBSCRIBE, streams]
+}
+
+pub fn encode_recenter() -> Vec<u8> {
+    vec![TAG_RECENTER]
 }
 
 pub fn encode_subscribed(ok: bool) -> Vec<u8> {

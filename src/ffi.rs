@@ -268,6 +268,22 @@ pub unsafe extern "C" fn tobii_user_presence_unsubscribe(device: *mut Device) ->
     TOBII_ERROR_NO_ERROR
 }
 
+/// Recalibrate the head rest pose now (extension; not in the original Stream
+/// Engine). Affects whichever client currently holds the device's mode.
+///
+/// # Safety
+/// `device` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
+    let Some(d) = device.as_mut() else {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    };
+    if write_frame(&mut d.stream, &ipc::encode_recenter()).is_err() {
+        return TOBII_ERROR_CONNECTION_FAILED;
+    }
+    TOBII_ERROR_NO_ERROR
+}
+
 /// Block until a device has data or a short timeout elapses.
 ///
 /// # Safety

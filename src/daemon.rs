@@ -6,12 +6,20 @@
 use anyhow::{Context, Result};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::engine::{Engine, EngineMode, Sample};
+
+/// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
+static RECENTER_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigusr1(_sig: libc::c_int) {
+    // Async-signal-safe: only an atomic store.
+    RECENTER_SIGNAL.store(true, Ordering::Relaxed);
+}
 use crate::ipc::{
     self, decode_subscribe, encode_gaze, encode_head, encode_presence, encode_subscribed,
     read_frame, write_frame, STREAM_GAZE, STREAM_HEAD, STREAM_PRESENCE,
@@ -27,15 +35,44 @@ struct State {
     engine: Option<Engine>,
     mode: Option<EngineMode>,
     clients: Vec<Client>,
+    /// If set, keep an engine of this mode running even with no clients, so the
+    /// device stays warm and client connects are instant (`TOBII_PREWARM`).
+    prewarm: Option<EngineMode>,
 }
 
 impl State {
-    /// Stop the engine once no client consumes any stream.
+    /// True if some client consumes a stream, or a pre-warm mode is set.
+    fn engine_wanted(&self) -> bool {
+        self.prewarm.is_some() || self.clients.iter().any(|c| c.streams != 0)
+    }
+
+    /// Stop the engine once no client consumes any stream — unless a pre-warm
+    /// mode is configured, in which case keep (or restart) it. Also drops a dead
+    /// engine so it can be restarted.
     fn reconcile(&mut self) {
+        if self.engine.as_ref().is_some_and(|e| !e.is_alive()) {
+            self.engine = None;
+        }
+        if let Some(mode) = self.prewarm {
+            if self.engine.is_none() {
+                self.engine = Some(Engine::start(mode));
+                self.mode = Some(mode);
+            }
+            return;
+        }
         if self.clients.iter().all(|c| c.streams == 0) {
             self.engine = None;
             self.mode = None;
         }
+    }
+}
+
+/// Pre-warm mode from `TOBII_PREWARM` (head | gaze), else none.
+fn prewarm_mode() -> Option<EngineMode> {
+    match std::env::var("TOBII_PREWARM").ok().as_deref() {
+        Some("head" | "head-camera" | "camera") => Some(EngineMode::HeadCamera),
+        Some("gaze") => Some(EngineMode::Gaze),
+        _ => None,
     }
 }
 
@@ -80,16 +117,67 @@ fn obtain_listener() -> Result<UnixListener> {
 pub fn run() -> Result<()> {
     let listener = obtain_listener()?;
 
+    let prewarm = prewarm_mode();
     let state = Arc::new(Mutex::new(State {
         engine: None,
         mode: None,
         clients: Vec::new(),
+        prewarm,
     }));
+
+    // Pre-warm: bring the device up now (pays the cold-start lottery once) and
+    // keep it streaming so later client connects are instant.
+    if let Some(mode) = prewarm {
+        println!("pre-warming device in {mode:?} mode");
+        let mut st = state.lock().unwrap();
+        st.engine = Some(Engine::start(mode));
+        st.mode = Some(mode);
+    }
 
     // Pump thread: drain the active engine and fan samples out to clients.
     {
         let state = state.clone();
         thread::spawn(move || pump(state));
+    }
+
+    // Watchdog: if the device thread died (a cold start that exhausted its
+    // internal retries, an unplug, etc.) but it's still wanted, restart it.
+    {
+        let state = state.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(3));
+            let mut st = state.lock().unwrap();
+            let dead = st.engine.as_ref().is_some_and(|e| !e.is_alive());
+            if (dead || st.engine.is_none()) && st.engine_wanted() {
+                // Don't spin (reloading the model) on an unplugged device.
+                if let Some(mode) = st.prewarm.or(st.mode) {
+                    if crate::device::device_present() {
+                        println!("engine ({mode:?}) not running but wanted; restarting");
+                        st.engine = Some(Engine::start(mode));
+                        st.mode = Some(mode);
+                    }
+                }
+            }
+        });
+    }
+
+    // SIGUSR1 -> recenter the head rest pose (alternative to a client command).
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            on_sigusr1 as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+    {
+        let state = state.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(150));
+            if RECENTER_SIGNAL.swap(false, Ordering::Relaxed) {
+                if let Some(engine) = state.lock().unwrap().engine.as_ref() {
+                    engine.request_recenter();
+                }
+            }
+        });
     }
 
     let ids = AtomicU64::new(1);
@@ -115,12 +203,20 @@ pub fn run() -> Result<()> {
 fn client_reader(state: Arc<Mutex<State>>, id: u64, mut stream: UnixStream) {
     loop {
         match read_frame(&mut stream) {
-            Ok(Some(body)) => {
-                if let Some(streams) = decode_subscribe(&body) {
-                    let ok = handle_subscribe(&state, id, streams);
-                    let _ = write_frame(&mut stream, &encode_subscribed(ok));
+            Ok(Some(body)) => match body.first().copied() {
+                Some(ipc::TAG_SUBSCRIBE) => {
+                    if let Some(streams) = decode_subscribe(&body) {
+                        let ok = handle_subscribe(&state, id, streams);
+                        let _ = write_frame(&mut stream, &encode_subscribed(ok));
+                    }
                 }
-            }
+                Some(ipc::TAG_RECENTER) => {
+                    if let Some(engine) = state.lock().unwrap().engine.as_ref() {
+                        engine.request_recenter();
+                    }
+                }
+                _ => {}
+            },
             _ => break, // EOF or error
         }
     }

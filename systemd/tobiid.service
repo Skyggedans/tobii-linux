@@ -12,6 +12,11 @@ Restart=on-failure
 RestartSec=2
 # The daemon claims the USB device; keep it lean.
 Nice=-5
+# Keep the device warm so client connects are instant (the IR illuminator stays
+# on while the service runs). Uncomment for head tracking:
+#Environment=TOBII_PREWARM=head
+# Skipping the USB reset shaves a couple seconds off startup:
+#Environment=TOBII_NO_RESET=1
 
 [Install]
 WantedBy=default.target

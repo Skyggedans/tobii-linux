@@ -49,6 +49,7 @@ pub enum Sample {
 /// access is sufficient and lock-free.
 pub struct Engine {
     stop: Arc<AtomicBool>,
+    recenter: Arc<AtomicBool>,
     rx: Receiver<Sample>,
     pending: VecDeque<Sample>,
     handle: Option<JoinHandle<()>>,
@@ -58,11 +59,13 @@ pub struct Engine {
 impl Engine {
     pub fn start(mode: EngineMode) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let recenter = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let s = stop.clone();
+        let rc = recenter.clone();
         let handle = thread::spawn(move || {
             let result = match mode {
-                EngineMode::HeadCamera => crate::device::run_pose_engine(&s, &tx),
+                EngineMode::HeadCamera => crate::device::run_pose_engine(&s, &rc, &tx),
                 EngineMode::Gaze => crate::device::run_gaze_engine(&s, &tx),
             };
             if let Err(e) = result {
@@ -71,6 +74,7 @@ impl Engine {
         });
         Engine {
             stop,
+            recenter,
             rx,
             pending: VecDeque::new(),
             handle: Some(handle),
@@ -80,6 +84,16 @@ impl Engine {
 
     pub fn mode(&self) -> EngineMode {
         self.mode
+    }
+
+    /// Ask the head tracker to recalibrate its rest pose on the next frames.
+    pub fn request_recenter(&self) {
+        self.recenter.store(true, Ordering::Relaxed);
+    }
+
+    /// Is the device thread still running (false once it has exited/failed)?
+    pub fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Block up to `timeout` until at least one sample is available.

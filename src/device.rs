@@ -631,40 +631,202 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
 /// Drive the camera head-pose pipeline for the FFI/library engine: own the
 /// device, run the tracker, and push pose samples to `tx` until `stop` is set.
 /// Init packets are embedded so the library is self-contained.
-pub(crate) fn run_pose_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Result<()> {
-    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
+///
+/// The device init is flaky (~every other cold start it comes up without the
+/// camera streaming), so the whole open+init+bring-up is retried: the startup
+/// watchdog in `read_camera_frames` bails fast with `StreamStartupTimeout` and
+/// we redo a full, fresh init instead of leaving the engine dead.
+pub(crate) fn run_pose_engine(
+    stop: &Arc<AtomicBool>,
+    recenter: &Arc<AtomicBool>,
+    tx: &Sender<Sample>,
+) -> Result<()> {
     let mut tracker = crate::track::Tracker::new()?;
     let ctx = UsbContext::new()?;
-    let mut h = open_tobii(&ctx)?;
-    vendor_control_init(&mut h)?;
-    let packets = parse_init_packets(INIT_PACKETS)?;
+    // The init is a blind replay that assumes the device starts from a clean
+    // baseline, but we never send a stop on exit, so a prior session leaves it
+    // "hot" and the replay desyncs (~every other cold start). A USB reset forces
+    // re-enumeration to a known state so the replay's preconditions hold.
+    reset_device_baseline(&ctx);
+
+    for attempt in 1..=MAX_REPLAY_ATTEMPTS {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match pose_engine_attempt(&ctx, stop, recenter, tx, &mut tracker) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < MAX_REPLAY_ATTEMPTS && !stop.load(Ordering::Relaxed) => {
+                eprintln!(
+                    "tobii camera init attempt {attempt}/{MAX_REPLAY_ATTEMPTS} failed: {e}; \
+                     redoing full init"
+                );
+                thread::sleep(Duration::from_millis(700));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort USB reset to drop any state a prior session left on the device,
+/// so the replayed init starts from a known baseline. Re-enumeration is what we
+/// want; we then wait for the device to reappear (by presence, not a blind
+/// sleep) so the following init doesn't race a missing device.
+///
+/// Set `TOBII_NO_RESET=1` to skip it (faster start; try this now that uvcvideo
+/// is kept off the device — the reset may no longer be needed).
+fn reset_device_baseline(ctx: &UsbContext) {
+    let skip = std::env::var("TOBII_NO_RESET")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if skip {
+        return;
+    }
+    if let Ok(h) = open_tobii(ctx) {
+        match h.reset() {
+            Ok(()) => println!("reset Tobii to baseline before init"),
+            Err(e) => println!("reset best-effort failed: {e:?}"),
+        }
+        drop(h); // device may re-enumerate; reopen fresh below
+    }
+    // Poll for re-enumeration to finish (cap ~3s) instead of sleeping blindly.
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(100));
+        if tobii_present(ctx) {
+            thread::sleep(Duration::from_millis(150)); // brief settle
+            return;
+        }
+    }
+}
+
+/// Is the Tobii plugged in right now? (Cheap check for the daemon watchdog.)
+pub(crate) fn device_present() -> bool {
+    UsbContext::new().map(|ctx| tobii_present(&ctx)).unwrap_or(false)
+}
+
+/// Is the Tobii on the bus right now (without opening/claiming it)?
+fn tobii_present(ctx: &UsbContext) -> bool {
+    ctx.devices()
+        .map(|devs| {
+            devs.iter().any(|d| {
+                d.device_descriptor()
+                    .map(|x| x.vendor_id() == VID && x.product_id() == PID)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Replay the embedded init packet sequence on EP 0x05.
+fn replay_init(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    packets: &[InitPacket],
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
     let mut no_log: Option<PacketLog> = None;
-    for pkt in &packets {
+    for pkt in packets {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let expected_seq = if marker(&pkt.data) == Some(0x51) {
             seq(&pkt.data)
         } else {
             None
         };
-        if h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000)).is_err() {
-            break;
-        }
+        h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000))
+            .context("init packet write failed")?;
         if let Some(s) = expected_seq {
-            let _ = wait_for_response_seq(&mut h, s, &mut no_log);
+            let _ = wait_for_response_seq(h, s, &mut no_log);
         }
         thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
+}
+
+/// Does the bulk camera endpoint deliver any payload within `dur`?
+fn probe_camera(h: &mut rusb::DeviceHandle<UsbContext>, dur: Duration) -> bool {
+    let mut buf = vec![0u8; 65536];
+    let start = Instant::now();
+    while start.elapsed() < dur {
+        if let Ok(n) = h.read_bulk(EP_VIDEO, &mut buf, Duration::from_millis(300)) {
+            if n > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One open+init+camera bring-up, streaming poses until `stop` or a failure.
+///
+/// On a cold start the camera does not stream after a single init pass — the
+/// device needs the init replayed again (re-COMMIT alone does nothing). We do
+/// that on the *same* handle (no costly re-open/reset), replaying init + COMMIT
+/// and probing until the camera flows, which avoids the slow second open cycle.
+fn pose_engine_attempt(
+    ctx: &UsbContext,
+    stop: &Arc<AtomicBool>,
+    recenter: &Arc<AtomicBool>,
+    tx: &Sender<Sample>,
+    tracker: &mut crate::track::Tracker,
+) -> Result<()> {
+    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
+    let packets = parse_init_packets(INIT_PACKETS)?;
+    let mut h = open_tobii(ctx)?;
+    vendor_control_init(&mut h)?;
     if h.kernel_driver_active(IFACE_VIDEO).unwrap_or(false) {
         let _ = h.detach_kernel_driver(IFACE_VIDEO);
     }
     h.claim_interface(IFACE_VIDEO)
         .context("failed to claim video streaming interface 2")?;
-    let frame_size = uvc_negotiate(&mut h, None)?;
-    thread::sleep(Duration::from_millis(100));
-    let _ = h.clear_halt(EP_VIDEO);
+
+    // Bring up the camera. A cold start needs more than the first init+COMMIT,
+    // and replaying init on the same handle alone doesn't help — so try cheap
+    // escalating primes (re-claiming the camera interface) before the caller
+    // falls back to a full device re-open. The log says which prime worked.
+    let primes = ["init+commit", "reclaim iface2", "reinit + reclaim iface2"];
+    let mut frame_size = CAM_WIDTH * CAM_HEIGHT;
+    let mut started = false;
+    for (pass, label) in primes.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match pass {
+            0 => replay_init(&mut h, &packets, stop)?,
+            1 => {
+                let _ = h.release_interface(IFACE_VIDEO);
+                thread::sleep(Duration::from_millis(50));
+                h.claim_interface(IFACE_VIDEO)
+                    .context("re-claim video interface")?;
+            }
+            _ => {
+                replay_init(&mut h, &packets, stop)?;
+                let _ = h.release_interface(IFACE_VIDEO);
+                thread::sleep(Duration::from_millis(50));
+                h.claim_interface(IFACE_VIDEO)
+                    .context("re-claim video interface")?;
+            }
+        }
+        frame_size = uvc_negotiate(&mut h, None)?;
+        thread::sleep(Duration::from_millis(80));
+        let _ = h.clear_halt(EP_VIDEO);
+        if probe_camera(&mut h, Duration::from_millis(1500)) {
+            println!("camera streaming via prime: {label}");
+            started = true;
+            break;
+        }
+        println!("camera silent after prime: {label}");
+    }
+    if !started {
+        anyhow::bail!(StreamStartupTimeout);
+    }
 
     read_camera_frames(&mut h, frame_size, Some(2), |frame| {
         if stop.load(Ordering::Relaxed) {
             return Ok(false);
+        }
+        if recenter.swap(false, Ordering::Relaxed) {
+            tracker.recenter();
         }
         if let Some(p) = tracker.process(frame, CAM_WIDTH, CAM_HEIGHT)? {
             let _ = tx.send(Sample::Pose(PoseSample {
@@ -680,22 +842,55 @@ pub(crate) fn run_pose_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Re
 /// Drive the 0x83 processed stream for the FFI/library engine: own the device,
 /// decode gaze + presence, and push gaze samples to `tx` until `stop` is set.
 /// The camera is *not* claimed here — doing so would throttle this stream.
+///
+/// Same flaky-init story as the camera path (see `run_pose_engine`): reset to a
+/// baseline, then retry the full init if the 0x83 stream doesn't start.
 pub(crate) fn run_gaze_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Result<()> {
-    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
     let ctx = UsbContext::new()?;
-    let mut h = open_tobii(&ctx)?;
+    reset_device_baseline(&ctx);
+
+    for attempt in 1..=MAX_REPLAY_ATTEMPTS {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match gaze_engine_attempt(&ctx, stop, tx) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < MAX_REPLAY_ATTEMPTS && !stop.load(Ordering::Relaxed) => {
+                eprintln!(
+                    "tobii gaze init attempt {attempt}/{MAX_REPLAY_ATTEMPTS} failed: {e}; \
+                     redoing full init"
+                );
+                thread::sleep(Duration::from_millis(700));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One open+init+read of the 0x83 stream, pushing gaze samples until `stop` or a
+/// failure. Bails with `StreamStartupTimeout` if no stream packet arrives in 5s.
+fn gaze_engine_attempt(
+    ctx: &UsbContext,
+    stop: &Arc<AtomicBool>,
+    tx: &Sender<Sample>,
+) -> Result<()> {
+    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
+    let mut h = open_tobii(ctx)?;
     vendor_control_init(&mut h)?;
     let packets = parse_init_packets(INIT_PACKETS)?;
     let mut no_log: Option<PacketLog> = None;
     for pkt in &packets {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let expected_seq = if marker(&pkt.data) == Some(0x51) {
             seq(&pkt.data)
         } else {
             None
         };
-        if h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000)).is_err() {
-            break;
-        }
+        h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000))
+            .context("init packet write failed")?;
         if let Some(s) = expected_seq {
             let _ = wait_for_response_seq(&mut h, s, &mut no_log);
         }
@@ -704,7 +899,12 @@ pub(crate) fn run_gaze_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Re
 
     let mut buf = vec![0u8; 16384];
     let mut packet_no = 0u64;
+    let mut delivered = 0u64;
+    let t_start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        if delivered == 0 && t_start.elapsed().as_secs_f64() > 5.0 {
+            anyhow::bail!(StreamStartupTimeout);
+        }
         match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(500)) {
             Ok(n) if n > 0 => {
                 let data = &buf[..n];
@@ -717,6 +917,7 @@ pub(crate) fn run_gaze_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Re
                 }
                 let frame = TrackingFrame::from_decoded(packet_no, &decoded);
                 packet_no += 1;
+                delivered += 1;
                 let _ = tx.send(Sample::Gaze(GazeSample {
                     timestamp_us: frame.ts_us as i64,
                     gaze_valid: frame.gaze_valid,
@@ -969,9 +1170,17 @@ fn read_camera_frames(
     let mut type_hist = [0u64; 256];
     let mut typed = 0u64;
     let mut hist_printed = false;
+    let mut delivered = 0u64;
     let t_start = Instant::now();
 
     loop {
+        // Startup watchdog: a healthy init delivers matching frames within ~1s.
+        // If none arrive in 5s the device came up half-initialised — bail with a
+        // retryable error so the caller redoes the full init replay.
+        if delivered == 0 && t_start.elapsed().as_secs_f64() > 5.0 {
+            anyhow::bail!(StreamStartupTimeout);
+        }
+
         match h.read_bulk(EP_VIDEO, &mut buf, Duration::from_millis(2000)) {
             Ok(0) => continue,
             Ok(n) => {
@@ -992,8 +1201,11 @@ fn read_camera_frames(
                 // Flush the previous frame on FID change (its type is `cur_type`).
                 let boundary = last_fid.is_some() && last_fid != Some(fid);
                 if boundary && !frame.is_empty() {
-                    if type_filter.is_none_or(|t| t == cur_type) && !on_frame(&frame)? {
-                        break;
+                    if type_filter.is_none_or(|t| t == cur_type) {
+                        delivered += 1;
+                        if !on_frame(&frame)? {
+                            break;
+                        }
                     }
                     frame.clear();
                 }
@@ -1014,7 +1226,11 @@ fn read_camera_frames(
                 }
 
                 if eof && !frame.is_empty() {
-                    let stop = type_filter.is_none_or(|t| t == cur_type) && !on_frame(&frame)?;
+                    let mut stop = false;
+                    if type_filter.is_none_or(|t| t == cur_type) {
+                        delivered += 1;
+                        stop = !on_frame(&frame)?;
+                    }
                     frame.clear();
                     last_fid = None;
                     if stop {

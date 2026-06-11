@@ -1,0 +1,17 @@
+# Keep the kernel uvcvideo driver off the Tobii Eye Tracker 5 (USB 2104:0313).
+#
+# We drive the IR camera directly over libusb (claim interface 2 + raw UVC
+# control + bulk reads on EP 0x82), NOT via V4L2 / /dev/videoN. uvcvideo only
+# gets in the way: it binds and probes the camera interface between runs, which
+# races with our init and is a source of the "works every other start" flakiness.
+# This device is not a usable webcam anyway (3 interleaved IR cameras in a custom
+# Tobii frame format), so nothing is lost by unbinding uvcvideo from it.
+#
+# Install:  sudo cp 99-tobii-no-uvcvideo.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger
+#           (re-plug the tracker)
+#
+# When uvcvideo binds an interface of this device, immediately unbind it.
+ACTION=="bind", SUBSYSTEM=="usb", DEVTYPE=="usb_interface", DRIVER=="uvcvideo", \
+  ATTRS{idVendor}=="2104", ATTRS{idProduct}=="0313", \
+  RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/uvcvideo/unbind'"

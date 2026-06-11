@@ -16,17 +16,28 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut host = "127.0.0.1".to_string();
     let mut port: u16 = 4242;
+    let mut recenter = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().ok_or("--host needs a value")?,
             "--port" => port = args.next().ok_or("--port needs a value")?.parse()?,
+            "--recenter" => recenter = true,
             "-h" | "--help" => {
-                println!("usage: tobii-opentrack [--host 127.0.0.1] [--port 4242]");
+                println!("usage: tobii-opentrack [--host 127.0.0.1] [--port 4242] [--recenter]");
                 return Ok(());
             }
             other => return Err(format!("unknown arg: {other}").into()),
         }
+    }
+
+    // One-shot: ask the running daemon to recalibrate the rest pose and exit.
+    // Bind this to a hotkey to re-center without restarting anything.
+    if recenter {
+        let mut stream = ipc::connect()?;
+        write_frame(&mut stream, &ipc::encode_recenter())?;
+        println!("tobii-opentrack: recenter sent");
+        return Ok(());
     }
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;

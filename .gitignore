@@ -1,2 +1,5 @@
 /target
 tobii_stream*.bin
+
+# Local AI pre-commit review artifacts
+.local_ai/

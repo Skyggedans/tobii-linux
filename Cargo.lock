@@ -651,6 +651,7 @@ name = "tobii5-init-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "ort",
  "rusb",
 ]

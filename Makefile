@@ -16,7 +16,7 @@ USERUNITDIR ?= $(HOME)/.config/systemd/user
 SUDO        ?= sudo
 
 REL         := target/release
-BINS        := tobiid tobii-opentrack tobii5-init-replay
+BINS        := tobiid tobii-opentrack tobii-gaze-keys tobii5-init-replay
 LIB         := libtobii.so
 
 .PHONY: build install install-bin install-udev install-units enable disable uninstall clean
@@ -38,9 +38,11 @@ install-bin:
 
 install-udev:
 	$(SUDO) install -m 0644 systemd/99-tobii-uaccess.rules $(UDEVDIR)/
+	$(SUDO) install -m 0644 systemd/99-tobii-no-uvcvideo.rules $(UDEVDIR)/
+	$(SUDO) install -m 0644 systemd/99-tobii-uinput.rules $(UDEVDIR)/
 	$(SUDO) udevadm control --reload
 	$(SUDO) udevadm trigger
-	@echo "udev rule installed — re-plug the tracker if it was already connected"
+	@echo "udev rules installed — re-plug the tracker if it was already connected"
 
 # Install user units, rewriting ExecStart to the installed binary path.
 install-units:
@@ -61,7 +63,7 @@ uninstall: disable
 	-rm -f $(USERUNITDIR)/tobiid.service $(USERUNITDIR)/tobiid.socket
 	systemctl --user daemon-reload
 	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS)) $(LIBDIR)/$(LIB)
-	$(SUDO) rm -f $(UDEVDIR)/99-tobii-uaccess.rules
+	$(SUDO) rm -f $(UDEVDIR)/99-tobii-uaccess.rules $(UDEVDIR)/99-tobii-no-uvcvideo.rules $(UDEVDIR)/99-tobii-uinput.rules
 	$(SUDO) udevadm control --reload || true
 	$(SUDO) ldconfig || true
 

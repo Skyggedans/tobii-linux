@@ -377,6 +377,7 @@ pub(crate) struct Tracker {
     cy: f32,
     pivot: [f64; 3], // neck offset in model cm: [0, down, back]
     debug: bool,
+    roll_eyeline: bool,
     frame: u64,
 }
 
@@ -395,7 +396,13 @@ impl Tracker {
             env_f64("TOBII_PIVOT_BACK", PIVOT_NECK_BACK_CM),
         ];
         let debug = std::env::var("TOBII_POSE_DEBUG").is_ok();
-        eprintln!("tracker pivot = [down {:.1}, back {:.1}] cm", pivot[1], pivot[2]);
+        let roll_eyeline = std::env::var("TOBII_ROLL_EYELINE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        eprintln!(
+            "tracker pivot = [down {:.1}, back {:.1}] cm, roll_eyeline={roll_eyeline}",
+            pivot[1], pivot[2]
+        );
         Ok(Self {
             model: FaceModel::new()?,
             canonical: canonical_f64(),
@@ -407,8 +414,17 @@ impl Tracker {
             cy: 0.0,
             pivot,
             debug,
+            roll_eyeline,
             frame: 0,
         })
+    }
+
+    /// Drop the calibrated rest pose so it recalibrates from the next frames.
+    pub(crate) fn recenter(&mut self) {
+        self.origin = None;
+        self.accum.clear();
+        self.have = false;
+        eprintln!("recenter: recalibrating rest pose");
     }
 
     pub(crate) fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
@@ -475,7 +491,18 @@ impl Tracker {
         );
         let e = euler_deg(&r);
         // Match MediaPipe's convention (yaw/roll negate vs our euler).
-        let mp = [e[0], -e[1], -e[2]]; // pitch, yaw, roll
+        let mut mp = [e[0], -e[1], -e[2]]; // pitch, yaw, roll
+
+        // Optional: measure roll directly from the eye line (outer corners 33 &
+        // 263). This is decoupled from yaw/pitch and symmetric by construction,
+        // avoiding euler cross-axis coupling. Flip the sign here if reversed.
+        if self.roll_eyeline {
+            let r_eye = image2d[33]; // subject's right eye outer (image left)
+            let l_eye = image2d[263]; // subject's left eye outer (image right)
+            let dx = l_eye[0] - r_eye[0];
+            let dy = l_eye[1] - r_eye[1];
+            mp[2] = -dy.atan2(dx).to_degrees();
+        }
 
         // Translate the reported position to the neck pivot: t' = t + R*pivot.
         // A pure head rotation about the neck then leaves t' ~constant (rotates

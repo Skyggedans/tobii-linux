@@ -1,0 +1,9 @@
+# Let non-root users open /dev/uinput so `tobii-gaze-keys` can inject Left/Right
+# arrow keys without sudo. By default /dev/uinput is root-only (crw-------);
+# this hands it to the `input` group with group-write.
+#
+# Install:  sudo cp 99-tobii-uinput.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
+#           sudo usermod -aG input $USER     # then re-login for the group to apply
+#
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
