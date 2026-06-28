@@ -7,7 +7,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import { Tiling, Navigator } from './imports.js';
-import { subscribeFrame, parseFrames, ema, STREAM_GAZE } from './gazelib.js';
+import { subscribeFrame, parseFrames, ema, gazeToPixel, hitTest, STREAM_GAZE } from './gazelib.js';
 
 const EMA_ALPHA = 0.4;        // gaze smoothing (0..1; higher = snappier)
 const HYSTERESIS_PX = 24;     // border deadband before switching tiles
@@ -106,9 +106,43 @@ class GazeSwitcher {
         if (!g.valid) return;
         this._sx = ema(this._sx, g.x, EMA_ALPHA);
         this._sy = ema(this._sy, g.y, EMA_ALPHA);
-        // Task 5 replaces this log with selection logic.
-        if (Navigator.navigating)
-            console.log(`#tobii-gaze x=${this._sx.toFixed(3)} y=${this._sy.toFixed(3)}`);
+        this._maybeSelect();
+    }
+
+    _tilesOf(minimap) {
+        const baseX = minimap.actor.x + minimap.clip.x + minimap.container.x;
+        const baseY = minimap.actor.y + minimap.clip.y + minimap.container.y;
+        const tiles = [];
+        for (const column of minimap) {
+            for (const c of column) {
+                if (!c.meta_window) continue;
+                tiles.push({
+                    x0: baseX + c.x, y0: baseY + c.y,
+                    w: c.width, h: c.height,
+                    id: c.meta_window.get_id(),
+                    window: c.meta_window,
+                });
+            }
+        }
+        return tiles;
+    }
+
+    _maybeSelect() {
+        if (!Navigator.navigating) { this._prevId = null; return; }
+        const nav = Navigator.navigator;
+        if (!nav) return;
+        const space = Tiling.spaces.selectedSpace;
+        const minimap = nav.minimaps?.get(space);
+        if (!minimap || typeof minimap === 'number') return; // pending/absent
+        const tiles = this._tilesOf(minimap);
+        if (tiles.length === 0) return;
+        const { px, py } = gazeToPixel(this._sx, this._sy, space.monitor);
+        const id = hitTest(tiles, px, py, this._prevId, HYSTERESIS_PX);
+        if (id === null || id === this._prevId) return;
+        const t = tiles.find(t => t.id === id);
+        // Task 6 replaces this log with the actual selection call.
+        if (t) console.log(`#tobii-gaze over: ${t.window.title}`);
+        this._prevId = id;
     }
 
     destroy() {
