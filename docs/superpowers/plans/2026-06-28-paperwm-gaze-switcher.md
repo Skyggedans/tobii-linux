@@ -484,25 +484,29 @@ git commit -m "feat(gaze-switch): GJS module skeleton with async tobiid socket c
 ### Task 4: Install target + in-Shell verification (connect & log)
 
 **Files:**
-- Modify: `Makefile` (append two targets)
+- Create: `paperwm-gaze/Makefile` (self-contained; does NOT modify the repo root Makefile)
 
 **Interfaces:**
 - Consumes: `paperwm-gaze/gaze.js`, `paperwm-gaze/gazelib.js`.
-- Produces: `make install-paperwm-gaze`, `make uninstall-paperwm-gaze`.
+- Produces: `make -C paperwm-gaze install`, `make -C paperwm-gaze uninstall`, `make -C paperwm-gaze test`.
 
-- [ ] **Step 1: Add the install/uninstall targets**
+> Note: the install target lives in its own `paperwm-gaze/Makefile` (not the repo
+> root Makefile) so the gaze switcher stays self-contained and the install never
+> entangles unrelated root-Makefile changes. Recipes run with cwd = `paperwm-gaze/`,
+> so source files are referenced as `gaze.js`/`gazelib.js`.
 
-Append to `Makefile` (use **tab** indentation for recipe lines, as Make requires):
+- [ ] **Step 1: Create the self-contained Makefile**
+
+Create `paperwm-gaze/Makefile` (use **tab** indentation for recipe lines, as Make requires):
 
 ```makefile
-
-# --- tobii gaze switcher (PaperWM in-place install) ---
+# tobii gaze switcher — self-contained install into the PaperWM extension.
 PAPERWM_EXT ?= $(HOME)/.local/share/gnome-shell/extensions/paperwm@paperwm.github.com
 
-.PHONY: install-paperwm-gaze uninstall-paperwm-gaze
-install-paperwm-gaze:
+.PHONY: install uninstall test
+install:
 	@test -d "$(PAPERWM_EXT)" || { echo "PaperWM not found at $(PAPERWM_EXT)"; exit 1; }
-	cp paperwm-gaze/gaze.js paperwm-gaze/gazelib.js "$(PAPERWM_EXT)/"
+	cp gaze.js gazelib.js "$(PAPERWM_EXT)/"
 	@grep -q '// tobii-gaze' "$(PAPERWM_EXT)/extension.js" || { \
 	  sed -i "/} from '.\/imports.js';/a import * as Gaze from './gaze.js'; // tobii-gaze" "$(PAPERWM_EXT)/extension.js"; \
 	  sed -i "/modules = \[/a\\        Gaze, // tobii-gaze" "$(PAPERWM_EXT)/extension.js"; \
@@ -510,15 +514,18 @@ install-paperwm-gaze:
 	}
 	@echo "Installed. Log out and back in (Wayland) to reload PaperWM."
 
-uninstall-paperwm-gaze:
+uninstall:
 	-sed -i '/\/\/ tobii-gaze/d' "$(PAPERWM_EXT)/extension.js"
 	-rm -f "$(PAPERWM_EXT)/gaze.js" "$(PAPERWM_EXT)/gazelib.js"
 	@echo "Removed tobii gaze switcher. Log out and back in to reload PaperWM."
+
+test:
+	gjs -m tests/test_gazelib.js
 ```
 
 - [ ] **Step 2: Install and verify the patch is idempotent**
 
-Run: `make install-paperwm-gaze && make install-paperwm-gaze`
+Run: `make -C paperwm-gaze install && make -C paperwm-gaze install`
 Expected: first run prints `patched extension.js` then `Installed...`; second run skips patching (no second `patched extension.js`). Confirm exactly one occurrence each:
 Run: `grep -c '// tobii-gaze' "$HOME/.local/share/gnome-shell/extensions/paperwm@paperwm.github.com/extension.js"`
 Expected: `2` (the import line + the modules entry).
@@ -539,7 +546,7 @@ Run: `gnome-extensions enable paperwm@paperwm.github.com`
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Makefile
+git add paperwm-gaze/Makefile
 git commit -m "build(gaze-switch): idempotent in-place install target for PaperWM"
 ```
 
@@ -615,7 +622,7 @@ In `paperwm-gaze/gaze.js`, replace the `_onGaze` method with:
 
 - [ ] **Step 3: Reinstall and reload**
 
-Run: `make install-paperwm-gaze`
+Run: `make -C paperwm-gaze install`
 Then log out and back in.
 
 - [ ] **Step 4: Verify the logged window tracks your gaze**
@@ -669,7 +676,7 @@ with:
 
 - [ ] **Step 2: Reinstall and reload**
 
-Run: `make install-paperwm-gaze`
+Run: `make -C paperwm-gaze install`
 Then log out and back in.
 
 - [ ] **Step 3: Verify end-to-end selection + activation**
@@ -723,7 +730,7 @@ activates the selected window natively).
 - `gjs` (for the tests).
 
 ## Install
-    make install-paperwm-gaze
+    make -C paperwm-gaze install
     # then log out and back in (Wayland can't hot-reload extension files)
 
 Re-run after every PaperWM upgrade — upgrades overwrite extension files. The
@@ -731,7 +738,7 @@ target is idempotent (marker-guarded) and copies `gaze.js` + `gazelib.js` into
 the extension and patches `extension.js`.
 
 ## Uninstall
-    make uninstall-paperwm-gaze
+    make -C paperwm-gaze uninstall
     # then log out and back in
 
 ## Test
