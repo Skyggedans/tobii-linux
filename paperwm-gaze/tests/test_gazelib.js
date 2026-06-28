@@ -1,7 +1,7 @@
 import system from 'system';
 import {
     parseFrames, frameWithLen, subscribeFrame, ema, gazeToPixel, hitTest,
-    TAG_GAZE, TAG_SUBSCRIBE, STREAM_GAZE,
+    TAG_GAZE, TAG_SUBSCRIBE, TAG_SUBSCRIBED, STREAM_GAZE,
 } from '../gazelib.js';
 
 let failures = 0;
@@ -67,6 +67,21 @@ ok(approx(ema(0, 10, 0.5), 5), 'ema halfway');
     ok(hitTest(tiles, 150, 50, 'a', 10) === 'b', 'moves to b when inside');
     ok(hitTest(tiles, 105, 50, 'a', 10) === 'a', 'hysteresis keeps a near border');
     ok(hitTest(tiles, 300, 50, 'b', 10) === 'b', 'outside keeps previous');
+}
+// SUBSCRIBED ack decodes for ok and busy
+{
+    const okFrame = frameWithLen(Uint8Array.from([TAG_SUBSCRIBED, 1]));
+    const busyFrame = frameWithLen(Uint8Array.from([TAG_SUBSCRIBED, 0]));
+    ok(parseFrames(okFrame).subscribedOk === true, 'subscribed ok=true decoded');
+    ok(parseFrames(busyFrame).subscribedOk === false, 'subscribed ok=false decoded');
+}
+// flush adjacent tiles: the shared edge pixel belongs to the right tile only
+{
+    const tiles = [
+        { x0: 0, y0: 0, w: 100, h: 100, id: 'a' },
+        { x0: 100, y0: 0, w: 100, h: 100, id: 'b' },
+    ];
+    ok(hitTest(tiles, 100, 50, null, 10) === 'b', 'shared edge x=100 belongs to b');
 }
 
 print(failures === 0 ? 'ALL PASS' : `FAILED ${failures}`);

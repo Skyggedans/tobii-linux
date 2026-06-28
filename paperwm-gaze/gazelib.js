@@ -70,7 +70,7 @@ export function gazeToPixel(gx, gy, monitor) {
 export function hitTest(tiles, px, py, prevId, margin) {
     let hit = null;
     for (const t of tiles) {
-        if (px >= t.x0 && px <= t.x0 + t.w && py >= t.y0 && py <= t.y0 + t.h) {
+        if (px >= t.x0 && px < t.x0 + t.w && py >= t.y0 && py < t.y0 + t.h) {
             hit = t.id;
             break;
         }
