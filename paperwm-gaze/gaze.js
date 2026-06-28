@@ -50,7 +50,7 @@ class GazeSwitcher {
                 conn.get_output_stream().write_all(
                     subscribeFrame(STREAM_GAZE), this._cancellable);
             } catch (e) {
-                this._scheduleReconnect();
+                this._reconnect();
                 return;
             }
             this._buf = new Uint8Array(0);
@@ -81,7 +81,10 @@ class GazeSwitcher {
                     return;
                 }
                 const arr = bytes.get_data();
-                if (!arr || arr.length === 0) { this._reconnect(); return; }
+                if (!arr || arr.length === 0) {
+                    if (!this._cancellable.is_cancelled()) this._reconnect();
+                    return;
+                }
                 const merged = new Uint8Array(this._buf.length + arr.length);
                 merged.set(this._buf, 0);
                 merged.set(arr, this._buf.length);
