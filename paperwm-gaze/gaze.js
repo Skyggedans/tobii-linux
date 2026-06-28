@@ -140,8 +140,13 @@ class GazeSwitcher {
         const id = hitTest(tiles, px, py, this._prevId, HYSTERESIS_PX);
         if (id === null || id === this._prevId) return;
         const t = tiles.find(t => t.id === id);
-        // Task 6 replaces this log with the actual selection call.
-        if (t) console.log(`#tobii-gaze over: ${t.window.title}`);
+        if (t && t.window !== space.selectedWindow) {
+            try {
+                Tiling.ensureViewport(t.window, space, { moveto: false });
+            } catch (e) {
+                console.log(`#tobii-gaze ensureViewport failed: ${e}`);
+            }
+        }
         this._prevId = id;
     }
 
