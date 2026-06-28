@@ -99,6 +99,7 @@ class GazeSwitcher {
         try { this._conn?.close(null); } catch (e) {}
         this._conn = null;
         this._istream = null;
+        this._buf = new Uint8Array(0);
         this._scheduleReconnect();
     }
 
@@ -130,10 +131,10 @@ class GazeSwitcher {
     _maybeSelect() {
         if (!Navigator.navigating) { this._prevId = null; return; }
         const nav = Navigator.navigator;
-        if (!nav) return;
+        if (!nav) { this._prevId = null; return; }
         const space = Tiling.spaces.selectedSpace;
         const minimap = nav.minimaps?.get(space);
-        if (!minimap || typeof minimap === 'number') return; // pending/absent
+        if (!minimap || typeof minimap === 'number') { this._prevId = null; return; } // pending/absent
         const tiles = this._tilesOf(minimap);
         if (tiles.length === 0) return;
         const { px, py } = gazeToPixel(this._sx, this._sy, space.monitor);
