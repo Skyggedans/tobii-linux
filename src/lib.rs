@@ -17,7 +17,9 @@ pub mod daemon;
 pub mod dashboard;
 /// Decoding of the 0x83 gaze / tracking stream into frames.
 pub mod decode;
-/// USB device bring-up and the live streaming / diagnostic subcommands.
+/// Research and diagnostic subcommands (replay, UVC camera, image83 tools).
+pub mod devcmd;
+/// USB transport and the live 0x83 gaze + image engine.
 pub mod device;
 pub mod engine;
 pub mod ffi;
@@ -57,12 +59,12 @@ pub fn run() -> Result<()> {
         Command::ExtractCalibration { path, json_path } => {
             analysis::extract_calibration(path, json_path.as_deref())
         }
-        Command::Replay { .. } => device::run(&opts),
-        Command::Camera { .. } => device::run_camera(&opts),
-        Command::Track { .. } => device::run_track(&opts),
-        Command::Probe { .. } => device::run_probe(&opts),
-        Command::Image83 { .. } => device::run_image83(&opts),
-        Command::Image83Replay { path, csv } => device::run_image83_replay(path, csv.as_deref()),
+        Command::Replay { .. } => devcmd::run(&opts),
+        Command::Camera { .. } => devcmd::run_camera(&opts),
+        Command::Track { .. } => devcmd::run_track(&opts),
+        Command::Probe { .. } => devcmd::run_probe(&opts),
+        Command::Image83 { .. } => devcmd::run_image83(&opts),
+        Command::Image83Replay { path, csv } => devcmd::run_image83_replay(path, csv.as_deref()),
         Command::Head83 { path, occs } => analysis::head83(path, occs),
     }
 }
