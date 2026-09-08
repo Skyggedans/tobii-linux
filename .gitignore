@@ -6,3 +6,7 @@ tobii_stream*.bin
 
 # Research captures, logs and analysis output (see fixtures/README.md)
 /fixtures/
+
+# Unrelated third-party download that landed in the repo root; left on
+# disk untouched, just not tracked.
+/gameshell*

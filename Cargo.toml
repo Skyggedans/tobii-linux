@@ -1,34 +1,22 @@
-[package]
-name = "tobii5-init-replay"
+# Workspace root. The crates split along the production / research boundary:
+# the daemon stack (tobii-proto -> tobii-pose -> tobii-usb -> tobiid), the
+# client-facing pieces (tobii-ipc, tobii-ffi, tobii-clients) and the research
+# CLI (tobii-tools). See INSTALL.md for the layout.
+[workspace]
+# Resolver 3 is not the default for a virtual manifest; without it the feature
+# unification of ort/rusb would silently change.
+resolver = "3"
+# Filled in as each crate is extracted; becomes ["crates/*"] with the first one.
+members = []
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Tobii Eye Tracker 5 on Linux: gaze + head-pose daemon, OpenTrack bridge, Stream-Engine-like libtobii.so"
 license = "MIT"
 publish = false
 
-[lib]
-name = "tobii"
-crate-type = ["rlib", "cdylib"]
-path = "src/lib.rs"
-
-[[bin]]
-name = "tobii5-init-replay"
-path = "src/main.rs"
-
-[[bin]]
-name = "tobiid"
-path = "src/bin/tobiid.rs"
-
-[[bin]]
-name = "tobii-opentrack"
-path = "src/bin/tobii_opentrack.rs"
-
-[[bin]]
-name = "tobii-gaze-keys"
-path = "src/bin/tobii_gaze_keys.rs"
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 libc = "0.2"
 ort = "2.0.0-rc.10"
@@ -38,12 +26,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # rust-skills: lint-deny-correctness, lint-warn-{suspicious,style,complexity,perf},
 # lint-pedantic-selective, lint-cfg-check, lint-missing-docs, lint-unsafe-doc.
-[lints.rust]
+# Every member opts in with `[lints] workspace = true`; a member that forgets
+# silently loses the whole table, so keep `make check` honest.
+[workspace.lints.rust]
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unexpected_cfgs = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
@@ -70,6 +60,7 @@ undocumented_unsafe_blocks = "warn"
 unwrap_used = "warn"
 
 # rust-skills opt-lto-release / opt-codegen-units / perf-release-profile.
+# A profile in a member manifest is ignored, so this must stay at the root.
 # panic stays "unwind": the daemon's watchdog recovers a panicked engine
 # thread, and extern "C" fns already abort on unwind.
 [profile.release]
@@ -77,3 +68,44 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[package]
+name = "tobii5-init-replay"
+description = "Tobii Eye Tracker 5 on Linux: gaze + head-pose daemon, OpenTrack bridge, Stream-Engine-like libtobii.so"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tobii"
+crate-type = ["rlib", "cdylib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tobii5-init-replay"
+path = "src/main.rs"
+
+[[bin]]
+name = "tobiid"
+path = "src/bin/tobiid.rs"
+
+[[bin]]
+name = "tobii-opentrack"
+path = "src/bin/tobii_opentrack.rs"
+
+[[bin]]
+name = "tobii-gaze-keys"
+path = "src/bin/tobii_gaze_keys.rs"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+ort.workspace = true
+rusb.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -22,7 +22,7 @@ LIB         := libtobii.so
 .PHONY: build install install-bin install-udev install-units enable enable-keys disable uninstall clean
 
 build:
-	cargo build --release
+	cargo build --release --workspace
 
 install: build install-bin install-udev install-units
 	@echo
