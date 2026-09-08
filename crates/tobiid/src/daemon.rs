@@ -18,12 +18,12 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::engine::{Engine, Sample};
-use crate::ipc::{
+use tobii_ipc::{
     self, PRESENCE_AWAY, PRESENCE_PRESENT, STREAM_GAZE, STREAM_HEAD, STREAM_PRESENCE,
     decode_subscribe, encode_gaze, encode_head, encode_presence, encode_subscribed, read_frame,
     write_frame,
 };
+use tobii_usb::engine::{Engine, Sample};
 
 /// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
 static RECENTER_SIGNAL: AtomicBool = AtomicBool::new(false);
@@ -135,7 +135,7 @@ fn obtain_listener() -> Result<UnixListener> {
         return Ok(listener);
     }
 
-    let path = ipc::socket_path();
+    let path = tobii_ipc::socket_path();
     // A stale socket file from a previous run is expected; a missing one is fine.
     let _ = std::fs::remove_file(&path);
     let listener =
@@ -178,7 +178,7 @@ pub fn run() -> Result<()> {
                 let mut st = lock_state(&state);
                 let running = st.engine.as_ref().is_some_and(Engine::is_alive);
                 // Don't spin (reloading the model) on an unplugged device.
-                if !running && st.is_engine_wanted() && crate::device::is_device_present() {
+                if !running && st.is_engine_wanted() && tobii_usb::device::is_device_present() {
                     warn!("engine not running but wanted; restarting");
                     st.engine = Some(Engine::start());
                     st.sync_head_wanted();
@@ -214,7 +214,7 @@ pub fn run() -> Result<()> {
                     drop(st);
                     // Under socket activation the file is systemd's; elsewhere it
                     // may already be gone. Either way there is nothing to do.
-                    let _ = std::fs::remove_file(ipc::socket_path());
+                    let _ = std::fs::remove_file(tobii_ipc::socket_path());
                     info!("shutdown signal: device teardown done, exiting");
                     std::process::exit(0);
                 }
@@ -269,7 +269,7 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
     // Loop ends on EOF or a read error.
     while let Ok(Some(body)) = read_frame(&mut stream) {
         match body.first().copied() {
-            Some(ipc::TAG_SUBSCRIBE) => {
+            Some(tobii_ipc::TAG_SUBSCRIBE) => {
                 if let Some(streams) = decode_subscribe(&body) {
                     let ok = handle_subscribe(state, id, streams);
                     // A failed reply means the client is gone; the next read
@@ -277,7 +277,7 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
                     let _ = write_frame(&mut stream, &encode_subscribed(ok));
                 }
             }
-            Some(ipc::TAG_RECENTER) => {
+            Some(tobii_ipc::TAG_RECENTER) => {
                 if let Some(engine) = lock_state(state).engine.as_ref() {
                     engine.request_recenter();
                 }

@@ -1,0 +1,19 @@
+[package]
+name = "tobiid"
+description = "The Tobii daemon: owns the device and serves head/gaze/presence to local clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+tobii-ipc.workspace = true
+tobii-log.workspace = true
+tobii-usb.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

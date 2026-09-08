@@ -1,9 +1,11 @@
 //! The Tobii daemon: claims the device and serves head/gaze/presence streams to
 //! clients over a Unix socket. Run it directly, or let a client auto-spawn it.
 
+mod daemon;
+
 fn main() {
-    tobii5_init_replay::logging::init();
-    if let Err(e) = tobii5_init_replay::daemon::run() {
+    tobii_log::init();
+    if let Err(e) = daemon::run() {
         // Full cause chain on one line, written directly (not via `tracing`) so
         // a restrictive `RUST_LOG` can never hide the reason the daemon exited.
         eprintln!("tobiid: {e:#}");

@@ -13,7 +13,6 @@
 pub mod analysis;
 /// Command-line parsing for the `tobii5-init-replay` CLI.
 pub mod cli;
-pub mod daemon;
 /// Terminal dashboard rendering live tracking frames.
 pub mod dashboard;
 /// Research and diagnostic subcommands (replay, UVC camera, image83 tools).

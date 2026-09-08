@@ -26,6 +26,7 @@ tobii-ffi = { path = "crates/tobii-ffi" }
 tobii-pose = { path = "crates/tobii-pose" }
 tobii-proto = { path = "crates/tobii-proto" }
 tobii-usb = { path = "crates/tobii-usb" }
+tobiid = { path = "crates/tobiid" }
 tobii-ipc = { path = "crates/tobii-ipc" }
 tobii-log = { path = "crates/tobii-log" }
 
@@ -90,13 +91,8 @@ path = "src/lib.rs"
 name = "tobii5-init-replay"
 path = "src/main.rs"
 
-[[bin]]
-name = "tobiid"
-path = "src/bin/tobiid.rs"
-
 [dependencies]
 anyhow.workspace = true
-libc.workspace = true
 ort.workspace = true
 rusb.workspace = true
 tracing.workspace = true

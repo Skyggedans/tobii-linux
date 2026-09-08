@@ -778,13 +778,24 @@ name = "tobii5-init-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
  "ort",
  "rusb",
  "tobii-ipc",
  "tobii-log",
  "tobii-pose",
  "tobii-proto",
+ "tobii-usb",
+ "tracing",
+]
+
+[[package]]
+name = "tobiid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tobii-ipc",
+ "tobii-log",
  "tobii-usb",
  "tracing",
 ]
