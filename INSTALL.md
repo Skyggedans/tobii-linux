@@ -23,26 +23,49 @@ only in the standalone research subcommands (`camera`, `track`, `probe`).
 ## 1. Prerequisites
 
 - Rust toolchain (stable) + Cargo.
-- The repo includes the model (`models/face_landmarks.onnx`) and init capture
-  (`init_packets_ep.txt`); both are embedded at **build** time, so no runtime
+- The repo includes the model (`crates/tobii-pose/models/face_landmarks.onnx`)
+  and the init capture (`crates/tobii-usb/init_packets_ep.txt`); both are
+  embedded at **build** time, so no runtime
   data files are needed.
 - A Tobii Eye Tracker 5 plugged in.
 
 ## 2. Build
 
 ```bash
-cargo build --release
+cargo build --release --workspace     # or: make build
 ```
 
 Produces in `target/release/`:
 
-| Artifact | What it is |
-|---|---|
-| `tobiid` | the daemon (claims the device, serves clients) |
-| `tobii-opentrack` | thin client: head pose → OpenTrack UDP |
-| `tobii-gaze-keys` | thin client: gaze at screen edge → Left/Right arrow key |
-| `tobii5-init-replay` | the CLI / analysis & diagnostics tool |
-| `libtobii.so` | C ABI (`tobii_*`) in the shape of the Tobii Stream Engine; a daemon client |
+| Artifact | What it is | Installed? |
+|---|---|---|
+| `tobiid` | the daemon (claims the device, serves clients) | yes |
+| `tobii-opentrack` | thin client: head pose → OpenTrack UDP | yes |
+| `tobii-gaze-keys` | thin client: gaze at screen edge → Left/Right arrow key | yes |
+| `libtobii.so` | C ABI (`tobii_*`) in the shape of the Tobii Stream Engine; a daemon client | yes |
+| `tobii5-init-replay` | log analysis, UVC camera and diagnostics | no — run it from `target/release/` |
+
+### Workspace layout
+
+The driver and the research tooling are separate crates, so the daemon never
+compiles the analysis code and `libtobii.so` links neither ONNX Runtime nor the
+embedded assets (it is ~0.4 MB rather than ~20 MB).
+
+| Crate | What it holds | Heavy deps |
+|---|---|---|
+| `tobii-proto` | wire formats: framing, the 0x500 gaze stream, the 0x50e images, the `TBI5LOG1` log | none |
+| `tobii-pose` | face landmarks and the head-pose fit; owns `models/` | `ort` |
+| `tobii-usb` | USB transport and the live 0x83 engine; owns `init_packets_ep.txt` | `rusb` |
+| `tobii-ipc` | the daemon protocol | none (std only) |
+| `tobii-log` | shared `tracing` subscriber setup | — |
+| `tobiid` | the daemon binary | — |
+| `tobii-ffi` | `libtobii.so` (cdylib) | — |
+| `tobii-clients` | `tobii-opentrack`, `tobii-gaze-keys` | — |
+| `tobii-tools` | `tobii5-init-replay`: analysis, UVC camera, diagnostics | all of the above |
+
+`make check` runs what CI would: `cargo fmt --all --check`, clippy with
+`-D warnings` over all targets, the tests and `cargo doc`. `make verify-abi`
+asserts `libtobii.so` still exports the 13 `tobii_*` entry points.
 
 ## 2b. One-shot install (Makefile)
 
@@ -156,7 +179,7 @@ hold the device until a client subscribes.)
 ## 5. After a rebuild
 
 ```bash
-cargo build --release
+cargo build --release --workspace
 systemctl --user restart tobiid        # 4b
 # or: systemctl --user restart tobiid.socket   # 4c
 # or: pkill -f release/tobiid                   # 4a (next client respawns it)

@@ -16,13 +16,31 @@ USERUNITDIR ?= $(HOME)/.config/systemd/user
 SUDO        ?= sudo
 
 REL         := target/release
-BINS        := tobiid tobii-opentrack tobii-gaze-keys tobii5-init-replay
+# tobii5-init-replay is built but NOT installed: every one of its subcommands
+# is log analysis, UVC-camera work or diagnostics, none of which the driver
+# needs. Run it from $(REL). It is still removed by `uninstall` for anyone who
+# installed it with an older Makefile.
+BINS        := tobiid tobii-opentrack tobii-gaze-keys
+LEGACY_BINS := tobii5-init-replay
 LIB         := libtobii.so
 
-.PHONY: build install install-bin install-udev install-units enable enable-keys disable uninstall clean
+.PHONY: build check verify-abi install install-bin install-udev install-units enable enable-keys disable uninstall clean
 
 build:
 	cargo build --release --workspace
+
+# Everything CI would run.
+check:
+	cargo fmt --all --check
+	cargo clippy --release --all-targets --workspace -- -D warnings
+	cargo test --workspace
+	cargo doc --no-deps --workspace
+
+# libtobii.so must keep presenting the 13 Stream-Engine entry points.
+verify-abi: build
+	@n=$$(nm -D --defined-only $(REL)/$(LIB) | grep -c ' T tobii_'); \
+	 [ "$$n" = 13 ] || { echo "libtobii.so exports $$n tobii_* symbols, expected 13"; exit 1; }
+	@echo "libtobii.so exports 13 tobii_* symbols"
 
 install: build install-bin install-udev install-units
 	@echo
@@ -69,7 +87,7 @@ disable:
 uninstall: disable
 	-rm -f $(USERUNITDIR)/tobiid.service $(USERUNITDIR)/tobiid.socket $(USERUNITDIR)/tobii-gaze-keys.service
 	systemctl --user daemon-reload
-	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS)) $(LIBDIR)/$(LIB)
+	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS) $(LEGACY_BINS)) $(LIBDIR)/$(LIB)
 	$(SUDO) rm -f $(UDEVDIR)/99-tobii-uaccess.rules $(UDEVDIR)/99-tobii-no-uvcvideo.rules $(UDEVDIR)/99-tobii-uinput.rules
 	$(SUDO) udevadm control --reload || true
 	$(SUDO) ldconfig || true
