@@ -11,7 +11,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use crate::sinks::now_us;
+use crate::time::now_us;
 
 /// Key of a decoded stream value: `(field id, occurrence, component)`.
 pub(crate) type FieldKey = (u32, usize, usize);

@@ -24,13 +24,15 @@ use crate::dashboard::render_dashboard_status;
 use crate::decode::{TrackingFrame, decode_stream_payload};
 use crate::engine::{GazeSample, PoseSample, Sample};
 use crate::image83::{ImageFrame, decode_image_payload, upscale2x_into, write_pgm};
+use crate::log::{PacketLog, log_packet};
 use crate::opentrack::OpentrackUdp;
 use crate::protocol::{
     BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, declared_len,
     marker, parse_init_packets, read_init_packets, seq, stream_id, stream_start_packet,
     stream_stop_packet,
 };
-use crate::sinks::{DecodedCsv, JsonlOutput, PacketLog, handle_live_decoded, log_packet, now_us};
+use crate::sinks::{DecodedCsv, JsonlOutput, handle_live_decoded};
+use crate::time::now_us;
 
 /// USB vendor id of the Tobii Eye Tracker 5.
 const VID: u16 = 0x2104;
@@ -1274,7 +1276,7 @@ fn pump_streams(
 /// Fails if the log cannot be read, the face model cannot be loaded, a gaze
 /// payload does not decode, or the CSV cannot be written.
 pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
-    use crate::protocol::read_log_payloads;
+    use crate::log::read_log_payloads;
     let payloads = read_log_payloads(path)?;
     let mut tracker = crate::track::Tracker::new_image83()?;
     let mut asm = BulkReassembler::new();

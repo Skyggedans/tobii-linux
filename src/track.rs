@@ -538,7 +538,7 @@ impl Tracker {
     }
 
     /// Tracker for the 0x50e image stream: feed it 280x280 frames upscaled 2x
-    /// (`image83::upscale2x`), i.e. 560x560 at the fitted focal length.
+    /// (`image83::upscale2x_into`), i.e. 560x560 at the fitted focal length.
     ///
     /// # Errors
     /// Fails when the landmark model cannot be loaded.
@@ -839,7 +839,8 @@ mod tests {
                 shifted[y * w + x] = frame.pixels[(y + 60) * w + (x + 70)];
             }
         }
-        let big = crate::image83::upscale2x(&shifted, w, h);
+        let mut big = Vec::new();
+        crate::image83::upscale2x_into(&shifted, w, h, &mut big);
         let mut t = Tracker::new_image83().unwrap();
         let mut found_at = None;
         for i in 0..12 {
@@ -870,7 +871,8 @@ mod tests {
         };
         let msg = std::fs::read(path).unwrap();
         let frame = crate::image83::decode_image_payload(&msg).unwrap();
-        let big = crate::image83::upscale2x(&frame.pixels, frame.width, frame.height);
+        let mut big = Vec::new();
+        crate::image83::upscale2x_into(&frame.pixels, frame.width, frame.height, &mut big);
         let (w, h) = (frame.width * 2, frame.height * 2);
         let mut fm = FaceModel::new().unwrap();
         let (cx, cy) = (w as f32 / 2.0, h as f32 * IMAGE83_CY_FRAC);

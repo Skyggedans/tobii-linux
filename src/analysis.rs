@@ -15,16 +15,14 @@ use crate::decode::{
     LiveField, TrackingFrame, decode_stream_payload, decode_stream_payload_with_status,
     field_value, head_point,
 };
+use crate::log::{PacketLog, main_stream_payloads, read_log_payloads};
 use crate::math::{
     dot3, normalize_angle_deg, solve_3x3, vector_pitch_deg, vector_roll_xy_deg, vector_yaw_deg,
 };
 use crate::opentrack::{
     DEFAULT_OPENTRACK_ANGLE_OCC, DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE, OPENTRACK_HEAD_SCALE,
 };
-use crate::protocol::{
-    InitPacket, hex_to_bytes, main_stream_payloads, marker, read_init_packets, read_log_payloads,
-};
-use crate::sinks::PacketLog;
+use crate::protocol::{InitPacket, hex_to_bytes, marker, read_init_packets};
 use crate::track::{euler_deg, kabsch};
 
 /// Decoded stream field key: `(field id, occurrence, component)`.

@@ -23,6 +23,7 @@ pub mod engine;
 pub mod ffi;
 pub mod image83;
 pub mod ipc;
+pub mod log;
 pub mod logging;
 /// Small numeric helpers (origin calibration, filtering, geometry).
 pub mod math;
@@ -30,8 +31,9 @@ pub mod math;
 pub mod opentrack;
 /// Init-packet capture parsing and the device control protocol.
 pub mod protocol;
-/// Output sinks for decoded frames (CSV, JSONL, raw log).
+/// Output sinks for decoded frames (CSV, JSONL) and the live fan-out.
 pub mod sinks;
+pub mod time;
 pub mod track;
 
 use anyhow::Result;
