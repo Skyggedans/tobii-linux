@@ -1,3 +1,11 @@
+//! Small fixed-size linear algebra and calibration helpers shared by the
+//! `OpenTrack` pose pipeline and the offline analysis: rest-origin averaging,
+//! angle wrapping, 3-vector/3x3 products and a tiny Gaussian solver.
+
+/// Rest-origin calibration for a 3-vector: once `origin` is set it is returned
+/// as-is; otherwise, while `can_calibrate`, `value` is accumulated into
+/// `sum`/`count` and the mean becomes the origin after `samples` values.
+/// Returns `None` until calibrated.
 pub(crate) fn calibrate_origin(
     origin: &mut Option<[f64; 3]>,
     sum: &mut [f64; 3],
@@ -14,8 +22,8 @@ pub(crate) fn calibrate_origin(
         return None;
     }
 
-    for i in 0..3 {
-        sum[i] += value[i];
+    for (s, v) in sum.iter_mut().zip(&value) {
+        *s += v;
     }
     *count += 1;
 
@@ -32,6 +40,7 @@ pub(crate) fn calibrate_origin(
     Some(calibrated)
 }
 
+/// Scalar counterpart of [`calibrate_origin`].
 pub(crate) fn calibrate_scalar_origin(
     origin: &mut Option<f64>,
     sum: &mut f64,
@@ -60,6 +69,8 @@ pub(crate) fn calibrate_scalar_origin(
     Some(calibrated)
 }
 
+/// Wrap an angle in degrees into `(-180, 180]`.
+#[must_use]
 pub(crate) fn normalize_angle_deg(mut angle: f64) -> f64 {
     while angle > 180.0 {
         angle -= 360.0;
@@ -70,14 +81,20 @@ pub(crate) fn normalize_angle_deg(mut angle: f64) -> f64 {
     angle
 }
 
+/// Dot product of two 3-vectors.
+#[must_use]
 pub(crate) fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// Euclidean length of a 3-vector.
+#[must_use]
 pub(crate) fn norm3(value: [f64; 3]) -> f64 {
     dot3(value, value).sqrt()
 }
 
+/// Multiply every element of a 3x3 matrix by `scale`.
+#[must_use]
 pub(crate) fn scale_matrix(mut matrix: [[f64; 3]; 3], scale: f64) -> [[f64; 3]; 3] {
     for row in &mut matrix {
         for value in row {
@@ -87,6 +104,10 @@ pub(crate) fn scale_matrix(mut matrix: [[f64; 3]; 3], scale: f64) -> [[f64; 3]; 
     matrix
 }
 
+/// Pick between the "rotation" hypothesis (translation explained by the
+/// rotation coupling) and the "translation" hypothesis (angles explained by
+/// the translation coupling) for one raw pose. Returns `(translation, angles)`.
+#[must_use]
 pub(crate) fn choose_pose_hypothesis(
     raw_translation: [f64; 3],
     raw_angles: [f64; 3],
@@ -116,6 +137,9 @@ pub(crate) fn choose_pose_hypothesis(
     }
 }
 
+/// Angles with the translation-induced coupling removed:
+/// `raw - angle_translation_comp * translation`.
+#[must_use]
 pub(crate) fn angles_from_translation(
     raw_angles: [f64; 3],
     translation: [f64; 3],
@@ -128,20 +152,30 @@ pub(crate) fn angles_from_translation(
     ]
 }
 
+/// Yaw (deg) of a direction vector: rotation about +y, from +z toward +x.
+#[must_use]
 pub(crate) fn vector_yaw_deg(vec: [f64; 3]) -> f64 {
     vec[0].atan2(vec[2]).to_degrees()
 }
 
+/// Pitch (deg) of a direction vector: elevation above the xz plane (image y
+/// points down, so `-y` is up).
+#[must_use]
 pub(crate) fn vector_pitch_deg(vec: [f64; 3]) -> f64 {
     (-vec[1])
         .atan2((vec[0] * vec[0] + vec[2] * vec[2]).sqrt())
         .to_degrees()
 }
 
+/// Roll (deg) of a vector projected onto the image xy plane.
+#[must_use]
 pub(crate) fn vector_roll_xy_deg(vec: [f64; 3]) -> f64 {
     vec[1].atan2(vec[0]).to_degrees()
 }
 
+/// Solve `a * x = b` by Gauss-Jordan elimination with partial pivoting and a
+/// tiny diagonal ridge. Returns `None` when a pivot is (numerically) zero.
+#[must_use]
 pub(crate) fn solve_3x3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
     for i in 0..3 {
         a[i][i] += 1e-9;
@@ -158,20 +192,22 @@ pub(crate) fn solve_3x3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3
         b.swap(i, pivot);
 
         let div = a[i][i];
-        for col in i..3 {
-            a[i][col] /= div;
+        for value in a[i].iter_mut().skip(i) {
+            *value /= div;
         }
         b[i] /= div;
 
-        for row in 0..3 {
+        let row_i = a[i];
+        let b_i = b[i];
+        for (row, (a_row, b_row)) in a.iter_mut().zip(&mut b).enumerate() {
             if row == i {
                 continue;
             }
-            let factor = a[row][i];
-            for col in i..3 {
-                a[row][col] -= factor * a[i][col];
+            let factor = a_row[i];
+            for (value, pivot_value) in a_row.iter_mut().zip(&row_i).skip(i) {
+                *value -= factor * pivot_value;
             }
-            b[row] -= factor * b[i];
+            *b_row -= factor * b_i;
         }
     }
 

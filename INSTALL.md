@@ -164,12 +164,21 @@ systemctl --user restart tobiid        # 4b
 
 ## 6. Logs & debug
 
-With a systemd unit the daemon's output (incl. `tracker pivot=…` and pose
-debug) goes to the journal:
+All binaries log through `tracing` to **stderr**: one line per event with a
+timestamp, level and structured `key=value` fields (colour only on a
+terminal). The level is set with `RUST_LOG` (default `info`; ONNX Runtime's
+own chatter is capped at `warn` unless you override it), e.g.
+`RUST_LOG=debug` to also see the per-packet USB handshake trace, or
+`RUST_LOG=tobii=debug,ort=warn`. With a systemd unit it all lands in the
+journal:
 
 ```bash
 journalctl --user -u tobiid -f
 ```
+
+Diagnostic subcommands (`image83`, `probe`, `head83`, the analysis tools)
+print their **reports on stdout**; only status/warnings go to stderr, so
+the reports can be piped or redirected cleanly.
 
 (Auto-spawned daemons — option 4a — have their stdio sent to `/dev/null`; run
 `tobiid` by hand in a terminal if you want to see its output there.)
@@ -190,7 +199,8 @@ tracker runs in the daemon, not in the client):
 | `TOBII_PREWARM` | unset | `1` (or the historical `head` / `gaze`): init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). |
 | `TOBII_NO_RESET` | unset | `1` skips the USB reset at init (a couple seconds faster; the reset rarely helps now that uvcvideo is kept off the device) |
 | `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
-| `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s |
+| `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s (an `info` event with `frames_per_s`/`poses_per_s`/`mean_ms` fields) |
+| `RUST_LOG` | `info` | log filter for all binaries (`debug`, `tobii=debug,ort=warn`, …); see §6 |
 | `TOBII_CAMERA_TILT_DEG` | `20` | upward tilt of the tracker camera; head angles are reported in the upright frame (yaw about the true vertical), so a turn does not leak into roll |
 
 Head-pose inference on the image stream runs only while some client subscribes

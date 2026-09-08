@@ -1,5 +1,12 @@
-use anyhow::{Context, Result};
+//! Argument parsing for the `tobii5-init-replay` CLI: the default replay /
+//! stream mode (`Command::Replay`) plus the research and diagnostic
+//! subcommands. Hand-rolled on `std::env::args` (no clap) so the binary stays
+//! dependency-free; `print_usage` is the human-readable option surface.
+
+use anyhow::{Context, Result, bail, ensure};
 use std::env;
+use std::iter::{Peekable, Skip};
+use std::str::FromStr;
 
 use crate::opentrack::{
     AngleComponent, AngleSource, CouplingMode, DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
@@ -11,84 +18,151 @@ use crate::opentrack::{
     DEFAULT_OPENTRACK_TRANSLATION_SCALE,
 };
 
+/// Default raw USB stream log written by the replay mode (`--log`).
 pub(crate) const DEFAULT_LOG_PATH: &str = "tobii_stream.bin";
 
+/// `OpenTrack` UDP host used when only `--opentrack-port` is given.
 pub(crate) const DEFAULT_OPENTRACK_HOST: &str = "127.0.0.1";
 
+/// `OpenTrack` UDP port used when only `--opentrack-host` is given.
 pub(crate) const DEFAULT_OPENTRACK_PORT: u16 = 4242;
 
+/// Init-packet capture replayed to bring the device up when none is given.
+const DEFAULT_INIT_PATH: &str = "init_packets_ep.txt";
+
+/// The process arguments after the program name.
+type Args = Peekable<Skip<env::Args>>;
+
+/// Which subcommand was selected on the command line, with its own arguments.
+#[derive(Debug)]
 pub(crate) enum Command {
+    /// Default mode: replay the init capture and stream gaze / head data.
     Replay {
+        /// Init-packet capture to replay.
         init_path: String,
     },
+    /// Grab frames from the UVC IR camera on interface 2.
     Camera {
+        /// Init-packet capture to replay first (unless `skip_replay`).
         init_path: String,
+        /// Prefix of the written `<prefix>NNN.pgm` frames.
         out_prefix: String,
+        /// Number of frames to capture.
         max_frames: usize,
+        /// Skip the init replay.
         skip_replay: bool,
+        /// Optional FIFO to stream raw frames into.
         fifo: Option<String>,
+        /// UVC frame type override.
         frame_type: Option<u8>,
+        /// UVC frame interval override (100 ns units).
         interval: Option<u32>,
     },
+    /// Head tracking from the UVC camera, forwarded to `OpenTrack`.
     Track {
+        /// Init-packet capture to replay first (unless `skip_replay`).
         init_path: String,
+        /// Skip the init replay.
         skip_replay: bool,
+        /// `OpenTrack` UDP host.
         host: String,
+        /// `OpenTrack` UDP port.
         port: u16,
     },
+    /// Check whether the 0x83 stream and the UVC camera run concurrently.
     Probe {
+        /// Init-packet capture to replay.
         init_path: String,
     },
+    /// Live capture of the 0x50e IR image stream multiplexed on EP 0x83.
     Image83 {
+        /// Init-packet capture to replay.
         init_path: String,
+        /// Capture duration.
         secs: f64,
+        /// Prefix of the written image frames.
         out_prefix: String,
+        /// Maximum number of image frames to write.
         max_frames: usize,
+        /// Optional raw stream log to write.
         log_path: Option<String>,
+        /// Run the head tracker on each frame.
         pose: bool,
+        /// Gaze-only baseline: do not enable the image stream.
         no_image: bool,
     },
+    /// Replay a recorded 0x83 log through the image / pose decoder.
     Image83Replay {
+        /// Recorded stream log.
         path: String,
+        /// Optional CSV output of the decoded poses.
         csv: Option<String>,
     },
+    /// Head-axis analysis of the 0x83 3D points in a recorded log.
     Head83 {
+        /// Recorded stream log.
         path: String,
+        /// Point occurrences to fit the head frame to.
         occs: Vec<usize>,
     },
+    /// Summarise a recorded stream log.
     AnalyzeLog {
+        /// Recorded stream log.
         path: String,
     },
+    /// Compare field statistics across several recorded logs.
     CompareLogs {
+        /// Labelled logs to compare.
         inputs: Vec<LogInput>,
     },
+    /// Decode and print every frame of a recorded log.
     DecodeStream {
+        /// Recorded stream log.
         path: String,
     },
+    /// Convert a tshark TSV export into the binary log format.
     ImportTsv {
+        /// tshark TSV export.
         tsv_path: String,
+        /// Binary log to write.
         log_path: String,
     },
+    /// Rank candidate head-pose fields across labelled logs.
     PoseCandidates {
+        /// Labelled logs to compare.
         inputs: Vec<LogInput>,
     },
+    /// Compare decoded frames across labelled logs.
     CompareDecoded {
+        /// Labelled logs to compare.
         inputs: Vec<LogInput>,
     },
+    /// Derive the head axes from yaw / pitch / roll / shift labelled logs.
     HeadAxes {
+        /// Labelled logs (labels: yaw / pitch / roll / shift*).
         inputs: Vec<LogInput>,
     },
+    /// Extract the calibration blob from an init-packet capture.
     ExtractCalibration {
+        /// Init-packet capture.
         path: String,
+        /// Optional JSON output path.
         json_path: Option<String>,
     },
 }
 
+/// One `[label:]path.bin` argument of the multi-log analysis subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogInput {
+    /// Display label; defaults to the file stem.
     pub(crate) label: String,
+    /// Path of the recorded stream log.
     pub(crate) path: String,
 }
 
+/// Parsed command line: the selected [`Command`] plus the replay-mode and
+/// `OpenTrack` options (which only `Command::Replay` reads).
+#[derive(Debug)]
 pub(crate) struct Options {
     pub(crate) command: Command,
     pub(crate) log_path: Option<String>,
@@ -122,7 +196,7 @@ pub(crate) struct Options {
 
 impl Options {
     /// Build an `Options` carrying `command` with every other field at its
-    /// default. Used by non-streaming subcommands that ignore the OpenTrack
+    /// default. Used by non-streaming subcommands that ignore the `OpenTrack`
     /// knobs.
     fn for_command(command: Command) -> Self {
         Self {
@@ -157,8 +231,253 @@ impl Options {
         }
     }
 
+    /// Parse the process arguments. The first argument may name a subcommand;
+    /// otherwise the whole line is the replay / stream mode. `-h` / `--help`
+    /// print usage and exit the process.
+    ///
+    /// # Errors
+    /// Unknown options, options missing their value, values that do not parse
+    /// and values that fail validation (ranges, point pairs, ...).
     pub(crate) fn parse() -> Result<Self> {
-        let mut args = env::args().skip(1).peekable();
+        let mut args: Args = env::args().skip(1).peekable();
+        let parse_subcommand: fn(&mut Args) -> Result<Self> = match args.peek().map(String::as_str)
+        {
+            Some("track") => Self::parse_track,
+            Some("head-axes") => Self::parse_head_axes,
+            Some("head83") => Self::parse_head83,
+            Some("image83-replay") => Self::parse_image83_replay,
+            Some("image83") => Self::parse_image83,
+            Some("probe") => Self::parse_probe,
+            Some("camera") => Self::parse_camera,
+            Some("analyze-log") => Self::parse_analyze_log,
+            Some("compare-logs") => Self::parse_compare_logs,
+            Some("decode-stream") => Self::parse_decode_stream,
+            Some("import-tsv") => Self::parse_import_tsv,
+            Some("pose-candidates") => Self::parse_pose_candidates,
+            Some("compare-decoded") => Self::parse_compare_decoded,
+            Some("extract-calibration") => Self::parse_extract_calibration,
+            _ => return Self::parse_replay(&mut args),
+        };
+        args.next();
+        parse_subcommand(&mut args)
+    }
+
+    fn parse_track(args: &mut Args) -> Result<Self> {
+        let mut init_path = DEFAULT_INIT_PATH.to_string();
+        let mut skip_replay = false;
+        let mut host = DEFAULT_OPENTRACK_HOST.to_string();
+        let mut port = DEFAULT_OPENTRACK_PORT;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--no-replay" => skip_replay = true,
+                "--opentrack-host" => host = take_value(args, "--opentrack-host", "a host")?,
+                "--opentrack-port" => port = parse_value(args, "--opentrack-port", "a port")?,
+                "-h" | "--help" => print_help_and_exit(
+                    "usage: track [init_packets_ep.txt] [--no-replay] [--opentrack-host 127.0.0.1] [--opentrack-port 4242]",
+                ),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
+                other => init_path = other.to_string(),
+            }
+        }
+        Ok(Self::for_command(Command::Track {
+            init_path,
+            skip_replay,
+            host,
+            port,
+        }))
+    }
+
+    fn parse_head_axes(args: &mut Args) -> Result<Self> {
+        let inputs = parse_log_inputs(
+            args,
+            "usage: head-axes [label:]path.bin [label:]path.bin ... (labels: yaw/pitch/roll/shift*)",
+        )?;
+        Ok(Self::for_command(Command::HeadAxes { inputs }))
+    }
+
+    fn parse_head83(args: &mut Args) -> Result<Self> {
+        let path = args
+            .next()
+            .context("usage: head83 <log.bin> [occ,occ,...]")?;
+        let occs = match args.next() {
+            Some(spec) => spec
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<usize>()
+                        .context("bad occurrence in head83")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => vec![0, 1, 4, 5, 6, 9],
+        };
+        ensure!(occs.len() >= 3, "head83 needs at least 3 points");
+        Ok(Self::for_command(Command::Head83 { path, occs }))
+    }
+
+    fn parse_image83_replay(args: &mut Args) -> Result<Self> {
+        let path = args
+            .next()
+            .context("usage: image83-replay <log.bin> [--csv out.csv]")?;
+        let mut csv = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--csv" => csv = Some(take_value(args, "--csv", "a path")?),
+                s => bail!("unknown option: {s}"),
+            }
+        }
+        Ok(Self::for_command(Command::Image83Replay { path, csv }))
+    }
+
+    fn parse_image83(args: &mut Args) -> Result<Self> {
+        let mut init_path = DEFAULT_INIT_PATH.to_string();
+        let mut secs = 10.0f64;
+        let mut out_prefix = "image83_".to_string();
+        let mut max_frames = 5usize;
+        let mut log_path = None;
+        let mut pose = false;
+        let mut no_image = false;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--no-image" => no_image = true,
+                "--secs" => secs = parse_value(args, "--secs", "a number")?,
+                "--out" => out_prefix = take_value(args, "--out", "a prefix")?,
+                "--frames" => max_frames = parse_value(args, "--frames", "a number")?,
+                "--log" => log_path = Some(take_value(args, "--log", "a path")?),
+                "--pose" => pose = true,
+                "-h" | "--help" => print_help_and_exit(
+                    "usage: image83 [init_packets_ep.txt] [--secs 10] [--out image83_] [--frames 5] [--log file.bin] [--pose] [--no-image]\n\
+                     Starts gaze + the 0x50e IR image stream on EP 0x83 and reports per-stream rates and gaze validity; \
+                     --pose runs the head tracker on each frame; --no-image is the gaze-only baseline for A/B.",
+                ),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
+                other => init_path = other.to_string(),
+            }
+        }
+        Ok(Self::for_command(Command::Image83 {
+            init_path,
+            secs,
+            out_prefix,
+            max_frames,
+            log_path,
+            pose,
+            no_image,
+        }))
+    }
+
+    fn parse_probe(args: &mut Args) -> Result<Self> {
+        let mut init_path = DEFAULT_INIT_PATH.to_string();
+        for arg in args.by_ref() {
+            match arg.as_str() {
+                "-h" | "--help" => print_help_and_exit(
+                    "usage: probe [init_packets_ep.txt]  (checks if 0x83 + camera stream concurrently)",
+                ),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
+                other => init_path = other.to_string(),
+            }
+        }
+        Ok(Self::for_command(Command::Probe { init_path }))
+    }
+
+    fn parse_camera(args: &mut Args) -> Result<Self> {
+        let mut init_path = DEFAULT_INIT_PATH.to_string();
+        let mut out_prefix = "frame".to_string();
+        let mut max_frames = 10usize;
+        let mut skip_replay = false;
+        let mut fifo = None;
+        let mut frame_type = None;
+        let mut interval = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--out" => out_prefix = take_value(args, "--out", "a prefix")?,
+                "--frames" => max_frames = parse_value(args, "--frames", "a number")?,
+                "--no-replay" => skip_replay = true,
+                "--fifo" => fifo = Some(take_value(args, "--fifo", "a path")?),
+                "--type" => frame_type = Some(parse_value(args, "--type", "a number")?),
+                "--interval" => {
+                    interval = Some(parse_value(args, "--interval", "a number (100ns units)")?);
+                }
+                "-h" | "--help" => print_help_and_exit(
+                    "usage: camera [init_packets_ep.txt] [--out frame] [--frames 10] [--no-replay] [--fifo path] [--type N] [--interval 100NS]",
+                ),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
+                other => init_path = other.to_string(),
+            }
+        }
+        Ok(Self::for_command(Command::Camera {
+            init_path,
+            out_prefix,
+            max_frames,
+            skip_replay,
+            fifo,
+            frame_type,
+            interval,
+        }))
+    }
+
+    fn parse_analyze_log(args: &mut Args) -> Result<Self> {
+        let path = args.next().context("usage: analyze-log <path>")?;
+        Ok(Self::for_command(Command::AnalyzeLog { path }))
+    }
+
+    fn parse_compare_logs(args: &mut Args) -> Result<Self> {
+        let inputs = parse_log_inputs(
+            args,
+            "usage: compare-logs [label:]path.bin [label:]path.bin ...",
+        )?;
+        Ok(Self::for_command(Command::CompareLogs { inputs }))
+    }
+
+    fn parse_decode_stream(args: &mut Args) -> Result<Self> {
+        let path = args.next().context("usage: decode-stream <path>")?;
+        Ok(Self::for_command(Command::DecodeStream { path }))
+    }
+
+    fn parse_import_tsv(args: &mut Args) -> Result<Self> {
+        const USAGE: &str = "usage: import-tsv <tshark.tsv> <out.bin>";
+        let tsv_path = args.next().context(USAGE)?;
+        let log_path = args.next().context(USAGE)?;
+        ensure!(args.next().is_none(), USAGE);
+        Ok(Self::for_command(Command::ImportTsv { tsv_path, log_path }))
+    }
+
+    fn parse_pose_candidates(args: &mut Args) -> Result<Self> {
+        let inputs = parse_log_inputs(
+            args,
+            "usage: pose-candidates [label:]path.bin [label:]path.bin ...",
+        )?;
+        Ok(Self::for_command(Command::PoseCandidates { inputs }))
+    }
+
+    fn parse_compare_decoded(args: &mut Args) -> Result<Self> {
+        let inputs = parse_log_inputs(
+            args,
+            "usage: compare-decoded [label:]path.bin [label:]path.bin ...",
+        )?;
+        Ok(Self::for_command(Command::CompareDecoded { inputs }))
+    }
+
+    fn parse_extract_calibration(args: &mut Args) -> Result<Self> {
+        const USAGE: &str =
+            "usage: extract-calibration <init_packets_ep.txt> [--json calibration.json]";
+        let path = args.next().context(USAGE)?;
+        let mut json_path = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--json" => json_path = Some(take_value(args, "--json", "a path")?),
+                "-h" | "--help" => print_help_and_exit(USAGE),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
+                other => bail!("unexpected argument for extract-calibration: {other}"),
+            }
+        }
+        Ok(Self::for_command(Command::ExtractCalibration {
+            path,
+            json_path,
+        }))
+    }
+
+    /// The default replay / stream mode: every option is optional and the
+    /// single positional argument is the init-packet capture.
+    fn parse_replay(args: &mut Args) -> Result<Self> {
         let mut init_path = None;
         let mut log_path = Some(DEFAULT_LOG_PATH.to_string());
         let mut max_init_packets = None;
@@ -191,571 +510,37 @@ impl Options {
         let mut opentrack_coupling_mode = CouplingMode::Rotation;
         let mut opentrack_auto_decouple = false;
 
-        if args.peek().map(String::as_str) == Some("track") {
-            args.next();
-            let mut track_init_path = "init_packets_ep.txt".to_string();
-            let mut skip_replay = false;
-            let mut host = DEFAULT_OPENTRACK_HOST.to_string();
-            let mut port = DEFAULT_OPENTRACK_PORT;
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "--no-replay" => skip_replay = true,
-                    "--opentrack-host" => {
-                        host = args.next().context("--opentrack-host requires a host")?;
-                    }
-                    "--opentrack-port" => {
-                        port = args
-                            .next()
-                            .context("--opentrack-port requires a port")?
-                            .parse()
-                            .context("bad --opentrack-port value")?;
-                    }
-                    "-h" | "--help" => {
-                        println!("usage: track [init_packets_ep.txt] [--no-replay] [--opentrack-host 127.0.0.1] [--opentrack-port 4242]");
-                        std::process::exit(0);
-                    }
-                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
-                    other => track_init_path = other.to_string(),
-                }
-            }
-            return Ok(Self::for_command(Command::Track {
-                init_path: track_init_path,
-                skip_replay,
-                host,
-                port,
-            }));
-        }
-
-        if args.peek().map(String::as_str) == Some("head-axes") {
-            args.next();
-            let inputs: Vec<LogInput> = args
-                .map(|arg| parse_log_input(&arg))
-                .collect::<Result<_>>()?;
-            anyhow::ensure!(
-                inputs.len() >= 2,
-                "usage: head-axes [label:]path.bin [label:]path.bin ... (labels: yaw/pitch/roll/shift*)"
-            );
-            return Ok(Self::for_command(Command::HeadAxes { inputs }));
-        }
-
-        if args.peek().map(String::as_str) == Some("head83") {
-            args.next();
-            let path = args.next().context("usage: head83 <log.bin> [occ,occ,...]")?;
-            let occs = match args.next() {
-                Some(spec) => spec
-                    .split(',')
-                    .map(|s| s.trim().parse::<usize>().context("bad occurrence in head83"))
-                    .collect::<Result<Vec<_>>>()?,
-                None => vec![0, 1, 4, 5, 6, 9],
-            };
-            anyhow::ensure!(occs.len() >= 3, "head83 needs at least 3 points");
-            return Ok(Self::for_command(Command::Head83 { path, occs }));
-        }
-
-        if args.peek().map(String::as_str) == Some("image83-replay") {
-            args.next();
-            let path = args.next().context("usage: image83-replay <log.bin> [--csv out.csv]")?;
-            let mut csv = None;
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "--csv" => csv = Some(args.next().context("--csv requires a path")?),
-                    s => anyhow::bail!("unknown option: {s}"),
-                }
-            }
-            return Ok(Self::for_command(Command::Image83Replay { path, csv }));
-        }
-
-        if args.peek().map(String::as_str) == Some("image83") {
-            args.next();
-            let mut init_path = "init_packets_ep.txt".to_string();
-            let mut secs = 10.0f64;
-            let mut out_prefix = "image83_".to_string();
-            let mut max_frames = 5usize;
-            let mut log_path = None;
-            let mut pose = false;
-            let mut no_image = false;
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "--no-image" => no_image = true,
-                    "--secs" => {
-                        secs = args
-                            .next()
-                            .context("--secs requires a number")?
-                            .parse()
-                            .context("bad --secs value")?;
-                    }
-                    "--out" => out_prefix = args.next().context("--out requires a prefix")?,
-                    "--frames" => {
-                        max_frames = args
-                            .next()
-                            .context("--frames requires a number")?
-                            .parse()
-                            .context("bad --frames value")?;
-                    }
-                    "--log" => log_path = Some(args.next().context("--log requires a path")?),
-                    "--pose" => pose = true,
-                    "-h" | "--help" => {
-                        println!(
-                            "usage: image83 [init_packets_ep.txt] [--secs 10] [--out image83_] [--frames 5] [--log file.bin] [--pose] [--no-image]\n\
-                             Starts gaze + the 0x50e IR image stream on EP 0x83 and reports per-stream rates and gaze validity; \
-                             --pose runs the head tracker on each frame; --no-image is the gaze-only baseline for A/B."
-                        );
-                        std::process::exit(0);
-                    }
-                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
-                    other => init_path = other.to_string(),
-                }
-            }
-            return Ok(Self::for_command(Command::Image83 {
-                init_path,
-                secs,
-                out_prefix,
-                max_frames,
-                log_path,
-                pose,
-                no_image,
-            }));
-        }
-
-        if args.peek().map(String::as_str) == Some("probe") {
-            args.next();
-            let mut probe_init_path = "init_packets_ep.txt".to_string();
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "-h" | "--help" => {
-                        println!("usage: probe [init_packets_ep.txt]  (checks if 0x83 + camera stream concurrently)");
-                        std::process::exit(0);
-                    }
-                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
-                    other => probe_init_path = other.to_string(),
-                }
-            }
-            return Ok(Self::for_command(Command::Probe {
-                init_path: probe_init_path,
-            }));
-        }
-
-        if args.peek().map(String::as_str) == Some("camera") {
-            args.next();
-            let mut camera_init_path = "init_packets_ep.txt".to_string();
-            let mut out_prefix = "frame".to_string();
-            let mut max_frames = 10usize;
-            let mut skip_replay = false;
-            let mut fifo = None;
-            let mut frame_type = None;
-            let mut interval = None;
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "--out" => out_prefix = args.next().context("--out requires a prefix")?,
-                    "--frames" => {
-                        max_frames = args
-                            .next()
-                            .context("--frames requires a number")?
-                            .parse()
-                            .context("bad --frames value")?;
-                    }
-                    "--no-replay" => skip_replay = true,
-                    "--fifo" => fifo = Some(args.next().context("--fifo requires a path")?),
-                    "--type" => {
-                        frame_type = Some(
-                            args.next()
-                                .context("--type requires a number")?
-                                .parse()
-                                .context("bad --type value")?,
-                        );
-                    }
-                    "--interval" => {
-                        interval = Some(
-                            args.next()
-                                .context("--interval requires a number (100ns units)")?
-                                .parse()
-                                .context("bad --interval value")?,
-                        );
-                    }
-                    "-h" | "--help" => {
-                        println!("usage: camera [init_packets_ep.txt] [--out frame] [--frames 10] [--no-replay] [--fifo path] [--type N] [--interval 100NS]");
-                        std::process::exit(0);
-                    }
-                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
-                    other => camera_init_path = other.to_string(),
-                }
-            }
-            return Ok(Self::for_command(Command::Camera {
-                init_path: camera_init_path,
-                out_prefix,
-                max_frames,
-                skip_replay,
-                fifo,
-                frame_type,
-                interval,
-            }));
-        }
-
-        if args.peek().map(String::as_str) == Some("analyze-log") {
-            args.next();
-            let path = args.next().context("usage: analyze-log <path>")?;
-            return Ok(Self {
-                command: Command::AnalyzeLog { path },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
-        if args.peek().map(String::as_str) == Some("compare-logs") {
-            args.next();
-            let inputs: Vec<LogInput> = args
-                .map(|arg| parse_log_input(&arg))
-                .collect::<Result<_>>()?;
-            anyhow::ensure!(
-                inputs.len() >= 2,
-                "usage: compare-logs [label:]path.bin [label:]path.bin ..."
-            );
-            return Ok(Self {
-                command: Command::CompareLogs { inputs },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
-        if args.peek().map(String::as_str) == Some("decode-stream") {
-            args.next();
-            let path = args.next().context("usage: decode-stream <path>")?;
-            return Ok(Self {
-                command: Command::DecodeStream { path },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
-        if args.peek().map(String::as_str) == Some("import-tsv") {
-            args.next();
-            let tsv_path = args
-                .next()
-                .context("usage: import-tsv <tshark.tsv> <out.bin>")?;
-            let log_path = args
-                .next()
-                .context("usage: import-tsv <tshark.tsv> <out.bin>")?;
-            anyhow::ensure!(
-                args.next().is_none(),
-                "usage: import-tsv <tshark.tsv> <out.bin>"
-            );
-            return Ok(Self {
-                command: Command::ImportTsv { tsv_path, log_path },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
-        if args.peek().map(String::as_str) == Some("pose-candidates") {
-            args.next();
-            let inputs: Vec<LogInput> = args
-                .map(|arg| parse_log_input(&arg))
-                .collect::<Result<_>>()?;
-            anyhow::ensure!(
-                inputs.len() >= 2,
-                "usage: pose-candidates [label:]path.bin [label:]path.bin ..."
-            );
-            return Ok(Self {
-                command: Command::PoseCandidates { inputs },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
-        if args.peek().map(String::as_str) == Some("compare-decoded") {
-            args.next();
-            let inputs: Vec<LogInput> = args
-                .map(|arg| parse_log_input(&arg))
-                .collect::<Result<_>>()?;
-            anyhow::ensure!(
-                inputs.len() >= 2,
-                "usage: compare-decoded [label:]path.bin [label:]path.bin ..."
-            );
-            return Ok(Self {
-                command: Command::CompareDecoded { inputs },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
-        if args.peek().map(String::as_str) == Some("extract-calibration") {
-            args.next();
-            let path = args.next().context(
-                "usage: extract-calibration <init_packets_ep.txt> [--json calibration.json]",
-            )?;
-            let mut json_path = None;
-
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "--json" => {
-                        json_path = Some(args.next().context("--json requires a path")?);
-                    }
-                    "-h" | "--help" => {
-                        println!(
-                            "usage: extract-calibration <init_packets_ep.txt> [--json calibration.json]"
-                        );
-                        std::process::exit(0);
-                    }
-                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
-                    other => anyhow::bail!("unexpected argument for extract-calibration: {other}"),
-                }
-            }
-
-            return Ok(Self {
-                command: Command::ExtractCalibration { path, json_path },
-                log_path: None,
-                max_init_packets: None,
-                max_stream_packets: None,
-                reconnect: false,
-                decoded_csv_path: None,
-                jsonl_path: None,
-                print_decoded: false,
-                dashboard: false,
-                opentrack_host: None,
-                opentrack_port: None,
-                opentrack_translation: true,
-                opentrack_angle_source: AngleSource::Gaze,
-                opentrack_angle_occ: Some(DEFAULT_OPENTRACK_ANGLE_OCC),
-                opentrack_angle_scale: DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE,
-                opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
-                opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-                opentrack_angle_points: None,
-                opentrack_roll_points: None,
-                opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
-                opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
-                opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
-                opentrack_translation_scale: DEFAULT_OPENTRACK_TRANSLATION_SCALE,
-                opentrack_angle_translation_comp: DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP,
-                opentrack_angle_translation_comp_scale:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
-                opentrack_angle_translation_deadzone:
-                    DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM,
-                opentrack_coupling_mode: CouplingMode::Rotation,
-                opentrack_auto_decouple: false,
-            });
-        }
-
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--log" => {
-                    log_path = Some(args.next().context("--log requires a path")?);
-                }
-                "--no-log" => {
-                    log_path = None;
-                }
+                "--log" => log_path = Some(take_value(args, "--log", "a path")?),
+                "--no-log" => log_path = None,
                 "--max-init-packets" => {
-                    max_init_packets = Some(
-                        args.next()
-                            .context("--max-init-packets requires a number")?
-                            .parse()
-                            .context("bad --max-init-packets value")?,
-                    );
+                    max_init_packets = Some(parse_value(args, "--max-init-packets", "a number")?);
                 }
                 "--max-stream-packets" => {
-                    max_stream_packets = Some(
-                        args.next()
-                            .context("--max-stream-packets requires a number")?
-                            .parse()
-                            .context("bad --max-stream-packets value")?,
-                    );
+                    max_stream_packets =
+                        Some(parse_value(args, "--max-stream-packets", "a number")?);
                 }
-                "--no-reconnect" => {
-                    reconnect = false;
-                }
+                "--no-reconnect" => reconnect = false,
                 "--decoded-csv" => {
-                    decoded_csv_path = Some(args.next().context("--decoded-csv requires a path")?);
+                    decoded_csv_path = Some(take_value(args, "--decoded-csv", "a path")?);
                 }
-                "--jsonl" => {
-                    jsonl_path = Some(args.next().context("--jsonl requires a path")?);
-                }
-                "--print-decoded" => {
-                    print_decoded = true;
-                }
-                "--dashboard" => {
-                    dashboard = true;
-                }
+                "--jsonl" => jsonl_path = Some(take_value(args, "--jsonl", "a path")?),
+                "--print-decoded" => print_decoded = true,
+                "--dashboard" => dashboard = true,
                 "--opentrack-host" => {
-                    opentrack_host = Some(args.next().context("--opentrack-host requires a host")?);
+                    opentrack_host = Some(take_value(args, "--opentrack-host", "a host")?);
                 }
                 "--opentrack-port" => {
-                    opentrack_port = Some(
-                        args.next()
-                            .context("--opentrack-port requires a port")?
-                            .parse()
-                            .context("bad --opentrack-port value")?,
-                    );
+                    opentrack_port = Some(parse_value(args, "--opentrack-port", "a port")?);
                 }
-                "--opentrack-no-translation" => {
-                    opentrack_translation = false;
-                }
+                "--opentrack-no-translation" => opentrack_translation = false,
                 "--opentrack-angle-source" => {
-                    opentrack_angle_source = parse_angle_source(
-                        &args
-                            .next()
-                            .context("--opentrack-angle-source requires gaze or head")?,
-                    )?;
+                    opentrack_angle_source = parse_angle_source(&take_value(
+                        args,
+                        "--opentrack-angle-source",
+                        "gaze or head",
+                    )?)?;
                     if !opentrack_angle_scale_set {
                         opentrack_angle_scale = match opentrack_angle_source {
                             AngleSource::Gaze => DEFAULT_OPENTRACK_GAZE_ANGLE_SCALE,
@@ -770,164 +555,137 @@ impl Options {
                     if !opentrack_angle_scale_set {
                         opentrack_angle_scale = DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE;
                     }
-                    opentrack_angle_occ = Some(
-                        args.next()
-                            .context("--opentrack-angle-occ requires an occurrence number")?
-                            .parse()
-                            .context("bad --opentrack-angle-occ value")?,
-                    );
+                    opentrack_angle_occ = Some(parse_value(
+                        args,
+                        "--opentrack-angle-occ",
+                        "an occurrence number",
+                    )?);
                 }
                 "--opentrack-no-angles" => {
                     opentrack_angle_source = AngleSource::Head;
                     opentrack_angle_occ = None;
                 }
                 "--opentrack-angle-scale" => {
-                    opentrack_angle_scale = parse_angle_scale(
-                        &args
-                            .next()
-                            .context("--opentrack-angle-scale requires a number or x,y,z")?,
-                    )?;
+                    opentrack_angle_scale = parse_angle_scale(&take_value(
+                        args,
+                        "--opentrack-angle-scale",
+                        "a number or x,y,z",
+                    )?)?;
                     opentrack_angle_scale_set = true;
                 }
                 "--opentrack-angle-map" => {
-                    opentrack_angle_map = parse_angle_map(
-                        &args
-                            .next()
-                            .context("--opentrack-angle-map requires values like x,-y,z")?,
-                    )?;
+                    opentrack_angle_map = parse_angle_map(&take_value(
+                        args,
+                        "--opentrack-angle-map",
+                        "values like x,-y,z",
+                    )?)?;
                 }
                 "--opentrack-origin-samples" => {
-                    opentrack_origin_samples = args
-                        .next()
-                        .context("--opentrack-origin-samples requires a number")?
-                        .parse()
-                        .context("bad --opentrack-origin-samples value")?;
-                    anyhow::ensure!(
+                    opentrack_origin_samples =
+                        parse_value(args, "--opentrack-origin-samples", "a number")?;
+                    ensure!(
                         opentrack_origin_samples > 0,
                         "--opentrack-origin-samples must be greater than zero"
                     );
                 }
                 "--opentrack-angle-points" => {
                     opentrack_angle_points = Some(parse_point_pair(
-                        &args
-                            .next()
-                            .context("--opentrack-angle-points requires A,B")?,
+                        &take_value(args, "--opentrack-angle-points", "A,B")?,
                         "--opentrack-angle-points",
                     )?);
                 }
-                "--opentrack-no-angle-points" => {
-                    opentrack_angle_points = None;
-                }
+                "--opentrack-no-angle-points" => opentrack_angle_points = None,
                 "--opentrack-roll-points" => {
                     opentrack_roll_points = Some(parse_point_pair(
-                        &args
-                            .next()
-                            .context("--opentrack-roll-points requires A,B")?,
+                        &take_value(args, "--opentrack-roll-points", "A,B")?,
                         "--opentrack-roll-points",
                     )?);
                 }
-                "--opentrack-no-roll-points" => {
-                    opentrack_roll_points = None;
-                }
+                "--opentrack-no-roll-points" => opentrack_roll_points = None,
                 "--opentrack-smoothing" => {
-                    opentrack_smoothing = args
-                        .next()
-                        .context("--opentrack-smoothing requires a number from 0 to 1")?
-                        .parse()
-                        .context("bad --opentrack-smoothing value")?;
-                    anyhow::ensure!(
+                    opentrack_smoothing =
+                        parse_value(args, "--opentrack-smoothing", "a number from 0 to 1")?;
+                    ensure!(
                         (0.0..=1.0).contains(&opentrack_smoothing),
                         "--opentrack-smoothing must be between 0 and 1"
                     );
                 }
                 "--opentrack-angle-deadzone" => {
-                    opentrack_angle_deadzone = args
-                        .next()
-                        .context("--opentrack-angle-deadzone requires degrees")?
-                        .parse()
-                        .context("bad --opentrack-angle-deadzone value")?;
-                    anyhow::ensure!(
+                    opentrack_angle_deadzone =
+                        parse_value(args, "--opentrack-angle-deadzone", "degrees")?;
+                    ensure!(
                         opentrack_angle_deadzone >= 0.0,
                         "--opentrack-angle-deadzone must be non-negative"
                     );
                 }
                 "--opentrack-rotation-comp" => {
                     opentrack_rotation_comp = parse_matrix3(
-                        &args
-                            .next()
-                            .context("--opentrack-rotation-comp requires values")?,
+                        &take_value(args, "--opentrack-rotation-comp", "values")?,
                         "--opentrack-rotation-comp",
                     )?;
                 }
                 "--opentrack-translation-scale" => {
                     opentrack_translation_scale = parse_three_f64(
-                        &args
-                            .next()
-                            .context("--opentrack-translation-scale requires X,Y,Z")?,
+                        &take_value(args, "--opentrack-translation-scale", "X,Y,Z")?,
                         "--opentrack-translation-scale",
                     )?;
                 }
                 "--opentrack-angle-translation-comp" => {
-                    opentrack_angle_translation_comp = parse_angle_translation_comp(
-                        &args
-                            .next()
-                            .context("--opentrack-angle-translation-comp requires values")?,
-                    )?;
+                    opentrack_angle_translation_comp = parse_angle_translation_comp(&take_value(
+                        args,
+                        "--opentrack-angle-translation-comp",
+                        "values",
+                    )?)?;
                 }
                 "--opentrack-angle-translation-comp-scale" => {
-                    opentrack_angle_translation_comp_scale = args
-                        .next()
-                        .context("--opentrack-angle-translation-comp-scale requires a number")?
-                        .parse()
-                        .context("bad --opentrack-angle-translation-comp-scale value")?;
-                    anyhow::ensure!(
+                    opentrack_angle_translation_comp_scale =
+                        parse_value(args, "--opentrack-angle-translation-comp-scale", "a number")?;
+                    ensure!(
                         opentrack_angle_translation_comp_scale >= 0.0,
                         "--opentrack-angle-translation-comp-scale must be non-negative"
                     );
                 }
                 "--opentrack-angle-translation-deadzone" => {
-                    opentrack_angle_translation_deadzone = args
-                        .next()
-                        .context("--opentrack-angle-translation-deadzone requires centimeters")?
-                        .parse()
-                        .context("bad --opentrack-angle-translation-deadzone value")?;
-                    anyhow::ensure!(
+                    opentrack_angle_translation_deadzone = parse_value(
+                        args,
+                        "--opentrack-angle-translation-deadzone",
+                        "centimeters",
+                    )?;
+                    ensure!(
                         opentrack_angle_translation_deadzone >= 0.0,
                         "--opentrack-angle-translation-deadzone must be non-negative"
                     );
                 }
                 "--opentrack-coupling-mode" => {
-                    opentrack_coupling_mode = parse_coupling_mode(&args.next().context(
-                        "--opentrack-coupling-mode requires rotation|translation|hybrid|auto",
+                    opentrack_coupling_mode = parse_coupling_mode(&take_value(
+                        args,
+                        "--opentrack-coupling-mode",
+                        "rotation|translation|hybrid|auto",
                     )?)?;
                 }
-                "--opentrack-auto-decouple" => {
-                    opentrack_auto_decouple = true;
-                }
-                "--opentrack-no-auto-decouple" => {
-                    opentrack_auto_decouple = false;
-                }
+                "--opentrack-auto-decouple" => opentrack_auto_decouple = true,
+                "--opentrack-no-auto-decouple" => opentrack_auto_decouple = false,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
                 }
-                s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
                 path => {
                     if init_path.replace(path.to_string()).is_some() {
-                        anyhow::bail!("only one init packet file can be provided");
+                        bail!("only one init packet file can be provided");
                     }
                 }
             }
         }
 
-        anyhow::ensure!(
+        ensure!(
             !(dashboard && jsonl_path.as_deref() == Some("-")),
             "--dashboard cannot be combined with --jsonl - because both write to stdout"
         );
 
         Ok(Self {
             command: Command::Replay {
-                init_path: init_path.unwrap_or_else(|| "init_packets_ep.txt".to_string()),
+                init_path: init_path.unwrap_or_else(|| DEFAULT_INIT_PATH.to_string()),
             },
             log_path,
             max_init_packets,
@@ -959,6 +717,10 @@ impl Options {
         })
     }
 
+    /// `(host, port)` of the `OpenTrack` UDP sink, or `None` when neither
+    /// `--opentrack-host` nor `--opentrack-port` was given; a missing half
+    /// falls back to the default.
+    #[must_use]
     pub(crate) fn opentrack_target(&self) -> Option<(String, u16)> {
         if self.opentrack_host.is_none() && self.opentrack_port.is_none() {
             return None;
@@ -966,48 +728,94 @@ impl Options {
 
         Some((
             self.opentrack_host
-                .clone()
-                .unwrap_or_else(|| DEFAULT_OPENTRACK_HOST.to_string()),
+                .as_deref()
+                .unwrap_or(DEFAULT_OPENTRACK_HOST)
+                .to_string(),
             self.opentrack_port.unwrap_or(DEFAULT_OPENTRACK_PORT),
         ))
     }
 }
 
+/// Print `usage` (a subcommand's `-h` text) and exit successfully.
+fn print_help_and_exit(usage: &str) -> ! {
+    println!("{usage}");
+    std::process::exit(0)
+}
+
+/// Take the next argument as the value of `option`, erroring with
+/// "`option` requires `what`" when the command line ends first.
+fn take_value(args: &mut Args, option: &str, what: &str) -> Result<String> {
+    args.next()
+        .with_context(|| format!("{option} requires {what}"))
+}
+
+/// Take the next argument as the value of `option` and parse it as `T`.
+fn parse_value<T>(args: &mut Args, option: &str, what: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    take_value(args, option, what)?
+        .parse()
+        .with_context(|| format!("bad {option} value"))
+}
+
+/// Parse the remaining arguments as `[label:]path.bin` inputs; the multi-log
+/// subcommands need at least two.
+fn parse_log_inputs(args: &mut Args, usage: &str) -> Result<Vec<LogInput>> {
+    let inputs: Vec<LogInput> = args
+        .map(|arg| parse_log_input(&arg))
+        .collect::<Result<_>>()?;
+    ensure!(inputs.len() >= 2, "{usage}");
+    Ok(inputs)
+}
+
+/// Print the top-level usage text (replay mode plus subcommand one-liners).
 pub(crate) fn print_usage() {
     println!(
         "usage:\n  cargo run -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--dashboard] [--opentrack-host 127.0.0.1] [--opentrack-port 4242] [--opentrack-no-translation] [--opentrack-translation-scale X,Y,Z] [--opentrack-angle-source model|gaze|head] [--opentrack-coupling-mode rotation|translation|hybrid|auto] [--opentrack-auto-decouple] [--opentrack-angle-points A,B] [--opentrack-angle-translation-comp X,Y,Z] [--opentrack-angle-translation-comp-scale N] [--opentrack-angle-translation-deadzone CM] [--opentrack-angle-occ N] [--opentrack-angle-map x,-y,off] [--opentrack-angle-scale N|YAW,PITCH,ROLL] [--opentrack-origin-samples N] [--opentrack-smoothing 0.35] [--opentrack-angle-deadzone 0.35] [--opentrack-rotation-comp X,Y,Z] [--opentrack-roll-points A,B] [--opentrack-no-angles] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -- analyze-log tobii_stream.bin\n  cargo run -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -- decode-stream tobii_stream.bin\n  cargo run -- import-tsv tshark.tsv out.bin\n  cargo run -- pose-candidates [label:]path.bin [label:]path.bin ...\n  cargo run -- compare-decoded [label:]path.bin [label:]path.bin ...\n  cargo run -- extract-calibration init_packets_ep.txt [--json calibration.json]\n  cargo run -- camera [init_packets_ep.txt] [--out frame] [--frames 10]"
     );
 }
 
+/// Parse `x,y,z` for `option`.
+///
+/// # Errors
+/// Not exactly three comma-separated values, or a value that is not a number.
 pub(crate) fn parse_three_f64(s: &str, option: &str) -> Result<[f64; 3]> {
-    let parts: Vec<_> = s.split(',').collect();
-    anyhow::ensure!(
-        parts.len() == 3,
-        "{option} must contain three comma-separated numbers"
-    );
+    let parts: Vec<&str> = s.split(',').collect();
+    let [x, y, z] = parts.as_slice() else {
+        bail!("{option} must contain three comma-separated numbers");
+    };
 
     Ok([
-        parts[0]
-            .trim()
+        x.trim()
             .parse()
             .with_context(|| format!("bad {option} x value"))?,
-        parts[1]
-            .trim()
+        y.trim()
             .parse()
             .with_context(|| format!("bad {option} y value"))?,
-        parts[2]
-            .trim()
+        z.trim()
             .parse()
             .with_context(|| format!("bad {option} z value"))?,
     ])
 }
 
+/// Parse the `--opentrack-angle-translation-comp` matrix (see [`parse_matrix3`]).
+///
+/// # Errors
+/// Same as [`parse_matrix3`].
 pub(crate) fn parse_angle_translation_comp(s: &str) -> Result<[[f64; 3]; 3]> {
     parse_matrix3(s, "--opentrack-angle-translation-comp")
 }
 
+/// Parse a 3x3 matrix for `option`: either three diagonal values `x,y,z` or
+/// nine row-major values.
+///
+/// # Errors
+/// Neither three nor nine comma-separated values, or a value that is not a
+/// number.
 pub(crate) fn parse_matrix3(s: &str, option: &str) -> Result<[[f64; 3]; 3]> {
-    let parts: Vec<_> = s.split(',').map(str::trim).collect();
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
     if parts.len() == 3 {
         let diagonal = parse_three_f64(s, option)?;
         return Ok([
@@ -1017,15 +825,15 @@ pub(crate) fn parse_matrix3(s: &str, option: &str) -> Result<[[f64; 3]; 3]> {
         ]);
     }
 
-    anyhow::ensure!(
+    ensure!(
         parts.len() == 9,
         "{option} must contain 3 diagonal values or 9 matrix values"
     );
 
     let mut matrix = [[0.0; 3]; 3];
-    for row in 0..3 {
-        for col in 0..3 {
-            matrix[row][col] = parts[row * 3 + col]
+    for (row, values) in matrix.iter_mut().zip(parts.chunks_exact(3)) {
+        for (cell, value) in row.iter_mut().zip(values) {
+            *cell = value
                 .parse()
                 .with_context(|| format!("bad {option} value"))?;
         }
@@ -1033,6 +841,10 @@ pub(crate) fn parse_matrix3(s: &str, option: &str) -> Result<[[f64; 3]; 3]> {
     Ok(matrix)
 }
 
+/// Parse `A,B` (two distinct point occurrences) for `option`.
+///
+/// # Errors
+/// No comma, a side that is not an integer, or `A == B`.
 pub(crate) fn parse_point_pair(s: &str, option: &str) -> Result<(usize, usize)> {
     let (a, b) = s
         .split_once(',')
@@ -1045,74 +857,95 @@ pub(crate) fn parse_point_pair(s: &str, option: &str) -> Result<(usize, usize)> 
         .trim()
         .parse()
         .with_context(|| format!("bad second point for {option}"))?;
-    anyhow::ensure!(a != b, "{option} needs two different points");
+    ensure!(a != b, "{option} needs two different points");
     Ok((a, b))
 }
 
+/// Parse `--opentrack-angle-scale`: one scale for all axes or `yaw,pitch,roll`.
+///
+/// # Errors
+/// Neither one nor three values, a non-numeric value, or a zero scale.
 pub(crate) fn parse_angle_scale(s: &str) -> Result<[f64; 3]> {
-    let parts: Vec<_> = s.split(',').collect();
-    if parts.len() == 1 {
-        let scale = parse_nonzero_scale(parts[0])?;
-        return Ok([scale, scale, scale]);
+    let parts: Vec<&str> = s.split(',').collect();
+    match parts.as_slice() {
+        [scale] => {
+            let scale = parse_nonzero_scale(scale)?;
+            Ok([scale; 3])
+        }
+        [yaw, pitch, roll] => Ok([
+            parse_nonzero_scale(yaw)?,
+            parse_nonzero_scale(pitch)?,
+            parse_nonzero_scale(roll)?,
+        ]),
+        _ => bail!("--opentrack-angle-scale must be one number or three comma-separated numbers"),
     }
-
-    anyhow::ensure!(
-        parts.len() == 3,
-        "--opentrack-angle-scale must be one number or three comma-separated numbers"
-    );
-
-    Ok([
-        parse_nonzero_scale(parts[0])?,
-        parse_nonzero_scale(parts[1])?,
-        parse_nonzero_scale(parts[2])?,
-    ])
 }
 
+/// Parse `--opentrack-angle-source` (`gaze`, `head` or `model`).
+///
+/// # Errors
+/// Any other value.
 pub(crate) fn parse_angle_source(s: &str) -> Result<AngleSource> {
     match s.trim() {
         "gaze" => Ok(AngleSource::Gaze),
         "head" => Ok(AngleSource::Head),
         "model" => Ok(AngleSource::Model),
-        other => anyhow::bail!("unknown --opentrack-angle-source: {other}"),
+        other => bail!("unknown --opentrack-angle-source: {other}"),
     }
 }
 
+/// Parse `--opentrack-coupling-mode` (`rotation`, `translation`, `hybrid` or
+/// `auto`).
+///
+/// # Errors
+/// Any other value.
 pub(crate) fn parse_coupling_mode(s: &str) -> Result<CouplingMode> {
     match s.trim() {
         "rotation" => Ok(CouplingMode::Rotation),
         "translation" => Ok(CouplingMode::Translation),
         "hybrid" => Ok(CouplingMode::Hybrid),
         "auto" => Ok(CouplingMode::Auto),
-        other => anyhow::bail!("unknown --opentrack-coupling-mode: {other}"),
+        other => bail!("unknown --opentrack-coupling-mode: {other}"),
     }
 }
 
+/// Parse one `--opentrack-angle-scale` component, rejecting zero.
+///
+/// # Errors
+/// Not a number, or (within `f64::EPSILON` of) zero.
 pub(crate) fn parse_nonzero_scale(s: &str) -> Result<f64> {
     let scale: f64 = s
         .trim()
         .parse()
         .context("bad --opentrack-angle-scale value")?;
-    anyhow::ensure!(
+    ensure!(
         scale.abs() > f64::EPSILON,
         "--opentrack-angle-scale must not contain zero"
     );
     Ok(scale)
 }
 
+/// Parse `--opentrack-angle-map`: three axes like `x,-y,off`.
+///
+/// # Errors
+/// Not exactly three values, or an axis [`parse_angle_component`] rejects.
 pub(crate) fn parse_angle_map(s: &str) -> Result<[AngleComponent; 3]> {
-    let parts: Vec<_> = s.split(',').collect();
-    anyhow::ensure!(
-        parts.len() == 3,
-        "--opentrack-angle-map must contain exactly three comma-separated axes"
-    );
+    let parts: Vec<&str> = s.split(',').collect();
+    let [yaw, pitch, roll] = parts.as_slice() else {
+        bail!("--opentrack-angle-map must contain exactly three comma-separated axes");
+    };
 
     Ok([
-        parse_angle_component(parts[0])?,
-        parse_angle_component(parts[1])?,
-        parse_angle_component(parts[2])?,
+        parse_angle_component(yaw)?,
+        parse_angle_component(pitch)?,
+        parse_angle_component(roll)?,
     ])
 }
 
+/// Parse one angle-map axis: `[+|-](x|y|z|0|1|2)` or `off` / `none` / `_`.
+///
+/// # Errors
+/// Any other axis name.
 pub(crate) fn parse_angle_component(s: &str) -> Result<AngleComponent> {
     let s = s.trim();
     let (sign, axis) = if let Some(axis) = s.strip_prefix('-') {
@@ -1131,28 +964,34 @@ pub(crate) fn parse_angle_component(s: &str) -> Result<AngleComponent> {
         "x" | "0" => 0,
         "y" | "1" => 1,
         "z" | "2" => 2,
-        _ => anyhow::bail!("bad angle axis {s:?}; use x, y, z, off or 0, 1, 2"),
+        _ => bail!("bad angle axis {s:?}; use x, y, z, off or 0, 1, 2"),
     };
 
     Ok(AngleComponent::new(component, sign))
 }
 
+/// Parse one `[label:]path.bin` argument; without a label the file stem is
+/// used.
+///
+/// # Errors
+/// An explicit label or path that is empty.
 pub(crate) fn parse_log_input(arg: &str) -> Result<LogInput> {
-    if let Some((label, path)) = arg.split_once(':') {
-        anyhow::ensure!(!label.is_empty(), "empty compare-log label in {arg}");
-        anyhow::ensure!(!path.is_empty(), "empty compare-log path in {arg}");
+    let Some((label, path)) = arg.split_once(':') else {
+        let label = std::path::Path::new(arg)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(arg)
+            .to_string();
         return Ok(LogInput {
-            label: label.to_string(),
-            path: path.to_string(),
+            label,
+            path: arg.to_string(),
         });
-    }
+    };
 
-    let path = arg.to_string();
-    let label = std::path::Path::new(arg)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(arg)
-        .to_string();
-
-    Ok(LogInput { label, path })
+    ensure!(!label.is_empty(), "empty compare-log label in {arg}");
+    ensure!(!path.is_empty(), "empty compare-log path in {arg}");
+    Ok(LogInput {
+        label: label.to_string(),
+        path: path.to_string(),
+    })
 }

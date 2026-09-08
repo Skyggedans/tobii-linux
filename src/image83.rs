@@ -13,8 +13,11 @@
 //!   key 5 -> type 2 u32 stride (280)
 //!   key 6 -> type 0x15 blob: BE u32 pixel-count + row-major pixels
 //! Verified against the Windows Stream Engine captures (session1-3.pcapng and
-//! the pcap_analysis replication set); the iris positions in these frames match
+//! the `pcap_analysis` replication set); the iris positions in these frames match
 //! the projected 0x83 eyeball centres to <1 px with f≈376 px (280-px frame).
+
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use crate::decode::STREAM_TLV_OFFSET;
 
@@ -29,14 +32,28 @@ const KEY_PIXELS: u32 = 6;
 /// Largest frame we accept (guards allocation on a corrupt header).
 const MAX_DIM: u32 = 4096;
 
+/// One decoded camera frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImageFrame {
     /// Device timestamp, microseconds (same clock as the gaze stream's key 1).
     pub(crate) device_ts_us: u64,
+    /// Frame width in pixels.
     pub(crate) width: usize,
+    /// Frame height in pixels.
     pub(crate) height: usize,
     /// Row-major 8-bit grayscale, `width * height` bytes (stride removed).
     pub(crate) pixels: Vec<u8>,
+}
+
+/// Which keyed field the next value entry belongs to, while walking the TLVs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyState {
+    /// Not inside a `0x20bb9` field; values are ignored.
+    None,
+    /// Saw the `0x20bb9` field id; the next type-2 entry is the key.
+    Expecting,
+    /// Inside the keyed field `key`; the next entry is its value.
+    Key(u32),
 }
 
 fn be_u32(b: &[u8]) -> Option<u32> {
@@ -45,9 +62,10 @@ fn be_u32(b: &[u8]) -> Option<u32> {
 
 /// Decode one 0x50e stream message into a frame; `None` if it is not a
 /// well-formed image message.
+#[must_use]
 pub(crate) fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
     let mut off = STREAM_TLV_OFFSET;
-    let mut key = None::<u32>;
+    let mut key = KeyState::None;
     let mut ts = None;
     let mut bpp = None;
     let mut width = None;
@@ -57,41 +75,38 @@ pub(crate) fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
 
     while off + 5 <= payload.len() {
         let typ = payload[off];
-        let len = be_u32(&payload[off + 1..])? as usize;
+        let len = usize::try_from(be_u32(&payload[off + 1..])?).ok()?;
         off += 5;
-        let value = payload.get(off..off + len)?;
-        off += len;
+        let end = off.checked_add(len)?;
+        let value = payload.get(off..end)?;
+        off = end;
         match typ {
             5 if len == 4 => {
                 // A field id. Only 0x20bb9 announces a keyed field; the key
                 // itself is the next type-2 entry.
-                if be_u32(value)? == KEY_ID {
-                    key = Some(u32::MAX); // expect the key next
+                key = if be_u32(value)? == KEY_ID {
+                    KeyState::Expecting
                 } else {
-                    key = None;
-                }
+                    KeyState::None
+                };
             }
             2 if len == 4 => {
                 let v = be_u32(value)?;
                 match key {
-                    Some(u32::MAX) => key = Some(v),
-                    Some(KEY_BPP) => bpp = Some(v),
-                    Some(KEY_WIDTH) => width = Some(v),
-                    Some(KEY_HEIGHT) => height = Some(v),
-                    Some(KEY_STRIDE) => stride = Some(v),
-                    _ => {}
+                    KeyState::Expecting => key = KeyState::Key(v),
+                    KeyState::Key(KEY_BPP) => bpp = Some(v),
+                    KeyState::Key(KEY_WIDTH) => width = Some(v),
+                    KeyState::Key(KEY_HEIGHT) => height = Some(v),
+                    KeyState::Key(KEY_STRIDE) => stride = Some(v),
+                    KeyState::None | KeyState::Key(_) => {}
                 }
             }
-            6 if len == 8 => {
-                if key == Some(KEY_TIMESTAMP) {
-                    ts = Some(u64::from_be_bytes(value.try_into().ok()?));
-                }
+            6 if len == 8 && key == KeyState::Key(KEY_TIMESTAMP) => {
+                ts = Some(u64::from_be_bytes(value.try_into().ok()?));
             }
-            0x15 => {
-                if key == Some(KEY_PIXELS) && len >= 4 {
-                    let n = be_u32(value)? as usize;
-                    blob = value.get(4..4 + n);
-                }
+            0x15 if key == KeyState::Key(KEY_PIXELS) && len >= 4 => {
+                let n = usize::try_from(be_u32(value)?).ok()?;
+                blob = value.get(4..).and_then(|px| px.get(..n));
             }
             _ => {}
         }
@@ -101,18 +116,23 @@ pub(crate) fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
     if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM || bpp? != 8 {
         return None;
     }
-    let stride = stride.unwrap_or(width) as usize;
-    let (w, h) = (width as usize, height as usize);
+    let stride = usize::try_from(stride.unwrap_or(width)).ok()?;
+    let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
     let blob = blob?;
-    if stride < w || blob.len() < stride * (h - 1) + w {
+    // `w`, `h` <= MAX_DIM, so the products below stay far below usize::MAX;
+    // `stride` is unbounded on the wire, hence checked.
+    let needed = stride.checked_mul(h - 1)?.checked_add(w)?;
+    if stride < w || blob.len() < needed {
         return None;
     }
     let pixels = if stride == w {
         blob[..w * h].to_vec()
     } else {
         let mut px = Vec::with_capacity(w * h);
-        for row in 0..h {
-            px.extend_from_slice(&blob[row * stride..row * stride + w]);
+        // The last chunk may be shorter than `stride` but holds >= `w` bytes
+        // (checked above).
+        for row in blob.chunks(stride).take(h) {
+            px.extend_from_slice(&row[..w]);
         }
         px
     };
@@ -126,29 +146,65 @@ pub(crate) fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
 
 /// 2x nearest-neighbour upscale (280x280 -> 560x560), so the frame can go
 /// through the same face crop / landmark pipeline as the UVC camera path.
+///
+/// Allocating convenience wrapper around [`upscale2x_into`], kept for the
+/// tests; the per-frame paths reuse one buffer instead.
+///
+/// # Panics
+///
+/// Panics if `src` holds fewer than `w * h` bytes.
+#[cfg(test)]
+#[must_use]
 pub(crate) fn upscale2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h * 4];
-    let ow = w * 2;
-    for y in 0..h {
-        let row = &src[y * w..y * w + w];
-        let o0 = (2 * y) * ow;
-        let o1 = o0 + ow;
-        for (x, &v) in row.iter().enumerate() {
-            out[o0 + 2 * x] = v;
-            out[o0 + 2 * x + 1] = v;
-            out[o1 + 2 * x] = v;
-            out[o1 + 2 * x + 1] = v;
-        }
-    }
+    let mut out = Vec::new();
+    upscale2x_into(src, w, h, &mut out);
     out
 }
 
+/// [`upscale2x`] writing into `out`, which is resized to `w * h * 4` bytes.
+///
+/// A caller in a per-frame loop hands the same vector back every time and
+/// keeps its allocation.
+///
+/// # Panics
+///
+/// Panics if `src` holds fewer than `w * h` bytes.
+pub(crate) fn upscale2x_into(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+    assert!(
+        src.len() >= w * h,
+        "upscale2x: source has {} bytes, need {}",
+        src.len(),
+        w * h
+    );
+    out.clear();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let ow = w * 2;
+    out.resize(ow * h * 2, 0);
+    for (src_row, out_rows) in src[..w * h]
+        .chunks_exact(w)
+        .zip(out.chunks_exact_mut(ow * 2))
+    {
+        let (r0, r1) = out_rows.split_at_mut(ow);
+        for (pair, &v) in r0.chunks_exact_mut(2).zip(src_row) {
+            pair[0] = v;
+            pair[1] = v;
+        }
+        r1.copy_from_slice(r0);
+    }
+}
+
 /// Write a frame as a binary PGM.
-pub(crate) fn write_pgm(path: &str, frame: &ImageFrame) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
+///
+/// # Errors
+///
+/// Propagates file creation and write failures.
+pub(crate) fn write_pgm(path: impl AsRef<Path>, frame: &ImageFrame) -> std::io::Result<()> {
+    let mut f = BufWriter::new(std::fs::File::create(path)?);
     write!(f, "P5\n{} {}\n255\n", frame.width, frame.height)?;
-    f.write_all(&frame.pixels)
+    f.write_all(&frame.pixels)?;
+    f.flush()
 }
 
 #[cfg(test)]
@@ -157,7 +213,7 @@ mod tests {
 
     fn tlv(typ: u8, value: &[u8]) -> Vec<u8> {
         let mut v = vec![typ];
-        v.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        v.extend_from_slice(&u32::try_from(value.len()).expect("fits u32").to_be_bytes());
         v.extend_from_slice(value);
         v
     }
@@ -170,20 +226,23 @@ mod tests {
     }
 
     /// Synthesize an image message the way the firmware lays it out.
-    pub(crate) fn synth_message(w: u32, h: u32, stride: u32, ts: u64, pixels: &[u8]) -> Vec<u8> {
+    fn synth_message(w: u32, h: u32, stride: u32, ts: u64, pixels: &[u8]) -> Vec<u8> {
         let mut body = tlv(5, &0x60bb8u32.to_be_bytes());
         body.extend(keyed(KEY_TIMESTAMP, tlv(6, &ts.to_be_bytes())));
         body.extend(keyed(KEY_BPP, tlv(2, &8u32.to_be_bytes())));
         body.extend(keyed(KEY_WIDTH, tlv(2, &w.to_be_bytes())));
         body.extend(keyed(KEY_HEIGHT, tlv(2, &h.to_be_bytes())));
         body.extend(keyed(KEY_STRIDE, tlv(2, &stride.to_be_bytes())));
-        let mut blob = (pixels.len() as u32).to_be_bytes().to_vec();
+        let mut blob = u32::try_from(pixels.len())
+            .expect("fits u32")
+            .to_be_bytes()
+            .to_vec();
         blob.extend_from_slice(pixels);
         body.extend(keyed(KEY_PIXELS, tlv(0x15, &blob)));
 
         let total = STREAM_TLV_OFFSET + body.len();
         let mut msg = vec![1, 0, 0, 0];
-        msg.extend_from_slice(&(total as u32).to_le_bytes());
+        msg.extend_from_slice(&u32::try_from(total).expect("fits u32").to_le_bytes());
         msg.extend_from_slice(&0x53u32.to_be_bytes());
         msg.extend_from_slice(&[0; 8]);
         msg.extend_from_slice(&0x50eu32.to_be_bytes());
@@ -209,7 +268,7 @@ mod tests {
         // 3 wide, stride 4, 2 rows: pad byte 0xff after each row.
         let px = vec![1, 2, 3, 0xff, 4, 5, 6, 0xff];
         let msg = synth_message(3, 2, 4, 7, &px);
-        let f = decode_image_payload(&msg).unwrap();
+        let f = decode_image_payload(&msg).expect("decodes");
         assert_eq!(f.pixels, vec![1, 2, 3, 4, 5, 6]);
     }
 
@@ -233,7 +292,32 @@ mod tests {
         let msg = synth_message(3, 2, 4, 0, &[0u8; 6]);
         assert!(decode_image_payload(&msg).is_none());
         let msg = synth_message(3, 2, 4, 0, &[0u8; 7]);
-        assert!(decode_image_payload(&msg).is_some(), "last row needs only `width` bytes");
+        assert!(
+            decode_image_payload(&msg).is_some(),
+            "last row needs only `width` bytes"
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_tlv_and_huge_stride_without_panicking() {
+        // A TLV whose declared length overruns the message: None, no panic.
+        let mut msg = synth_message(4, 3, 4, 0, &[0u8; 12]);
+        msg.extend(tlv(2, &[0, 0, 0, 0]));
+        let n = msg.len();
+        msg[n - 8..n - 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_image_payload(&msg).is_none());
+        // A stride far larger than the blob must fail the size check cleanly.
+        let msg = synth_message(4, 3, u32::MAX, 0, &[0u8; 12]);
+        assert!(decode_image_payload(&msg).is_none());
+    }
+
+    #[test]
+    fn upscale_into_reuses_the_buffer() {
+        let mut out = vec![0xffu8; 999];
+        upscale2x_into(&[1, 2, 3, 4], 2, 2, &mut out);
+        assert_eq!(out, upscale2x(&[1, 2, 3, 4], 2, 2));
+        upscale2x_into(&[], 0, 0, &mut out);
+        assert!(out.is_empty(), "a zero-sized frame empties the buffer");
     }
 
     #[test]
@@ -244,19 +328,22 @@ mod tests {
     }
 
     /// Optional check against a real captured message (contains the user's
-    /// face, so it is not committed): set TOBII_IMAGE83_FIXTURE to its path.
+    /// face, so it is not committed): set `TOBII_IMAGE83_FIXTURE` to its path.
     #[test]
     fn decodes_real_capture_if_available() {
         let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
             return;
         };
-        let msg = std::fs::read(path).unwrap();
+        let msg = std::fs::read(path).expect("fixture readable");
         assert_eq!(msg.len(), 78609);
         let f = decode_image_payload(&msg).expect("real message decodes");
         assert_eq!((f.width, f.height), (280, 280));
         assert_eq!(f.pixels.len(), 280 * 280);
         assert!(f.device_ts_us > 0);
-        let mean = f.pixels.iter().map(|&p| p as f64).sum::<f64>() / f.pixels.len() as f64;
-        assert!(mean > 5.0 && mean < 200.0, "plausible IR exposure, mean {mean}");
+        let mean = f.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / f.pixels.len() as f64;
+        assert!(
+            mean > 5.0 && mean < 200.0,
+            "plausible IR exposure, mean {mean}"
+        );
     }
 }

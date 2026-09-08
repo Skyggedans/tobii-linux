@@ -4,7 +4,9 @@
 fn main() {
     tobii::logging::init();
     if let Err(e) = tobii::daemon::run() {
-        eprintln!("tobiid: {e:?}");
+        // Full cause chain on one line, written directly (not via `tracing`) so
+        // a restrictive `RUST_LOG` can never hide the reason the daemon exited.
+        eprintln!("tobiid: {e:#}");
         std::process::exit(1);
     }
 }

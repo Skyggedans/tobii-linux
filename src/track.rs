@@ -1,10 +1,12 @@
 //! Head pose from the IR face frame, fully in Rust: crop the 560x560 frame,
-//! run the MediaPipe face-landmark model via ONNX Runtime (`ort`), fit the
+//! run the `MediaPipe` face-landmark model via ONNX Runtime (`ort`), fit the
 //! canonical face mesh to the landmarks (Kabsch) and read out yaw/pitch/roll.
-//! Validated against MediaPipe to within ~3 degrees.
+//! Validated against `MediaPipe` to within ~3 degrees.
 
 use anyhow::{Context, Result};
 use ort::session::Session;
+use ort::value::TensorRef;
+use tracing::info;
 
 use crate::canonical::CANONICAL_FACE;
 
@@ -44,25 +46,43 @@ const IMAGE83_CROP_HALF: f32 = 110.0;
 /// tilted 20.0° relative to the display frame). Relative head rotations are
 /// expressed in the upright (display) frame, so yaw is a turn about the true
 /// vertical: with the camera-frame decomposition a 30° turn read as 28° yaw +
-/// 11° roll and a 20° tilt as 19° roll + 7° yaw. Override: TOBII_CAMERA_TILT_DEG.
+/// 11° roll and a 20° tilt as 19° roll + 7° yaw. Override: `TOBII_CAMERA_TILT_DEG`.
 const CAMERA_TILT_DEG: f64 = 20.0;
 
+/// The face-landmark ONNX session plus the buffers it reuses every frame: the
+/// 256x256x3 model input and the 468 landmarks it emits.
 pub(crate) struct FaceModel {
     session: Session,
+    /// Model input, `IN * IN * 3` normalised grey values (kept across frames).
+    input: Vec<f32>,
+    /// Landmarks of the last `landmarks` call (kept across frames).
+    pts: Vec<[f32; 3]>,
 }
 
 impl FaceModel {
+    /// Load the embedded face-landmark model into a new ONNX Runtime session.
+    ///
+    /// # Errors
+    /// Fails when ONNX Runtime cannot be initialised or rejects the model.
     pub(crate) fn new() -> Result<Self> {
         let session = Session::builder()?
             .commit_from_memory(MODEL)
             .context("failed to load face landmark model")?;
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            input: vec![0f32; IN * IN * 3],
+            pts: Vec::with_capacity(NLM),
+        })
     }
 
     /// Crop a centred square around `(cx, cy)` of the wWxhH grayscale frame,
     /// bilinearly resize to 256x256, normalise to [0,1] and run the model.
     /// Returns the 468 face landmarks (x,y in input px, z relative) and the
-    /// face-presence score.
+    /// face-presence score. The landmarks borrow an internal buffer that the
+    /// next call overwrites.
+    ///
+    /// # Errors
+    /// Fails when the ONNX session rejects the input or the run fails.
     pub(crate) fn landmarks(
         &mut self,
         gray: &[u8],
@@ -71,45 +91,46 @@ impl FaceModel {
         cx: f32,
         cy: f32,
         half: f32,
-    ) -> Result<(Vec<[f32; 3]>, f32)> {
+    ) -> Result<(&[[f32; 3]], f32)> {
         let x0 = cx - half;
         let y0 = cy - half;
         let span = half * 2.0;
-        let mut input = vec![0f32; IN * IN * 3];
-        for oy in 0..IN {
+        // Rows of IN pixels, each pixel three (identical) channels.
+        for (oy, row) in self.input.chunks_exact_mut(IN * 3).enumerate() {
             let sy = y0 + (oy as f32 + 0.5) / IN as f32 * span - 0.5;
-            for ox in 0..IN {
+            for (ox, px) in row.chunks_exact_mut(3).enumerate() {
                 let sx = x0 + (ox as f32 + 0.5) / IN as f32 * span - 0.5;
                 let v = bilinear(gray, w, h, sx, sy) / 255.0;
-                let o = (oy * IN + ox) * 3;
-                input[o] = v;
-                input[o + 1] = v;
-                input[o + 2] = v;
+                px.fill(v);
             }
         }
 
-        let value = ort::value::Tensor::from_array(([1usize, IN, IN, 3], input))?;
+        let value = TensorRef::from_array_view(([1usize, IN, IN, 3], self.input.as_slice()))?;
         let outputs = self.session.run(ort::inputs!["input_12" => value])?;
         let (_, lm) = outputs["Identity"].try_extract_tensor::<f32>()?;
         let (_, score) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
 
-        let pts: Vec<[f32; 3]> = (0..NLM)
-            .map(|i| [lm[i * 3], lm[i * 3 + 1], lm[i * 3 + 2]])
-            .collect();
-        Ok((pts, score[0]))
+        self.pts.clear();
+        self.pts
+            .extend(lm.chunks_exact(3).take(NLM).map(|p| [p[0], p[1], p[2]]));
+        Ok((self.pts.as_slice(), score[0]))
     }
 }
 
+// reason: `x`/`y` are clamped to `[0, w-1]`/`[0, h-1]` first, so the
+// floor->usize cast is in range and non-negative (num-cast-try-from).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[must_use]
 fn bilinear(g: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
+    let x0 = x.floor() as usize; // cast: clamped to [0, w-1] above
+    let y0 = y.floor() as usize; // cast: clamped to [0, h-1] above
     let x1 = (x0 + 1).min(w - 1);
     let y1 = (y0 + 1).min(h - 1);
     let fx = x - x0 as f32;
     let fy = y - y0 as f32;
-    let p = |xx: usize, yy: usize| g[yy * w + xx] as f32;
+    let p = |xx: usize, yy: usize| f32::from(g[yy * w + xx]);
     let top = p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx;
     let bot = p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx;
     top * (1.0 - fy) + bot * fy
@@ -117,14 +138,15 @@ fn bilinear(g: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
 
 /// Rotation (canonical -> observed) via Horn's quaternion method on the
 /// cross-covariance, no external SVD needed.
+#[must_use]
 pub(crate) fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3]; 3] {
     let n = reference.len();
     let mut rc = [0.0; 3];
     let mut cc = [0.0; 3];
-    for i in 0..n {
+    for (r, c) in reference.iter().zip(current) {
         for k in 0..3 {
-            rc[k] += reference[i][k];
-            cc[k] += current[i][k];
+            rc[k] += r[k];
+            cc[k] += c[k];
         }
     }
     for k in 0..3 {
@@ -132,10 +154,10 @@ pub(crate) fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3];
         cc[k] /= n as f64;
     }
     let mut hm = [[0.0; 3]; 3];
-    for i in 0..n {
+    for (r, c) in reference.iter().zip(current) {
         for a in 0..3 {
             for b in 0..3 {
-                hm[a][b] += (reference[i][a] - rc[a]) * (current[i][b] - cc[b]);
+                hm[a][b] += (r[a] - rc[a]) * (c[b] - cc[b]);
             }
         }
     }
@@ -152,20 +174,20 @@ pub(crate) fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3];
     for row in &nn {
         shift = shift.max(row.iter().map(|v| v.abs()).sum());
     }
-    for i in 0..4 {
-        nn[i][i] += shift;
+    for (i, row) in nn.iter_mut().enumerate() {
+        row[i] += shift;
     }
     let mut v = [1.0, 0.2, 0.1, 0.05];
     for _ in 0..200 {
         let mut wv = [0.0; 4];
-        for r in 0..4 {
-            for c in 0..4 {
-                wv[r] += nn[r][c] * v[c];
+        for (wr, row) in wv.iter_mut().zip(&nn) {
+            for (a, b) in row.iter().zip(&v) {
+                *wr += a * b;
             }
         }
         let m = (wv[0] * wv[0] + wv[1] * wv[1] + wv[2] * wv[2] + wv[3] * wv[3]).sqrt();
-        for i in 0..4 {
-            v[i] = wv[i] / m;
+        for (vi, wi) in v.iter_mut().zip(&wv) {
+            *vi = wi / m;
         }
     }
     let (qw, qx, qy, qz) = (v[0], v[1], v[2], v[3]);
@@ -189,6 +211,7 @@ pub(crate) fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3];
 }
 
 /// [pitch, yaw, roll] in degrees from a rotation matrix.
+#[must_use]
 pub(crate) fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
     let sy = (r[0][0] * r[0][0] + r[1][0] * r[1][0]).sqrt();
     if sy > 1e-6 {
@@ -209,6 +232,7 @@ pub(crate) fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
 const IDENTITY3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 /// Inverse of `euler_deg`: R = Rz(roll) * Ry(yaw) * Rx(pitch), degrees in.
+#[must_use]
 fn from_euler_deg(e: &[f64; 3]) -> [[f64; 3]; 3] {
     let (sa, ca) = e[0].to_radians().sin_cos();
     let (sb, cb) = e[1].to_radians().sin_cos();
@@ -222,10 +246,12 @@ fn from_euler_deg(e: &[f64; 3]) -> [[f64; 3]; 3] {
 
 /// `T · R · R0^T · T^T`: the rotation that takes the rest pose `R0` to `R`,
 /// expressed in the upright frame (`T` = camera -> upright).
+#[must_use]
 fn relative_upright(r: &[[f64; 3]; 3], r0: &[[f64; 3]; 3], t: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     matmul3(&matmul3(t, &matmul3(r, &transpose3(r0))), &transpose3(t))
 }
 
+#[must_use]
 fn transpose3(r: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut o = [[0.0; 3]; 3];
     for i in 0..3 {
@@ -236,6 +262,7 @@ fn transpose3(r: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     o
 }
 
+#[must_use]
 fn matvec3(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
     [
         r[0][0] * p[0] + r[0][1] * p[1] + r[0][2] * p[2],
@@ -244,6 +271,7 @@ fn matvec3(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
     ]
 }
 
+#[must_use]
 fn matmul3(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut o = [[0.0; 3]; 3];
     for i in 0..3 {
@@ -257,6 +285,7 @@ fn matmul3(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
 }
 
 /// Rodrigues: axis-angle vector -> rotation matrix.
+#[must_use]
 fn expmap(w: [f64; 3]) -> [[f64; 3]; 3] {
     let th = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
     if th < 1e-12 {
@@ -284,6 +313,9 @@ fn expmap(w: [f64; 3]) -> [[f64; 3]; 3] {
     ]
 }
 
+/// Gauss-Jordan solve of the 6x6 normal equations with partial pivoting;
+/// singular pivots are skipped and their unknowns left at zero.
+#[must_use]
 fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> [f64; 6] {
     let mut m = *a;
     let mut y = *b;
@@ -300,26 +332,33 @@ fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> [f64; 6] {
         if d.abs() < 1e-12 {
             continue;
         }
-        for r in 0..6 {
+        let row_i = m[i];
+        let y_i = y[i];
+        for (r, (row, yr)) in m.iter_mut().zip(&mut y).enumerate() {
             if r == i {
                 continue;
             }
-            let f = m[r][i] / d;
-            for c in i..6 {
-                m[r][c] -= f * m[i][c];
+            let f = row[i] / d;
+            for (mc, ic) in row.iter_mut().zip(&row_i).skip(i) {
+                *mc -= f * ic;
             }
-            y[r] -= f * y[i];
+            *yr -= f * y_i;
         }
     }
     let mut x = [0.0; 6];
-    for i in 0..6 {
-        x[i] = if m[i][i].abs() > 1e-12 { y[i] / m[i][i] } else { 0.0 };
+    for (i, xi) in x.iter_mut().enumerate() {
+        *xi = if m[i][i].abs() > 1e-12 {
+            y[i] / m[i][i]
+        } else {
+            0.0
+        };
     }
     x
 }
 
-/// Perspective PnP via Gauss-Newton minimising reprojection error. Returns the
+/// Perspective `PnP` via Gauss-Newton minimising reprojection error. Returns the
 /// rotation (object->camera) and translation (cm), initialised from `init_r`.
+#[must_use]
 pub(crate) fn solve_pnp(
     model: &[[f64; 3]],
     image: &[[f64; 2]],
@@ -341,11 +380,18 @@ pub(crate) fn solve_pnp(
                 continue;
             }
             let iz = 1.0 / q[2];
-            let res = [focal * q[0] * iz + cx - im[0], focal * q[1] * iz + cy - im[1]];
+            let res = [
+                focal * q[0] * iz + cx - im[0],
+                focal * q[1] * iz + cy - im[1],
+            ];
             let duq = [focal * iz, 0.0, -focal * q[0] * iz * iz];
             let dvq = [0.0, focal * iz, -focal * q[1] * iz * iz];
             // dQ/ddelta = -skew(rp)
-            let sk = [[0.0, rp[2], -rp[1]], [-rp[2], 0.0, rp[0]], [rp[1], -rp[0], 0.0]];
+            let sk = [
+                [0.0, rp[2], -rp[1]],
+                [-rp[2], 0.0, rp[0]],
+                [rp[1], -rp[0], 0.0],
+            ];
             let mut ju = [0.0; 6];
             let mut jv = [0.0; 6];
             for j in 0..3 {
@@ -354,15 +400,16 @@ pub(crate) fn solve_pnp(
             }
             ju[3..6].copy_from_slice(&duq);
             jv[3..6].copy_from_slice(&dvq);
-            for a in 0..6 {
-                jtr[a] += ju[a] * res[0] + jv[a] * res[1];
-                for b in 0..6 {
-                    jtj[a][b] += ju[a] * ju[b] + jv[a] * jv[b];
+            for ((jtr_a, jtj_row), (ua, va)) in jtr.iter_mut().zip(&mut jtj).zip(ju.iter().zip(&jv))
+            {
+                *jtr_a += ua * res[0] + va * res[1];
+                for (cell, (ub, vb)) in jtj_row.iter_mut().zip(ju.iter().zip(&jv)) {
+                    *cell += ua * ub + va * vb;
                 }
             }
         }
-        for i in 0..6 {
-            jtj[i][i] += jtj[i][i] * 1e-3 + 1e-9;
+        for (i, row) in jtj.iter_mut().enumerate() {
+            row[i] += row[i] * 1e-3 + 1e-9;
         }
         let d = solve6(&jtj, &jtr);
         r = matmul3(&expmap([-d[0], -d[1], -d[2]]), &r);
@@ -373,12 +420,14 @@ pub(crate) fn solve_pnp(
     (r, t)
 }
 
+/// RMS distance of the points from their centroid.
+#[must_use]
 fn spread3(p: &[[f64; 3]]) -> f64 {
     let n = p.len() as f64;
     let mut c = [0.0; 3];
     for q in p {
-        for k in 0..3 {
-            c[k] += q[k] / n;
+        for (ck, qk) in c.iter_mut().zip(q) {
+            *ck += qk / n;
         }
     }
     let mut s = 0.0;
@@ -388,12 +437,14 @@ fn spread3(p: &[[f64; 3]]) -> f64 {
     (s / n).sqrt()
 }
 
+/// RMS distance of the points from their centroid.
+#[must_use]
 fn spread2(p: &[[f64; 2]]) -> f64 {
     let n = p.len() as f64;
     let mut c = [0.0; 2];
     for q in p {
-        for k in 0..2 {
-            c[k] += q[k] / n;
+        for (ck, qk) in c.iter_mut().zip(q) {
+            *ck += qk / n;
         }
     }
     let mut s = 0.0;
@@ -404,19 +455,24 @@ fn spread2(p: &[[f64; 2]]) -> f64 {
 }
 
 /// Canonical mesh as f64 for the fit.
+#[must_use]
 pub(crate) fn canonical_f64() -> Vec<[f64; 3]> {
     CANONICAL_FACE
         .iter()
-        .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
         .collect()
 }
 
 /// Live head-pose tracker: face-following crop, landmark inference, Kabsch fit,
-/// rest-pose calibration and smoothing. `process` returns the OpenTrack pose
+/// rest-pose calibration and smoothing. `process` returns the `OpenTrack` pose
 /// [TX, TY, TZ, Yaw, Pitch, Roll] once calibrated, else `None`.
 pub(crate) struct Tracker {
     model: FaceModel,
     canonical: Vec<[f64; 3]>,
+    /// Landmarks in full-frame pixels (reused every frame).
+    image2d: Vec<[f64; 2]>,
+    /// Landmarks in model crop coordinates as f64 (reused every frame).
+    observed: Vec<[f64; 3]>,
     origin: Option<[f64; 6]>,
     accum: Vec<[f64; 6]>,
     out: [f64; 6],
@@ -473,17 +529,30 @@ fn env_f64(key: &str, default: f64) -> f64 {
 }
 
 impl Tracker {
-    /// Tracker for the UVC camera path (560x560 frames, MediaPipe-like FOV).
+    /// Tracker for the UVC camera path (560x560 frames, `MediaPipe`-like FOV).
+    ///
+    /// # Errors
+    /// Fails when the landmark model cannot be loaded.
     pub(crate) fn new() -> Result<Self> {
         Self::with_geometry(FOCAL, CROP_HALF, 0.42)
     }
 
     /// Tracker for the 0x50e image stream: feed it 280x280 frames upscaled 2x
     /// (`image83::upscale2x`), i.e. 560x560 at the fitted focal length.
+    ///
+    /// # Errors
+    /// Fails when the landmark model cannot be loaded.
     pub(crate) fn new_image83() -> Result<Self> {
         Self::with_geometry(IMAGE83_FOCAL, IMAGE83_CROP_HALF, IMAGE83_CY_FRAC)
     }
 
+    /// Tracker for frames with pinhole focal length `focal` (px), a face crop of
+    /// half-size `crop_half` (px) first centred at `cy_frac` of the frame height.
+    /// Reads the `TOBII_PIVOT_DOWN`, `TOBII_PIVOT_BACK`, `TOBII_POSE_DEBUG`,
+    /// `TOBII_ROLL_EYELINE` and `TOBII_CAMERA_TILT_DEG` overrides.
+    ///
+    /// # Errors
+    /// Fails when the landmark model cannot be loaded.
     pub(crate) fn with_geometry(focal: f64, crop_half: f32, cy_frac: f32) -> Result<Self> {
         let pivot = [
             0.0,
@@ -491,18 +560,21 @@ impl Tracker {
             env_f64("TOBII_PIVOT_BACK", PIVOT_NECK_BACK_CM),
         ];
         let debug = std::env::var("TOBII_POSE_DEBUG").is_ok();
-        let roll_eyeline = std::env::var("TOBII_ROLL_EYELINE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
-        eprintln!(
-            "tracker pivot = [down {:.1}, back {:.1}] cm, roll_eyeline={roll_eyeline}",
-            pivot[1], pivot[2]
+        let roll_eyeline =
+            std::env::var("TOBII_ROLL_EYELINE").is_ok_and(|v| !v.is_empty() && v != "0");
+        info!(
+            pivot_down_cm = pivot[1],
+            pivot_back_cm = pivot[2],
+            roll_eyeline,
+            "tracker pivot"
         );
         Ok(Self {
             model: FaceModel::new()?,
             canonical: canonical_f64(),
+            image2d: Vec::with_capacity(NLM),
+            observed: Vec::with_capacity(NLM),
             origin: None,
-            accum: Vec::new(),
+            accum: Vec::with_capacity(CALIB_FRAMES),
             out: [0.0; 6],
             have: false,
             cx: 0.0,
@@ -522,6 +594,7 @@ impl Tracker {
     }
 
     /// Unfiltered pose of the last frame (see `last_raw`), for offline analysis.
+    #[must_use]
     pub(crate) fn last_raw(&self) -> Option<[f64; 6]> {
         self.last_raw
     }
@@ -532,9 +605,15 @@ impl Tracker {
         self.rot0 = None;
         self.accum.clear();
         self.have = false;
-        eprintln!("recenter: recalibrating rest pose");
+        info!("recenter: recalibrating rest pose");
     }
 
+    /// Run one `w`x`h` grayscale frame through the pipeline. Returns the
+    /// smoothed `OpenTrack` pose once the rest pose is calibrated; `None` while
+    /// calibrating or when no face is found.
+    ///
+    /// # Errors
+    /// Fails when landmark inference fails.
     pub(crate) fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
         if self.cx == 0.0 {
             self.cx = w as f32 / 2.0;
@@ -561,47 +640,40 @@ impl Tracker {
         }
         self.searching = None;
 
-        // Landmark centroid + spread in the 256 crop, mapped back to the frame.
+        // Landmark centroid in the 256 crop, mapped back to the frame.
         let span = crop_half * 2.0;
         let (mut mx, mut my) = (0.0f32, 0.0f32);
-        for p in &pts {
+        for p in pts {
             mx += p[0];
             my += p[1];
         }
         mx /= pts.len() as f32;
         my /= pts.len() as f32;
-        let mut size = 0.0f32;
-        for p in &pts {
-            size += ((p[0] - mx).powi(2) + (p[1] - my).powi(2)).sqrt();
-        }
-        size /= pts.len() as f32;
-        let _ = size;
         let crop_x0 = self.cx - crop_half;
         let crop_y0 = self.cy - crop_half;
         self.cx = crop_x0 + mx / IN as f32 * span; // follow the face next frame
         self.cy = crop_y0 + my / IN as f32 * span;
 
         // Map landmarks to full-frame 2D, and keep the model's 3D for the init.
-        let image2d: Vec<[f64; 2]> = pts
-            .iter()
-            .map(|p| {
-                [
-                    (crop_x0 + p[0] / IN as f32 * span) as f64,
-                    (crop_y0 + p[1] / IN as f32 * span) as f64,
-                ]
-            })
-            .collect();
-        let observed: Vec<[f64; 3]> = pts
-            .iter()
-            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
-            .collect();
-        let init_r = kabsch(&self.canonical, &observed);
-        let init_depth = focal * spread3(&self.canonical) / spread2(&image2d).max(1e-6);
+        self.image2d.clear();
+        self.image2d.extend(pts.iter().map(|p| {
+            [
+                f64::from(crop_x0 + p[0] / IN as f32 * span),
+                f64::from(crop_y0 + p[1] / IN as f32 * span),
+            ]
+        }));
+        self.observed.clear();
+        self.observed.extend(
+            pts.iter()
+                .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]),
+        );
+        let init_r = kabsch(&self.canonical, &self.observed);
+        let init_depth = focal * spread3(&self.canonical) / spread2(&self.image2d).max(1e-6);
 
         // Perspective solve: metric, rotation-decoupled rotation + translation.
         let (r, t) = solve_pnp(
             &self.canonical,
-            &image2d,
+            &self.image2d,
             focal,
             w as f64 / 2.0,
             h as f64 / 2.0,
@@ -616,8 +688,8 @@ impl Tracker {
         // 263). This is decoupled from yaw/pitch and symmetric by construction,
         // avoiding euler cross-axis coupling. Flip the sign here if reversed.
         if self.roll_eyeline {
-            let r_eye = image2d[33]; // subject's right eye outer (image left)
-            let l_eye = image2d[263]; // subject's left eye outer (image right)
+            let r_eye = self.image2d[33]; // subject's right eye outer (image left)
+            let l_eye = self.image2d[263]; // subject's left eye outer (image right)
             let dx = l_eye[0] - r_eye[0];
             let dy = l_eye[1] - r_eye[1];
             mp[2] = -dy.atan2(dx).to_degrees();
@@ -632,32 +704,41 @@ impl Tracker {
         self.last_raw = Some(raw);
 
         self.frame += 1;
-        if self.debug && self.frame % 8 == 0 {
-            eprintln!(
-                "yaw/pit={:+5.1}/{:+5.1}  t=[{:+5.1} {:+5.1} {:+5.1}]  t'=[{:+5.1} {:+5.1} {:+5.1}] cm",
-                mp[1], mp[0], t[0], t[1], t[2], tp[0], tp[1], tp[2]
+        if self.debug && self.frame.is_multiple_of(8) {
+            // Opted in via TOBII_POSE_DEBUG, so it stays visible at the
+            // default (info) filter level.
+            info!(
+                yaw = mp[1],
+                pitch = mp[0],
+                tx = t[0],
+                ty = t[1],
+                tz = t[2],
+                pivot_tx = tp[0],
+                pivot_ty = tp[1],
+                pivot_tz = tp[2],
+                "pose (deg, cm)"
             );
         }
 
-        if self.origin.is_none() {
+        let Some(o) = self.origin else {
             self.accum.push(raw);
             if self.accum.len() >= CALIB_FRAMES {
+                let n = self.accum.len() as f64;
                 let mut o = [0.0; 6];
                 for a in &self.accum {
-                    for i in 0..6 {
-                        o[i] += a[i] / self.accum.len() as f64;
+                    for (oi, ai) in o.iter_mut().zip(a) {
+                        *oi += ai / n;
                     }
                 }
                 self.origin = Some(o);
                 // Rest rotation from the averaged eulers (undo the MediaPipe
                 // sign flip applied to `mp`).
                 self.rot0 = Some(from_euler_deg(&[o[3], -o[4], -o[5]]));
-                eprintln!("calibrated rest pose");
+                info!("calibrated rest pose");
             }
             return Ok(None);
-        }
+        };
 
-        let o = self.origin.unwrap();
         let tx = (raw[0] - o[0]) * TRANS_SIGN[0] * TRANS_GAIN[0];
         let ty = (raw[1] - o[1]) * TRANS_SIGN[1] * TRANS_GAIN[1];
         let tz = (raw[2] - o[2]) * TRANS_SIGN[2] * TRANS_GAIN[2];
@@ -680,19 +761,21 @@ impl Tracker {
         };
         let target = [tx, ty, tz, yaw, pitch, roll]; // OpenTrack order
 
-        if !self.have {
+        if self.have {
+            for (out, tgt) in self.out.iter_mut().zip(&target) {
+                *out += SMOOTH * (tgt - *out);
+            }
+        } else {
             self.out = target;
             self.have = true;
-        } else {
-            for i in 0..6 {
-                self.out[i] += SMOOTH * (target[i] - self.out[i]);
-            }
         }
         Ok(Some(self.out))
     }
 }
 
 #[cfg(test)]
+// reason: unwrap on fixtures is the idiomatic test failure (test-* rules).
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -715,13 +798,25 @@ mod tests {
         let cam_from_up = transpose3(&tilt);
         let rest_up = from_euler_deg(&[-8.0, 0.0, 0.0]);
         let r0 = matmul3(&cam_from_up, &rest_up);
-        let turned = matmul3(&cam_from_up, &matmul3(&from_euler_deg(&[0.0, 30.0, 0.0]), &rest_up));
+        let turned = matmul3(
+            &cam_from_up,
+            &matmul3(&from_euler_deg(&[0.0, 30.0, 0.0]), &rest_up),
+        );
         let naive = euler_deg(&turned);
         let e0 = euler_deg(&r0);
-        assert!((naive[2] - e0[2]).abs() > 8.0, "per-axis subtraction leaks roll: {naive:?} - {e0:?}");
+        assert!(
+            (naive[2] - e0[2]).abs() > 8.0,
+            "per-axis subtraction leaks roll: {naive:?} - {e0:?}"
+        );
         let e = euler_deg(&relative_upright(&turned, &r0, &tilt));
-        assert!(e[0].abs() < 1e-9 && (e[1] - 30.0).abs() < 1e-9 && e[2].abs() < 1e-9, "{e:?}");
-        let rolled = matmul3(&cam_from_up, &matmul3(&from_euler_deg(&[0.0, 0.0, 20.0]), &rest_up));
+        assert!(
+            e[0].abs() < 1e-9 && (e[1] - 30.0).abs() < 1e-9 && e[2].abs() < 1e-9,
+            "{e:?}"
+        );
+        let rolled = matmul3(
+            &cam_from_up,
+            &matmul3(&from_euler_deg(&[0.0, 0.0, 20.0]), &rest_up),
+        );
         let e = euler_deg(&relative_upright(&rolled, &r0, &tilt));
         assert!(e[1].abs() < 1e-9 && (e[2] - 20.0).abs() < 1e-9, "{e:?}");
     }
@@ -754,12 +849,20 @@ mod tests {
                 break;
             }
         }
-        assert!(matches!(found_at, Some(i) if i < SEARCH_GRID.len()), "face found within one sweep, got {found_at:?}");
-        assert!(t.cx < 300.0 && t.cy < 300.0, "crop re-seated onto the shifted face: ({}, {})", t.cx, t.cy);
+        assert!(
+            matches!(found_at, Some(i) if i < SEARCH_GRID.len()),
+            "face found within one sweep, got {found_at:?}"
+        );
+        assert!(
+            t.cx < 300.0 && t.cy < 300.0,
+            "crop re-seated onto the shifted face: ({}, {})",
+            t.cx,
+            t.cy
+        );
     }
 
     /// Head pose from a real 0x50e frame (user's face, so the fixture is not
-    /// committed): set TOBII_IMAGE83_FIXTURE to a captured 78609-byte message.
+    /// committed): set `TOBII_IMAGE83_FIXTURE` to a captured 78609-byte message.
     #[test]
     fn image83_frame_yields_a_face_pose() {
         let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
@@ -778,16 +881,38 @@ mod tests {
         let canon = canonical_f64();
         let image2d: Vec<[f64; 2]> = pts
             .iter()
-            .map(|p| [(x0 + p[0] / IN as f32 * span) as f64, (y0 + p[1] / IN as f32 * span) as f64])
+            .map(|p| {
+                [
+                    f64::from(x0 + p[0] / IN as f32 * span),
+                    f64::from(y0 + p[1] / IN as f32 * span),
+                ]
+            })
             .collect();
-        let observed: Vec<[f64; 3]> =
-            pts.iter().map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
+        let observed: Vec<[f64; 3]> = pts
+            .iter()
+            .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
+            .collect();
         let init_r = kabsch(&canon, &observed);
         let init_depth = IMAGE83_FOCAL * spread3(&canon) / spread2(&image2d);
-        let (r, t) = solve_pnp(&canon, &image2d, IMAGE83_FOCAL, w as f64 / 2.0, h as f64 / 2.0, init_r, init_depth);
+        let (r, t) = solve_pnp(
+            &canon,
+            &image2d,
+            IMAGE83_FOCAL,
+            w as f64 / 2.0,
+            h as f64 / 2.0,
+            init_r,
+            init_depth,
+        );
         let e = euler_deg(&r);
-        println!(">>> image83 score={score:.2} pitch/yaw/roll = {:.1}/{:.1}/{:.1}  t = {:.1}/{:.1}/{:.1} cm", e[0], e[1], e[2], t[0], t[1], t[2]);
-        assert!(t[2] > 30.0 && t[2] < 150.0, "depth in a plausible range, got {} cm", t[2]);
+        println!(
+            ">>> image83 score={score:.2} pitch/yaw/roll = {:.1}/{:.1}/{:.1}  t = {:.1}/{:.1}/{:.1} cm",
+            e[0], e[1], e[2], t[0], t[1], t[2]
+        );
+        assert!(
+            t[2] > 30.0 && t[2] < 150.0,
+            "depth in a plausible range, got {} cm",
+            t[2]
+        );
         assert!(e[1].abs() < 45.0 && e[2].abs() < 45.0, "yaw/roll plausible");
     }
 
@@ -825,21 +950,39 @@ mod tests {
         let canon = canonical_f64();
         let image2d: Vec<[f64; 2]> = pts
             .iter()
-            .map(|p| [
-                (x0 + p[0] / IN as f32 * span) as f64,
-                (y0 + p[1] / IN as f32 * span) as f64,
-            ])
+            .map(|p| {
+                [
+                    f64::from(x0 + p[0] / IN as f32 * span),
+                    f64::from(y0 + p[1] / IN as f32 * span),
+                ]
+            })
             .collect();
-        let observed: Vec<[f64; 3]> = pts.iter().map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
+        let observed: Vec<[f64; 3]> = pts
+            .iter()
+            .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
+            .collect();
         let init_r = kabsch(&canon, &observed);
         let init_depth = FOCAL * spread3(&canon) / spread2(&image2d);
-        let (r, t) = solve_pnp(&canon, &image2d, FOCAL, w as f64 / 2.0, h as f64 / 2.0, init_r, init_depth);
+        let (r, t) = solve_pnp(
+            &canon,
+            &image2d,
+            FOCAL,
+            w as f64 / 2.0,
+            h as f64 / 2.0,
+            init_r,
+            init_depth,
+        );
         let e = euler_deg(&r);
         // Python cv2.solvePnP (flip Y/Z, fov63): pitch -19.2, yaw +1.4, roll -4.0, t.z +39.3
-        println!(">>> score={score:.2} pnp pitch/yaw/roll = {:.1}/{:.1}/{:.1}  t = {:.1}/{:.1}/{:.1}",
-            e[0], e[1], e[2], t[0], t[1], t[2]);
+        println!(
+            ">>> score={score:.2} pnp pitch/yaw/roll = {:.1}/{:.1}/{:.1}  t = {:.1}/{:.1}/{:.1}",
+            e[0], e[1], e[2], t[0], t[1], t[2]
+        );
         assert!(score > 0.0, "face detected");
-        assert!((e[0] - (-19.2)).abs() < 4.0, "pitch close to python solvePnP");
+        assert!(
+            (e[0] - (-19.2)).abs() < 4.0,
+            "pitch close to python solvePnP"
+        );
         assert!((t[2] - 39.3).abs() < 5.0, "depth ~40cm metric");
     }
 }

@@ -6,14 +6,23 @@
 //! Needs write access to `/dev/uinput` (typically root): run with `sudo`, or
 //! grant your user access to the device.
 
+use std::cmp::Ordering;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use tobii::ipc::{decode_server, encode_subscribe, read_frame, write_frame, ServerMsg, STREAM_GAZE};
+use anyhow::{Context, Result, bail, ensure};
+use tobii::ipc::{
+    STREAM_GAZE, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
+};
 
 mod uinput {
-    //! Minimal dependency-free `uinput` keyboard via raw libc ioctl/write.
-    use std::io;
-    use std::os::unix::io::RawFd;
+    //! Minimal dependency-free `uinput` keyboard: a `File` on `/dev/uinput`
+    //! driven with raw libc ioctls.
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Duration;
 
     // ioctl request numbers (see <linux/uinput.h>, computed for x86_64).
     const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564; // _IOW('U', 100, int)
@@ -26,9 +35,12 @@ mod uinput {
     const SYN_REPORT: u16 = 0;
     const BUS_USB: u16 = 0x03;
 
+    /// evdev key code of the Left arrow.
     pub const KEY_LEFT: u16 = 105;
+    /// evdev key code of the Right arrow.
     pub const KEY_RIGHT: u16 = 106;
 
+    /// `struct input_id` from `<linux/input.h>`.
     #[repr(C)]
     struct InputId {
         bustype: u16,
@@ -37,6 +49,7 @@ mod uinput {
         version: u16,
     }
 
+    /// `struct uinput_user_dev` from `<linux/uinput.h>`.
     #[repr(C)]
     struct UinputUserDev {
         name: [u8; 80],
@@ -48,6 +61,7 @@ mod uinput {
         absflat: [i32; 64],
     }
 
+    /// `struct input_event` on 64-bit Linux: 16-byte `timeval`, type, code, value.
     #[repr(C)]
     struct InputEvent {
         tv_sec: i64,
@@ -57,82 +71,107 @@ mod uinput {
         value: i32,
     }
 
+    /// Marker for `#[repr(C)]` structs that can be handed to the kernel as raw
+    /// bytes.
+    ///
+    /// # Safety
+    ///
+    /// Implementors must be `#[repr(C)]`, contain only integer fields (and
+    /// arrays/structs of them) and have no padding, so every byte of a value
+    /// is initialised.
+    unsafe trait PlainBytes {}
+
+    // SAFETY: `#[repr(C)]`; 80 + 4*2 + 4 + 4*64*4 bytes of integers, all
+    // naturally aligned, no padding.
+    unsafe impl PlainBytes for UinputUserDev {}
+    // SAFETY: `#[repr(C)]`; 8 + 8 + 2 + 2 + 4 = 24 bytes of integers, no padding.
+    unsafe impl PlainBytes for InputEvent {}
+
+    /// View a kernel ABI struct as the bytes the driver expects on `write(2)`.
+    fn as_bytes<T: PlainBytes>(v: &T) -> &[u8] {
+        // SAFETY: `PlainBytes` guarantees `T` has no padding or non-integer
+        // fields, so all `size_of::<T>()` bytes behind `v` are initialised; the
+        // borrow keeps them alive and unaliased-mutably for the returned lifetime.
+        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
+    }
+
+    /// `ioctl(fd, req, arg)` for the `_IOW(int)`-style uinput requests.
+    fn ioctl_int(file: &File, req: libc::c_ulong, arg: libc::c_int) -> io::Result<()> {
+        // SAFETY: `file` keeps the descriptor open for the duration of the call
+        // and the request takes a plain `int` by value — no pointer is passed.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), req, arg) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `ioctl(fd, req)` for the argument-less `_IO`-style uinput requests.
+    fn ioctl_none(file: &File, req: libc::c_ulong) -> io::Result<()> {
+        // SAFETY: `file` keeps the descriptor open for the duration of the call
+        // and the request takes no argument.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), req) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A virtual keyboard registered with the kernel; unregistered on drop.
     pub struct Keyboard {
-        fd: RawFd,
+        file: File,
     }
 
     impl Keyboard {
         /// Create a virtual keyboard exposing the given keys.
         pub fn new(keys: &[u16]) -> io::Result<Self> {
-            let path = b"/dev/uinput\0";
-            let fd = unsafe {
-                libc::open(
-                    path.as_ptr() as *const libc::c_char,
-                    libc::O_WRONLY | libc::O_NONBLOCK,
-                )
+            let file = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open("/dev/uinput")?;
+            // From here on `Drop` issues UI_DEV_DESTROY on any early return.
+            let kb = Keyboard { file };
+
+            ioctl_int(&kb.file, UI_SET_EVBIT, libc::c_int::from(EV_KEY))?;
+            ioctl_int(&kb.file, UI_SET_EVBIT, libc::c_int::from(EV_SYN))?;
+            for &k in keys {
+                ioctl_int(&kb.file, UI_SET_KEYBIT, libc::c_int::from(k))?;
+            }
+
+            let mut dev = UinputUserDev {
+                name: [0; 80],
+                id: InputId {
+                    bustype: BUS_USB,
+                    vendor: 0x1234,
+                    product: 0x5678,
+                    version: 1,
+                },
+                ff_effects_max: 0,
+                absmax: [0; 64],
+                absmin: [0; 64],
+                absfuzz: [0; 64],
+                absflat: [0; 64],
             };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let kb = Keyboard { fd };
-
-            unsafe {
-                if libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                for &k in keys {
-                    if libc::ioctl(fd, UI_SET_KEYBIT, k as libc::c_int) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-            }
-
-            let mut dev: UinputUserDev = unsafe { std::mem::zeroed() };
             let name = b"tobii-gaze-keys";
             dev.name[..name.len()].copy_from_slice(name);
-            dev.id = InputId {
-                bustype: BUS_USB,
-                vendor: 0x1234,
-                product: 0x5678,
-                version: 1,
-            };
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &dev as *const _ as *const u8,
-                    std::mem::size_of::<UinputUserDev>(),
-                )
-            };
-            if unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) }
-                != bytes.len() as isize
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if unsafe { libc::ioctl(fd, UI_DEV_CREATE) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            (&kb.file).write_all(as_bytes(&dev))?;
+            ioctl_none(&kb.file, UI_DEV_CREATE)?;
             // Give udev/compositor a moment to register the new device.
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(200));
             Ok(kb)
         }
 
         fn emit(&self, type_: u16, code: u16, value: i32) -> io::Result<()> {
-            let ev = InputEvent { tv_sec: 0, tv_usec: 0, type_, code, value };
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &ev as *const _ as *const u8,
-                    std::mem::size_of::<InputEvent>(),
-                )
+            let ev = InputEvent {
+                tv_sec: 0,
+                tv_usec: 0,
+                type_,
+                code,
+                value,
             };
-            let n = unsafe {
-                libc::write(self.fd, bytes.as_ptr() as *const libc::c_void, bytes.len())
-            };
-            if n != bytes.len() as isize {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            (&self.file).write_all(as_bytes(&ev))
         }
 
         /// Press and release one key.
@@ -147,9 +186,9 @@ mod uinput {
 
     impl Drop for Keyboard {
         fn drop(&mut self) {
-            unsafe {
-                libc::ioctl(self.fd, UI_DEV_DESTROY);
-                libc::close(self.fd);
+            // The descriptor itself is closed when `file` drops right after this.
+            if let Err(e) = ioctl_none(&self.file, UI_DEV_DESTROY) {
+                tracing::warn!(error = %e, "UI_DEV_DESTROY failed");
             }
         }
     }
@@ -160,14 +199,15 @@ mod superkey {
     //! `/dev/input/event*` in background threads. Works under X11 and Wayland.
     use std::fs;
     use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     const EV_KEY: u16 = 0x01;
     const KEY_LEFTMETA: u16 = 125;
     const KEY_RIGHTMETA: u16 = 126;
 
+    /// Live state of the two Meta keys, fed by one reader thread per device.
     pub struct Watcher {
         left: Arc<AtomicBool>,
         right: Arc<AtomicBool>,
@@ -185,10 +225,12 @@ mod superkey {
                     continue;
                 }
                 // Some nodes aren't readable by us (or are busy) — skip them.
-                let Ok(file) = fs::File::open(entry.path()) else { continue };
+                let Ok(file) = fs::File::open(entry.path()) else {
+                    continue;
+                };
                 opened += 1;
                 let (l, r) = (Arc::clone(&left), Arc::clone(&right));
-                thread::spawn(move || reader_loop(file, l, r));
+                thread::spawn(move || reader_loop(file, &l, &r));
             }
             if opened == 0 {
                 return Err(std::io::Error::new(
@@ -200,12 +242,14 @@ mod superkey {
         }
 
         /// True while either Super/Meta key is currently down.
-        pub fn down(&self) -> bool {
+        pub fn is_down(&self) -> bool {
+            // Relaxed: the flags are pure signals; no other data is published
+            // through them.
             self.left.load(Ordering::Relaxed) || self.right.load(Ordering::Relaxed)
         }
     }
 
-    fn reader_loop(mut file: fs::File, left: Arc<AtomicBool>, right: Arc<AtomicBool>) {
+    fn reader_loop(mut file: fs::File, left: &AtomicBool, right: &AtomicBool) {
         // input_event on 64-bit: 16B timeval + u16 type + u16 code + i32 value.
         let mut buf = [0u8; 24];
         while file.read_exact(&mut buf).is_ok() {
@@ -227,12 +271,25 @@ mod superkey {
 fn main() {
     tobii::logging::init();
     if let Err(e) = run() {
-        eprintln!("tobii-gaze-keys: {e}");
+        eprintln!("tobii-gaze-keys: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// Take and parse the value following `flag`.
+fn next_value<T>(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let v = args
+        .next()
+        .with_context(|| format!("{flag} needs a value"))?;
+    v.parse()
+        .with_context(|| format!("{flag}: invalid value {v:?}"))
+}
+
+fn run() -> Result<()> {
     // Manual thresholds (absolute gaze-X). Left unset => adaptive auto-calibration,
     // which tracks the actually-observed gaze-X range and triggers near its edges.
     // This handles trackers whose gaze-X isn't centered/symmetric (a fixed 0.15
@@ -245,13 +302,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--left" => left_edge = Some(args.next().ok_or("--left needs a value")?.parse()?),
-            "--right" => right_edge = Some(args.next().ok_or("--right needs a value")?.parse()?),
-            "--margin" => margin = args.next().ok_or("--margin needs a value")?.parse()?,
+            "--left" => left_edge = Some(next_value(&mut args, "--left")?),
+            "--right" => right_edge = Some(next_value(&mut args, "--right")?),
+            "--margin" => margin = next_value(&mut args, "--margin")?,
             "--no-super" => require_super = false,
             "--interval-ms" => {
-                let ms: u64 = args.next().ok_or("--interval-ms needs a value")?.parse()?;
-                interval = Duration::from_millis(ms);
+                interval = Duration::from_millis(next_value(&mut args, "--interval-ms")?);
             }
             "-h" | "--help" => {
                 println!(
@@ -271,51 +327,59 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
-            other => return Err(format!("unknown arg: {other}").into()),
+            other => bail!("unknown arg: {other}"),
         }
     }
-    let auto = left_edge.is_none() && right_edge.is_none();
-    if !auto {
-        // Partial manual spec: fill the unset side with a sane default.
-        let l = left_edge.unwrap_or(0.15);
-        let r = right_edge.unwrap_or(0.85);
-        if !(l < r) {
-            return Err("--left must be less than --right".into());
+    // Fixed thresholds as soon as either side is given (the other side gets a
+    // sane default); otherwise auto calibration.
+    let edges = match (left_edge, right_edge) {
+        (None, None) => None,
+        (l, r) => {
+            let (l, r) = (l.unwrap_or(0.15), r.unwrap_or(0.85));
+            // `partial_cmp` so that a NaN on either side is rejected as well.
+            ensure!(
+                l.partial_cmp(&r) == Some(Ordering::Less),
+                "--left must be less than --right"
+            );
+            Some((l, r))
         }
-        left_edge = Some(l);
-        right_edge = Some(r);
-    }
-    if !(margin > 0.0 && margin < 0.5) {
-        return Err("--margin must be between 0 and 0.5".into());
-    }
+    };
+    ensure!(
+        margin > 0.0 && margin < 0.5,
+        "--margin must be between 0 and 0.5"
+    );
 
     let kb = uinput::Keyboard::new(&[uinput::KEY_LEFT, uinput::KEY_RIGHT])
-        .map_err(|e| format!("opening /dev/uinput ({e}); try running with sudo"))?;
+        .context("opening /dev/uinput (try running with sudo)")?;
 
     // Watch the physical Super/Meta key (unless gating is disabled).
     let supers = if require_super {
-        Some(superkey::Watcher::spawn().map_err(|e| {
-            format!("watching modifier keys ({e}); need read access to /dev/input/event*")
-        })?)
+        Some(
+            superkey::Watcher::spawn()
+                .context("watching modifier keys (need read access to /dev/input/event*)")?,
+        )
     } else {
         None
     };
 
-    let mut stream = tobii::ipc::connect_or_spawn()?;
-    write_frame(&mut stream, &encode_subscribe(STREAM_GAZE))?;
+    let mut stream = tobii::ipc::connect_or_spawn().context("connecting to tobiid")?;
+    write_frame(&mut stream, &encode_subscribe(STREAM_GAZE))
+        .context("subscribing to the gaze stream")?;
 
-    let gate = if require_super { " while Super held" } else { "" };
-    if auto {
+    let gate = if require_super {
+        " while Super held"
+    } else {
+        ""
+    };
+    if let Some((l, r)) = edges {
         println!(
-            "tobii-gaze-keys: AUTO calibration (margin {margin:.2}), 1 tap / {}ms{gate}\n\
-             look fully LEFT and fully RIGHT once to learn your gaze range...",
+            "tobii-gaze-keys: fixed edges <{l:.2} / >{r:.2}, 1 tap / {}ms{gate}",
             interval.as_millis()
         );
     } else {
         println!(
-            "tobii-gaze-keys: fixed edges <{:.2} / >{:.2}, 1 tap / {}ms{gate}",
-            left_edge.unwrap(),
-            right_edge.unwrap(),
+            "tobii-gaze-keys: AUTO calibration (margin {margin:.2}), 1 tap / {}ms{gate}\n\
+             look fully LEFT and fully RIGHT once to learn your gaze range...",
             interval.as_millis()
         );
     }
@@ -331,12 +395,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut xmax = f32::NEG_INFINITY;
 
     loop {
-        let Some(body) = read_frame(&mut stream)? else {
-            return Err("daemon closed the connection".into());
+        let Some(body) = read_frame(&mut stream).context("reading from tobiid")? else {
+            bail!("daemon closed the connection");
         };
         match decode_server(&body) {
             Some(ServerMsg::Subscribed { ok: false }) => {
-                return Err("daemon is busy with the other mode (head)".into());
+                bail!("daemon is busy with the other mode (head)")
             }
             Some(ServerMsg::Subscribed { ok: true }) => {}
             Some(ServerMsg::Gaze { valid, xy, .. }) => {
@@ -350,7 +414,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let x = xy[0];
 
                 // Resolve the active left/right thresholds for this sample.
-                let (lo, hi, calibrating) = if let (Some(l), Some(r)) = (left_edge, right_edge) {
+                let (lo, hi, calibrating) = if let Some((l, r)) = edges {
                     (l, r, false)
                 } else {
                     // Auto: grow the envelope, then relax it gently toward the
@@ -369,7 +433,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 // Gate on the physical Super/Meta key, if required.
-                let super_held = supers.as_ref().map_or(true, |s| s.down());
+                let super_held = supers.as_ref().is_none_or(superkey::Watcher::is_down);
 
                 if calibrating {
                     last_left = None;
@@ -382,15 +446,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprint!("\r   hold Super  (x={x:.2})        ");
                 } else if x <= lo {
                     last_right = None;
-                    if last_left.map_or(true, |t| now.duration_since(t) >= interval) {
-                        kb.tap(uinput::KEY_LEFT)?;
+                    if last_left.is_none_or(|t| now.duration_since(t) >= interval) {
+                        kb.tap(uinput::KEY_LEFT).context("tapping Left")?;
                         last_left = Some(now);
                         eprint!("\r<- LEFT  (x={x:.2})        ");
                     }
                 } else if x >= hi {
                     last_left = None;
-                    if last_right.map_or(true, |t| now.duration_since(t) >= interval) {
-                        kb.tap(uinput::KEY_RIGHT)?;
+                    if last_right.is_none_or(|t| now.duration_since(t) >= interval) {
+                        kb.tap(uinput::KEY_RIGHT).context("tapping Right")?;
                         last_right = Some(now);
                         eprint!("\r-> RIGHT (x={x:.2})        ");
                     }
@@ -401,6 +465,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprint!("\r   center (x={x:.2})        ");
                 }
             }
+            // Head/presence frames aren't subscribed here and unknown tags decode
+            // to `None`. `ServerMsg` belongs to the library crate (this binary is
+            // a separate crate), so a wildcard keeps this client building if the
+            // enum grows or becomes `#[non_exhaustive]`.
             _ => {}
         }
     }

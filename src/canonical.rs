@@ -1,4 +1,6 @@
-// MediaPipe canonical face mesh (468 verts, cm), Y/Z flipped to image coords.
+//! `MediaPipe` canonical face mesh, used as the 3D model for the head-pose fit.
+
+/// `MediaPipe` canonical face mesh (468 verts, cm), Y/Z flipped to image coords.
 pub(crate) const CANONICAL_FACE: [[f32; 3]; 468] = [
     [0.0, 3.4064, -5.9795],
     [0.0, 1.1269, -7.4756],

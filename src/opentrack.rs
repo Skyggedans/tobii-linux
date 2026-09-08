@@ -1,19 +1,28 @@
+//! `OpenTrack` "UDP over network" sink for the replay/track CLI paths: turns a
+//! decoded `TrackingFrame` into the 6-double `x,y,z,yaw,pitch,roll` packet,
+//! with origin calibration, rotation/translation decoupling and smoothing.
+
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use tracing::info;
 
-use crate::decode::{field_value, head_point, mean_keys, LiveField, TrackingFrame};
+use crate::decode::{LiveField, TrackingFrame, field_value, head_point, mean_keys};
 use crate::math::{
     angles_from_translation, calibrate_origin, calibrate_scalar_origin, choose_pose_hypothesis,
     dot3, norm3, normalize_angle_deg, scale_matrix, solve_3x3,
 };
 
+/// Device head-position units per `OpenTrack` centimetre.
 pub(crate) const OPENTRACK_HEAD_SCALE: f64 = 1000.0;
 
+/// Default `angle_scale` for [`AngleSource::Gaze`].
 pub(crate) const DEFAULT_OPENTRACK_GAZE_ANGLE_SCALE: [f64; 3] = [40.0, 60.0, 1.0];
 
+/// Default `angle_scale` for [`AngleSource::Head`] / [`AngleSource::Model`].
 pub(crate) const DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE: [f64; 3] = [2.0, 1.0, 2.0];
 
+/// Default head-angle occurrence of 0x00031f41.
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_OCC: usize = 7;
 
 /// Default roll axis: the inter-eye line between the two eyeball rotation
@@ -23,26 +32,37 @@ pub(crate) const DEFAULT_OPENTRACK_ANGLE_OCC: usize = 7;
 /// Override on the replay path with `--opentrack-roll-points`/`--opentrack-no-roll-points`.
 pub(crate) const DEFAULT_OPENTRACK_ROLL_POINTS: (usize, usize) = (4, 9);
 
+/// Output angles are clamped to +/- this many degrees.
 pub(crate) const OPENTRACK_MAX_HEAD_ANGLE_DEG: f64 = 45.0;
 
+/// Frames averaged into each rest-pose origin by default.
 pub(crate) const DEFAULT_OPENTRACK_ORIGIN_SAMPLES: usize = 30;
 
+/// Default exponential smoothing factor.
 pub(crate) const DEFAULT_OPENTRACK_SMOOTHING: f64 = 0.35;
 
+/// Default angle deadzone (degrees).
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG: f64 = 0.35;
 
+/// Default rotation -> translation lever arm (none).
 pub(crate) const DEFAULT_OPENTRACK_ROTATION_COMP: [[f64; 3]; 3] = [[0.0; 3]; 3];
 
+/// Default per-axis translation multiplier.
 pub(crate) const DEFAULT_OPENTRACK_TRANSLATION_SCALE: [f64; 3] = [1.0, 1.0, 1.0];
 
+/// Default translation -> angle compensation (none).
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP: [[f64; 3]; 3] = [[0.0; 3]; 3];
 
+/// Default scalar on the translation -> angle compensation.
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE: f64 = 1.0;
 
+/// Default translation deadzone (cm) for the hybrid/auto hypotheses.
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM: f64 = 0.0;
 
+/// Consecutive frames a hybrid-mode switch must be requested before it happens.
 pub(crate) const OPENTRACK_COUPLING_SWITCH_FRAMES: usize = 4;
 
+/// Score margin one hypothesis must win by to trigger a hybrid-mode switch.
 pub(crate) const OPENTRACK_COUPLING_SWITCH_MARGIN: f64 = 0.20;
 
 // Opt-in online decoupling of rotation-induced translation
@@ -101,39 +121,56 @@ const OPENTRACK_DECOUPLE_MIN_WEIGHT: f64 = 90.0;
 const OPENTRACK_DECOUPLE_ANGLE_GATE_DEG: f64 = 1.0;
 const OPENTRACK_DECOUPLE_BLEND: f64 = 0.1;
 
+/// Default raw component -> output axis map: yaw = comp 0, pitch = -comp 1, roll off.
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_MAP: [AngleComponent; 3] = [
     AngleComponent::new(0, 1.0),
     AngleComponent::new(1, -1.0),
     AngleComponent::disabled(),
 ];
 
-#[derive(Clone, Copy)]
+/// Where the yaw/pitch signal sent to `OpenTrack` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AngleSource {
+    /// Mean gaze direction of both eyes (0x00021f40 occ 0/5).
     Gaze,
+    /// The stream's positional head "angles" (0x00031f41, `--opentrack-angle-occ`).
     Head,
     /// Learned translation-invariant rigid-rotation model (occ 0-9 landmarks).
     Model,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// How rotation- and translation-induced pose components are separated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CouplingMode {
+    /// Subtract `rotation_comp * angles` from the translation.
     Rotation,
+    /// Subtract `angle_translation_comp * translation` from the angles.
     Translation,
+    /// Pick per frame between the two hypotheses with hysteresis.
     Hybrid,
+    /// Pick per frame by [`choose_pose_hypothesis`].
     Auto,
 }
 
-#[derive(Clone, Copy)]
+/// One output angle axis: which stream component feeds it and with what sign.
+/// A zero sign disables the axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AngleComponent {
+    /// Component index (0..3) inside the head-angle occurrence.
     pub(crate) component: usize,
+    /// Multiplier applied to the raw value; `0.0` means disabled.
     pub(crate) sign: f64,
 }
 
 impl AngleComponent {
+    /// Axis fed by `component`, scaled by `sign`.
+    #[must_use]
     pub(crate) const fn new(component: usize, sign: f64) -> Self {
         Self { component, sign }
     }
 
+    /// Axis that always outputs zero.
+    #[must_use]
     pub(crate) const fn disabled() -> Self {
         Self {
             component: 0,
@@ -141,11 +178,54 @@ impl AngleComponent {
         }
     }
 
+    /// `true` when this axis is switched off (exact-zero sign is the sentinel).
+    #[must_use]
     pub(crate) fn is_disabled(self) -> bool {
         self.sign == 0.0
     }
 }
 
+/// Tuning knobs for [`OpentrackUdp`], filled from the CLI options.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OpentrackConfig {
+    /// Send head translation (otherwise x/y/z are always zero).
+    pub(crate) send_translation: bool,
+    /// Source of the yaw/pitch signal.
+    pub(crate) angle_source: AngleSource,
+    /// Head-angle occurrence of 0x00031f41 used by [`AngleSource::Head`].
+    pub(crate) angle_occurrence: Option<usize>,
+    /// Divisor per output axis (raw units per degree).
+    pub(crate) angle_scale: [f64; 3],
+    /// Raw component -> output axis mapping for [`AngleSource::Head`].
+    pub(crate) angle_map: [AngleComponent; 3],
+    /// Frames averaged for each rest-pose origin.
+    pub(crate) origin_samples: usize,
+    /// Landmark pair whose direction gives yaw/pitch, if any.
+    pub(crate) angle_points: Option<(usize, usize)>,
+    /// Landmark pair whose in-plane direction gives roll, if any.
+    pub(crate) roll_points: Option<(usize, usize)>,
+    /// Exponential smoothing factor for the output pose (1.0 = no smoothing).
+    pub(crate) smoothing_alpha: f64,
+    /// Angles below this magnitude (degrees) are zeroed.
+    pub(crate) angle_deadzone: f64,
+    /// Fixed rotation -> translation lever arm (zero = learn online when enabled).
+    pub(crate) rotation_comp: [[f64; 3]; 3],
+    /// Per-axis multiplier on the translation.
+    pub(crate) translation_scale: [f64; 3],
+    /// Translation -> angle compensation matrix.
+    pub(crate) angle_translation_comp: [[f64; 3]; 3],
+    /// Scalar applied to `angle_translation_comp`.
+    pub(crate) angle_translation_comp_scale: f64,
+    /// Translation magnitude (cm) below which the rotation hypothesis wins.
+    pub(crate) angle_translation_deadzone: f64,
+    /// Rotation/translation separation strategy.
+    pub(crate) coupling_mode: CouplingMode,
+    /// Learn the rotation -> translation lever arm online.
+    pub(crate) auto_decouple: bool,
+}
+
+/// Live `OpenTrack` UDP sender with its calibration and filter state.
+#[derive(Debug)]
 pub(crate) struct OpentrackUdp {
     pub(crate) socket: UdpSocket,
     pub(crate) target: SocketAddr,
@@ -189,27 +269,30 @@ pub(crate) struct OpentrackUdp {
 }
 
 impl OpentrackUdp {
-    pub(crate) fn connect(
-        host: &str,
-        port: u16,
-        send_translation: bool,
-        angle_source: AngleSource,
-        angle_occurrence: Option<usize>,
-        angle_scale: [f64; 3],
-        angle_map: [AngleComponent; 3],
-        origin_samples: usize,
-        angle_points: Option<(usize, usize)>,
-        roll_points: Option<(usize, usize)>,
-        smoothing_alpha: f64,
-        angle_deadzone: f64,
-        rotation_comp: [[f64; 3]; 3],
-        translation_scale: [f64; 3],
-        angle_translation_comp: [[f64; 3]; 3],
-        angle_translation_comp_scale: f64,
-        angle_translation_deadzone: f64,
-        coupling_mode: CouplingMode,
-        auto_decouple: bool,
-    ) -> Result<Self> {
+    /// Resolve `host:port`, bind a UDP socket and build the sender from `config`.
+    ///
+    /// # Errors
+    /// Fails when the target does not resolve or the socket cannot be bound.
+    pub(crate) fn new(host: &str, port: u16, config: &OpentrackConfig) -> Result<Self> {
+        let OpentrackConfig {
+            send_translation,
+            angle_source,
+            angle_occurrence,
+            angle_scale,
+            angle_map,
+            origin_samples,
+            angle_points,
+            roll_points,
+            smoothing_alpha,
+            angle_deadzone,
+            rotation_comp,
+            translation_scale,
+            angle_translation_comp,
+            angle_translation_comp_scale,
+            angle_translation_deadzone,
+            coupling_mode,
+            auto_decouple,
+        } = *config;
         let target = (host, port)
             .to_socket_addrs()
             .with_context(|| format!("failed to resolve opentrack target {host}:{port}"))?
@@ -228,9 +311,11 @@ impl OpentrackUdp {
             AngleSource::Gaze => "gaze",
         };
         let decouple = auto_decouple && is_zero_matrix(rotation_comp);
-        println!(
-            "Sending OpenTrack UDP frames to {target}; angle source: {source}; rotation->translation auto-decouple: {}",
-            if decouple { "on" } else { "off" }
+        info!(
+            %target,
+            angle_source = source,
+            auto_decouple = decouple,
+            "sending OpenTrack UDP frames"
         );
 
         Ok(Self {
@@ -265,13 +350,65 @@ impl OpentrackUdp {
             coupling_candidate: CouplingMode::Rotation,
             coupling_candidate_count: 0,
             last_pose: None,
-            auto_decouple: auto_decouple && is_zero_matrix(rotation_comp),
+            auto_decouple: decouple,
             decouple_ata: [[0.0; 3]; 3],
             decouple_atb: [[0.0; 3]; 3],
             decouple_weight: 0.0,
             learned_rotation_comp: [[0.0; 3]; 3],
             last_angles: None,
         })
+    }
+
+    /// Positional form of [`OpentrackUdp::new`], kept for the existing
+    /// `device::replay_and_read_stream` call site.
+    ///
+    /// # Errors
+    /// See [`OpentrackUdp::new`].
+    #[allow(clippy::too_many_arguments)] // reason: legacy call site; prefer `new` + `OpentrackConfig`
+    pub(crate) fn connect(
+        host: &str,
+        port: u16,
+        send_translation: bool,
+        angle_source: AngleSource,
+        angle_occurrence: Option<usize>,
+        angle_scale: [f64; 3],
+        angle_map: [AngleComponent; 3],
+        origin_samples: usize,
+        angle_points: Option<(usize, usize)>,
+        roll_points: Option<(usize, usize)>,
+        smoothing_alpha: f64,
+        angle_deadzone: f64,
+        rotation_comp: [[f64; 3]; 3],
+        translation_scale: [f64; 3],
+        angle_translation_comp: [[f64; 3]; 3],
+        angle_translation_comp_scale: f64,
+        angle_translation_deadzone: f64,
+        coupling_mode: CouplingMode,
+        auto_decouple: bool,
+    ) -> Result<Self> {
+        Self::new(
+            host,
+            port,
+            &OpentrackConfig {
+                send_translation,
+                angle_source,
+                angle_occurrence,
+                angle_scale,
+                angle_map,
+                origin_samples,
+                angle_points,
+                roll_points,
+                smoothing_alpha,
+                angle_deadzone,
+                rotation_comp,
+                translation_scale,
+                angle_translation_comp,
+                angle_translation_comp_scale,
+                angle_translation_deadzone,
+                coupling_mode,
+                auto_decouple,
+            },
+        )
     }
 
     /// Returns the rotation->translation compensation matrix to apply this
@@ -289,17 +426,14 @@ impl OpentrackUdp {
         }
 
         if learn && norm3(angles) >= OPENTRACK_DECOUPLE_ANGLE_GATE_DEG {
-            for r in 0..3 {
-                for c in 0..3 {
-                    self.decouple_ata[r][c] =
-                        self.decouple_ata[r][c] * OPENTRACK_DECOUPLE_FORGET + angles[r] * angles[c];
+            for (ata_row, angle_r) in self.decouple_ata.iter_mut().zip(angles) {
+                for (cell, angle_c) in ata_row.iter_mut().zip(angles) {
+                    *cell = *cell * OPENTRACK_DECOUPLE_FORGET + angle_r * angle_c;
                 }
             }
-            for axis in 0..3 {
-                for c in 0..3 {
-                    self.decouple_atb[axis][c] = self.decouple_atb[axis][c]
-                        * OPENTRACK_DECOUPLE_FORGET
-                        + translation[axis] * angles[c];
+            for (atb_row, shift) in self.decouple_atb.iter_mut().zip(translation) {
+                for (cell, angle_c) in atb_row.iter_mut().zip(angles) {
+                    *cell = *cell * OPENTRACK_DECOUPLE_FORGET + shift * angle_c;
                 }
             }
             self.decouple_weight = self.decouple_weight * OPENTRACK_DECOUPLE_FORGET + 1.0;
@@ -309,16 +443,16 @@ impl OpentrackUdp {
                 // from inventing a compensation; it shrinks toward zero there.
                 let ridge = OPENTRACK_DECOUPLE_RIDGE * self.decouple_weight;
                 let mut ata = self.decouple_ata;
-                for i in 0..3 {
-                    ata[i][i] += ridge;
+                for (i, row) in ata.iter_mut().enumerate() {
+                    row[i] += ridge;
                 }
-                for axis in 0..3 {
-                    if let Some(row) = solve_3x3(ata, self.decouple_atb[axis]) {
-                        for c in 0..3 {
-                            self.learned_rotation_comp[axis][c] = self.learned_rotation_comp[axis]
-                                [c]
-                                * (1.0 - OPENTRACK_DECOUPLE_BLEND)
-                                + row[c] * OPENTRACK_DECOUPLE_BLEND;
+                for (learned_row, atb_row) in
+                    self.learned_rotation_comp.iter_mut().zip(self.decouple_atb)
+                {
+                    if let Some(row) = solve_3x3(ata, atb_row) {
+                        for (cell, solved) in learned_row.iter_mut().zip(row) {
+                            *cell = *cell * (1.0 - OPENTRACK_DECOUPLE_BLEND)
+                                + solved * OPENTRACK_DECOUPLE_BLEND;
                         }
                     }
                 }
@@ -328,6 +462,11 @@ impl OpentrackUdp {
         self.learned_rotation_comp
     }
 
+    /// Convert one frame to an `OpenTrack` pose and send it. Returns the pose
+    /// that went on the wire, or `None` when the frame carries no head position.
+    ///
+    /// # Errors
+    /// Fails when the UDP send fails.
     pub(crate) fn send_frame(
         &mut self,
         frame: &TrackingFrame,
@@ -364,7 +503,8 @@ impl OpentrackUdp {
                 self.angle_translation_comp,
                 self.angle_translation_comp_scale,
             );
-            let rotation_comp = self.rotation_compensation(raw_translation, raw_angles, origin.is_some());
+            let rotation_comp =
+                self.rotation_compensation(raw_translation, raw_angles, origin.is_some());
             match self.coupling_mode {
                 CouplingMode::Rotation => (
                     [
@@ -406,8 +546,8 @@ impl OpentrackUdp {
         // as its plugin API: TX, TY, TZ, Yaw, Pitch, Roll.
         let values = self.filter_pose([x_cm, y_cm, z_cm, yaw_deg, pitch_deg, roll_deg]);
         let mut packet = [0u8; 48];
-        for (i, value) in values.iter().enumerate() {
-            packet[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        for (chunk, value) in packet.chunks_exact_mut(8).zip(values) {
+            chunk.copy_from_slice(&value.to_le_bytes());
         }
 
         self.socket
@@ -417,7 +557,9 @@ impl OpentrackUdp {
         Ok(Some(values))
     }
 
-    pub(crate) fn choose_pose_hypothesis_hybrid(
+    /// Hybrid coupling: score both hypotheses and switch state only after
+    /// [`OPENTRACK_COUPLING_SWITCH_FRAMES`] consecutive frames agree.
+    fn choose_pose_hypothesis_hybrid(
         &mut self,
         raw_translation: [f64; 3],
         raw_angles: [f64; 3],
@@ -467,11 +609,13 @@ impl OpentrackUdp {
 
         match self.coupling_state {
             CouplingMode::Translation => translation_pose,
-            _ => rotation_pose,
+            CouplingMode::Rotation | CouplingMode::Hybrid | CouplingMode::Auto => rotation_pose,
         }
     }
 
-    pub(crate) fn filter_pose(&mut self, mut values: [f64; 6]) -> [f64; 6] {
+    /// Apply the angle deadzone, then exponentially smooth against the last
+    /// sent pose.
+    fn filter_pose(&mut self, mut values: [f64; 6]) -> [f64; 6] {
         for value in &mut values[3..] {
             if value.abs() < self.angle_deadzone {
                 *value = 0.0;
@@ -484,14 +628,16 @@ impl OpentrackUdp {
         };
 
         let mut filtered = values;
-        for i in 0..6 {
-            filtered[i] = previous[i] + self.smoothing_alpha * (values[i] - previous[i]);
+        for ((out, prev), value) in filtered.iter_mut().zip(previous).zip(values) {
+            *out = prev + self.smoothing_alpha * (value - prev);
         }
         self.last_pose = Some(filtered);
         filtered
     }
 
-    pub(crate) fn calibrate_translation_origin(
+    /// Average the first `origin_samples` head positions (while a user is
+    /// present) into the translation rest pose.
+    fn calibrate_translation_origin(
         &mut self,
         head: [f64; 3],
         can_calibrate: bool,
@@ -506,7 +652,8 @@ impl OpentrackUdp {
         )
     }
 
-    pub(crate) fn relative_angles(
+    /// Yaw/pitch/roll relative to the calibrated rest pose, in degrees.
+    fn relative_angles(
         &mut self,
         decoded: &BTreeMap<(u32, usize, usize), f64>,
         can_calibrate: bool,
@@ -558,7 +705,6 @@ impl OpentrackUdp {
                 for (axis, weight) in HEAD_ROT_MODEL[feature].iter().enumerate() {
                     model[axis] += weight * centred;
                 }
-                let _ = component;
                 feature += 1;
             }
         }
@@ -596,15 +742,15 @@ impl OpentrackUdp {
             return Some(angles);
         }
 
-        if let AngleSource::Model = self.angle_source {
+        if self.angle_source == AngleSource::Model {
             return self.model_angles(decoded, can_calibrate);
         }
 
-        if let AngleSource::Gaze = self.angle_source {
-            if let Some(angles) = self.relative_angles_from_gaze(decoded, can_calibrate) {
-                return Some(angles);
-            }
-        };
+        if self.angle_source == AngleSource::Gaze
+            && let Some(angles) = self.relative_angles_from_gaze(decoded, can_calibrate)
+        {
+            return Some(angles);
+        }
 
         let occurrence = self.angle_occurrence?;
         let mut angles = [0.0; 3];
@@ -639,7 +785,8 @@ impl OpentrackUdp {
         ])
     }
 
-    pub(crate) fn relative_angles_from_gaze(
+    /// Yaw/pitch from the mean binocular gaze direction (roll is always 0).
+    fn relative_angles_from_gaze(
         &mut self,
         decoded: &BTreeMap<(u32, usize, usize), f64>,
         can_calibrate: bool,
@@ -678,7 +825,9 @@ impl OpentrackUdp {
         ])
     }
 
-    pub(crate) fn relative_angles_from_points(
+    /// Yaw/pitch from the direction between two head landmarks
+    /// (`angle_points`); roll is always 0.
+    fn relative_angles_from_points(
         &mut self,
         decoded: &BTreeMap<(u32, usize, usize), f64>,
         can_calibrate: bool,
@@ -718,7 +867,9 @@ impl OpentrackUdp {
         ])
     }
 
-    pub(crate) fn relative_roll_from_points(
+    /// Roll from the in-plane direction between two head landmarks
+    /// (`roll_points`).
+    fn relative_roll_from_points(
         &mut self,
         decoded: &BTreeMap<(u32, usize, usize), f64>,
         can_calibrate: bool,
@@ -743,11 +894,15 @@ impl OpentrackUdp {
     }
 }
 
+/// `true` when every entry is exactly zero (the "not configured" sentinel).
 fn is_zero_matrix(matrix: [[f64; 3]; 3]) -> bool {
     matrix.iter().flatten().all(|value| *value == 0.0)
 }
 
-pub(crate) fn pose_for_coupling_mode(
+/// `(translation, angles)` under one coupling hypothesis; `Hybrid`/`Auto`
+/// evaluate as `Rotation` here, the caller does the selection.
+#[must_use]
+fn pose_for_coupling_mode(
     mode: CouplingMode,
     raw_translation: [f64; 3],
     raw_angles: [f64; 3],
@@ -759,7 +914,7 @@ pub(crate) fn pose_for_coupling_mode(
             raw_translation,
             angles_from_translation(raw_angles, raw_translation, angle_translation_comp),
         ),
-        _ => (
+        CouplingMode::Rotation | CouplingMode::Hybrid | CouplingMode::Auto => (
             [
                 raw_translation[0] - dot3(rotation_comp[0], raw_angles),
                 raw_translation[1] - dot3(rotation_comp[1], raw_angles),

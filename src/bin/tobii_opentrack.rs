@@ -1,88 +1,111 @@
-//! Thin client: subscribe to head pose from `tobiid` and forward it to OpenTrack
+//! Thin client: subscribe to head pose from `tobiid` and forward it to `OpenTrack`
 //! over UDP (the 6-double `x,y,z,yaw,pitch,roll` packet). Auto-spawns the daemon
 //! if it isn't running.
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
-use tobii::ipc::{self, decode_server, encode_subscribe, read_frame, write_frame, ServerMsg, STREAM_HEAD};
+use anyhow::{Context, Result, bail};
+use tobii::ipc::{
+    self, STREAM_HEAD, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
+};
 
 fn main() {
     tobii::logging::init();
     if let Err(e) = run() {
-        eprintln!("tobii-opentrack: {e}");
+        eprintln!("tobii-opentrack: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<()> {
     let mut host = "127.0.0.1".to_string();
     let mut port: u16 = 4242;
     let mut recenter = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--host" => host = args.next().ok_or("--host needs a value")?,
-            "--port" => port = args.next().ok_or("--port needs a value")?.parse()?,
+            "--host" => host = args.next().context("--host needs a value")?,
+            "--port" => {
+                let v = args.next().context("--port needs a value")?;
+                port = v
+                    .parse()
+                    .with_context(|| format!("--port: invalid value {v:?}"))?;
+            }
             "--recenter" => recenter = true,
             "-h" | "--help" => {
                 println!("usage: tobii-opentrack [--host 127.0.0.1] [--port 4242] [--recenter]");
                 return Ok(());
             }
-            other => return Err(format!("unknown arg: {other}").into()),
+            other => bail!("unknown arg: {other}"),
         }
     }
 
     // One-shot: ask the running daemon to recalibrate the rest pose and exit.
     // Bind this to a hotkey to re-center without restarting anything.
     if recenter {
-        let mut stream = ipc::connect()?;
-        write_frame(&mut stream, &ipc::encode_recenter())?;
+        let mut stream = ipc::connect().context("connecting to tobiid")?;
+        write_frame(&mut stream, &ipc::encode_recenter()).context("sending recenter")?;
         println!("tobii-opentrack: recenter sent");
         return Ok(());
     }
 
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    let target = format!("{host}:{port}");
+    let socket = UdpSocket::bind("0.0.0.0:0").context("binding a udp socket")?;
+    // Resolve once up front: `send_to` with a host string would re-resolve it
+    // for every frame.
+    let target: SocketAddr = (host.as_str(), port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {host}:{port}"))?
+        .next()
+        .with_context(|| format!("{host}:{port} resolved to no address"))?;
 
-    let mut stream = ipc::connect_or_spawn()?;
-    write_frame(&mut stream, &encode_subscribe(STREAM_HEAD))?;
+    let mut stream = ipc::connect_or_spawn().context("connecting to tobiid")?;
+    write_frame(&mut stream, &encode_subscribe(STREAM_HEAD))
+        .context("subscribing to the head stream")?;
 
-    println!("tobii-opentrack: head pose -> OpenTrack {target}");
+    println!("tobii-opentrack: head pose -> OpenTrack {host}:{port}");
     let mut frames = 0u64;
+    let mut packet = [0u8; 48];
     loop {
-        let Some(body) = read_frame(&mut stream)? else {
-            return Err("daemon closed the connection".into());
+        let Some(body) = read_frame(&mut stream).context("reading from tobiid")? else {
+            bail!("daemon closed the connection");
         };
         match decode_server(&body) {
             Some(ServerMsg::Subscribed { ok: false }) => {
-                return Err("daemon is busy with the other mode (gaze)".into());
+                bail!("daemon is busy with the other mode (gaze)")
             }
             Some(ServerMsg::Subscribed { ok: true }) => {}
-            Some(ServerMsg::Head { pos_mm, rot_rad, .. }) => {
+            Some(ServerMsg::Head {
+                pos_mm, rot_rad, ..
+            }) => {
                 // OpenTrack order: x, y, z, yaw, pitch, roll. Translation in cm
                 // (the wire carries Tobii-convention mm; OpenTrack here expects
                 // cm, matching the standalone `track` path), angles in degrees.
                 let pose = [
-                    pos_mm[0] as f64 / 10.0,
-                    pos_mm[1] as f64 / 10.0,
-                    pos_mm[2] as f64 / 10.0,
-                    (rot_rad[1] as f64).to_degrees(), // yaw
-                    (rot_rad[0] as f64).to_degrees(), // pitch
-                    (rot_rad[2] as f64).to_degrees(), // roll
+                    f64::from(pos_mm[0]) / 10.0,
+                    f64::from(pos_mm[1]) / 10.0,
+                    f64::from(pos_mm[2]) / 10.0,
+                    f64::from(rot_rad[1]).to_degrees(), // yaw
+                    f64::from(rot_rad[0]).to_degrees(), // pitch
+                    f64::from(rot_rad[2]).to_degrees(), // roll
                 ];
-                let mut packet = [0u8; 48];
-                for (i, v) in pose.iter().enumerate() {
-                    packet[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                for (chunk, v) in packet.chunks_exact_mut(8).zip(&pose) {
+                    chunk.copy_from_slice(&v.to_le_bytes());
                 }
-                socket.send_to(&packet, &target)?;
+                socket
+                    .send_to(&packet, target)
+                    .context("sending to OpenTrack")?;
                 frames += 1;
-                if frames % 8 == 0 {
+                if frames.is_multiple_of(8) {
                     eprint!(
                         "\ryaw/pit/roll={:+5.1}/{:+5.1}/{:+5.1}  xyz={:+6.1}/{:+6.1}/{:+6.1}   ",
                         pose[3], pose[4], pose[5], pose[0], pose[1], pose[2]
                     );
                 }
             }
+            // Gaze/presence frames aren't subscribed here and unknown tags decode
+            // to `None`. `ServerMsg` belongs to the library crate (this binary is
+            // a separate crate), so a wildcard keeps this client building if the
+            // enum grows or becomes `#[non_exhaustive]`.
             _ => {}
         }
     }

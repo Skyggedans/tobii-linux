@@ -1,18 +1,43 @@
+//! Decoder for the gaze stream (id 0x500) on EP 0x83: TLV parsing into a
+//! `(field id, occurrence, component)` map of 32.32 fixed-point values, and the
+//! derived per-frame quantities (`TrackingFrame`) built from them.
+//!
+//! Field ids: `0x00021f40` carries 2-D gaze/eye points (occ1 = left eye,
+//! occ3 = right eye) in a 0..1024 screen space; `0x00031f41` carries 3-D head
+//! points in µm (occ4/occ9 = eyeball rotation centres, occ10/occ11 = pupil
+//! diameters). See the stream-0x83 field map for the full table.
+
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::sinks::now_us;
 
+/// Key of a decoded stream value: `(field id, occurrence, component)`.
+pub(crate) type FieldKey = (u32, usize, usize);
+
+/// All values of one decoded stream message, keyed by [`FieldKey`].
+pub(crate) type FieldValues = BTreeMap<FieldKey, f64>;
+
+/// Offset of the first TLV entry in a 0x53 stream message (after the common
+/// 34-byte stream header).
 pub(crate) const STREAM_TLV_OFFSET: usize = 34;
 
+/// Full-scale gaze coordinate; gaze points are reported in `0..=1024`.
 pub(crate) const GAZE_COORD_MAX: f64 = 1024.0;
+
+/// The device reports an absent field as exactly `±1024.0` or `0.0` (32.32
+/// fixed point, so these are bit-exact).
+const FIELD_SENTINEL: f64 = 1024.0;
+
+/// Denominator of the 32.32 fixed-point wire format (`2^32`).
+const FIXED_POINT_ONE: f64 = 4_294_967_296.0;
 
 /// Lever arm (µm) from the inter-eye line down to the head-roll pivot. A pure
 /// head roll swings the eye midpoint sideways about a point below the eyes;
 /// adding `lever * sin(roll)` back to the midpoint x removes that arc from the
 /// reported lateral translation, so a roll nets ~zero apparent tx. Fit on the
-/// roll_only captures (native ≈137 mm; the Windows replication set gives
+/// `roll_only` captures (native ≈137 mm; the Windows replication set gives
 /// ≈120–125 mm) — user/mounting dependent, hence a single tunable constant.
 pub(crate) const HEAD_ROLL_LEVER_UM: f64 = 137_000.0;
 
@@ -20,6 +45,7 @@ pub(crate) const HEAD_ROLL_LEVER_UM: f64 = 137_000.0;
 /// binocular readings track to r ≈ 1.0). occ10 comp2 = left, occ11 comp2 = right.
 pub(crate) const PUPIL_RAW_PER_MM: f64 = 100.0;
 
+/// Raw stream fields written to the decoded CSV, in column order.
 pub(crate) const LIVE_FIELDS: &[LiveField] = &[
     LiveField::new("gaze0_x", 0x00021f40, 0, 0),
     LiveField::new("gaze0_y", 0x00021f40, 0, 1),
@@ -49,6 +75,7 @@ pub(crate) const LIVE_FIELDS: &[LiveField] = &[
     LiveField::new("head9_z", 0x00031f41, 9, 2),
 ];
 
+/// Column names of [`derive_live_values`], in the same order as its output.
 pub(crate) const DERIVED_FIELDS: &[&str] = &[
     "gaze_valid",
     "gaze_x",
@@ -73,16 +100,28 @@ pub(crate) const DERIVED_FIELDS: &[&str] = &[
     "pupil_right",
 ];
 
-#[derive(Clone, Copy)]
+/// Address of one scalar in a decoded stream message, plus its CSV name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LiveField {
+    /// CSV column name (empty for ad-hoc lookups).
     pub(crate) name: &'static str,
+    /// TLV field id (type-5 entry).
     pub(crate) id: u32,
+    /// Zero-based index of this id's repetition within the message.
     pub(crate) occurrence: usize,
+    /// Zero-based index of the type-4 value following that id.
     pub(crate) component: usize,
 }
 
 impl LiveField {
-    pub(crate) const fn new(name: &'static str, id: u32, occurrence: usize, component: usize) -> Self {
+    /// A field address; `name` is only used for CSV headers.
+    #[must_use]
+    pub(crate) const fn new(
+        name: &'static str,
+        id: u32,
+        occurrence: usize,
+        component: usize,
+    ) -> Self {
         Self {
             name,
             id,
@@ -91,12 +130,17 @@ impl LiveField {
         }
     }
 
-    pub(crate) fn key(self) -> (u32, usize, usize) {
+    /// The map key this field is stored under.
+    #[must_use]
+    pub(crate) fn key(self) -> FieldKey {
         (self.id, self.occurrence, self.component)
     }
 }
 
-pub(crate) fn head_point(values: &BTreeMap<(u32, usize, usize), f64>, occurrence: usize) -> Option<[f64; 3]> {
+/// The 3-D head point of occurrence `occurrence` of field `0x00031f41`, or
+/// `None` if any component is absent (sentinel-filtered).
+#[must_use]
+pub(crate) fn head_point(values: &FieldValues, occurrence: usize) -> Option<[f64; 3]> {
     Some([
         field_value(values, LiveField::new("", 0x00031f41, occurrence, 0))?,
         field_value(values, LiveField::new("", 0x00031f41, occurrence, 1))?,
@@ -104,35 +148,61 @@ pub(crate) fn head_point(values: &BTreeMap<(u32, usize, usize), f64>, occurrence
     ])
 }
 
-#[derive(Clone, Debug)]
+/// One decoded gaze-stream message as the derived quantities the sinks emit.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrackingFrame {
+    /// Host wall-clock time (µs since the Unix epoch) when decoded.
     pub(crate) ts_us: u64,
+    /// Running stream message counter.
     pub(crate) packet: u64,
+    /// Whether the binocular gaze point lies within the plausible screen range.
     pub(crate) gaze_valid: bool,
+    /// Binocular gaze x (mean of both eyes), 0..1024.
     pub(crate) gaze_x: Option<f64>,
+    /// Binocular gaze y (mean of both eyes), 0..1024.
     pub(crate) gaze_y: Option<f64>,
+    /// `gaze_x / 1024` clamped to 0..1.
     pub(crate) gaze_norm_x: Option<f64>,
+    /// `gaze_y / 1024` clamped to 0..1.
     pub(crate) gaze_norm_y: Option<f64>,
+    /// Left-eye gaze x, 0..1024.
     pub(crate) left_eye_x: Option<f64>,
+    /// Left-eye gaze y, 0..1024.
     pub(crate) left_eye_y: Option<f64>,
+    /// Normalised left-eye gaze x.
     pub(crate) left_eye_norm_x: Option<f64>,
+    /// Normalised left-eye gaze y.
     pub(crate) left_eye_norm_y: Option<f64>,
+    /// Right-eye gaze x, 0..1024.
     pub(crate) right_eye_x: Option<f64>,
+    /// Right-eye gaze y, 0..1024.
     pub(crate) right_eye_y: Option<f64>,
+    /// Normalised right-eye gaze x.
     pub(crate) right_eye_norm_x: Option<f64>,
+    /// Normalised right-eye gaze y.
     pub(crate) right_eye_norm_y: Option<f64>,
+    /// Head lateral position (µm), roll-compensated.
     pub(crate) head_x: Option<f64>,
+    /// Head vertical position (µm).
     pub(crate) head_y: Option<f64>,
+    /// Head distance from the tracker (µm).
     pub(crate) head_z: Option<f64>,
+    /// Always `None`: yaw is not recoverable from this stream.
     pub(crate) head_yaw: Option<f64>,
+    /// Always `None`: pitch is not recoverable from this stream.
     pub(crate) head_pitch: Option<f64>,
+    /// Head roll (degrees) from the inter-eye line.
     pub(crate) head_roll: Option<f64>,
+    /// Left pupil diameter (mm).
     pub(crate) pupil_left: Option<f64>,
+    /// Right pupil diameter (mm).
     pub(crate) pupil_right: Option<f64>,
 }
 
 impl TrackingFrame {
-    pub(crate) fn from_decoded(packet: u64, values: &BTreeMap<(u32, usize, usize), f64>) -> Self {
+    /// Build a frame from a decoded value map, stamping it with the host clock.
+    #[must_use]
+    pub(crate) fn from_decoded(packet: u64, values: &FieldValues) -> Self {
         let derived = derive_live_values(values);
 
         Self {
@@ -162,6 +232,12 @@ impl TrackingFrame {
         }
     }
 
+    /// Write the frame as one JSON object (no trailing newline); absent or
+    /// non-finite numbers become `null`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates write failures from `out`.
     pub(crate) fn write_json<W: Write>(&self, out: &mut W) -> Result<()> {
         write!(
             out,
@@ -197,11 +273,19 @@ impl TrackingFrame {
         Ok(())
     }
 
+    /// Head position as `[x, y, z]` (µm), or `None` if any axis is absent.
+    #[must_use]
     pub(crate) fn head_xyz(&self) -> Option<[f64; 3]> {
         Some([self.head_x?, self.head_y?, self.head_z?])
     }
 }
 
+/// Write `"name":value` (six decimals, `null` when absent or non-finite),
+/// preceded by a comma unless `first`.
+///
+/// # Errors
+///
+/// Propagates write failures from `out`.
 pub(crate) fn write_json_number<W: Write>(
     out: &mut W,
     name: &str,
@@ -220,7 +304,9 @@ pub(crate) fn write_json_number<W: Write>(
     Ok(())
 }
 
-pub(crate) fn derive_live_values(values: &BTreeMap<(u32, usize, usize), f64>) -> [Option<f64>; 21] {
+/// Compute the [`DERIVED_FIELDS`] columns (same order) from a decoded message.
+#[must_use]
+pub(crate) fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
     let left_eye_x = field_value(values, LiveField::new("", 0x00021f40, 1, 0));
     let left_eye_y = field_value(values, LiveField::new("", 0x00021f40, 1, 1));
     let right_eye_x = field_value(values, LiveField::new("", 0x00021f40, 3, 0));
@@ -273,7 +359,7 @@ pub(crate) fn derive_live_values(values: &BTreeMap<(u32, usize, usize), f64>) ->
         field_value(values, LiveField::new("", 0x00031f41, 10, 2)).map(|v| v / PUPIL_RAW_PER_MM);
     let pupil_right =
         field_value(values, LiveField::new("", 0x00031f41, 11, 2)).map(|v| v / PUPIL_RAW_PER_MM);
-    let gaze_valid = gaze_valid(gaze_x, gaze_y);
+    let gaze_valid = is_gaze_valid(gaze_x, gaze_y);
 
     [
         Some(if gaze_valid { 1.0 } else { 0.0 }),
@@ -300,7 +386,10 @@ pub(crate) fn derive_live_values(values: &BTreeMap<(u32, usize, usize), f64>) ->
     ]
 }
 
-pub(crate) fn gaze_valid(x: Option<f64>, y: Option<f64>) -> bool {
+/// Whether both gaze coordinates are present and within 25% beyond the
+/// screen edges (`-256..=1280`).
+#[must_use]
+pub(crate) fn is_gaze_valid(x: Option<f64>, y: Option<f64>) -> bool {
     let Some(x) = x else {
         return false;
     };
@@ -312,20 +401,30 @@ pub(crate) fn gaze_valid(x: Option<f64>, y: Option<f64>) -> bool {
         && (-0.25 * GAZE_COORD_MAX..=1.25 * GAZE_COORD_MAX).contains(&y)
 }
 
+/// Gaze coordinate scaled to `0..=1` (clamped).
+#[must_use]
 pub(crate) fn norm_gaze(value: Option<f64>) -> Option<f64> {
     value.map(|value| (value / GAZE_COORD_MAX).clamp(0.0, 1.0))
 }
 
-pub(crate) fn field_value(values: &BTreeMap<(u32, usize, usize), f64>, field: LiveField) -> Option<f64> {
+/// Look up a field, treating the device's "absent" sentinels (`±1024.0`,
+/// `0.0`) as `None`.
+#[must_use]
+// reason: the sentinels are exact 32.32 fixed-point constants from the wire,
+// so a bit-exact comparison is the correct check (num-float-compare).
+#[allow(clippy::float_cmp)]
+pub(crate) fn field_value(values: &FieldValues, field: LiveField) -> Option<f64> {
     let value = values.get(&field.key()).copied()?;
-    if value.abs() == 1024.0 || value == 0.0 {
+    if value.abs() == FIELD_SENTINEL || value == 0.0 {
         None
     } else {
         Some(value)
     }
 }
 
-pub(crate) fn mean_keys(values: &BTreeMap<(u32, usize, usize), f64>, fields: &[LiveField]) -> Option<f64> {
+/// Mean of the present (non-sentinel) fields, or `None` if none are present.
+#[must_use]
+pub(crate) fn mean_keys(values: &FieldValues, fields: &[LiveField]) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0usize;
 
@@ -341,15 +440,31 @@ pub(crate) fn mean_keys(values: &BTreeMap<(u32, usize, usize), f64>, fields: &[L
     (count > 0).then_some(sum / count as f64)
 }
 
-pub(crate) fn decode_stream_payload(payload: &[u8]) -> Result<BTreeMap<(u32, usize, usize), f64>> {
+/// Decode a stream message into its value map, ignoring truncation.
+///
+/// # Errors
+///
+/// See [`decode_stream_payload_with_status`].
+pub(crate) fn decode_stream_payload(payload: &[u8]) -> Result<FieldValues> {
     let (values, _) = decode_stream_payload_with_status(payload)?;
     Ok(values)
 }
 
-pub(crate) fn decode_stream_payload_with_status(
-    payload: &[u8],
-) -> Result<(BTreeMap<(u32, usize, usize), f64>, bool)> {
-    let mut values = BTreeMap::<(u32, usize, usize), f64>::new();
+/// Decode the TLV list of a stream message starting at [`STREAM_TLV_OFFSET`].
+///
+/// Entries are `type: u8, len: BE u32, value`. A type-5/len-4 entry announces
+/// a field id (its n-th repetition is occurrence n); each following type-4/
+/// len-8 entry is one BE i64 32.32 fixed-point component of that field. Other
+/// entries (2/3: u32, 6: u64 timestamp) are skipped.
+///
+/// Returns the values and whether the list was truncated (an entry's declared
+/// length ran past the end of the payload); parsing stops at that entry.
+///
+/// # Errors
+///
+/// Fails only if a wire length does not fit in `usize` (32-bit hosts).
+pub(crate) fn decode_stream_payload_with_status(payload: &[u8]) -> Result<(FieldValues, bool)> {
+    let mut values = FieldValues::new();
     let mut offset = STREAM_TLV_OFFSET;
     let mut current_id = None::<u32>;
     let mut current_occurrence = 0usize;
@@ -359,10 +474,14 @@ pub(crate) fn decode_stream_payload_with_status(
 
     while offset + 5 <= payload.len() {
         let typ = payload[offset];
-        let len = u32::from_be_bytes(payload[offset + 1..offset + 5].try_into()?) as usize;
+        let len = usize::try_from(u32::from_be_bytes(
+            payload[offset + 1..offset + 5].try_into()?,
+        ))?;
         offset += 5;
 
-        if offset + len > payload.len() {
+        // `offset <= payload.len()` here, so this cannot underflow, and the
+        // subtraction form cannot overflow the way `offset + len` could.
+        if len > payload.len() - offset {
             malformed = true;
             break;
         }
@@ -381,12 +500,16 @@ pub(crate) fn decode_stream_payload_with_status(
             (4, 8) => {
                 if let Some(id) = current_id {
                     let raw = i64::from_be_bytes(value.try_into()?);
-                    let fixed = raw as f64 / 4_294_967_296.0;
+                    // cast: 32.32 fixed point -> f64; the integer part is
+                    // small (µm / screen units), well within f64's 53 bits.
+                    let fixed = raw as f64 / FIXED_POINT_ONE;
                     values.insert((id, current_occurrence, component), fixed);
                     component += 1;
                 }
             }
-            (2, 4) | (3, 4) | (6, 8) => {}
+            // u32 fields and the u64 device timestamp: not used by the live
+            // decoder, listed so the known wire types are documented here.
+            (2 | 3, 4) | (6, 8) => {}
             _ => {}
         }
 
@@ -400,10 +523,34 @@ pub(crate) fn decode_stream_payload_with_status(
 mod tests {
     use super::*;
 
-    fn eye(values: &mut BTreeMap<(u32, usize, usize), f64>, occ: usize, p: [f64; 3]) {
+    fn eye(values: &mut FieldValues, occ: usize, p: [f64; 3]) {
         for (component, v) in p.into_iter().enumerate() {
             values.insert((0x00031f41, occ, component), v);
         }
+    }
+
+    /// One TLV entry: `type`, BE u32 length, value.
+    fn tlv(typ: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![typ];
+        v.extend_from_slice(&u32::try_from(value.len()).expect("fits u32").to_be_bytes());
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// A stream message with header padding and one id followed by `raw`
+    /// 32.32 fixed-point components (already in wire units).
+    fn message(id: u32, raw: &[i64]) -> Vec<u8> {
+        let mut msg = vec![0u8; STREAM_TLV_OFFSET];
+        msg.extend(tlv(5, &id.to_be_bytes()));
+        for r in raw {
+            msg.extend(tlv(4, &r.to_be_bytes()));
+        }
+        msg
+    }
+
+    /// `v` in 32.32 fixed point.
+    const fn fixed(v: i64) -> i64 {
+        v << 32
     }
 
     #[test]
@@ -453,5 +600,63 @@ mod tests {
         assert!(derived[14].is_none()); // head_y
         assert!(derived[15].is_none()); // head_z
         assert!(derived[18].is_none()); // head_roll
+    }
+
+    #[test]
+    fn field_value_filters_exact_sentinels_only() {
+        let mut values = BTreeMap::new();
+        values.insert((0x00021f40, 1, 0), 1024.0);
+        values.insert((0x00021f40, 1, 1), -1024.0);
+        values.insert((0x00021f40, 3, 0), 0.0);
+        values.insert((0x00021f40, 3, 1), 1023.5);
+        assert_eq!(
+            field_value(&values, LiveField::new("", 0x00021f40, 1, 0)),
+            None
+        );
+        assert_eq!(
+            field_value(&values, LiveField::new("", 0x00021f40, 1, 1)),
+            None
+        );
+        assert_eq!(
+            field_value(&values, LiveField::new("", 0x00021f40, 3, 0)),
+            None
+        );
+        assert_eq!(
+            field_value(&values, LiveField::new("", 0x00021f40, 3, 1)),
+            Some(1023.5)
+        );
+        assert_eq!(
+            field_value(&values, LiveField::new("", 0x00021f40, 9, 9)),
+            None
+        );
+    }
+
+    #[test]
+    fn decodes_fixed_point_components_by_occurrence() {
+        let mut msg = message(0x00031f41, &[fixed(3) >> 1, fixed(-2), fixed(3)]);
+        msg.extend(message(0x00031f41, &[fixed(4)])[STREAM_TLV_OFFSET..].to_vec());
+        let (values, malformed) = decode_stream_payload_with_status(&msg).expect("decodes");
+        assert!(!malformed);
+        assert_eq!(values.get(&(0x00031f41, 0, 0)), Some(&1.5));
+        assert_eq!(values.get(&(0x00031f41, 0, 1)), Some(&-2.0));
+        assert_eq!(values.get(&(0x00031f41, 0, 2)), Some(&3.0));
+        assert_eq!(values.get(&(0x00031f41, 1, 0)), Some(&4.0));
+        assert_eq!(values.len(), 4);
+    }
+
+    #[test]
+    fn truncated_entry_sets_malformed_without_panicking() {
+        let mut msg = message(0x00031f41, &[fixed(1)]);
+        // Append an entry whose declared length overruns the payload.
+        msg.push(4);
+        msg.extend_from_slice(&u32::MAX.to_be_bytes());
+        msg.push(0xaa);
+        let (values, malformed) = decode_stream_payload_with_status(&msg).expect("decodes");
+        assert!(malformed);
+        assert_eq!(values.len(), 1, "entries before the truncation are kept");
+        // A payload shorter than the header decodes to nothing.
+        let (values, malformed) = decode_stream_payload_with_status(&[0u8; 10]).expect("decodes");
+        assert!(values.is_empty());
+        assert!(!malformed);
     }
 }
