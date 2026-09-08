@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Wall-clock microseconds since the Unix epoch (0 before the epoch,
 /// saturating at `u64::MAX`).
 #[must_use]
-pub(crate) fn now_us() -> u64 {
+pub fn now_us() -> u64 {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

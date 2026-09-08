@@ -18,26 +18,20 @@ pub mod cli;
 pub mod daemon;
 /// Terminal dashboard rendering live tracking frames.
 pub mod dashboard;
-/// Decoding of the 0x83 gaze / tracking stream into frames.
-pub mod decode;
 /// Research and diagnostic subcommands (replay, UVC camera, image83 tools).
 pub mod devcmd;
 /// USB transport and the live 0x83 gaze + image engine.
 pub mod device;
 pub mod engine;
-pub mod image83;
 pub use tobii_ipc as ipc;
-pub mod log;
 pub use tobii_log as logging;
+pub use tobii_proto::{decode, image83, log, protocol, time};
 /// Small numeric helpers (origin calibration, filtering, geometry).
 pub mod math;
 /// `OpenTrack` UDP sink and head/gaze-to-6DOF mapping.
 pub mod opentrack;
-/// Init-packet capture parsing and the device control protocol.
-pub mod protocol;
 /// Output sinks for decoded frames (CSV, JSONL) and the live fan-out.
 pub mod sinks;
-pub mod time;
 pub mod track;
 
 use anyhow::Result;

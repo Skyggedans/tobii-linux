@@ -34,15 +34,15 @@ const MAX_DIM: u32 = 4096;
 
 /// One decoded camera frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ImageFrame {
+pub struct ImageFrame {
     /// Device timestamp, microseconds (same clock as the gaze stream's key 1).
-    pub(crate) device_ts_us: u64,
+    pub device_ts_us: u64,
     /// Frame width in pixels.
-    pub(crate) width: usize,
+    pub width: usize,
     /// Frame height in pixels.
-    pub(crate) height: usize,
+    pub height: usize,
     /// Row-major 8-bit grayscale, `width * height` bytes (stride removed).
-    pub(crate) pixels: Vec<u8>,
+    pub pixels: Vec<u8>,
 }
 
 /// Which keyed field the next value entry belongs to, while walking the TLVs.
@@ -63,7 +63,7 @@ fn be_u32(b: &[u8]) -> Option<u32> {
 /// Decode one 0x50e stream message into a frame; `None` if it is not a
 /// well-formed image message.
 #[must_use]
-pub(crate) fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
+pub fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
     let mut off = STREAM_TLV_OFFSET;
     let mut key = KeyState::None;
     let mut ts = None;
@@ -155,13 +155,14 @@ pub(crate) fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
 /// Panics if `src` holds fewer than `w * h` bytes.
 #[cfg(test)]
 #[must_use]
-pub(crate) fn upscale2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+pub fn upscale2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = Vec::new();
     upscale2x_into(src, w, h, &mut out);
     out
 }
 
-/// [`upscale2x`] writing into `out`, which is resized to `w * h * 4` bytes.
+/// 2x nearest-neighbour upscale writing into `out`, which is resized to
+/// `w * h * 4` bytes.
 ///
 /// A caller in a per-frame loop hands the same vector back every time and
 /// keeps its allocation.
@@ -169,7 +170,7 @@ pub(crate) fn upscale2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// # Panics
 ///
 /// Panics if `src` holds fewer than `w * h` bytes.
-pub(crate) fn upscale2x_into(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+pub fn upscale2x_into(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
     assert!(
         src.len() >= w * h,
         "upscale2x: source has {} bytes, need {}",
@@ -200,7 +201,7 @@ pub(crate) fn upscale2x_into(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) 
 /// # Errors
 ///
 /// Propagates file creation and write failures.
-pub(crate) fn write_pgm(path: impl AsRef<Path>, frame: &ImageFrame) -> std::io::Result<()> {
+pub fn write_pgm(path: impl AsRef<Path>, frame: &ImageFrame) -> std::io::Result<()> {
     let mut f = BufWriter::new(std::fs::File::create(path)?);
     write!(f, "P5\n{} {}\n255\n", frame.width, frame.height)?;
     f.write_all(&frame.pixels)?;

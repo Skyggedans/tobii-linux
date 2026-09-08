@@ -11,21 +11,21 @@ use anyhow::{Context, Result};
 use std::fs;
 
 /// Marker (BE u32 at offset 8) of a host->device command message.
-pub(crate) const MARKER_COMMAND: u32 = 0x51;
+pub const MARKER_COMMAND: u32 = 0x51;
 /// Marker of a device->host response to a command (same `seq` as the command).
-pub(crate) const MARKER_RESPONSE: u32 = 0x52;
+pub const MARKER_RESPONSE: u32 = 0x52;
 /// Marker of a device->host stream message (gaze, presence, image).
-pub(crate) const MARKER_STREAM: u32 = 0x53;
+pub const MARKER_STREAM: u32 = 0x53;
 /// Marker of an unsolicited device->host notification.
-pub(crate) const MARKER_NOTIFICATION: u32 = 0x4e;
+pub const MARKER_NOTIFICATION: u32 = 0x4e;
 
 /// One line of an `init_packets` file: the OUT endpoint and the raw payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InitPacket {
+pub struct InitPacket {
     /// USB endpoint the payload was written to (e.g. `0x05`).
-    pub(crate) ep: u8,
+    pub ep: u8,
     /// Raw bytes as sent on the wire.
-    pub(crate) data: Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 /// Read and parse an `init_packets` text file (see [`parse_init_packets`]).
@@ -33,7 +33,7 @@ pub(crate) struct InitPacket {
 /// # Errors
 ///
 /// Fails if the file cannot be read or a line does not parse.
-pub(crate) fn read_init_packets(path: &str) -> Result<Vec<InitPacket>> {
+pub fn read_init_packets(path: &str) -> Result<Vec<InitPacket>> {
     let text = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
     parse_init_packets(&text)
 }
@@ -45,7 +45,7 @@ pub(crate) fn read_init_packets(path: &str) -> Result<Vec<InitPacket>> {
 ///
 /// Fails on a line missing either column, a non-hex endpoint, or a payload
 /// that is not an even-length hex string.
-pub(crate) fn parse_init_packets(text: &str) -> Result<Vec<InitPacket>> {
+pub fn parse_init_packets(text: &str) -> Result<Vec<InitPacket>> {
     let mut packets = Vec::new();
 
     for (line_no, line) in text.lines().enumerate() {
@@ -82,7 +82,7 @@ pub(crate) fn parse_init_packets(text: &str) -> Result<Vec<InitPacket>> {
 /// # Errors
 ///
 /// Fails on an odd number of hex digits or any non-hex byte pair.
-pub(crate) fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
+pub fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
     let s = s.trim().replace(':', "");
 
     if !s.len().is_multiple_of(2) {
@@ -110,19 +110,19 @@ pub(crate) fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
 /// For device->host messages this includes the 8-byte prefix; for host->device
 /// commands (see [`stream_start_packet`]) it is the body length after it.
 #[must_use]
-pub(crate) fn declared_len(buf: &[u8]) -> Option<u32> {
+pub fn declared_len(buf: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(buf.get(4..8)?.try_into().ok()?))
 }
 
 /// Message marker (BE u32 at offset 8): one of the `MARKER_*` constants.
 #[must_use]
-pub(crate) fn marker(buf: &[u8]) -> Option<u32> {
+pub fn marker(buf: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(buf.get(8..12)?.try_into().ok()?))
 }
 
 /// Command / response sequence number (BE u32 at offset 12).
 #[must_use]
-pub(crate) fn seq(buf: &[u8]) -> Option<u32> {
+pub fn seq(buf: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(buf.get(12..16)?.try_into().ok()?))
 }
 
@@ -141,15 +141,15 @@ pub(crate) fn seq(buf: &[u8]) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 /// Gaze stream (1724-byte messages, ~33 Hz).
-pub(crate) const STREAM_ID_GAZE: u32 = 0x500;
+pub const STREAM_ID_GAZE: u32 = 0x500;
 /// Presence stream (101-byte messages).
-pub(crate) const STREAM_ID_PRESENCE: u32 = 0x504;
+pub const STREAM_ID_PRESENCE: u32 = 0x504;
 /// `primary_camera_image` stream (78609-byte messages, see [`crate::image83`]).
-pub(crate) const STREAM_ID_IMAGE: u32 = 0x50e;
+pub const STREAM_ID_IMAGE: u32 = 0x50e;
 
 /// Stream id of a 0x53 stream message (BE u32 at payload offset 20).
 #[must_use]
-pub(crate) fn stream_id(buf: &[u8]) -> Option<u32> {
+pub fn stream_id(buf: &[u8]) -> Option<u32> {
     if marker(buf) != Some(MARKER_STREAM) {
         return None;
     }
@@ -184,14 +184,14 @@ fn looks_like_prefix(b: &[u8]) -> bool {
 /// in the message prefix and resyncs by dropping bytes when the prefix is
 /// implausible.
 #[derive(Debug, Default)]
-pub(crate) struct BulkReassembler {
+pub struct BulkReassembler {
     pending: Vec<u8>,
 }
 
 impl BulkReassembler {
     /// An empty reassembler.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -200,7 +200,7 @@ impl BulkReassembler {
     /// Allocating convenience wrapper around [`Self::push_into`], kept for the
     /// tests; the reader paths reuse one vector instead.
     #[cfg(test)]
-    pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+    pub fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         self.push_into(data, &mut out);
         out
@@ -210,7 +210,7 @@ impl BulkReassembler {
     ///
     /// `out` is cleared first, so a caller in a read loop can hand the same
     /// vector back on every iteration and keep its allocation.
-    pub(crate) fn push_into(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
+    pub fn push_into(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
         out.clear();
         if data.is_empty() {
             return;
@@ -256,7 +256,7 @@ impl BulkReassembler {
 
     /// Bytes buffered but not yet forming a message.
     #[must_use]
-    pub(crate) fn pending_len(&self) -> usize {
+    pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
 }
@@ -294,13 +294,13 @@ fn stream_command_packet(cmd: u32, seq: u32, id: u32, with_flags: bool) -> Vec<u
 
 /// Command 1220: start streaming `id` (e.g. `STREAM_ID_IMAGE`).
 #[must_use]
-pub(crate) fn stream_start_packet(seq: u32, id: u32) -> Vec<u8> {
+pub fn stream_start_packet(seq: u32, id: u32) -> Vec<u8> {
     stream_command_packet(CMD_STREAM_START, seq, id, true)
 }
 
 /// Command 1230: stop streaming `id`.
 #[must_use]
-pub(crate) fn stream_stop_packet(seq: u32, id: u32) -> Vec<u8> {
+pub fn stream_stop_packet(seq: u32, id: u32) -> Vec<u8> {
     stream_command_packet(CMD_STREAM_STOP, seq, id, false)
 }
 

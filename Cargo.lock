@@ -745,6 +745,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+]
+
+[[package]]
 name = "tobii5-init-replay"
 version = "0.1.0"
 dependencies = [
@@ -754,6 +762,7 @@ dependencies = [
  "rusb",
  "tobii-ipc",
  "tobii-log",
+ "tobii-proto",
  "tracing",
 ]
 

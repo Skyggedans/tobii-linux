@@ -14,17 +14,17 @@ use std::io::Write;
 use crate::time::now_us;
 
 /// Key of a decoded stream value: `(field id, occurrence, component)`.
-pub(crate) type FieldKey = (u32, usize, usize);
+pub type FieldKey = (u32, usize, usize);
 
 /// All values of one decoded stream message, keyed by [`FieldKey`].
-pub(crate) type FieldValues = BTreeMap<FieldKey, f64>;
+pub type FieldValues = BTreeMap<FieldKey, f64>;
 
 /// Offset of the first TLV entry in a 0x53 stream message (after the common
 /// 34-byte stream header).
-pub(crate) const STREAM_TLV_OFFSET: usize = 34;
+pub const STREAM_TLV_OFFSET: usize = 34;
 
 /// Full-scale gaze coordinate; gaze points are reported in `0..=1024`.
-pub(crate) const GAZE_COORD_MAX: f64 = 1024.0;
+pub const GAZE_COORD_MAX: f64 = 1024.0;
 
 /// The device reports an absent field as exactly `±1024.0` or `0.0` (32.32
 /// fixed point, so these are bit-exact).
@@ -39,14 +39,14 @@ const FIXED_POINT_ONE: f64 = 4_294_967_296.0;
 /// reported lateral translation, so a roll nets ~zero apparent tx. Fit on the
 /// `roll_only` captures (native ≈137 mm; the Windows replication set gives
 /// ≈120–125 mm) — user/mounting dependent, hence a single tunable constant.
-pub(crate) const HEAD_ROLL_LEVER_UM: f64 = 137_000.0;
+pub const HEAD_ROLL_LEVER_UM: f64 = 137_000.0;
 
 /// Pupil diameter is reported in hundredths of a millimeter (raw 342 ≈ 3.42 mm;
 /// binocular readings track to r ≈ 1.0). occ10 comp2 = left, occ11 comp2 = right.
-pub(crate) const PUPIL_RAW_PER_MM: f64 = 100.0;
+pub const PUPIL_RAW_PER_MM: f64 = 100.0;
 
 /// Raw stream fields written to the decoded CSV, in column order.
-pub(crate) const LIVE_FIELDS: &[LiveField] = &[
+pub const LIVE_FIELDS: &[LiveField] = &[
     LiveField::new("gaze0_x", 0x00021f40, 0, 0),
     LiveField::new("gaze0_y", 0x00021f40, 0, 1),
     LiveField::new("gaze1_x", 0x00021f40, 1, 0),
@@ -76,7 +76,7 @@ pub(crate) const LIVE_FIELDS: &[LiveField] = &[
 ];
 
 /// Column names of [`derive_live_values`], in the same order as its output.
-pub(crate) const DERIVED_FIELDS: &[&str] = &[
+pub const DERIVED_FIELDS: &[&str] = &[
     "gaze_valid",
     "gaze_x",
     "gaze_y",
@@ -102,26 +102,21 @@ pub(crate) const DERIVED_FIELDS: &[&str] = &[
 
 /// Address of one scalar in a decoded stream message, plus its CSV name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LiveField {
+pub struct LiveField {
     /// CSV column name (empty for ad-hoc lookups).
-    pub(crate) name: &'static str,
+    pub name: &'static str,
     /// TLV field id (type-5 entry).
-    pub(crate) id: u32,
+    pub id: u32,
     /// Zero-based index of this id's repetition within the message.
-    pub(crate) occurrence: usize,
+    pub occurrence: usize,
     /// Zero-based index of the type-4 value following that id.
-    pub(crate) component: usize,
+    pub component: usize,
 }
 
 impl LiveField {
     /// A field address; `name` is only used for CSV headers.
     #[must_use]
-    pub(crate) const fn new(
-        name: &'static str,
-        id: u32,
-        occurrence: usize,
-        component: usize,
-    ) -> Self {
+    pub const fn new(name: &'static str, id: u32, occurrence: usize, component: usize) -> Self {
         Self {
             name,
             id,
@@ -132,7 +127,7 @@ impl LiveField {
 
     /// The map key this field is stored under.
     #[must_use]
-    pub(crate) fn key(self) -> FieldKey {
+    pub fn key(self) -> FieldKey {
         (self.id, self.occurrence, self.component)
     }
 }
@@ -140,7 +135,7 @@ impl LiveField {
 /// The 3-D head point of occurrence `occurrence` of field `0x00031f41`, or
 /// `None` if any component is absent (sentinel-filtered).
 #[must_use]
-pub(crate) fn head_point(values: &FieldValues, occurrence: usize) -> Option<[f64; 3]> {
+pub fn head_point(values: &FieldValues, occurrence: usize) -> Option<[f64; 3]> {
     Some([
         field_value(values, LiveField::new("", 0x00031f41, occurrence, 0))?,
         field_value(values, LiveField::new("", 0x00031f41, occurrence, 1))?,
@@ -150,59 +145,59 @@ pub(crate) fn head_point(values: &FieldValues, occurrence: usize) -> Option<[f64
 
 /// One decoded gaze-stream message as the derived quantities the sinks emit.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct TrackingFrame {
+pub struct TrackingFrame {
     /// Host wall-clock time (µs since the Unix epoch) when decoded.
-    pub(crate) ts_us: u64,
+    pub ts_us: u64,
     /// Running stream message counter.
-    pub(crate) packet: u64,
+    pub packet: u64,
     /// Whether the binocular gaze point lies within the plausible screen range.
-    pub(crate) gaze_valid: bool,
+    pub gaze_valid: bool,
     /// Binocular gaze x (mean of both eyes), 0..1024.
-    pub(crate) gaze_x: Option<f64>,
+    pub gaze_x: Option<f64>,
     /// Binocular gaze y (mean of both eyes), 0..1024.
-    pub(crate) gaze_y: Option<f64>,
+    pub gaze_y: Option<f64>,
     /// `gaze_x / 1024` clamped to 0..1.
-    pub(crate) gaze_norm_x: Option<f64>,
+    pub gaze_norm_x: Option<f64>,
     /// `gaze_y / 1024` clamped to 0..1.
-    pub(crate) gaze_norm_y: Option<f64>,
+    pub gaze_norm_y: Option<f64>,
     /// Left-eye gaze x, 0..1024.
-    pub(crate) left_eye_x: Option<f64>,
+    pub left_eye_x: Option<f64>,
     /// Left-eye gaze y, 0..1024.
-    pub(crate) left_eye_y: Option<f64>,
+    pub left_eye_y: Option<f64>,
     /// Normalised left-eye gaze x.
-    pub(crate) left_eye_norm_x: Option<f64>,
+    pub left_eye_norm_x: Option<f64>,
     /// Normalised left-eye gaze y.
-    pub(crate) left_eye_norm_y: Option<f64>,
+    pub left_eye_norm_y: Option<f64>,
     /// Right-eye gaze x, 0..1024.
-    pub(crate) right_eye_x: Option<f64>,
+    pub right_eye_x: Option<f64>,
     /// Right-eye gaze y, 0..1024.
-    pub(crate) right_eye_y: Option<f64>,
+    pub right_eye_y: Option<f64>,
     /// Normalised right-eye gaze x.
-    pub(crate) right_eye_norm_x: Option<f64>,
+    pub right_eye_norm_x: Option<f64>,
     /// Normalised right-eye gaze y.
-    pub(crate) right_eye_norm_y: Option<f64>,
+    pub right_eye_norm_y: Option<f64>,
     /// Head lateral position (µm), roll-compensated.
-    pub(crate) head_x: Option<f64>,
+    pub head_x: Option<f64>,
     /// Head vertical position (µm).
-    pub(crate) head_y: Option<f64>,
+    pub head_y: Option<f64>,
     /// Head distance from the tracker (µm).
-    pub(crate) head_z: Option<f64>,
+    pub head_z: Option<f64>,
     /// Always `None`: yaw is not recoverable from this stream.
-    pub(crate) head_yaw: Option<f64>,
+    pub head_yaw: Option<f64>,
     /// Always `None`: pitch is not recoverable from this stream.
-    pub(crate) head_pitch: Option<f64>,
+    pub head_pitch: Option<f64>,
     /// Head roll (degrees) from the inter-eye line.
-    pub(crate) head_roll: Option<f64>,
+    pub head_roll: Option<f64>,
     /// Left pupil diameter (mm).
-    pub(crate) pupil_left: Option<f64>,
+    pub pupil_left: Option<f64>,
     /// Right pupil diameter (mm).
-    pub(crate) pupil_right: Option<f64>,
+    pub pupil_right: Option<f64>,
 }
 
 impl TrackingFrame {
     /// Build a frame from a decoded value map, stamping it with the host clock.
     #[must_use]
-    pub(crate) fn from_decoded(packet: u64, values: &FieldValues) -> Self {
+    pub fn from_decoded(packet: u64, values: &FieldValues) -> Self {
         let derived = derive_live_values(values);
 
         Self {
@@ -238,7 +233,7 @@ impl TrackingFrame {
     /// # Errors
     ///
     /// Propagates write failures from `out`.
-    pub(crate) fn write_json<W: Write>(&self, out: &mut W) -> Result<()> {
+    pub fn write_json<W: Write>(&self, out: &mut W) -> Result<()> {
         write!(
             out,
             "{{\"ts_us\":{},\"packet\":{},\"gaze_valid\":{},",
@@ -275,7 +270,7 @@ impl TrackingFrame {
 
     /// Head position as `[x, y, z]` (µm), or `None` if any axis is absent.
     #[must_use]
-    pub(crate) fn head_xyz(&self) -> Option<[f64; 3]> {
+    pub fn head_xyz(&self) -> Option<[f64; 3]> {
         Some([self.head_x?, self.head_y?, self.head_z?])
     }
 }
@@ -286,7 +281,7 @@ impl TrackingFrame {
 /// # Errors
 ///
 /// Propagates write failures from `out`.
-pub(crate) fn write_json_number<W: Write>(
+pub fn write_json_number<W: Write>(
     out: &mut W,
     name: &str,
     value: Option<f64>,
@@ -306,7 +301,7 @@ pub(crate) fn write_json_number<W: Write>(
 
 /// Compute the [`DERIVED_FIELDS`] columns (same order) from a decoded message.
 #[must_use]
-pub(crate) fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
+pub fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
     let left_eye_x = field_value(values, LiveField::new("", 0x00021f40, 1, 0));
     let left_eye_y = field_value(values, LiveField::new("", 0x00021f40, 1, 1));
     let right_eye_x = field_value(values, LiveField::new("", 0x00021f40, 3, 0));
@@ -389,7 +384,7 @@ pub(crate) fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
 /// Whether both gaze coordinates are present and within 25% beyond the
 /// screen edges (`-256..=1280`).
 #[must_use]
-pub(crate) fn is_gaze_valid(x: Option<f64>, y: Option<f64>) -> bool {
+pub fn is_gaze_valid(x: Option<f64>, y: Option<f64>) -> bool {
     let Some(x) = x else {
         return false;
     };
@@ -403,7 +398,7 @@ pub(crate) fn is_gaze_valid(x: Option<f64>, y: Option<f64>) -> bool {
 
 /// Gaze coordinate scaled to `0..=1` (clamped).
 #[must_use]
-pub(crate) fn norm_gaze(value: Option<f64>) -> Option<f64> {
+pub fn norm_gaze(value: Option<f64>) -> Option<f64> {
     value.map(|value| (value / GAZE_COORD_MAX).clamp(0.0, 1.0))
 }
 
@@ -413,7 +408,7 @@ pub(crate) fn norm_gaze(value: Option<f64>) -> Option<f64> {
 // reason: the sentinels are exact 32.32 fixed-point constants from the wire,
 // so a bit-exact comparison is the correct check (num-float-compare).
 #[allow(clippy::float_cmp)]
-pub(crate) fn field_value(values: &FieldValues, field: LiveField) -> Option<f64> {
+pub fn field_value(values: &FieldValues, field: LiveField) -> Option<f64> {
     let value = values.get(&field.key()).copied()?;
     if value.abs() == FIELD_SENTINEL || value == 0.0 {
         None
@@ -424,7 +419,7 @@ pub(crate) fn field_value(values: &FieldValues, field: LiveField) -> Option<f64>
 
 /// Mean of the present (non-sentinel) fields, or `None` if none are present.
 #[must_use]
-pub(crate) fn mean_keys(values: &FieldValues, fields: &[LiveField]) -> Option<f64> {
+pub fn mean_keys(values: &FieldValues, fields: &[LiveField]) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0usize;
 
@@ -445,7 +440,7 @@ pub(crate) fn mean_keys(values: &FieldValues, fields: &[LiveField]) -> Option<f6
 /// # Errors
 ///
 /// See [`decode_stream_payload_with_status`].
-pub(crate) fn decode_stream_payload(payload: &[u8]) -> Result<FieldValues> {
+pub fn decode_stream_payload(payload: &[u8]) -> Result<FieldValues> {
     let (values, _) = decode_stream_payload_with_status(payload)?;
     Ok(values)
 }
@@ -463,7 +458,7 @@ pub(crate) fn decode_stream_payload(payload: &[u8]) -> Result<FieldValues> {
 /// # Errors
 ///
 /// Fails only if a wire length does not fit in `usize` (32-bit hosts).
-pub(crate) fn decode_stream_payload_with_status(payload: &[u8]) -> Result<(FieldValues, bool)> {
+pub fn decode_stream_payload_with_status(payload: &[u8]) -> Result<(FieldValues, bool)> {
     let mut values = FieldValues::new();
     let mut offset = STREAM_TLV_OFFSET;
     let mut current_id = None::<u32>;

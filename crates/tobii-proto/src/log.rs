@@ -14,15 +14,15 @@ use crate::protocol::{MARKER_STREAM, marker};
 use crate::time::now_us;
 
 /// Magic at the start of a packet log written by [`PacketLog`].
-pub(crate) const LOG_MAGIC: &[u8; 8] = b"TBI5LOG1";
+pub const LOG_MAGIC: &[u8; 8] = b"TBI5LOG1";
 
 /// Size of one packet-log record header (`ts_us` u64, `ep` u32, LE u32 payload length).
 const LOG_RECORD_HEADER_LEN: usize = 16;
 
 /// Raw USB packet log (`LOG_MAGIC` header, then one record per packet).
 #[derive(Debug)]
-pub(crate) struct PacketLog {
-    pub(crate) out: BufWriter<File>,
+pub struct PacketLog {
+    out: BufWriter<File>,
 }
 
 impl PacketLog {
@@ -30,7 +30,7 @@ impl PacketLog {
     ///
     /// # Errors
     /// Fails when the file cannot be created or the header cannot be written.
-    pub(crate) fn create(path: &str) -> Result<Self> {
+    pub fn create(path: &str) -> Result<Self> {
         let mut out = BufWriter::new(
             File::create(path).with_context(|| format!("failed to create log {path}"))?,
         );
@@ -43,7 +43,7 @@ impl PacketLog {
     ///
     /// # Errors
     /// See [`PacketLog::write_record_at`].
-    pub(crate) fn write_record(&mut self, ep: u8, data: &[u8]) -> Result<()> {
+    pub fn write_record(&mut self, ep: u8, data: &[u8]) -> Result<()> {
         self.write_record_at(now_us(), ep, data)
     }
 
@@ -52,7 +52,7 @@ impl PacketLog {
     ///
     /// # Errors
     /// Fails when the payload exceeds `u32::MAX` bytes or the write fails.
-    pub(crate) fn write_record_at(&mut self, ts_us: u64, ep: u8, data: &[u8]) -> Result<()> {
+    pub fn write_record_at(&mut self, ts_us: u64, ep: u8, data: &[u8]) -> Result<()> {
         let len = u32::try_from(data.len()).context("packet too large for the log record")?;
         self.out.write_all(&[0, ep, 0, 0])?;
         self.out.write_all(&ts_us.to_le_bytes())?;
@@ -67,7 +67,7 @@ impl PacketLog {
 ///
 /// # Errors
 /// See [`PacketLog::write_record`].
-pub(crate) fn log_packet(log: &mut Option<PacketLog>, ep: u8, data: &[u8]) -> Result<()> {
+pub fn log_packet(log: &mut Option<PacketLog>, ep: u8, data: &[u8]) -> Result<()> {
     if let Some(log) = log {
         log.write_record(ep, data)?;
     }
@@ -80,7 +80,7 @@ pub(crate) fn log_packet(log: &mut Option<PacketLog>, ep: u8, data: &[u8]) -> Re
 ///
 /// Fails if the file cannot be opened, the magic does not match, or a record
 /// is truncated after its header.
-pub(crate) fn read_log_payloads(path: &str) -> Result<Vec<Vec<u8>>> {
+pub fn read_log_payloads(path: &str) -> Result<Vec<Vec<u8>>> {
     let mut input =
         BufReader::new(File::open(path).with_context(|| format!("failed to open log {path}"))?);
     let mut magic = [0u8; LOG_MAGIC.len()];
@@ -120,7 +120,7 @@ pub(crate) fn read_log_payloads(path: &str) -> Result<Vec<Vec<u8>>> {
 /// # Errors
 ///
 /// Propagates [`read_log_payloads`] failures.
-pub(crate) fn main_stream_payloads(path: &str) -> Result<Vec<Vec<u8>>> {
+pub fn main_stream_payloads(path: &str) -> Result<Vec<Vec<u8>>> {
     let stream: Vec<Vec<u8>> = read_log_payloads(path)?
         .into_iter()
         .filter(|payload| marker(payload) == Some(MARKER_STREAM))
