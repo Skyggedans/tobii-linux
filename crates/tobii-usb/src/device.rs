@@ -4,7 +4,7 @@
 //! This is the production path: open and claim the device, replay the captured
 //! init sequence, then decode the multiplexed gaze (0x500) and IR image (0x50e)
 //! streams on EP 0x83, running head-pose inference on the images. The UVC
-//! camera and every offline/diagnostic subcommand live in [`crate::devcmd`].
+//! camera and every offline/diagnostic subcommand live in the research CLI.
 
 use anyhow::{Context, Result};
 use rusb::{Context as UsbContext, UsbContext as _};
@@ -15,15 +15,15 @@ use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
 use tracing::{debug, error, info, warn};
 
-use crate::decode::{TrackingFrame, decode_stream_payload};
 use crate::engine::{GazeSample, PoseSample, Sample};
-use crate::image83::{ImageFrame, decode_image_payload, upscale2x_into};
-use crate::log::{PacketLog, log_packet};
-use crate::protocol::{
+use tobii_proto::decode::{TrackingFrame, decode_stream_payload};
+use tobii_proto::image83::{ImageFrame, decode_image_payload, upscale2x_into};
+use tobii_proto::log::{PacketLog, log_packet};
+use tobii_proto::protocol::{
     BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, declared_len, marker,
     parse_init_packets, seq, stream_id, stream_start_packet, stream_stop_packet,
 };
-use crate::time::now_us;
+use tobii_proto::time::now_us;
 
 /// USB vendor id of the Tobii Eye Tracker 5.
 pub(crate) const VID: u16 = 0x2104;
@@ -35,7 +35,7 @@ pub(crate) const PID: u16 = 0x0313;
 pub(crate) const IFACE: u8 = 0;
 
 /// Bulk IN endpoint of the multiplexed processed stream.
-pub(crate) const EP_IN: u8 = 0x83;
+pub const EP_IN: u8 = 0x83;
 
 /// Bulk OUT endpoint for command messages (what the init replay writes to).
 pub(crate) const EP_OUT: u8 = 0x05;
@@ -43,10 +43,10 @@ pub(crate) const EP_OUT: u8 = 0x05;
 /// One read must hold the largest multiplexed message on EP 0x83: the 0x50e
 /// image stream is 78609 bytes. Every message ends in a short USB packet, so a
 /// buffer this size normally returns exactly one whole message per read.
-pub(crate) const READ_BUF: usize = 128 * 1024;
+pub const READ_BUF: usize = 128 * 1024;
 
 /// Full open+init attempts before giving up on a device that never streams.
-pub(crate) const MAX_REPLAY_ATTEMPTS: usize = 5;
+pub const MAX_REPLAY_ATTEMPTS: usize = 5;
 
 /// Bulk-flag parsing shared by the `TOBII_*` opt-out variables: set and
 /// neither empty nor `"0"`.
@@ -56,7 +56,7 @@ fn is_env_flag_set(name: &str) -> bool {
 
 /// Retryable failure: the device accepted the init but never streamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StreamStartupTimeout;
+pub struct StreamStartupTimeout;
 
 impl fmt::Display for StreamStartupTimeout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,7 +67,12 @@ impl fmt::Display for StreamStartupTimeout {
 impl error::Error for StreamStartupTimeout {}
 
 /// Find the tracker on the bus, open it and claim interface 0.
-pub(crate) fn open_tobii(ctx: &UsbContext) -> Result<rusb::DeviceHandle<UsbContext>> {
+///
+/// # Errors
+///
+/// Fails when no matching device is present, or when it cannot be opened,
+/// configured or claimed (usually a permissions or busy-device problem).
+pub fn open_tobii(ctx: &UsbContext) -> Result<rusb::DeviceHandle<UsbContext>> {
     let devices = ctx.devices()?;
     let mut found = None;
 
@@ -110,7 +115,11 @@ pub(crate) fn open_tobii(ctx: &UsbContext) -> Result<rusb::DeviceHandle<UsbConte
 
 /// The vendor control handshake that powers the sensor and starts the
 /// processed stream firmware-side (requests 48 / 70 / 65).
-pub(crate) fn vendor_control_init(h: &mut rusb::DeviceHandle<UsbContext>) -> Result<()> {
+///
+/// # Errors
+///
+/// Propagates a failing control transfer.
+pub fn vendor_control_init(h: &mut rusb::DeviceHandle<UsbContext>) -> Result<()> {
     let timeout = Duration::from_millis(2000);
 
     let init_data: [u8; 24] = [
@@ -145,7 +154,7 @@ pub(crate) fn vendor_control_init(h: &mut rusb::DeviceHandle<UsbContext>) -> Res
 /// device is left streaming and comes up in an undefined state on the next open
 /// (the "works every other start" flakiness). Best-effort: errors are ignored
 /// because we run it on the teardown path where the handle is about to drop.
-pub(crate) fn vendor_control_deinit(h: &mut rusb::DeviceHandle<UsbContext>) {
+pub fn vendor_control_deinit(h: &mut rusb::DeviceHandle<UsbContext>) {
     let timeout = Duration::from_millis(500);
     // Quiet on success: this also runs on each cold-start prime re-open, where a
     // "stop stream written" line would just be confusing noise.
@@ -157,7 +166,7 @@ pub(crate) fn vendor_control_deinit(h: &mut rusb::DeviceHandle<UsbContext>) {
 /// The seq an init/command packet expects echoed in its `0x52` response:
 /// only `0x51` command packets get one.
 #[must_use]
-pub(crate) fn command_seq(data: &[u8]) -> Option<u32> {
+pub fn command_seq(data: &[u8]) -> Option<u32> {
     if marker(data) == Some(0x51) {
         seq(data)
     } else {
@@ -167,7 +176,7 @@ pub(crate) fn command_seq(data: &[u8]) -> Option<u32> {
 
 /// Where `wait_for_response_seq` reports each message it reads while waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResponseEcho {
+pub enum ResponseEcho {
     /// Echo to stdout as program output (the `replay` handshake trace).
     Stdout,
     /// `debug!` only (daemon / engine / diagnostics that own their stdout).
@@ -176,7 +185,11 @@ pub(crate) enum ResponseEcho {
 
 /// Read EP `0x83` until the `0x52` response carrying `expected_seq` arrives,
 /// logging every message read meanwhile to `log`.
-pub(crate) fn wait_for_response_seq(
+///
+/// # Errors
+///
+/// Fails when the bulk read fails, or when writing to `log` fails.
+pub fn wait_for_response_seq(
     h: &mut rusb::DeviceHandle<UsbContext>,
     expected_seq: u32,
     log: &mut Option<PacketLog>,
@@ -250,7 +263,7 @@ fn reset_device_baseline(ctx: &UsbContext) {
 
 /// Is the Tobii plugged in right now? (Cheap check for the daemon watchdog.)
 #[must_use]
-pub(crate) fn is_device_present() -> bool {
+pub fn is_device_present() -> bool {
     UsbContext::new()
         .map(|ctx| is_tobii_present(&ctx))
         .unwrap_or(false)
@@ -285,7 +298,7 @@ fn is_tobii_present(ctx: &UsbContext) -> bool {
 const RESET_ESCALATION_ATTEMPT: usize = 3;
 
 /// Own the device for the daemon engine and stream samples into `tx` until
-/// `stop` is set (see the note above [`RESET_ESCALATION_ATTEMPT`]).
+/// `stop` is set (see the note on the reset-escalation constant below).
 ///
 /// `stop`, `recenter` and `head_wanted` are pure signals (no data is
 /// published through them), so every access uses `Ordering::Relaxed`.
@@ -294,7 +307,7 @@ const RESET_ESCALATION_ATTEMPT: usize = 3;
 ///
 /// Returns the last attempt's error once the device fails to stream after
 /// [`MAX_REPLAY_ATTEMPTS`] opens, or immediately on a non-retryable USB error.
-pub(crate) fn run_gaze_engine(
+pub fn run_gaze_engine(
     stop: &Arc<AtomicBool>,
     recenter: &Arc<AtomicBool>,
     head_wanted: &Arc<AtomicBool>,
@@ -391,7 +404,7 @@ fn pose_worker(
     head_wanted: &AtomicBool,
     tx: &Sender<Sample>,
 ) {
-    let mut tracker = match crate::track::Tracker::new_image83() {
+    let mut tracker = match tobii_pose::track::Tracker::new_image83() {
         Ok(t) => t,
         Err(e) => {
             error!(
@@ -493,7 +506,11 @@ fn gaze_engine_attempt(
 /// Replay the init-packet sequence once on `h`, waiting (best-effort) for
 /// each command's `0x52` echo. Returns early without error once `stop` is
 /// set; a failed write ends the replay with an error.
-pub(crate) fn replay_init_packets(
+///
+/// # Errors
+///
+/// Fails when an init packet cannot be written to the device.
+pub fn replay_init_packets(
     h: &mut rusb::DeviceHandle<UsbContext>,
     packets: &[InitPacket],
     stop: Option<&AtomicBool>,
@@ -521,7 +538,7 @@ pub(crate) fn replay_init_packets(
 /// while a freshly requested 0x50e stream may run). Draining matters: an
 /// unread IN buffer can stall the firmware. `asm` is shared with the pump so
 /// a partially read message is not lost at the hand-off.
-pub(crate) fn wait_for_gaze_stream(
+pub fn wait_for_gaze_stream(
     h: &mut rusb::DeviceHandle<UsbContext>,
     stop: &AtomicBool,
     dur: Duration,
@@ -564,7 +581,8 @@ fn to_i64_us(us: u64) -> i64 {
 /// The command sequence number to use after the init replay: one past the
 /// highest 0x51 seq in the replayed packets (the device echoes it in the 0x52
 /// response, which is how we match replies).
-pub(crate) fn next_command_seq(packets: &[InitPacket]) -> u32 {
+#[must_use]
+pub fn next_command_seq(packets: &[InitPacket]) -> u32 {
     packets
         .iter()
         .filter(|p| marker(&p.data) == Some(0x51))
@@ -600,11 +618,11 @@ fn send_command(
 }
 
 /// Ask the device to start stream `id` (command 1220) and wait for the ack.
-pub(crate) fn start_stream(
-    h: &mut rusb::DeviceHandle<UsbContext>,
-    cmd_seq: u32,
-    id: u32,
-) -> Result<()> {
+///
+/// # Errors
+///
+/// Fails when the command cannot be written or is not acknowledged in time.
+pub fn start_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32) -> Result<()> {
     send_command(
         h,
         &stream_start_packet(cmd_seq, id),
@@ -614,11 +632,11 @@ pub(crate) fn start_stream(
 }
 
 /// Ask the device to stop stream `id` (command 1230) and wait for the ack.
-pub(crate) fn stop_stream(
-    h: &mut rusb::DeviceHandle<UsbContext>,
-    cmd_seq: u32,
-    id: u32,
-) -> Result<()> {
+///
+/// # Errors
+///
+/// Fails when the command cannot be written or is not acknowledged in time.
+pub fn stop_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32) -> Result<()> {
     send_command(
         h,
         &stream_stop_packet(cmd_seq, id),

@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tobii-ffi = { path = "crates/tobii-ffi" }
 tobii-pose = { path = "crates/tobii-pose" }
 tobii-proto = { path = "crates/tobii-proto" }
+tobii-usb = { path = "crates/tobii-usb" }
 tobii-ipc = { path = "crates/tobii-ipc" }
 tobii-log = { path = "crates/tobii-log" }
 
@@ -102,6 +103,7 @@ tracing.workspace = true
 tobii-ipc.workspace = true
 tobii-pose.workspace = true
 tobii-proto.workspace = true
+tobii-usb.workspace = true
 tobii-log.workspace = true
 
 [lints]

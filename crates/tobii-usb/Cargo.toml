@@ -1,0 +1,18 @@
+[package]
+name = "tobii-usb"
+description = "USB transport for the Tobii Eye Tracker 5 and the live 0x83 gaze + IR image engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rusb.workspace = true
+tobii-pose.workspace = true
+tobii-proto.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

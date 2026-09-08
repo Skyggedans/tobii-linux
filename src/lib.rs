@@ -18,13 +18,11 @@ pub mod daemon;
 pub mod dashboard;
 /// Research and diagnostic subcommands (replay, UVC camera, image83 tools).
 pub mod devcmd;
-/// USB transport and the live 0x83 gaze + image engine.
-pub mod device;
-pub mod engine;
 pub use tobii_ipc as ipc;
 pub use tobii_log as logging;
 pub use tobii_pose::track;
 pub use tobii_proto::{decode, image83, log, protocol, time};
+pub use tobii_usb::{device, engine};
 /// Small numeric helpers (origin calibration, filtering, geometry).
 pub mod math;
 /// `OpenTrack` UDP sink and head/gaze-to-6DOF mapping.

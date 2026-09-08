@@ -28,7 +28,10 @@ pub(crate) const DEFAULT_OPENTRACK_HOST: &str = "127.0.0.1";
 pub(crate) const DEFAULT_OPENTRACK_PORT: u16 = 4242;
 
 /// Init-packet capture replayed to bring the device up when none is given.
-const DEFAULT_INIT_PATH: &str = "init_packets_ep.txt";
+const DEFAULT_INIT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/tobii-usb/init_packets_ep.txt"
+);
 
 /// The process arguments after the program name.
 type Args = Peekable<Skip<env::Args>>;

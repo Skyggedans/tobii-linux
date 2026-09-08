@@ -393,5 +393,8 @@ fn push_sample_frames(s: &Sample, out: &mut Vec<(u8, Vec<u8>)>) {
             ));
             out.push((STREAM_PRESENCE, encode_presence(g.timestamp_us, status)));
         }
+        // `Sample` is #[non_exhaustive]: a kind added by a newer engine is
+        // dropped rather than breaking the wire protocol.
+        _ => {}
     }
 }
