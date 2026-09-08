@@ -1,6 +1,6 @@
 //! Process-wide diagnostics setup for the binaries.
 //!
-//! The library itself only emits through the [`tracing`] facade (it never
+//! The library itself only emits through the `tracing` facade (it never
 //! installs a subscriber, so `libtobii.so` stays silent inside a host
 //! application unless that application sets one up). Each executable calls
 //! [`init`] once at start.

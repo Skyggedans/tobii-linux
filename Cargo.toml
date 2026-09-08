@@ -6,8 +6,7 @@
 # Resolver 3 is not the default for a virtual manifest; without it the feature
 # unification of ort/rusb would silently change.
 resolver = "3"
-# Filled in as each crate is extracted; becomes ["crates/*"] with the first one.
-members = []
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +22,8 @@ ort = "2.0.0-rc.10"
 rusb = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tobii-ipc = { path = "crates/tobii-ipc" }
+tobii-log = { path = "crates/tobii-log" }
 
 # rust-skills: lint-deny-correctness, lint-warn-{suspicious,style,complexity,perf},
 # lint-pedantic-selective, lint-cfg-check, lint-missing-docs, lint-unsafe-doc.
@@ -105,7 +106,8 @@ libc.workspace = true
 ort.workspace = true
 rusb.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tobii-ipc.workspace = true
+tobii-log.workspace = true
 
 [lints]
 workspace = true

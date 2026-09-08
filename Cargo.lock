@@ -715,6 +715,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-ipc"
+version = "0.1.0"
+
+[[package]]
+name = "tobii-log"
+version = "0.1.0"
+dependencies = [
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tobii5-init-replay"
 version = "0.1.0"
 dependencies = [
@@ -722,8 +733,9 @@ dependencies = [
  "libc",
  "ort",
  "rusb",
+ "tobii-ipc",
+ "tobii-log",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

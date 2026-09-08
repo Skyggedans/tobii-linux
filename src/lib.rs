@@ -24,9 +24,9 @@ pub mod device;
 pub mod engine;
 pub mod ffi;
 pub mod image83;
-pub mod ipc;
+pub use tobii_ipc as ipc;
 pub mod log;
-pub mod logging;
+pub use tobii_log as logging;
 /// Small numeric helpers (origin calibration, filtering, geometry).
 pub mod math;
 /// `OpenTrack` UDP sink and head/gaze-to-6DOF mapping.

@@ -209,6 +209,9 @@ impl Device {
                 }
             }
             ServerMsg::Subscribed { .. } => {}
+            // `ServerMsg` is #[non_exhaustive]: a message kind added by a newer
+            // daemon is ignored rather than breaking the C ABI.
+            _ => {}
         }
     }
 }

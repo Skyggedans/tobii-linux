@@ -1,0 +1,15 @@
+[package]
+name = "tobii-ipc"
+description = "Length-prefixed binary IPC between tobiid and its clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately dependency-free: libtobii.so links this and nothing else, which
+# is what keeps the shared object small.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "tobii-log"
+description = "Shared tracing-subscriber setup for the Tobii executables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
