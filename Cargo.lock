@@ -745,6 +745,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-pose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ort",
+ "tobii-proto",
+ "tracing",
+]
+
+[[package]]
 name = "tobii-proto"
 version = "0.1.0"
 dependencies = [
@@ -762,6 +772,7 @@ dependencies = [
  "rusb",
  "tobii-ipc",
  "tobii-log",
+ "tobii-pose",
  "tobii-proto",
  "tracing",
 ]

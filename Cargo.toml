@@ -23,6 +23,7 @@ rusb = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tobii-ffi = { path = "crates/tobii-ffi" }
+tobii-pose = { path = "crates/tobii-pose" }
 tobii-proto = { path = "crates/tobii-proto" }
 tobii-ipc = { path = "crates/tobii-ipc" }
 tobii-log = { path = "crates/tobii-log" }
@@ -99,6 +100,7 @@ ort.workspace = true
 rusb.workspace = true
 tracing.workspace = true
 tobii-ipc.workspace = true
+tobii-pose.workspace = true
 tobii-proto.workspace = true
 tobii-log.workspace = true
 

@@ -64,7 +64,7 @@ impl FaceModel {
     ///
     /// # Errors
     /// Fails when ONNX Runtime cannot be initialised or rejects the model.
-    pub(crate) fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let session = Session::builder()?
             .commit_from_memory(MODEL)
             .context("failed to load face landmark model")?;
@@ -139,7 +139,7 @@ fn bilinear(g: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
 /// Rotation (canonical -> observed) via Horn's quaternion method on the
 /// cross-covariance, no external SVD needed.
 #[must_use]
-pub(crate) fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3]; 3] {
+pub fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3]; 3] {
     let n = reference.len();
     let mut rc = [0.0; 3];
     let mut cc = [0.0; 3];
@@ -212,7 +212,7 @@ pub(crate) fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3];
 
 /// [pitch, yaw, roll] in degrees from a rotation matrix.
 #[must_use]
-pub(crate) fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
+pub fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
     let sy = (r[0][0] * r[0][0] + r[1][0] * r[1][0]).sqrt();
     if sy > 1e-6 {
         [
@@ -466,7 +466,7 @@ pub(crate) fn canonical_f64() -> Vec<[f64; 3]> {
 /// Live head-pose tracker: face-following crop, landmark inference, Kabsch fit,
 /// rest-pose calibration and smoothing. `process` returns the `OpenTrack` pose
 /// [TX, TY, TZ, Yaw, Pitch, Roll] once calibrated, else `None`.
-pub(crate) struct Tracker {
+pub struct Tracker {
     model: FaceModel,
     canonical: Vec<[f64; 3]>,
     /// Landmarks in full-frame pixels (reused every frame).
@@ -533,7 +533,7 @@ impl Tracker {
     ///
     /// # Errors
     /// Fails when the landmark model cannot be loaded.
-    pub(crate) fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Self::with_geometry(FOCAL, CROP_HALF, 0.42)
     }
 
@@ -542,7 +542,7 @@ impl Tracker {
     ///
     /// # Errors
     /// Fails when the landmark model cannot be loaded.
-    pub(crate) fn new_image83() -> Result<Self> {
+    pub fn new_image83() -> Result<Self> {
         Self::with_geometry(IMAGE83_FOCAL, IMAGE83_CROP_HALF, IMAGE83_CY_FRAC)
     }
 
@@ -595,12 +595,12 @@ impl Tracker {
 
     /// Unfiltered pose of the last frame (see `last_raw`), for offline analysis.
     #[must_use]
-    pub(crate) fn last_raw(&self) -> Option<[f64; 6]> {
+    pub fn last_raw(&self) -> Option<[f64; 6]> {
         self.last_raw
     }
 
     /// Drop the calibrated rest pose so it recalibrates from the next frames.
-    pub(crate) fn recenter(&mut self) {
+    pub fn recenter(&mut self) {
         self.origin = None;
         self.rot0 = None;
         self.accum.clear();
@@ -614,7 +614,7 @@ impl Tracker {
     ///
     /// # Errors
     /// Fails when landmark inference fails.
-    pub(crate) fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
+    pub fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
         if self.cx == 0.0 {
             self.cx = w as f32 / 2.0;
             self.cy = h as f32 * self.cy_frac;
@@ -829,7 +829,7 @@ mod tests {
             return;
         };
         let msg = std::fs::read(path).unwrap();
-        let frame = crate::image83::decode_image_payload(&msg).unwrap();
+        let frame = tobii_proto::image83::decode_image_payload(&msg).unwrap();
         let (w, h) = (frame.width, frame.height);
         // Shift the 280 image by (-70, -60): the face (centre ~ (140, 130))
         // moves to ~ (70, 70), i.e. outside the centred 110-px crop at 560.
@@ -840,7 +840,7 @@ mod tests {
             }
         }
         let mut big = Vec::new();
-        crate::image83::upscale2x_into(&shifted, w, h, &mut big);
+        tobii_proto::image83::upscale2x_into(&shifted, w, h, &mut big);
         let mut t = Tracker::new_image83().unwrap();
         let mut found_at = None;
         for i in 0..12 {
@@ -870,9 +870,9 @@ mod tests {
             return;
         };
         let msg = std::fs::read(path).unwrap();
-        let frame = crate::image83::decode_image_payload(&msg).unwrap();
+        let frame = tobii_proto::image83::decode_image_payload(&msg).unwrap();
         let mut big = Vec::new();
-        crate::image83::upscale2x_into(&frame.pixels, frame.width, frame.height, &mut big);
+        tobii_proto::image83::upscale2x_into(&frame.pixels, frame.width, frame.height, &mut big);
         let (w, h) = (frame.width * 2, frame.height * 2);
         let mut fm = FaceModel::new().unwrap();
         let (cx, cy) = (w as f32 / 2.0, h as f32 * IMAGE83_CY_FRAC);
@@ -939,9 +939,16 @@ mod tests {
         (bytes[idx..idx + w * h].to_vec(), w, h)
     }
 
+    /// Regression against the reference Python `solvePnP` result for one
+    /// recorded IR frame. The frame is a photograph of the user's face, so it
+    /// is not committed: point `TOBII_POSE_PGM_FIXTURE` at a 560x560 binary
+    /// PGM to run this (same convention as the two tests above).
     #[test]
     fn pose_matches_python() {
-        let (gray, w, h) = read_pgm("frame000.pgm");
+        let Ok(path) = std::env::var("TOBII_POSE_PGM_FIXTURE") else {
+            return;
+        };
+        let (gray, w, h) = read_pgm(&path);
         let mut fm = FaceModel::new().unwrap();
         let cx = w as f32 / 2.0;
         let cy = h as f32 * 0.42;

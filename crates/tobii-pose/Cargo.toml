@@ -1,0 +1,21 @@
+[package]
+name = "tobii-pose"
+description = "Head pose from the tracker's IR frames: MediaPipe face landmarks and a perspective fit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ort.workspace = true
+tracing.workspace = true
+
+# Tests only: the fixtures are raw 0x50e stream messages that have to be
+# decoded before they can be fed to the tracker.
+[dev-dependencies]
+tobii-proto.workspace = true
+
+[lints]
+workspace = true

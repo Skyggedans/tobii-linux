@@ -11,8 +11,6 @@
 /// Offline analysis of recorded stream logs (statistics, comparisons, head
 /// axes, calibration extraction).
 pub mod analysis;
-/// `MediaPipe` canonical face mesh used by the head-pose fit.
-pub mod canonical;
 /// Command-line parsing for the `tobii5-init-replay` CLI.
 pub mod cli;
 pub mod daemon;
@@ -25,6 +23,7 @@ pub mod device;
 pub mod engine;
 pub use tobii_ipc as ipc;
 pub use tobii_log as logging;
+pub use tobii_pose::track;
 pub use tobii_proto::{decode, image83, log, protocol, time};
 /// Small numeric helpers (origin calibration, filtering, geometry).
 pub mod math;
@@ -32,7 +31,6 @@ pub mod math;
 pub mod opentrack;
 /// Output sinks for decoded frames (CSV, JSONL) and the live fan-out.
 pub mod sinks;
-pub mod track;
 
 use anyhow::Result;
 use cli::{Command, Options};
