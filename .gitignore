@@ -3,3 +3,6 @@ tobii_stream*.bin
 
 # Local AI pre-commit review artifacts
 .local_ai/
+
+# Research captures, logs and analysis output (see fixtures/README.md)
+/fixtures/
