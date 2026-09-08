@@ -2,8 +2,8 @@
 //! clients over a Unix socket. Run it directly, or let a client auto-spawn it.
 
 fn main() {
-    tobii::logging::init();
-    if let Err(e) = tobii::daemon::run() {
+    tobii5_init_replay::logging::init();
+    if let Err(e) = tobii5_init_replay::daemon::run() {
         // Full cause chain on one line, written directly (not via `tracing`) so
         // a restrictive `RUST_LOG` can never hide the reason the daemon exited.
         eprintln!("tobiid: {e:#}");

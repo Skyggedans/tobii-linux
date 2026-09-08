@@ -11,9 +11,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use tobii::ipc::{
-    STREAM_GAZE, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
-};
+use tobii_ipc::{STREAM_GAZE, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame};
 
 mod uinput {
     //! Minimal dependency-free `uinput` keyboard: a `File` on `/dev/uinput`
@@ -269,7 +267,7 @@ mod superkey {
 }
 
 fn main() {
-    tobii::logging::init();
+    tobii_log::init();
     if let Err(e) = run() {
         eprintln!("tobii-gaze-keys: {e:#}");
         std::process::exit(1);
@@ -362,7 +360,7 @@ fn run() -> Result<()> {
         None
     };
 
-    let mut stream = tobii::ipc::connect_or_spawn().context("connecting to tobiid")?;
+    let mut stream = tobii_ipc::connect_or_spawn().context("connecting to tobiid")?;
     write_frame(&mut stream, &encode_subscribe(STREAM_GAZE))
         .context("subscribing to the gaze stream")?;
 

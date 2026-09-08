@@ -715,6 +715,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-clients"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tobii-ipc",
+ "tobii-log",
+ "tracing",
+]
+
+[[package]]
+name = "tobii-ffi"
+version = "0.1.0"
+dependencies = [
+ "tobii-ipc",
+ "tracing",
+]
+
+[[package]]
 name = "tobii-ipc"
 version = "0.1.0"
 

@@ -22,6 +22,7 @@ ort = "2.0.0-rc.10"
 rusb = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tobii-ffi = { path = "crates/tobii-ffi" }
 tobii-ipc = { path = "crates/tobii-ipc" }
 tobii-log = { path = "crates/tobii-log" }
 
@@ -80,8 +81,6 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-name = "tobii"
-crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
 
 [[bin]]
@@ -91,14 +90,6 @@ path = "src/main.rs"
 [[bin]]
 name = "tobiid"
 path = "src/bin/tobiid.rs"
-
-[[bin]]
-name = "tobii-opentrack"
-path = "src/bin/tobii_opentrack.rs"
-
-[[bin]]
-name = "tobii-gaze-keys"
-path = "src/bin/tobii_gaze_keys.rs"
 
 [dependencies]
 anyhow.workspace = true

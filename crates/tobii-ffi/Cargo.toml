@@ -1,0 +1,23 @@
+[package]
+name = "tobii-ffi"
+description = "libtobii.so: a Tobii Stream Engine-shaped C ABI backed by tobiid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The lib is named `tobii` so the artifact is target/release/libtobii.so, which
+# is what the Makefile installs and what consumers link against. Keep the
+# #[unsafe(no_mangle)] functions physically in this crate: symbols exported
+# from a dependency rlib are not reliably retained in a cdylib.
+[lib]
+name = "tobii"
+crate-type = ["cdylib"]
+
+[dependencies]
+tobii-ipc.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

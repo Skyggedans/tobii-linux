@@ -5,12 +5,12 @@
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
 use anyhow::{Context, Result, bail};
-use tobii::ipc::{
+use tobii_ipc::{
     self, STREAM_HEAD, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
 };
 
 fn main() {
-    tobii::logging::init();
+    tobii_log::init();
     if let Err(e) = run() {
         eprintln!("tobii-opentrack: {e:#}");
         std::process::exit(1);
@@ -43,8 +43,8 @@ fn run() -> Result<()> {
     // One-shot: ask the running daemon to recalibrate the rest pose and exit.
     // Bind this to a hotkey to re-center without restarting anything.
     if recenter {
-        let mut stream = ipc::connect().context("connecting to tobiid")?;
-        write_frame(&mut stream, &ipc::encode_recenter()).context("sending recenter")?;
+        let mut stream = tobii_ipc::connect().context("connecting to tobiid")?;
+        write_frame(&mut stream, &tobii_ipc::encode_recenter()).context("sending recenter")?;
         println!("tobii-opentrack: recenter sent");
         return Ok(());
     }
@@ -58,7 +58,7 @@ fn run() -> Result<()> {
         .next()
         .with_context(|| format!("{host}:{port} resolved to no address"))?;
 
-    let mut stream = ipc::connect_or_spawn().context("connecting to tobiid")?;
+    let mut stream = tobii_ipc::connect_or_spawn().context("connecting to tobiid")?;
     write_frame(&mut stream, &encode_subscribe(STREAM_HEAD))
         .context("subscribing to the head stream")?;
 

@@ -23,7 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::ipc::{
+use tobii_ipc::{
     self, STREAM_GAZE, STREAM_HEAD, STREAM_PRESENCE, ServerMsg, decode_server, encode_subscribe,
     read_frame, write_frame,
 };
@@ -104,7 +104,7 @@ impl fmt::Debug for Device {
 impl Device {
     /// Connect to the daemon (spawning it if needed) and start the reader thread.
     fn connect() -> io::Result<Self> {
-        let stream = ipc::connect_or_spawn()?;
+        let stream = tobii_ipc::connect_or_spawn()?;
         let reader_stream = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();
         let reader = thread::Builder::new()
@@ -499,7 +499,7 @@ pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
     let Some(d) = (unsafe { device.as_mut() }) else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
-    if write_frame(&mut d.stream, &ipc::encode_recenter()).is_err() {
+    if write_frame(&mut d.stream, &tobii_ipc::encode_recenter()).is_err() {
         return TOBII_ERROR_CONNECTION_FAILED;
     }
     TOBII_ERROR_NO_ERROR

@@ -1,8 +1,11 @@
-//! Tobii Eye Tracker 5 on Linux: USB decode, IR-camera head pose and a
-//! Stream-Engine-like C ABI (see [`ffi`]). Built both as a binary CLI and as
-//! `libtobii.so` (cdylib) for the FFI / `OpenTrack` integration.
+//! Tobii Eye Tracker 5 on Linux: USB transport and the live 0x83 engine, the
+//! `tobiid` daemon, the IR-camera head-pose tracker, and the research and
+//! diagnostic subcommands behind the `tobii5-init-replay` CLI.
 //!
-//! The library only emits diagnostics through the [`tracing`] facade; the
+//! The Stream-Engine-like C ABI (`libtobii.so`) lives in the `tobii-ffi`
+//! crate, and the client-facing IPC in `tobii-ipc`.
+//!
+//! The library only emits diagnostics through the `tracing` facade; the
 //! executables install a subscriber via [`logging::init`].
 
 /// Offline analysis of recorded stream logs (statistics, comparisons, head
@@ -22,7 +25,6 @@ pub mod devcmd;
 /// USB transport and the live 0x83 gaze + image engine.
 pub mod device;
 pub mod engine;
-pub mod ffi;
 pub mod image83;
 pub use tobii_ipc as ipc;
 pub mod log;

@@ -1,0 +1,28 @@
+[package]
+name = "tobii-clients"
+description = "Thin tobiid clients: the OpenTrack bridge and the gaze-to-keyboard binder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Declared explicitly: autodiscovery would name these tobii_opentrack and
+# tobii_gaze_keys, breaking the Makefile, both systemd units and INSTALL.md.
+[[bin]]
+name = "tobii-opentrack"
+path = "src/bin/tobii_opentrack.rs"
+
+[[bin]]
+name = "tobii-gaze-keys"
+path = "src/bin/tobii_gaze_keys.rs"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+tobii-ipc.workspace = true
+tobii-log.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
