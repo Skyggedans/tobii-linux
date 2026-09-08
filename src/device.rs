@@ -1731,7 +1731,7 @@ fn print_type_hist(hist: &[u64; 256], fps_total: f64) {
     let parts: Vec<String> = hist
         .iter()
         .enumerate()
-        .filter(|(_, &c)| c > 0)
+        .filter(|&(_, &c)| c > 0)
         .map(|(t, &c)| format!("type {t}={}%", 100 * c / total.max(1)))
         .collect();
     println!(

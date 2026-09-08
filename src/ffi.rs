@@ -120,38 +120,38 @@ pub type PresenceFn = unsafe extern "C" fn(PresenceStatus, i64, *mut c_void);
 
 /// # Safety
 /// `api` must be a valid pointer to write the handle into.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_api_create(
     api: *mut *mut Api,
     _custom_alloc: *const c_void,
     _custom_log: *const c_void,
-) -> Status {
+) -> Status { unsafe {
     if api.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     *api = Box::into_raw(Box::new(Api { _private: 0 }));
     TOBII_ERROR_NO_ERROR
-}
+}}
 
 /// # Safety
 /// `api` must come from `tobii_api_create`.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_api_destroy(api: *mut Api) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_api_destroy(api: *mut Api) -> Status { unsafe {
     if !api.is_null() {
         drop(Box::from_raw(api));
     }
     TOBII_ERROR_NO_ERROR
-}
+}}
 
 /// # Safety
 /// `device` must be a valid pointer to write the handle into.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_device_create(
     _api: *mut Api,
     _url: *const c_char,
     _field_of_use: i32,
     device: *mut *mut Device,
-) -> Status {
+) -> Status { unsafe {
     if device.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
@@ -186,26 +186,26 @@ pub unsafe extern "C" fn tobii_device_create(
     });
     *device = Box::into_raw(d);
     TOBII_ERROR_NO_ERROR
-}
+}}
 
 /// # Safety
 /// `device` must come from `tobii_device_create`.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_device_destroy(device: *mut Device) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_device_destroy(device: *mut Device) -> Status { unsafe {
     if !device.is_null() {
         drop(Box::from_raw(device));
     }
     TOBII_ERROR_NO_ERROR
-}
+}}
 
 /// # Safety
 /// `device` must be valid; `callback` is invoked from `process_callbacks`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_head_pose_subscribe(
     device: *mut Device,
     callback: HeadPoseFn,
     user_data: *mut c_void,
-) -> Status {
+) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
@@ -214,27 +214,27 @@ pub unsafe extern "C" fn tobii_head_pose_subscribe(
         d.head = Some((callback, user_data));
     }
     status
-}
+}}
 
 /// # Safety
 /// `device` must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_head_pose_unsubscribe(device: *mut Device) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_head_pose_unsubscribe(device: *mut Device) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     d.head = None;
     d.unsubscribe(STREAM_HEAD)
-}
+}}
 
 /// # Safety
 /// `device` must be valid; `callback` is invoked from `process_callbacks`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_gaze_point_subscribe(
     device: *mut Device,
     callback: GazePointFn,
     user_data: *mut c_void,
-) -> Status {
+) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
@@ -243,27 +243,27 @@ pub unsafe extern "C" fn tobii_gaze_point_subscribe(
         d.gaze = Some((callback, user_data));
     }
     status
-}
+}}
 
 /// # Safety
 /// `device` must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_gaze_point_unsubscribe(device: *mut Device) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_gaze_point_unsubscribe(device: *mut Device) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     d.gaze = None;
     d.unsubscribe(STREAM_GAZE)
-}
+}}
 
 /// # Safety
 /// `device` must be valid; `callback` is invoked from `process_callbacks`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_user_presence_subscribe(
     device: *mut Device,
     callback: PresenceFn,
     user_data: *mut c_void,
-) -> Status {
+) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
@@ -272,26 +272,26 @@ pub unsafe extern "C" fn tobii_user_presence_subscribe(
         d.presence = Some((callback, user_data));
     }
     status
-}
+}}
 
 /// # Safety
 /// `device` must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_user_presence_unsubscribe(device: *mut Device) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_user_presence_unsubscribe(device: *mut Device) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     d.presence = None;
     d.unsubscribe(STREAM_PRESENCE)
-}
+}}
 
 /// Recalibrate the head rest pose now (extension; not in the original Stream
 /// Engine). Affects whichever client currently holds the device's mode.
 ///
 /// # Safety
 /// `device` must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
@@ -299,17 +299,17 @@ pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
         return TOBII_ERROR_CONNECTION_FAILED;
     }
     TOBII_ERROR_NO_ERROR
-}
+}}
 
 /// Block until a device has data or a short timeout elapses.
 ///
 /// # Safety
 /// `devices` must point to `num_devices` valid device handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_wait_for_callbacks(
     num_devices: i32,
     devices: *const *mut Device,
-) -> Status {
+) -> Status { unsafe {
     if devices.is_null() || num_devices < 1 {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
@@ -329,14 +329,14 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
     } else {
         TOBII_ERROR_TIMED_OUT
     }
-}
+}}
 
 /// Dispatch queued samples to the subscribed callbacks.
 ///
 /// # Safety
 /// `device` must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> Status {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> Status { unsafe {
     let Some(d) = device.as_mut() else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
@@ -380,4 +380,4 @@ pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> 
         }
     }
     TOBII_ERROR_NO_ERROR
-}
+}}

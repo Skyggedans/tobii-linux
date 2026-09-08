@@ -7,6 +7,7 @@ use std::net::UdpSocket;
 use tobii::ipc::{self, decode_server, encode_subscribe, read_frame, write_frame, ServerMsg, STREAM_HEAD};
 
 fn main() {
+    tobii::logging::init();
     if let Err(e) = run() {
         eprintln!("tobii-opentrack: {e}");
         std::process::exit(1);

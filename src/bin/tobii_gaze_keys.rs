@@ -225,6 +225,7 @@ mod superkey {
 }
 
 fn main() {
+    tobii::logging::init();
     if let Err(e) = run() {
         eprintln!("tobii-gaze-keys: {e}");
         std::process::exit(1);

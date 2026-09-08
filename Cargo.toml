@@ -1,7 +1,11 @@
 [package]
 name = "tobii5-init-replay"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
+description = "Tobii Eye Tracker 5 on Linux: gaze + head-pose daemon, OpenTrack bridge, Stream-Engine-like libtobii.so"
+license = "MIT"
+publish = false
 
 [lib]
 name = "tobii"
@@ -29,3 +33,47 @@ anyhow = "1"
 libc = "0.2"
 ort = "2.0.0-rc.10"
 rusb = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# rust-skills: lint-deny-correctness, lint-warn-{suspicious,style,complexity,perf},
+# lint-pedantic-selective, lint-cfg-check, lint-missing-docs, lint-unsafe-doc.
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+# pedantic, selectively (see rust-skills lint-pedantic-selective)
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+doc_markdown = "warn"
+float_cmp = "warn"
+manual_let_else = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unnested_or_patterns = "warn"
+undocumented_unsafe_blocks = "warn"
+# unwrap in non-test code: rust-skills err-no-unwrap-prod / anti-unwrap-abuse
+unwrap_used = "warn"
+
+# rust-skills opt-lto-release / opt-codegen-units / perf-release-profile.
+# panic stays "unwind": the daemon's watchdog recovers a panicked engine
+# thread, and extern "C" fns already abort on unwind.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

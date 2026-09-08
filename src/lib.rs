@@ -13,6 +13,7 @@ pub mod engine;
 pub mod ffi;
 pub mod image83;
 pub mod ipc;
+pub mod logging;
 pub mod math;
 pub mod opentrack;
 pub mod protocol;
