@@ -3,7 +3,7 @@
 //! and the 0x50e image tools (`image83`, `image83-replay`).
 //!
 //! None of this is needed to run the driver — the daemon uses
-//! [`crate::device`] only. Everything here shares that module's USB transport
+//! [`tobii_usb::device`] only. Everything here shares that module's USB transport
 //! helpers rather than duplicating them.
 
 use anyhow::{Context, Result};
@@ -19,21 +19,21 @@ use tracing::{debug, error, info, warn};
 
 use crate::cli::{Command, Options};
 use crate::dashboard::render_dashboard_status;
-use crate::decode::{TrackingFrame, decode_stream_payload};
-use crate::device::{
+use crate::opentrack::OpentrackUdp;
+use crate::sinks::{DecodedCsv, JsonlOutput, handle_live_decoded};
+use tobii_proto::decode::{TrackingFrame, decode_stream_payload};
+use tobii_proto::image83::{decode_image_payload, upscale2x_into, write_pgm};
+use tobii_proto::log::{PacketLog, log_packet};
+use tobii_proto::protocol::{
+    BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, declared_len,
+    marker, read_init_packets, seq, stream_id,
+};
+use tobii_proto::time::now_us;
+use tobii_usb::device::{
     EP_IN, MAX_REPLAY_ATTEMPTS, READ_BUF, ResponseEcho, StreamStartupTimeout, command_seq,
     next_command_seq, open_tobii, replay_init_packets, start_stream, stop_stream,
     vendor_control_deinit, vendor_control_init, wait_for_gaze_stream, wait_for_response_seq,
 };
-use crate::image83::{decode_image_payload, upscale2x_into, write_pgm};
-use crate::log::{PacketLog, log_packet};
-use crate::opentrack::OpentrackUdp;
-use crate::protocol::{
-    BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, declared_len,
-    marker, read_init_packets, seq, stream_id,
-};
-use crate::sinks::{DecodedCsv, JsonlOutput, handle_live_decoded};
-use crate::time::now_us;
 
 /// Consecutive 2 s read timeouts before the first stream packet that count
 /// as "the stream never started" in the `replay` subcommand.
@@ -506,7 +506,7 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
     })
     .context("failed to create UDP socket")?;
     println!("Loading face model...");
-    let mut tracker = crate::track::Tracker::new()?;
+    let mut tracker = tobii_pose::track::Tracker::new()?;
 
     let ctx = UsbContext::new()?;
     let mut h = open_tobii(&ctx)?;
@@ -559,9 +559,9 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
 /// Fails if the log cannot be read, the face model cannot be loaded, a gaze
 /// payload does not decode, or the CSV cannot be written.
 pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
-    use crate::log::read_log_payloads;
+    use tobii_proto::log::read_log_payloads;
     let payloads = read_log_payloads(path)?;
-    let mut tracker = crate::track::Tracker::new_image83()?;
+    let mut tracker = tobii_pose::track::Tracker::new_image83()?;
     let mut asm = BulkReassembler::new();
     let mut out = csv
         .map(|p| {
@@ -701,7 +701,7 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
     let packets = read_init_packets(init_path)?;
     let stop = Arc::new(AtomicBool::new(false));
     let mut tracker = if *pose {
-        Some(crate::track::Tracker::new_image83()?)
+        Some(tobii_pose::track::Tracker::new_image83()?)
     } else {
         None
     };

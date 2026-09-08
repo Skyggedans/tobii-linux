@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use tracing::info;
 
-use crate::decode::{LiveField, TrackingFrame, field_value, head_point, mean_keys};
 use crate::math::{
     angles_from_translation, calibrate_origin, calibrate_scalar_origin, choose_pose_hypothesis,
     dot3, norm3, normalize_angle_deg, scale_matrix, solve_3x3,
 };
+use tobii_proto::decode::{LiveField, TrackingFrame, field_value, head_point, mean_keys};
 
 /// Device head-position units per `OpenTrack` centimetre.
 pub(crate) const OPENTRACK_HEAD_SCALE: f64 = 1000.0;

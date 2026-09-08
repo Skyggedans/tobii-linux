@@ -11,19 +11,19 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::LogInput;
-use crate::decode::{
-    LiveField, TrackingFrame, decode_stream_payload, decode_stream_payload_with_status,
-    field_value, head_point,
-};
-use crate::log::{PacketLog, main_stream_payloads, read_log_payloads};
 use crate::math::{
     dot3, normalize_angle_deg, solve_3x3, vector_pitch_deg, vector_roll_xy_deg, vector_yaw_deg,
 };
 use crate::opentrack::{
     DEFAULT_OPENTRACK_ANGLE_OCC, DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE, OPENTRACK_HEAD_SCALE,
 };
-use crate::protocol::{InitPacket, hex_to_bytes, marker, read_init_packets};
-use crate::track::{euler_deg, kabsch};
+use tobii_pose::track::{euler_deg, kabsch};
+use tobii_proto::decode::{
+    LiveField, TrackingFrame, decode_stream_payload, decode_stream_payload_with_status,
+    field_value, head_point,
+};
+use tobii_proto::log::{PacketLog, main_stream_payloads, read_log_payloads};
+use tobii_proto::protocol::{InitPacket, hex_to_bytes, marker, read_init_packets};
 
 /// Decoded stream field key: `(field id, occurrence, component)`.
 pub(crate) type FieldKey = (u32, usize, usize);

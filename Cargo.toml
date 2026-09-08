@@ -26,7 +26,6 @@ tobii-ffi = { path = "crates/tobii-ffi" }
 tobii-pose = { path = "crates/tobii-pose" }
 tobii-proto = { path = "crates/tobii-proto" }
 tobii-usb = { path = "crates/tobii-usb" }
-tobiid = { path = "crates/tobiid" }
 tobii-ipc = { path = "crates/tobii-ipc" }
 tobii-log = { path = "crates/tobii-log" }
 
@@ -74,33 +73,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-
-[package]
-name = "tobii5-init-replay"
-description = "Tobii Eye Tracker 5 on Linux: gaze + head-pose daemon, OpenTrack bridge, Stream-Engine-like libtobii.so"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-publish.workspace = true
-
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "tobii5-init-replay"
-path = "src/main.rs"
-
-[dependencies]
-anyhow.workspace = true
-ort.workspace = true
-rusb.workspace = true
-tracing.workspace = true
-tobii-ipc.workspace = true
-tobii-pose.workspace = true
-tobii-proto.workspace = true
-tobii-usb.workspace = true
-tobii-log.workspace = true
-
-[lints]
-workspace = true

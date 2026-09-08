@@ -5,7 +5,7 @@
 use anyhow::Result;
 use std::io::{self, BufWriter, Write};
 
-use crate::decode::TrackingFrame;
+use tobii_proto::decode::TrackingFrame;
 
 /// Print one compact line with the decoded values of `frame`.
 pub(crate) fn print_live_decoded(frame: &TrackingFrame) {

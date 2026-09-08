@@ -10,12 +10,12 @@ use std::io::{self, BufWriter, Write};
 use tracing::info;
 
 use crate::dashboard::{print_live_decoded, render_tracking_dashboard};
-use crate::decode::{
+use crate::opentrack::OpentrackUdp;
+use tobii_proto::decode::{
     DERIVED_FIELDS, LIVE_FIELDS, TrackingFrame, decode_stream_payload, derive_live_values,
 };
-use crate::opentrack::OpentrackUdp;
-use crate::protocol::marker;
-use crate::time::now_us;
+use tobii_proto::protocol::marker;
+use tobii_proto::time::now_us;
 
 /// CSV of the decoded stream candidates, one row per 0x53 packet.
 #[derive(Debug)]

@@ -1,0 +1,26 @@
+[package]
+name = "tobii-tools"
+description = "Research and diagnostic CLI: log analysis, the UVC camera path and the 0x50e image tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Built, but deliberately not installed by `make install`: nothing here is
+# needed to run the driver.
+[[bin]]
+name = "tobii5-init-replay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+rusb.workspace = true
+tobii-log.workspace = true
+tobii-pose.workspace = true
+tobii-proto.workspace = true
+tobii-usb.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -763,6 +763,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusb",
+ "tobii-log",
+ "tobii-pose",
+ "tobii-proto",
+ "tobii-usb",
+ "tracing",
+]
+
+[[package]]
 name = "tobii-usb"
 version = "0.1.0"
 dependencies = [
@@ -770,21 +783,6 @@ dependencies = [
  "rusb",
  "tobii-pose",
  "tobii-proto",
- "tracing",
-]
-
-[[package]]
-name = "tobii5-init-replay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ort",
- "rusb",
- "tobii-ipc",
- "tobii-log",
- "tobii-pose",
- "tobii-proto",
- "tobii-usb",
  "tracing",
 ]
 
