@@ -16,6 +16,13 @@ pub(crate) const DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE: [f64; 3] = [2.0, 1.0, 2.0];
 
 pub(crate) const DEFAULT_OPENTRACK_ANGLE_OCC: usize = 7;
 
+/// Default roll axis: the inter-eye line between the two eyeball rotation
+/// centers (occ4 = left, occ9 = right of 0x00031f41). These points are
+/// gaze-invariant, so the roll comes out clean (idle σ ≈ 0.16°) — unlike the
+/// stream's positional "yaw"/"pitch", which are translation artifacts.
+/// Override on the replay path with `--opentrack-roll-points`/`--opentrack-no-roll-points`.
+pub(crate) const DEFAULT_OPENTRACK_ROLL_POINTS: (usize, usize) = (4, 9);
+
 pub(crate) const OPENTRACK_MAX_HEAD_ANGLE_DEG: f64 = 45.0;
 
 pub(crate) const DEFAULT_OPENTRACK_ORIGIN_SAMPLES: usize = 30;

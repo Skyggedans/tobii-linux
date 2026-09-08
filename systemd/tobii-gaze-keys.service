@@ -1,0 +1,21 @@
+[Unit]
+Description=Tobii gaze-to-keyboard binder (look at screen edge → arrow keys)
+Documentation=https://github.com/  # tobii5-init-replay
+# The binder is a thin client of the daemon: it subscribes to the gaze stream
+# over %t/tobiid.sock, so the daemon must be up first. Requires= ties their
+# lifecycles together (daemon down → binder stops); After= orders startup.
+Requires=tobiid.service
+After=tobiid.service
+
+[Service]
+Type=simple
+# Dev build path; change to /usr/local/bin/tobii-gaze-keys once installed.
+ExecStart=%h/Work/tobii/target/release/tobii-gaze-keys
+Restart=on-failure
+RestartSec=2
+# Wait for the daemon's socket before launching, so the first connect succeeds
+# even if the daemon is still claiming the USB device.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -S "%t/tobiid.sock" ] && exit 0; sleep 0.1; done; exit 0'
+
+[Install]
+WantedBy=default.target

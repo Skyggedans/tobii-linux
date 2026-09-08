@@ -17,7 +17,7 @@ pub const TAG_SUBSCRIBE: u8 = 0x01; // client -> daemon: u8 streams
 pub const TAG_RECENTER: u8 = 0x02; // client -> daemon: reset the head rest pose
 pub const TAG_SUBSCRIBED: u8 = 0x10; // daemon -> client: u8 ok(1)/busy(0)
 pub const TAG_HEAD: u8 = 0x20; // i64 ts, 3xf32 pos(mm), 3xf32 rot(rad)
-pub const TAG_GAZE: u8 = 0x21; // i64 ts, u8 valid, 2xf32 xy(0..1)
+pub const TAG_GAZE: u8 = 0x21; // i64 ts, u8 valid, 2xf32 xy(0..1), 2xf32 pupil mm L/R (optional tail)
 pub const TAG_PRESENCE: u8 = 0x22; // i64 ts, u8 status
 
 /// Where the daemon listens. Per-user under the XDG runtime dir, else /tmp.
@@ -76,7 +76,7 @@ fn spawn_daemon() {
 pub enum ServerMsg {
     Subscribed { ok: bool },
     Head { ts_us: i64, pos_mm: [f32; 3], rot_rad: [f32; 3] },
-    Gaze { ts_us: i64, valid: bool, xy: [f32; 2] },
+    Gaze { ts_us: i64, valid: bool, xy: [f32; 2], pupil_mm: [f32; 2] },
     Presence { ts_us: i64, status: u8 },
 }
 
@@ -122,12 +122,12 @@ pub fn encode_head(ts_us: i64, pos_mm: [f32; 3], rot_rad: [f32; 3]) -> Vec<u8> {
     v
 }
 
-pub fn encode_gaze(ts_us: i64, valid: bool, xy: [f32; 2]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(18);
+pub fn encode_gaze(ts_us: i64, valid: bool, xy: [f32; 2], pupil_mm: [f32; 2]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(26);
     v.push(TAG_GAZE);
     v.extend_from_slice(&ts_us.to_le_bytes());
     v.push(valid as u8);
-    for x in &xy {
+    for x in xy.iter().chain(pupil_mm.iter()) {
         v.extend_from_slice(&x.to_le_bytes());
     }
     v
@@ -161,6 +161,12 @@ pub fn decode_server(body: &[u8]) -> Option<ServerMsg> {
             ts_us: rd_i64(body, 1),
             valid: body[9] != 0,
             xy: [rd_f32(body, 10), rd_f32(body, 14)],
+            // Pupil is an optional tail: older daemons omit it (18-byte frame).
+            pupil_mm: if body.len() >= 26 {
+                [rd_f32(body, 18), rd_f32(body, 22)]
+            } else {
+                [f32::NAN, f32::NAN]
+            },
         }),
         TAG_PRESENCE if body.len() >= 10 => Some(ServerMsg::Presence {
             ts_us: rd_i64(body, 1),
@@ -176,5 +182,40 @@ pub fn decode_subscribe(body: &[u8]) -> Option<u8> {
         Some(body[1])
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaze_pupil_round_trips() {
+        let body = encode_gaze(123, true, [0.25, -0.5], [3.42, 3.35]);
+        assert_eq!(body.len(), 26);
+        match decode_server(&body) {
+            Some(ServerMsg::Gaze { ts_us, valid, xy, pupil_mm }) => {
+                assert_eq!(ts_us, 123);
+                assert!(valid);
+                assert_eq!(xy, [0.25, -0.5]);
+                assert_eq!(pupil_mm, [3.42, 3.35]);
+            }
+            _ => panic!("expected Gaze"),
+        }
+    }
+
+    #[test]
+    fn legacy_gaze_frame_without_pupil_decodes_to_nan() {
+        // An 18-byte frame from an older daemon: base fields still decode, pupil absent.
+        let mut body = encode_gaze(7, false, [0.1, 0.2], [f32::NAN, f32::NAN]);
+        body.truncate(18);
+        match decode_server(&body) {
+            Some(ServerMsg::Gaze { ts_us, xy, pupil_mm, .. }) => {
+                assert_eq!(ts_us, 7);
+                assert_eq!(xy, [0.1, 0.2]);
+                assert!(pupil_mm[0].is_nan() && pupil_mm[1].is_nan());
+            }
+            _ => panic!("expected Gaze"),
+        }
     }
 }

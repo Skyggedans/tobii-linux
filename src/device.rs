@@ -5,7 +5,7 @@ use std::io::{BufWriter, Write};
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
 
@@ -13,8 +13,13 @@ use crate::cli::{Command, Options};
 use crate::dashboard::render_dashboard_status;
 use crate::decode::{decode_stream_payload, TrackingFrame};
 use crate::engine::{GazeSample, PoseSample, Sample};
+use crate::image83::{decode_image_payload, upscale2x, write_pgm, ImageFrame};
 use crate::opentrack::OpentrackUdp;
-use crate::protocol::{declared_len, marker, parse_init_packets, read_init_packets, seq, InitPacket};
+use crate::protocol::{
+    declared_len, marker, parse_init_packets, read_init_packets, seq, stream_id,
+    stream_start_packet, stream_stop_packet, BulkReassembler, InitPacket, STREAM_ID_GAZE,
+    STREAM_ID_IMAGE, STREAM_ID_PRESENCE,
+};
 use crate::sinks::{handle_live_decoded, log_packet, now_us, DecodedCsv, JsonlOutput, PacketLog};
 
 pub(crate) const VID: u16 = 0x2104;
@@ -24,6 +29,14 @@ pub(crate) const PID: u16 = 0x0313;
 pub(crate) const IFACE: u8 = 0;
 
 pub(crate) const EP_IN: u8 = 0x83;
+
+/// Bulk OUT endpoint for command messages (what the init replay writes to).
+pub(crate) const EP_OUT: u8 = 0x05;
+
+/// One read must hold the largest multiplexed message on EP 0x83: the 0x50e
+/// image stream is 78609 bytes. Every message ends in a short USB packet, so a
+/// buffer this size normally returns exactly one whole message per read.
+pub(crate) const READ_BUF: usize = 128 * 1024;
 
 pub(crate) const MAX_REPLAY_ATTEMPTS: usize = 5;
 
@@ -383,6 +396,21 @@ pub(crate) fn vendor_control_init(h: &mut rusb::DeviceHandle<UsbContext>) -> Res
     Ok(())
 }
 
+/// Mirror of the Windows Tobii Experience shutdown (captured in
+/// `tobii-sys/teardown.pcapng`): a single vendor control OUT, request 66,
+/// no data, which stops the 0x83 processed stream firmware-side. Without it the
+/// device is left streaming and comes up in an undefined state on the next open
+/// (the "works every other start" flakiness). Best-effort: errors are ignored
+/// because we run it on the teardown path where the handle is about to drop.
+pub(crate) fn vendor_control_deinit(h: &mut rusb::DeviceHandle<UsbContext>) {
+    let timeout = Duration::from_millis(500);
+    // Quiet on success: this also runs on each cold-start prime re-open, where a
+    // "stop stream written" line would just be confusing noise.
+    if let Err(e) = h.write_control(0x41, 66, 0, 0, &[], timeout) {
+        eprintln!("tobii deinit: control OUT 66 failed: {e}");
+    }
+}
+
 pub(crate) fn wait_for_response_seq(
     h: &mut rusb::DeviceHandle<UsbContext>,
     expected_seq: u32,
@@ -628,46 +656,6 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
     })
 }
 
-/// Drive the camera head-pose pipeline for the FFI/library engine: own the
-/// device, run the tracker, and push pose samples to `tx` until `stop` is set.
-/// Init packets are embedded so the library is self-contained.
-///
-/// The device init is flaky (~every other cold start it comes up without the
-/// camera streaming), so the whole open+init+bring-up is retried: the startup
-/// watchdog in `read_camera_frames` bails fast with `StreamStartupTimeout` and
-/// we redo a full, fresh init instead of leaving the engine dead.
-pub(crate) fn run_pose_engine(
-    stop: &Arc<AtomicBool>,
-    recenter: &Arc<AtomicBool>,
-    tx: &Sender<Sample>,
-) -> Result<()> {
-    let mut tracker = crate::track::Tracker::new()?;
-    let ctx = UsbContext::new()?;
-    // The init is a blind replay that assumes the device starts from a clean
-    // baseline, but we never send a stop on exit, so a prior session leaves it
-    // "hot" and the replay desyncs (~every other cold start). A USB reset forces
-    // re-enumeration to a known state so the replay's preconditions hold.
-    reset_device_baseline(&ctx);
-
-    for attempt in 1..=MAX_REPLAY_ATTEMPTS {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        match pose_engine_attempt(&ctx, stop, recenter, tx, &mut tracker) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < MAX_REPLAY_ATTEMPTS && !stop.load(Ordering::Relaxed) => {
-                eprintln!(
-                    "tobii camera init attempt {attempt}/{MAX_REPLAY_ATTEMPTS} failed: {e}; \
-                     redoing full init"
-                );
-                thread::sleep(Duration::from_millis(700));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
 /// Best-effort USB reset to drop any state a prior session left on the device,
 /// so the replayed init starts from a known baseline. Re-enumeration is what we
 /// want; we then wait for the device to reappear (by presence, not a blind
@@ -717,8 +705,193 @@ fn tobii_present(ctx: &UsbContext) -> bool {
         .unwrap_or(false)
 }
 
-/// Replay the embedded init packet sequence on EP 0x05.
-fn replay_init(
+/// Drive the 0x83 streams for the daemon engine: own the device, decode gaze +
+/// presence and the 0x50e IR image stream (head pose), and push samples to `tx`
+/// until `stop` is set. The UVC camera is *not* claimed here — doing so would
+/// throttle the 0x83 streams.
+///
+/// A cold gaze start normally arms on the *second* fresh open (the first accepts
+/// the init but doesn't stream — a firmware quirk, not stale state). A USB reset
+/// up front doesn't change that (verified: start behaves identically with and
+/// without it), so we no longer pay its re-enumeration cost on every start. It's
+/// kept only as a recovery escalation once several opens in a row fail to arm —
+/// which is the signature of a device left hot by an unclean exit (`kill -9`,
+/// crash) that skipped the teardown. `reset_device_baseline` still honors
+/// `TOBII_NO_RESET=1` (skip even the escalation).
+const RESET_ESCALATION_ATTEMPT: usize = 3;
+
+pub(crate) fn run_gaze_engine(
+    stop: &Arc<AtomicBool>,
+    recenter: &Arc<AtomicBool>,
+    head_wanted: &Arc<AtomicBool>,
+    tx: &Sender<Sample>,
+) -> Result<()> {
+    let ctx = UsbContext::new()?;
+
+    // Head pose from the 0x50e image stream runs on its own thread so a slow
+    // inference never blocks the USB reader (an unread IN buffer stalls the
+    // firmware). The reader drops each new frame into a single-slot mailbox;
+    // the worker always takes the newest one and skips whatever it missed.
+    let mailbox: PoseMailbox = Arc::new((Mutex::new(None), Condvar::new()));
+    // No worker (and no ONNX session) when the image stream is disabled.
+    let worker = image_stream_enabled().then(|| {
+        let mailbox = mailbox.clone();
+        let stop = stop.clone();
+        let recenter = recenter.clone();
+        let head_wanted = head_wanted.clone();
+        let tx = tx.clone();
+        thread::spawn(move || pose_worker(mailbox, stop, recenter, head_wanted, tx))
+    });
+
+    let result = (|| {
+        for attempt in 1..=MAX_REPLAY_ATTEMPTS {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            // Normal cold start arms by attempt 2 and never gets here; reaching the
+            // escalation means the device is genuinely stuck — reset to recover.
+            if attempt == RESET_ESCALATION_ATTEMPT {
+                println!("gaze: stream still not arming after {} opens; USB-reset to recover", attempt - 1);
+                reset_device_baseline(&ctx);
+            }
+            match gaze_engine_attempt(&ctx, stop, tx, &mailbox) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_REPLAY_ATTEMPTS && !stop.load(Ordering::Relaxed) => {
+                    // A cold device accepts the first init but doesn't start
+                    // streaming; a fresh re-open is what arms it (expected, not an
+                    // error). Report real failures loudly, the prime quietly.
+                    if e.downcast_ref::<StreamStartupTimeout>().is_some() {
+                        println!(
+                            "gaze: stream not armed on open {attempt}; re-opening to prime \
+                             (cold-start quirk)"
+                        );
+                    } else {
+                        eprintln!("tobii gaze init attempt {attempt} failed: {e}; re-opening");
+                    }
+                    thread::sleep(Duration::from_millis(700));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+
+    // Wake the worker so it notices `stop` (the caller sets it before joining
+    // us; on an internal failure we set it ourselves so the worker exits too).
+    stop.store(true, Ordering::Relaxed);
+    mailbox.1.notify_all();
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+    result
+}
+
+/// Single-slot hand-off of the newest image frame to the pose worker.
+pub(crate) type PoseMailbox = Arc<(Mutex<Option<ImageFrame>>, Condvar)>;
+
+fn mailbox_put(mailbox: &PoseMailbox, frame: ImageFrame) {
+    let (lock, cv) = &**mailbox;
+    *lock.lock().unwrap() = Some(frame);
+    cv.notify_one();
+}
+
+/// Head-pose inference loop over 0x50e frames (see `run_gaze_engine`).
+fn pose_worker(
+    mailbox: PoseMailbox,
+    stop: Arc<AtomicBool>,
+    recenter: Arc<AtomicBool>,
+    head_wanted: Arc<AtomicBool>,
+    tx: Sender<Sample>,
+) {
+    let mut tracker = match crate::track::Tracker::new_image83() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("image83 pose worker disabled: {e:?}");
+            return;
+        }
+    };
+    // `TOBII_IMAGE83_DEBUG=1`: report frames taken / poses / inference time.
+    let debug = std::env::var("TOBII_IMAGE83_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0");
+    let (mut taken, mut posed, mut infer_us) = (0u64, 0u64, 0u64);
+    let mut last_report = Instant::now();
+    // The tracker outlives head clients (a gaze client keeps the engine
+    // alive), so a new head subscriber must not inherit an old rest pose or
+    // smoothing state: recalibrate on every off->on edge after the first.
+    let mut was_wanted: Option<bool> = None;
+    let (lock, cv) = &*mailbox;
+    while !stop.load(Ordering::Relaxed) {
+        let frame = {
+            let mut slot = lock.lock().unwrap();
+            while slot.is_none() && !stop.load(Ordering::Relaxed) {
+                slot = cv.wait_timeout(slot, Duration::from_millis(200)).unwrap().0;
+            }
+            slot.take()
+        };
+        let Some(frame) = frame else { continue };
+        if recenter.swap(false, Ordering::Relaxed) {
+            tracker.recenter();
+        }
+        let wanted = head_wanted.load(Ordering::Relaxed);
+        if was_wanted == Some(false) && wanted {
+            tracker.recenter();
+        }
+        was_wanted = Some(wanted);
+        if !wanted {
+            continue;
+        }
+        let t0 = Instant::now();
+        let big = upscale2x(&frame.pixels, frame.width, frame.height);
+        match tracker.process(&big, frame.width * 2, frame.height * 2) {
+            Ok(Some(p)) => {
+                posed += 1;
+                let _ = tx.send(Sample::Pose(PoseSample {
+                    timestamp_us: now_us() as i64,
+                    pos_cm: [p[0], p[1], p[2]],
+                    rot_deg: [p[3], p[4], p[5]],
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("image83 pose: {e}"),
+        }
+        taken += 1;
+        infer_us += t0.elapsed().as_micros() as u64;
+        if debug && last_report.elapsed() >= Duration::from_secs(5) {
+            let dt = last_report.elapsed().as_secs_f64();
+            println!(
+                "image83 pose worker: {:.1} frames/s processed, {:.1} poses/s, mean {:.1} ms per frame",
+                taken as f64 / dt,
+                posed as f64 / dt,
+                infer_us as f64 / 1000.0 / taken.max(1) as f64
+            );
+            taken = 0;
+            posed = 0;
+            infer_us = 0;
+            last_report = Instant::now();
+        }
+    }
+}
+
+/// One open+init+read of the 0x83 stream, pushing gaze samples until `stop` or a
+/// failure. Bails with `StreamStartupTimeout` if no stream packet arrives in 5s.
+fn gaze_engine_attempt(
+    ctx: &UsbContext,
+    stop: &Arc<AtomicBool>,
+    tx: &Sender<Sample>,
+    mailbox: &PoseMailbox,
+) -> Result<()> {
+    let mut h = open_tobii(ctx)?;
+    vendor_control_init(&mut h)?;
+    // From here the 0x83 stream is running firmware-side (started by request 65
+    // inside vendor_control_init). Guarantee the Windows-style stop (request 66)
+    // on every exit — clean stop, error, or timeout — so the device isn't left
+    // mid-stream and the next open starts from a defined state.
+    let result = gaze_stream_loop(&mut h, stop, tx, mailbox);
+    vendor_control_deinit(&mut h);
+    result
+}
+
+/// Replay the init-packet sequence once on `h`.
+fn replay_gaze_init(
     h: &mut rusb::DeviceHandle<UsbContext>,
     packets: &[InitPacket],
     stop: &Arc<AtomicBool>,
@@ -743,190 +916,210 @@ fn replay_init(
     Ok(())
 }
 
-/// Does the bulk camera endpoint deliver any payload within `dur`?
-fn probe_camera(h: &mut rusb::DeviceHandle<UsbContext>, dur: Duration) -> bool {
-    let mut buf = vec![0u8; 65536];
+/// Read 0x83 for up to `dur`, returning true as soon as a decodable GAZE
+/// (0x500) frame arrives. 0x52 handshake/config responses and any image /
+/// presence messages are drained and ignored — an image frame must not count
+/// as proof the gaze pipeline armed (the cold-start quirk leaves gaze silent
+/// while a freshly requested 0x50e stream may run). Draining matters: an
+/// unread IN buffer can stall the firmware. `asm` is shared with the pump so
+/// a partially read message is not lost at the hand-off.
+fn wait_for_gaze_stream(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    stop: &Arc<AtomicBool>,
+    dur: Duration,
+    asm: &mut BulkReassembler,
+) -> bool {
+    let mut buf = vec![0u8; READ_BUF];
     let start = Instant::now();
-    while start.elapsed() < dur {
-        if let Ok(n) = h.read_bulk(EP_VIDEO, &mut buf, Duration::from_millis(300)) {
-            if n > 0 {
-                return true;
+    while start.elapsed() < dur && !stop.load(Ordering::Relaxed) {
+        if let Ok(n) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
+            for msg in asm.push(&buf[..n]) {
+                if stream_id(&msg) == Some(STREAM_ID_GAZE)
+                    && decode_stream_payload(&msg).is_ok_and(|d| !d.is_empty())
+                {
+                    return true;
+                }
             }
         }
     }
     false
 }
 
-/// One open+init+camera bring-up, streaming poses until `stop` or a failure.
+/// Longest the gaze stream may stay silent while running before the attempt
+/// is torn down and the device re-opened (a stream that never armed, or died).
+const GAZE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `TOBII_NO_IMAGE=1` keeps the 0x50e image stream off (gaze only, as before).
+fn image_stream_enabled() -> bool {
+    !std::env::var("TOBII_NO_IMAGE")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// The command sequence number to use after the init replay: one past the
+/// highest 0x51 seq in the replayed packets (the device echoes it in the 0x52
+/// response, which is how we match replies).
+fn next_command_seq(packets: &[InitPacket]) -> u32 {
+    packets
+        .iter()
+        .filter(|p| marker(&p.data) == Some(0x51))
+        .filter_map(|p| seq(&p.data))
+        .max()
+        .map_or(0x100, |s| s + 1)
+}
+
+/// Send one command message and wait (briefly) for its 0x52 response. Stream
+/// messages that arrive meanwhile are discarded, so this is only for the few
+/// commands sent around stream start/stop. Uses a full-size read buffer since
+/// a 78 KB image message may already be in flight.
+fn send_command(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    packet: &[u8],
+    deadline: Duration,
+) -> Result<()> {
+    let expected = seq(packet).context("command packet without seq")?;
+    h.write_bulk(EP_OUT, packet, Duration::from_millis(2000))
+        .context("command write failed")?;
+    let mut buf = vec![0u8; READ_BUF];
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
+            Ok(n) if marker(&buf[..n]) == Some(0x52) && seq(&buf[..n]) == Some(expected) => {
+                return Ok(());
+            }
+            Ok(_) | Err(rusb::Error::Timeout) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("no response to command seq {expected} within {deadline:?}")
+}
+
+pub(crate) fn start_stream(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    cmd_seq: u32,
+    id: u32,
+) -> Result<()> {
+    send_command(h, &stream_start_packet(cmd_seq, id), Duration::from_millis(1500))
+        .with_context(|| format!("start stream {id:#x}"))
+}
+
+pub(crate) fn stop_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32) -> Result<()> {
+    send_command(h, &stream_stop_packet(cmd_seq, id), Duration::from_millis(700))
+        .with_context(|| format!("stop stream {id:#x}"))
+}
+
+/// Replay the init packets, start the image stream, then pump 0x83 until `stop`
+/// or failure. Split out from `gaze_engine_attempt` so the caller can always
+/// run the device teardown after this returns, regardless of how it exits.
 ///
-/// On a cold start the camera does not stream after a single init pass — the
-/// device needs the init replayed again (re-COMMIT alone does nothing). We do
-/// that on the *same* handle (no costly re-open/reset), replaying init + COMMIT
-/// and probing until the camera flows, which avoids the slow second open cycle.
-fn pose_engine_attempt(
-    ctx: &UsbContext,
+/// Cold-start note: the 0x53 gaze stream reliably arms only on a *fresh* open —
+/// the first open after the device goes cold accepts the init but never starts
+/// streaming, and re-running the init on the same handle does not help (unlike
+/// the camera path; verified empirically). So if the stream doesn't arm here we
+/// bail with `StreamStartupTimeout` and let the caller re-open, which is what
+/// actually primes it.
+fn gaze_stream_loop(
+    h: &mut rusb::DeviceHandle<UsbContext>,
     stop: &Arc<AtomicBool>,
-    recenter: &Arc<AtomicBool>,
     tx: &Sender<Sample>,
-    tracker: &mut crate::track::Tracker,
+    mailbox: &PoseMailbox,
 ) -> Result<()> {
     const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
     let packets = parse_init_packets(INIT_PACKETS)?;
-    let mut h = open_tobii(ctx)?;
-    vendor_control_init(&mut h)?;
-    if h.kernel_driver_active(IFACE_VIDEO).unwrap_or(false) {
-        let _ = h.detach_kernel_driver(IFACE_VIDEO);
+    replay_gaze_init(h, &packets, stop)?;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
     }
-    h.claim_interface(IFACE_VIDEO)
-        .context("failed to claim video streaming interface 2")?;
-
-    // Bring up the camera. A cold start needs more than the first init+COMMIT,
-    // and replaying init on the same handle alone doesn't help — so try cheap
-    // escalating primes (re-claiming the camera interface) before the caller
-    // falls back to a full device re-open. The log says which prime worked.
-    let primes = ["init+commit", "reclaim iface2", "reinit + reclaim iface2"];
-    let mut frame_size = CAM_WIDTH * CAM_HEIGHT;
-    let mut started = false;
-    for (pass, label) in primes.iter().enumerate() {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        match pass {
-            0 => replay_init(&mut h, &packets, stop)?,
-            1 => {
-                let _ = h.release_interface(IFACE_VIDEO);
-                thread::sleep(Duration::from_millis(50));
-                h.claim_interface(IFACE_VIDEO)
-                    .context("re-claim video interface")?;
-            }
-            _ => {
-                replay_init(&mut h, &packets, stop)?;
-                let _ = h.release_interface(IFACE_VIDEO);
-                thread::sleep(Duration::from_millis(50));
-                h.claim_interface(IFACE_VIDEO)
-                    .context("re-claim video interface")?;
+    // The Windows Stream Engine subscribes the image stream right after its
+    // init; we do the same. Failure here is not fatal — gaze still works.
+    let mut cmd_seq = next_command_seq(&packets);
+    let mut image = image_stream_enabled();
+    if image {
+        match start_stream(h, cmd_seq, STREAM_ID_IMAGE) {
+            Ok(()) => println!("gaze: image stream 0x50e requested (head pose via IR frames)"),
+            Err(e) => {
+                eprintln!("gaze: image stream start failed ({e}); continuing gaze-only");
+                image = false;
             }
         }
-        frame_size = uvc_negotiate(&mut h, None)?;
-        thread::sleep(Duration::from_millis(80));
-        let _ = h.clear_halt(EP_VIDEO);
-        if probe_camera(&mut h, Duration::from_millis(1500)) {
-            println!("camera streaming via prime: {label}");
-            started = true;
-            break;
-        }
-        println!("camera silent after prime: {label}");
+        cmd_seq += 1;
     }
-    if !started {
+    // The device's first 0x53 frame lands ~3s after a good init; give it margin.
+    let mut asm = BulkReassembler::new();
+    if !wait_for_gaze_stream(h, stop, Duration::from_secs_f64(4.5), &mut asm) {
+        if image {
+            let _ = stop_stream(h, cmd_seq, STREAM_ID_IMAGE);
+        }
         anyhow::bail!(StreamStartupTimeout);
     }
 
-    read_camera_frames(&mut h, frame_size, Some(2), |frame| {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        if recenter.swap(false, Ordering::Relaxed) {
-            tracker.recenter();
-        }
-        if let Some(p) = tracker.process(frame, CAM_WIDTH, CAM_HEIGHT)? {
-            let _ = tx.send(Sample::Pose(PoseSample {
-                timestamp_us: now_us() as i64,
-                pos_cm: [p[0], p[1], p[2]],
-                rot_deg: [p[3], p[4], p[5]],
-            }));
-        }
-        Ok(true)
-    })
-}
-
-/// Drive the 0x83 processed stream for the FFI/library engine: own the device,
-/// decode gaze + presence, and push gaze samples to `tx` until `stop` is set.
-/// The camera is *not* claimed here — doing so would throttle this stream.
-///
-/// Same flaky-init story as the camera path (see `run_pose_engine`): reset to a
-/// baseline, then retry the full init if the 0x83 stream doesn't start.
-pub(crate) fn run_gaze_engine(stop: &Arc<AtomicBool>, tx: &Sender<Sample>) -> Result<()> {
-    let ctx = UsbContext::new()?;
-    reset_device_baseline(&ctx);
-
-    for attempt in 1..=MAX_REPLAY_ATTEMPTS {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        match gaze_engine_attempt(&ctx, stop, tx) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < MAX_REPLAY_ATTEMPTS && !stop.load(Ordering::Relaxed) => {
-                eprintln!(
-                    "tobii gaze init attempt {attempt}/{MAX_REPLAY_ATTEMPTS} failed: {e}; \
-                     redoing full init"
-                );
-                thread::sleep(Duration::from_millis(700));
-            }
-            Err(e) => return Err(e),
-        }
+    let result = pump_streams(h, stop, tx, mailbox, &mut asm);
+    if image {
+        // Mirror the Windows shutdown (1230 for 0x50e before the vendor stop).
+        let _ = stop_stream(h, cmd_seq, STREAM_ID_IMAGE);
     }
-    Ok(())
+    result
 }
 
-/// One open+init+read of the 0x83 stream, pushing gaze samples until `stop` or a
-/// failure. Bails with `StreamStartupTimeout` if no stream packet arrives in 5s.
-fn gaze_engine_attempt(
-    ctx: &UsbContext,
+/// Demultiplex EP 0x83: gaze frames -> `GazeSample`s, image frames -> the pose
+/// worker's mailbox, everything else (presence 0x504, responses) ignored.
+fn pump_streams(
+    h: &mut rusb::DeviceHandle<UsbContext>,
     stop: &Arc<AtomicBool>,
     tx: &Sender<Sample>,
+    mailbox: &PoseMailbox,
+    asm: &mut BulkReassembler,
 ) -> Result<()> {
-    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
-    let mut h = open_tobii(ctx)?;
-    vendor_control_init(&mut h)?;
-    let packets = parse_init_packets(INIT_PACKETS)?;
-    let mut no_log: Option<PacketLog> = None;
-    for pkt in &packets {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let expected_seq = if marker(&pkt.data) == Some(0x51) {
-            seq(&pkt.data)
-        } else {
-            None
-        };
-        h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000))
-            .context("init packet write failed")?;
-        if let Some(s) = expected_seq {
-            let _ = wait_for_response_seq(&mut h, s, &mut no_log);
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-
-    let mut buf = vec![0u8; 16384];
+    let mut buf = vec![0u8; READ_BUF];
     let mut packet_no = 0u64;
-    let mut delivered = 0u64;
-    let t_start = Instant::now();
+    let mut image_live = false;
+    let mut last_gaze = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        if delivered == 0 && t_start.elapsed().as_secs_f64() > 5.0 {
+        if last_gaze.elapsed() > GAZE_LIVENESS_TIMEOUT {
+            eprintln!("gaze: no gaze frame for {GAZE_LIVENESS_TIMEOUT:?}; re-opening the device");
             anyhow::bail!(StreamStartupTimeout);
         }
         match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(500)) {
             Ok(n) if n > 0 => {
-                let data = &buf[..n];
-                if marker(data) != Some(0x53) {
-                    continue;
+                for msg in asm.push(&buf[..n]) {
+                    match stream_id(&msg) {
+                        Some(STREAM_ID_GAZE) => {
+                            let decoded = decode_stream_payload(&msg)?;
+                            if decoded.is_empty() {
+                                continue;
+                            }
+                            last_gaze = Instant::now();
+                            let frame = TrackingFrame::from_decoded(packet_no, &decoded);
+                            packet_no += 1;
+                            let _ = tx.send(Sample::Gaze(GazeSample {
+                                timestamp_us: frame.ts_us as i64,
+                                gaze_valid: frame.gaze_valid,
+                                gaze_norm: [
+                                    frame.gaze_norm_x.unwrap_or(0.0),
+                                    frame.gaze_norm_y.unwrap_or(0.0),
+                                ],
+                                present: frame.gaze_valid,
+                                pupil_mm: [
+                                    frame.pupil_left.unwrap_or(f64::NAN),
+                                    frame.pupil_right.unwrap_or(f64::NAN),
+                                ],
+                            }));
+                        }
+                        Some(STREAM_ID_IMAGE) => {
+                            if let Some(frame) = decode_image_payload(&msg) {
+                                if !image_live {
+                                    println!(
+                                        "gaze: image stream 0x50e live ({}x{})",
+                                        frame.width, frame.height
+                                    );
+                                    image_live = true;
+                                }
+                                mailbox_put(mailbox, frame);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                let decoded = decode_stream_payload(data)?;
-                if decoded.is_empty() {
-                    continue;
-                }
-                let frame = TrackingFrame::from_decoded(packet_no, &decoded);
-                packet_no += 1;
-                delivered += 1;
-                let _ = tx.send(Sample::Gaze(GazeSample {
-                    timestamp_us: frame.ts_us as i64,
-                    gaze_valid: frame.gaze_valid,
-                    gaze_norm: [
-                        frame.gaze_norm_x.unwrap_or(0.0),
-                        frame.gaze_norm_y.unwrap_or(0.0),
-                    ],
-                    present: frame.gaze_valid,
-                }));
             }
             Ok(_) => {}
             Err(rusb::Error::Timeout) => continue,
@@ -934,6 +1127,277 @@ fn gaze_engine_attempt(
         }
     }
     Ok(())
+}
+
+/// Offline: run the image head tracker over a TBI5LOG1 log that contains the
+/// 0x50e stream (e.g. `image83 --log`, or `import-tsv` of a Windows capture)
+/// and pair each pose with the latest 0x83 gaze-frame head anchors. Writes a
+/// CSV for analysis and prints a summary (used to validate sign/scale against
+/// the MediaPipe reference and the 0x83 eyeball-centre translation).
+pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
+    use crate::protocol::read_log_payloads;
+    let payloads = read_log_payloads(path)?;
+    let mut tracker = crate::track::Tracker::new_image83()?;
+    let mut asm = BulkReassembler::new();
+    let mut out = csv
+        .map(|p| File::create(p).map(BufWriter::new).with_context(|| format!("create {p}")))
+        .transpose()?;
+    if let Some(o) = out.as_mut() {
+        writeln!(
+            o,
+            "image_idx,device_ts_us,face,raw_tx_cm,raw_ty_cm,raw_tz_cm,raw_pitch,raw_yaw,raw_roll,\
+             rel_tx_cm,rel_ty_cm,rel_tz_cm,rel_yaw,rel_pitch,rel_roll,\
+             g_head_x_mm,g_head_y_mm,g_head_z_mm,g_head_roll_deg,g_valid"
+        )?;
+    }
+    let mut last_gaze: Option<TrackingFrame> = None;
+    let (mut images, mut faces, mut poses, mut gaze_frames) = (0u64, 0u64, 0u64, 0u64);
+    let mut yaw_vs_x: Vec<(f64, f64)> = Vec::new();
+    for payload in &payloads {
+        for msg in asm.push(payload) {
+            match stream_id(&msg) {
+                Some(STREAM_ID_GAZE) => {
+                    let decoded = decode_stream_payload(&msg)?;
+                    if !decoded.is_empty() {
+                        last_gaze = Some(TrackingFrame::from_decoded(gaze_frames, &decoded));
+                        gaze_frames += 1;
+                    }
+                }
+                Some(STREAM_ID_IMAGE) => {
+                    let Some(frame) = decode_image_payload(&msg) else { continue };
+                    let big = upscale2x(&frame.pixels, frame.width, frame.height);
+                    let rel = tracker.process(&big, frame.width * 2, frame.height * 2)?;
+                    let raw = tracker.last_raw();
+                    faces += raw.is_some() as u64;
+                    poses += rel.is_some() as u64;
+                    let g = last_gaze.as_ref();
+                    if let (Some(r), Some(g)) = (raw, g) {
+                        if let (Some(x), true) = (g.head_x, g.head_z.is_some()) {
+                            yaw_vs_x.push((r[4], x / 1000.0));
+                        }
+                    }
+                    if let Some(o) = out.as_mut() {
+                        let f = |v: Option<f64>| v.map_or(String::from(""), |v| format!("{v:.3}"));
+                        let r6 = |v: Option<[f64; 6]>, i: usize| f(v.map(|a| a[i]));
+                        writeln!(
+                            o,
+                            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                            images,
+                            frame.device_ts_us,
+                            raw.is_some() as u8,
+                            r6(raw, 0), r6(raw, 1), r6(raw, 2), r6(raw, 3), r6(raw, 4), r6(raw, 5),
+                            r6(rel, 0), r6(rel, 1), r6(rel, 2), r6(rel, 3), r6(rel, 4), r6(rel, 5),
+                            f(g.and_then(|g| g.head_x).map(|v| v / 1000.0)),
+                            f(g.and_then(|g| g.head_y).map(|v| v / 1000.0)),
+                            f(g.and_then(|g| g.head_z).map(|v| v / 1000.0)),
+                            f(g.and_then(|g| g.head_roll)),
+                            g.map_or(0, |g| g.gaze_valid as u8),
+                        )?;
+                    }
+                    images += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    println!(
+        "{path}: {gaze_frames} gaze frames, {images} images, face found in {faces}, {poses} calibrated poses"
+    );
+    if yaw_vs_x.len() > 10 {
+        let n = yaw_vs_x.len() as f64;
+        let (my, mx) = (
+            yaw_vs_x.iter().map(|p| p.0).sum::<f64>() / n,
+            yaw_vs_x.iter().map(|p| p.1).sum::<f64>() / n,
+        );
+        let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+        for (y, x) in &yaw_vs_x {
+            sxy += (y - my) * (x - mx);
+            sxx += (x - mx) * (x - mx);
+            syy += (y - my) * (y - my);
+        }
+        println!(
+            "raw image yaw vs 0x83 head_x: r = {:.3}, slope {:.2} mm/deg (neck lever; expect ~-1.5 for +yaw = left)",
+            sxy / (sxx * syy).sqrt(),
+            sxy / syy
+        );
+    }
+    Ok(())
+}
+
+/// Diagnostic: bring the device up in gaze mode, additionally start the 0x50e
+/// image stream, and report what arrives on EP 0x83 for `secs` seconds: per-
+/// stream message rates, image timestamp cadence, the first frames as PGM, and
+/// optionally the head pose from each frame.
+pub(crate) fn run_image83(opts: &Options) -> Result<()> {
+    let Command::Image83 {
+        init_path,
+        secs,
+        out_prefix,
+        max_frames,
+        log_path,
+        pose,
+        no_image,
+    } = &opts.command
+    else {
+        unreachable!();
+    };
+
+    let ctx = UsbContext::new()?;
+    let packets = read_init_packets(init_path)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut tracker = if *pose {
+        Some(crate::track::Tracker::new_image83()?)
+    } else {
+        None
+    };
+    let mut log = log_path.as_deref().map(PacketLog::create).transpose()?;
+
+    for attempt in 1..=3 {
+        let mut h = open_tobii(&ctx)?;
+        vendor_control_init(&mut h)?;
+        println!("Replaying {} init packets (attempt {attempt})...", packets.len());
+        replay_gaze_init(&mut h, &packets, &stop)?;
+        let mut cmd_seq = next_command_seq(&packets);
+        let image = !*no_image;
+        if image {
+            match start_stream(&mut h, cmd_seq, STREAM_ID_IMAGE) {
+                Ok(()) => println!("image stream 0x50e start acknowledged (cmd 1220, seq {cmd_seq:#x})"),
+                Err(e) => println!("image stream start: {e}"),
+            }
+            cmd_seq += 1;
+        } else {
+            println!("image stream NOT requested (--no-image baseline)");
+        }
+        let mut asm = BulkReassembler::new();
+        if !wait_for_gaze_stream(&mut h, &stop, Duration::from_secs_f64(4.5), &mut asm) {
+            println!("no gaze stream within 4.5 s on open {attempt}; re-opening (cold-start quirk)");
+            if image {
+                let _ = stop_stream(&mut h, cmd_seq, STREAM_ID_IMAGE);
+            }
+            vendor_control_deinit(&mut h);
+            drop(h);
+            thread::sleep(Duration::from_millis(700));
+            continue;
+        }
+
+        // Everything that can fail while the streams run lives in this
+        // closure, so the teardown below always runs (a failed PGM write must
+        // not leave the device hot for the next start).
+        let result = (|| -> Result<()> {
+        let mut buf = vec![0u8; READ_BUF];
+        let mut counts: std::collections::BTreeMap<u32, (u64, u64)> = Default::default();
+        let mut other = 0u64;
+        let mut saved = 0usize;
+        let mut image_ts = Vec::<u64>::new();
+        let mut gaze_ts = Vec::<u64>::new();
+        let (mut gaze_frames, mut gaze_valid, mut eyes_valid) = (0u64, 0u64, 0u64);
+        let mut poses = 0u64;
+        let start = Instant::now();
+        let dur = Duration::from_secs_f64(*secs);
+        while start.elapsed() < dur {
+            let n = match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(300)) {
+                Ok(n) => n,
+                Err(rusb::Error::Timeout) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for msg in asm.push(&buf[..n]) {
+                log_packet(&mut log, EP_IN, &msg)?;
+                let Some(id) = stream_id(&msg) else {
+                    other += 1;
+                    continue;
+                };
+                let e = counts.entry(id).or_default();
+                e.0 += 1;
+                e.1 += msg.len() as u64;
+                match id {
+                    STREAM_ID_GAZE => {
+                        if let Ok(v) = decode_stream_payload(&msg) {
+                            if !v.is_empty() {
+                                let f = TrackingFrame::from_decoded(gaze_frames, &v);
+                                gaze_frames += 1;
+                                gaze_valid += f.gaze_valid as u64;
+                                eyes_valid += f.head_xyz().is_some() as u64;
+                            }
+                        }
+                        gaze_ts.push(now_us());
+                    }
+                    STREAM_ID_IMAGE => {
+                        let Some(frame) = decode_image_payload(&msg) else {
+                            println!("image message of {} bytes did not decode", msg.len());
+                            continue;
+                        };
+                        image_ts.push(frame.device_ts_us);
+                        if saved < *max_frames {
+                            let path = format!("{out_prefix}{saved:03}.pgm");
+                            write_pgm(&path, &frame)?;
+                            println!(
+                                "saved {path} ({}x{}, device ts {} us)",
+                                frame.width, frame.height, frame.device_ts_us
+                            );
+                            saved += 1;
+                        }
+                        if let Some(t) = tracker.as_mut() {
+                            let big = upscale2x(&frame.pixels, frame.width, frame.height);
+                            if let Some(p) = t.process(&big, frame.width * 2, frame.height * 2)? {
+                                poses += 1;
+                                if poses % 10 == 1 {
+                                    println!(
+                                        "pose: yaw {:+6.1} pitch {:+6.1} roll {:+6.1}  t = [{:+5.1} {:+5.1} {:+5.1}] cm",
+                                        p[3], p[4], p[5], p[0], p[1], p[2]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let dt = start.elapsed().as_secs_f64();
+        println!("\n=== EP 0x83 over {dt:.1} s ===");
+        for (id, (n, bytes)) in &counts {
+            let name = match *id {
+                STREAM_ID_GAZE => "gaze",
+                STREAM_ID_IMAGE => "image",
+                STREAM_ID_PRESENCE => "presence",
+                _ => "?",
+            };
+            println!(
+                "stream {id:#05x} {name:8} {n:6} msgs  {:7.1} msg/s  {:9} bytes",
+                *n as f64 / dt,
+                bytes
+            );
+        }
+        println!("non-stream messages: {other}; reassembler pending {} bytes", asm.pending_len());
+        if gaze_frames > 0 {
+            println!(
+                "gaze frames {gaze_frames}: gaze valid {:.1}%, both eyeball centres valid {:.1}%",
+                gaze_valid as f64 * 100.0 / gaze_frames as f64,
+                eyes_valid as f64 * 100.0 / gaze_frames as f64
+            );
+        }
+        if image_ts.len() > 2 {
+            let mut d: Vec<f64> = image_ts.windows(2).map(|w| (w[1] as f64 - w[0] as f64) / 1000.0).collect();
+            d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "image device-ts interval: median {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+                d[d.len() / 2],
+                d[d.len() * 95 / 100],
+                d[d.len() - 1]
+            );
+        }
+        if *pose {
+            println!("head poses emitted: {poses} (first ~30 frames calibrate the rest pose)");
+        }
+        Ok(())
+        })();
+        if image {
+            let _ = stop_stream(&mut h, cmd_seq, STREAM_ID_IMAGE);
+        }
+        vendor_control_deinit(&mut h);
+        return result;
+    }
+    anyhow::bail!("stream never armed after 3 opens")
 }
 
 /// Diagnostic: after the normal init (which starts the 0x83 processed stream),

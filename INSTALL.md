@@ -7,9 +7,16 @@ clients, plus an OpenTrack bridge and a Stream-Engine-like `libtobii.so`.
 ```
 libtobii.so / tobii-opentrack ──unix socket──▶ tobiid ──USB──▶ Tobii ET5
                                                  │
-                                  camera 6DOF head pose  OR  0x83 gaze+presence
-                                  (mutually exclusive — one mode at a time)
+                              EP 0x83: gaze + presence (stream 0x500, 33 Hz)
+                                     + 280x280 IR face image (stream 0x50e, 33 Hz)
+                                       → 6DOF head pose (MediaPipe landmarks + PnP)
+                              all served concurrently by one engine
 ```
+
+Head pose does not use the UVC camera: the device multiplexes its own IR image
+stream on the same endpoint as gaze (what the Windows Stream Engine uses), so
+head pose, gaze and presence work at the same time. The UVC camera survives
+only in the standalone research subcommands (`camera`, `track`, `probe`).
 
 ---
 
@@ -180,8 +187,15 @@ tracker runs in the daemon, not in the client):
 | `TOBII_PIVOT_BACK` | `6.0` | neck pivot behind the face origin (cm) — fixes pitch sliding |
 | `TOBII_POSE_DEBUG` | unset | log raw `t` vs pivoted `t'` and angles |
 | `TOBII_ROLL_EYELINE` | unset | `1` measures roll directly from the eye line (decoupled from yaw/pitch, symmetric by construction) instead of from the euler solve |
-| `TOBII_PREWARM` | unset | `head` or `gaze`: init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). Recommended for an always-on head-tracking service. |
+| `TOBII_PREWARM` | unset | `1` (or the historical `head` / `gaze`): init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). |
 | `TOBII_NO_RESET` | unset | `1` skips the USB reset at init (a couple seconds faster; the reset rarely helps now that uvcvideo is kept off the device) |
+| `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
+| `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s |
+| `TOBII_CAMERA_TILT_DEG` | `20` | upward tilt of the tracker camera; head angles are reported in the upright frame (yaw about the true vertical), so a turn does not leak into roll |
+
+Head-pose inference on the image stream runs only while some client subscribes
+to head pose (about 6 ms per frame at 33 Hz on a desktop CPU); gaze-only
+clients don't pay for it.
 
 Raise the pivots if pure rotations still **slide**; lower them if they
 **over-shoot** (slide the other way). For a systemd unit:
@@ -216,8 +230,7 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   `tobii_device_process_callbacks`. Position in **mm**, rotation in **radians**
   (`[pitch, yaw, roll]`), gaze normalized `0..1`. Link against it and it talks
   to the daemon for you.
-- **`tobii-gaze-keys`** — subscribes to **gaze** (so it runs the daemon in gaze
-  mode, mutually exclusive with head pose). While you look at the left/right edge
+- **`tobii-gaze-keys`** — subscribes to **gaze**. While you look at the left/right edge
   of the screen **and hold a Super/Meta key**, it taps the **Left**/**Right**
   arrow key once per second, via `/dev/uinput` (works under both X11 and Wayland).
   Because Super stays physically held, the app sees **Super+Left / Super+Right** —
@@ -238,8 +251,13 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   `--no-super` drops the Super requirement.
 - **`tobii5-init-replay track`** — standalone head→OpenTrack without the daemon
   (claims the device directly). Handy for isolating issues; same tracker code.
-- Diagnostics: `tobii5-init-replay probe` (camera-vs-0x83 concurrency),
-  `… head83 <log.bin>` (research: head pose from 0x83 points).
+- Diagnostics: `tobii5-init-replay image83 [--secs 10] [--pose] [--log f.bin] [--no-image]`
+  (starts gaze + the 0x50e image stream, reports per-stream rates and gaze
+  validity, saves the first frames as PGM, `--pose` runs the head tracker live;
+  `--no-image` is the gaze-only baseline), `… image83-replay <log.bin> [--csv out.csv]`
+  (runs the tracker over a logged capture and pairs poses with the 0x83 head
+  anchors), `… probe` (UVC-camera-vs-0x83 concurrency), `… head83 <log.bin>`
+  (research: head pose from 0x83 points).
 
 ### Recenter (recalibrate the head rest pose)
 
@@ -252,17 +270,21 @@ systemctl --user kill -s SIGUSR1 tobiid    # or signal the service
 kill -USR1 $(pgrep -x tobiid)              # or signal the process
 ```
 
-Via `libtobii.so`: call `tobii_recenter(device)`. (Head mode only; gaze has no
-rest pose.)
+Via `libtobii.so`: call `tobii_recenter(device)`. (Affects the head tracker;
+gaze has no rest pose.)
 
 ---
 
 ## 9. Notes & troubleshooting
 
-- **One mode at a time.** The hardware can't stream the IR camera and the 0x83
-  processed stream together. Head pose (camera) and gaze/presence (0x83) are
-  *mutually exclusive*: while one client holds head pose, a gaze subscription
-  gets `TOBII_ERROR_CONFLICTING_API` / a busy reply, and vice-versa.
+- **Head pose + gaze together.** One engine serves head pose (from the device's
+  0x50e IR image stream), gaze and presence concurrently; verified at 33 Hz each
+  with gaze validity unchanged. Never stream the UVC camera while the daemon
+  runs (the `camera`/`track`/`probe` research commands, or any app opening it
+  through uvcvideo): that throttles the 0x83 streams to <1 Hz.
+- **Head pose arrives ~1 s after the first frame.** The tracker averages the
+  first 30 frames as the rest pose (recenter to redo it); a cold device may
+  additionally take one re-open (~10 s) before any stream arms.
 - **Lazy claim.** An idle daemon holds no device; it opens the tracker only on
   the first subscription and releases it when the last client disconnects.
 - **"It flies around."** You're talking to an **old daemon** (pre-rebuild) — it

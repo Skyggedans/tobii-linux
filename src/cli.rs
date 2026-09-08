@@ -7,7 +7,7 @@ use crate::opentrack::{
     DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP, DEFAULT_OPENTRACK_ANGLE_TRANSLATION_COMP_SCALE,
     DEFAULT_OPENTRACK_ANGLE_TRANSLATION_DEADZONE_CM, DEFAULT_OPENTRACK_GAZE_ANGLE_SCALE,
     DEFAULT_OPENTRACK_HEAD_ANGLE_SCALE, DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
-    DEFAULT_OPENTRACK_ROTATION_COMP, DEFAULT_OPENTRACK_SMOOTHING,
+    DEFAULT_OPENTRACK_ROLL_POINTS, DEFAULT_OPENTRACK_ROTATION_COMP, DEFAULT_OPENTRACK_SMOOTHING,
     DEFAULT_OPENTRACK_TRANSLATION_SCALE,
 };
 
@@ -39,6 +39,19 @@ pub(crate) enum Command {
     Probe {
         init_path: String,
     },
+    Image83 {
+        init_path: String,
+        secs: f64,
+        out_prefix: String,
+        max_frames: usize,
+        log_path: Option<String>,
+        pose: bool,
+        no_image: bool,
+    },
+    Image83Replay {
+        path: String,
+        csv: Option<String>,
+    },
     Head83 {
         path: String,
         occs: Vec<usize>,
@@ -60,6 +73,9 @@ pub(crate) enum Command {
         inputs: Vec<LogInput>,
     },
     CompareDecoded {
+        inputs: Vec<LogInput>,
+    },
+    HeadAxes {
         inputs: Vec<LogInput>,
     },
     ExtractCalibration {
@@ -128,7 +144,7 @@ impl Options {
             opentrack_angle_map: DEFAULT_OPENTRACK_ANGLE_MAP,
             opentrack_origin_samples: DEFAULT_OPENTRACK_ORIGIN_SAMPLES,
             opentrack_angle_points: None,
-            opentrack_roll_points: None,
+            opentrack_roll_points: Some(DEFAULT_OPENTRACK_ROLL_POINTS),
             opentrack_smoothing: DEFAULT_OPENTRACK_SMOOTHING,
             opentrack_angle_deadzone: DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
             opentrack_rotation_comp: DEFAULT_OPENTRACK_ROTATION_COMP,
@@ -162,7 +178,7 @@ impl Options {
         let mut opentrack_angle_map = DEFAULT_OPENTRACK_ANGLE_MAP;
         let mut opentrack_origin_samples = DEFAULT_OPENTRACK_ORIGIN_SAMPLES;
         let mut opentrack_angle_points = None;
-        let mut opentrack_roll_points = None;
+        let mut opentrack_roll_points = Some(DEFAULT_OPENTRACK_ROLL_POINTS);
         let mut opentrack_smoothing = DEFAULT_OPENTRACK_SMOOTHING;
         let mut opentrack_angle_deadzone = DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG;
         let mut opentrack_rotation_comp = DEFAULT_OPENTRACK_ROTATION_COMP;
@@ -210,6 +226,18 @@ impl Options {
             }));
         }
 
+        if args.peek().map(String::as_str) == Some("head-axes") {
+            args.next();
+            let inputs: Vec<LogInput> = args
+                .map(|arg| parse_log_input(&arg))
+                .collect::<Result<_>>()?;
+            anyhow::ensure!(
+                inputs.len() >= 2,
+                "usage: head-axes [label:]path.bin [label:]path.bin ... (labels: yaw/pitch/roll/shift*)"
+            );
+            return Ok(Self::for_command(Command::HeadAxes { inputs }));
+        }
+
         if args.peek().map(String::as_str) == Some("head83") {
             args.next();
             let path = args.next().context("usage: head83 <log.bin> [occ,occ,...]")?;
@@ -222,6 +250,71 @@ impl Options {
             };
             anyhow::ensure!(occs.len() >= 3, "head83 needs at least 3 points");
             return Ok(Self::for_command(Command::Head83 { path, occs }));
+        }
+
+        if args.peek().map(String::as_str) == Some("image83-replay") {
+            args.next();
+            let path = args.next().context("usage: image83-replay <log.bin> [--csv out.csv]")?;
+            let mut csv = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--csv" => csv = Some(args.next().context("--csv requires a path")?),
+                    s => anyhow::bail!("unknown option: {s}"),
+                }
+            }
+            return Ok(Self::for_command(Command::Image83Replay { path, csv }));
+        }
+
+        if args.peek().map(String::as_str) == Some("image83") {
+            args.next();
+            let mut init_path = "init_packets_ep.txt".to_string();
+            let mut secs = 10.0f64;
+            let mut out_prefix = "image83_".to_string();
+            let mut max_frames = 5usize;
+            let mut log_path = None;
+            let mut pose = false;
+            let mut no_image = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--no-image" => no_image = true,
+                    "--secs" => {
+                        secs = args
+                            .next()
+                            .context("--secs requires a number")?
+                            .parse()
+                            .context("bad --secs value")?;
+                    }
+                    "--out" => out_prefix = args.next().context("--out requires a prefix")?,
+                    "--frames" => {
+                        max_frames = args
+                            .next()
+                            .context("--frames requires a number")?
+                            .parse()
+                            .context("bad --frames value")?;
+                    }
+                    "--log" => log_path = Some(args.next().context("--log requires a path")?),
+                    "--pose" => pose = true,
+                    "-h" | "--help" => {
+                        println!(
+                            "usage: image83 [init_packets_ep.txt] [--secs 10] [--out image83_] [--frames 5] [--log file.bin] [--pose] [--no-image]\n\
+                             Starts gaze + the 0x50e IR image stream on EP 0x83 and reports per-stream rates and gaze validity; \
+                             --pose runs the head tracker on each frame; --no-image is the gaze-only baseline for A/B."
+                        );
+                        std::process::exit(0);
+                    }
+                    s if s.starts_with('-') => anyhow::bail!("unknown option: {s}"),
+                    other => init_path = other.to_string(),
+                }
+            }
+            return Ok(Self::for_command(Command::Image83 {
+                init_path,
+                secs,
+                out_prefix,
+                max_frames,
+                log_path,
+                pose,
+                no_image,
+            }));
         }
 
         if args.peek().map(String::as_str) == Some("probe") {

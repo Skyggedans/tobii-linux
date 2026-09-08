@@ -2,10 +2,11 @@
 //! Built into `libtobii.so`.
 //!
 //! `tobii_device_create` connects to the daemon (auto-spawning it if needed), so
-//! several processes can consume the same device. Subscriptions select the mode;
-//! a head+gaze conflict (or a daemon already in the other mode) returns
-//! `TOBII_ERROR_CONFLICTING_API`. Pump with `tobii_wait_for_callbacks` +
-//! `tobii_device_process_callbacks` exactly like the Stream Engine.
+//! several processes can consume the same device, and head pose, gaze and
+//! presence can all be subscribed at once (`TOBII_ERROR_CONFLICTING_API` is
+//! kept for ABI compatibility; the daemon no longer refuses a subscription).
+//! Pump with `tobii_wait_for_callbacks` + `tobii_device_process_callbacks`
+//! exactly like the Stream Engine.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -55,6 +56,22 @@ pub struct Device {
 }
 
 impl Device {
+    /// Drop `bit` from the subscription and resend the mask, so the daemon
+    /// stops sending (and computing) that stream for us.
+    fn unsubscribe(&mut self, bit: u8) -> Status {
+        self.streams &= !bit;
+        if write_frame(&mut self.stream, &encode_subscribe(self.streams)).is_err() {
+            return TOBII_ERROR_CONNECTION_FAILED;
+        }
+        loop {
+            match self.rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(ServerMsg::Subscribed { .. }) => return TOBII_ERROR_NO_ERROR,
+                Ok(other) => self.pending.push_back(other),
+                Err(_) => return TOBII_ERROR_TIMED_OUT,
+            }
+        }
+    }
+
     /// Add `bit` to the subscription, resend, and wait for the daemon's ack.
     fn subscribe(&mut self, bit: u8) -> Status {
         self.streams |= bit;
@@ -207,7 +224,7 @@ pub unsafe extern "C" fn tobii_head_pose_unsubscribe(device: *mut Device) -> Sta
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     d.head = None;
-    TOBII_ERROR_NO_ERROR
+    d.unsubscribe(STREAM_HEAD)
 }
 
 /// # Safety
@@ -236,7 +253,7 @@ pub unsafe extern "C" fn tobii_gaze_point_unsubscribe(device: *mut Device) -> St
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     d.gaze = None;
-    TOBII_ERROR_NO_ERROR
+    d.unsubscribe(STREAM_GAZE)
 }
 
 /// # Safety
@@ -265,7 +282,7 @@ pub unsafe extern "C" fn tobii_user_presence_unsubscribe(device: *mut Device) ->
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     d.presence = None;
-    TOBII_ERROR_NO_ERROR
+    d.unsubscribe(STREAM_PRESENCE)
 }
 
 /// Recalibrate the head rest pose now (extension; not in the original Stream
@@ -340,7 +357,7 @@ pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> 
                     cb(&hp, ud);
                 }
             }
-            ServerMsg::Gaze { ts_us, valid, xy } => {
+            ServerMsg::Gaze { ts_us, valid, xy, .. } => {
                 if let Some((cb, ud)) = d.gaze {
                     let gp = GazePoint {
                         timestamp_us: ts_us,

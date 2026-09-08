@@ -74,6 +74,11 @@ pub(crate) fn render_tracking_dashboard(
         fmt_frame_value(frame.head_pitch),
         fmt_frame_value(frame.head_roll)
     );
+    println!(
+        "  pupil L/R mm{:>14} {:>14}",
+        fmt_frame_value(frame.pupil_left),
+        fmt_frame_value(frame.pupil_right)
+    );
     if let Some(pose) = opentrack_pose {
         println!();
         println!("OpenTrack UDP");

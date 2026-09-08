@@ -1162,6 +1162,186 @@ fn centroid3(pts: &[[f64; 3]]) -> [f64; 3] {
     c
 }
 
+/// The rigid 0x00031f41 landmark subset that gives the strongest yaw response
+/// with the least shift leak (see `head-axes` analysis).
+const RIGID_OCCS: [usize; 5] = [3, 5, 6, 8, 9];
+
+/// Rotation vector (axis * angle, degrees) of a rotation matrix. Translation-
+/// invariant by construction — this is the head rotation with the centroid
+/// (position) already factored out by Kabsch.
+fn rotvec_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    let cos = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let angle = cos.acos(); // radians, 0..pi
+    let axis = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
+    let n = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if n < 1e-9 {
+        return [0.0; 3];
+    }
+    let s = angle.to_degrees() / n;
+    [axis[0] * s, axis[1] * s, axis[2] * s]
+}
+
+/// Dominant eigenvector (unit) of a symmetric 3x3 via power iteration. Used to
+/// recover a rotation axis from the spread of per-frame rotation vectors —
+/// robust to symmetric left/right motion whose vectors would cancel in a mean.
+fn dominant_axis(m: &[[f64; 3]; 3]) -> [f64; 3] {
+    let mut v = [1.0, 0.3, 0.7];
+    for _ in 0..200 {
+        let mut w = [0.0; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                w[i] += m[i][j] * v[j];
+            }
+        }
+        let n = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+        if n < 1e-30 {
+            break;
+        }
+        v = [w[0] / n, w[1] / n, w[2] / n];
+    }
+    v
+}
+
+fn dot(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn unit(a: &[f64; 3]) -> [f64; 3] {
+    let n = dot(a, a).sqrt();
+    if n < 1e-12 {
+        *a
+    } else {
+        [a[0] / n, a[1] / n, a[2] / n]
+    }
+}
+
+/// Decode a dump into per-frame rotation vectors of the rigid head subset,
+/// relative to the mean of the first 30 valid frames (neutral pose).
+fn dump_rotvecs(path: &str) -> Result<Vec<[f64; 3]>> {
+    let payloads = main_stream_payloads(path)?;
+    let mut frames: Vec<Vec<[f64; 3]>> = Vec::new();
+    for payload in &payloads {
+        let values = decode_stream_payload(payload)?;
+        let mut pts = Vec::with_capacity(RIGID_OCCS.len());
+        let mut ok = true;
+        for &o in &RIGID_OCCS {
+            match head_point(&values, o) {
+                Some(p) if p.iter().any(|v| v.abs() > 1e-6) => pts.push(p),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            frames.push(pts);
+        }
+    }
+    anyhow::ensure!(frames.len() > 30, "too few valid frames in {path}");
+    let nref = 30.min(frames.len());
+    let mut reference = vec![[0.0; 3]; RIGID_OCCS.len()];
+    for frame in &frames[..nref] {
+        for (i, p) in frame.iter().enumerate() {
+            for k in 0..3 {
+                reference[i][k] += p[k] / nref as f64;
+            }
+        }
+    }
+    Ok(frames
+        .iter()
+        .map(|f| rotvec_deg(&kabsch(&reference, f)))
+        .collect())
+}
+
+/// Analysis: recover the head's rotation axes (in the tilted sensor frame) from
+/// controlled yaw/pitch/roll dumps, then show that projecting each frame's
+/// Kabsch rotation onto those axes yields yaw/pitch/roll that are decoupled
+/// from each other AND from translation. Pass labelled dumps; labels starting
+/// with `yaw`/`pitch`/`roll` define the basis, `shift*` are leak tests.
+pub(crate) fn head_axes(inputs: &[LogInput]) -> Result<()> {
+    let mut dumps: Vec<(String, Vec<[f64; 3]>, [f64; 3])> = Vec::new();
+    println!("Per-dump rotation axis (Kabsch on occ {RIGID_OCCS:?}, sensor frame):");
+    println!("  {:<10} {:>5} {:>22} {:>8}", "dump", "n", "axis (x,y,z)", "rot°range");
+    for input in inputs {
+        let rvs = dump_rotvecs(&input.path)?;
+        // Dominant axis = top eigenvector of sum of outer products rv·rvᵀ.
+        let mut m = [[0.0; 3]; 3];
+        for rv in &rvs {
+            for i in 0..3 {
+                for j in 0..3 {
+                    m[i][j] += rv[i] * rv[j];
+                }
+            }
+        }
+        let axis = dominant_axis(&m);
+        // Orient the axis so the dump's net motion is positive along it.
+        let mags: Vec<f64> = rvs.iter().map(|rv| dot(rv, &axis)).collect();
+        let (mn, mx, _) = min_max_std(&mags);
+        println!(
+            "  {:<10} {:>5} {:>7.3},{:>6.3},{:>6.3} {:>8.1}",
+            input.label,
+            rvs.len(),
+            axis[0],
+            axis[1],
+            axis[2],
+            mx - mn
+        );
+        dumps.push((input.label.clone(), rvs, axis));
+    }
+
+    // Build an orthonormal head basis from the yaw/pitch axes (roll = yaw×pitch).
+    let find = |p: &str| dumps.iter().find(|(l, ..)| l.starts_with(p)).map(|(_, _, a)| *a);
+    let (Some(yaw_ax), Some(pitch_ax)) = (find("yaw"), find("pitch")) else {
+        println!("\n(need both a `yaw…` and a `pitch…` dump to build the head basis)");
+        return Ok(());
+    };
+    let u_yaw = unit(&yaw_ax);
+    // Orthogonalize pitch against yaw (Gram-Schmidt), roll = yaw × pitch.
+    let p_proj = dot(&pitch_ax, &u_yaw);
+    let pitch_o = [
+        pitch_ax[0] - p_proj * u_yaw[0],
+        pitch_ax[1] - p_proj * u_yaw[1],
+        pitch_ax[2] - p_proj * u_yaw[2],
+    ];
+    let u_pitch = unit(&pitch_o);
+    let u_roll = unit(&cross(&u_yaw, &u_pitch));
+
+    let yaw_pitch_angle = dot(&u_yaw, &unit(&pitch_ax)).clamp(-1.0, 1.0).acos().to_degrees();
+    println!(
+        "\nHead basis (sensor frame): yaw {:.3?}, pitch⊥ {:.3?}, roll {:.3?}",
+        u_yaw, u_pitch, u_roll
+    );
+    println!("  raw yaw/pitch axes are {yaw_pitch_angle:.1}° apart (90° = orthogonal)");
+    let tilt = u_yaw[2].atan2(u_yaw[1]).to_degrees();
+    println!("  yaw axis tilt from sensor-Y toward Z: {tilt:.1}°  (the source of yaw→roll bleed)");
+
+    // Project every dump's rotation onto the head basis → decoupled angles.
+    println!("\nDecoupled angle ranges (projection onto head basis), degrees:");
+    println!("  {:<10} {:>9} {:>9} {:>9}", "dump", "yaw", "pitch", "roll");
+    for (label, rvs, _) in &dumps {
+        let proj = |u: &[f64; 3]| {
+            let v: Vec<f64> = rvs.iter().map(|rv| dot(rv, u)).collect();
+            let (mn, mx, _) = min_max_std(&v);
+            mx - mn
+        };
+        println!(
+            "  {:<10} {:>9.1} {:>9.1} {:>9.1}",
+            label,
+            proj(&u_yaw),
+            proj(&u_pitch),
+            proj(&u_roll)
+        );
+    }
+    Ok(())
+}
+
 fn min_max_std(v: &[f64]) -> (f64, f64, f64) {
     let mn = v.iter().copied().fold(f64::INFINITY, f64::min);
     let mx = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);

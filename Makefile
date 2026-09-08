@@ -19,7 +19,7 @@ REL         := target/release
 BINS        := tobiid tobii-opentrack tobii-gaze-keys tobii5-init-replay
 LIB         := libtobii.so
 
-.PHONY: build install install-bin install-udev install-units enable disable uninstall clean
+.PHONY: build install install-bin install-udev install-units enable enable-keys disable uninstall clean
 
 build:
 	cargo build --release
@@ -50,17 +50,24 @@ install-units:
 	sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/tobiid|' systemd/tobiid.service \
 		> $(USERUNITDIR)/tobiid.service
 	install -m 0644 systemd/tobiid.socket $(USERUNITDIR)/tobiid.socket
+	sed 's|^ExecStart=%h/Work/tobii/target/release/tobii-gaze-keys|ExecStart=$(BINDIR)/tobii-gaze-keys|' \
+		systemd/tobii-gaze-keys.service > $(USERUNITDIR)/tobii-gaze-keys.service
 	systemctl --user daemon-reload
 
 enable:
 	systemctl --user enable --now tobiid.service
 
+# Enable the gaze-to-keyboard binder too (pulls in tobiid via Requires=).
+enable-keys:
+	systemctl --user enable --now tobii-gaze-keys.service
+
 disable:
+	-systemctl --user disable --now tobii-gaze-keys.service
 	-systemctl --user disable --now tobiid.service
 	-systemctl --user disable --now tobiid.socket
 
 uninstall: disable
-	-rm -f $(USERUNITDIR)/tobiid.service $(USERUNITDIR)/tobiid.socket
+	-rm -f $(USERUNITDIR)/tobiid.service $(USERUNITDIR)/tobiid.socket $(USERUNITDIR)/tobii-gaze-keys.service
 	systemctl --user daemon-reload
 	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS)) $(LIBDIR)/$(LIB)
 	$(SUDO) rm -f $(UDEVDIR)/99-tobii-uaccess.rules $(UDEVDIR)/99-tobii-no-uvcvideo.rules $(UDEVDIR)/99-tobii-uinput.rules

@@ -1,13 +1,14 @@
-//! Background engine that owns the USB device and produces tracking samples.
+//! Background engine that owns the USB device and produces tracking samples:
+//! gaze point + user presence from the 0x83 gaze stream (~33 Hz) plus
+//! gaze-independent 6DOF head pose from the device's own 280x280 IR image
+//! stream (0x50e), which the firmware multiplexes on the same endpoint
+//! concurrently. Head-pose inference only runs while a client wants it
+//! (`set_head_wanted`).
 //!
-//! The device cannot run the processed (0x83) pipeline and the raw camera at
-//! the same time: pulling the UVC camera throttles 0x83 from ~33 Hz to <1 Hz
-//! (firmware mode, not bandwidth — verified with `probe`). So an `Engine` runs
-//! in exactly **one** mode at a time:
-//!   * `HeadCamera` — gaze-independent 6DOF head pose from the IR camera (~8 fps)
-//!   * `Gaze`       — gaze point + user presence from the 0x83 stream (~33 Hz)
-//! The FFI device picks the mode from the first subscription; mixing the two on
-//! one physical device is rejected.
+//! The UVC camera (interface 2) is never used by the engine: streaming it
+//! throttles the 0x83 streams from ~33 Hz to <1 Hz (firmware mode, not
+//! bandwidth — verified with `probe`). The UVC path survives only in the
+//! standalone research subcommands (`camera`, `track`, `probe`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,12 +16,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum EngineMode {
-    HeadCamera,
-    Gaze,
-}
 
 #[derive(Clone, Copy)]
 pub struct PoseSample {
@@ -35,9 +30,10 @@ pub struct GazeSample {
     pub gaze_valid: bool,
     pub gaze_norm: [f64; 2], // normalized screen, ~[-1, 1]
     pub present: bool,       // user presence
+    pub pupil_mm: [f64; 2],  // left, right diameter; NaN if unavailable
 }
 
-/// One item out of the engine; which variant arrives depends on the mode.
+/// One item out of the engine.
 #[derive(Clone, Copy)]
 pub enum Sample {
     Pose(PoseSample),
@@ -50,45 +46,45 @@ pub enum Sample {
 pub struct Engine {
     stop: Arc<AtomicBool>,
     recenter: Arc<AtomicBool>,
+    head_wanted: Arc<AtomicBool>,
     rx: Receiver<Sample>,
     pending: VecDeque<Sample>,
     handle: Option<JoinHandle<()>>,
-    mode: EngineMode,
 }
 
 impl Engine {
-    pub fn start(mode: EngineMode) -> Self {
+    pub fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let recenter = Arc::new(AtomicBool::new(false));
+        let head_wanted = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let s = stop.clone();
         let rc = recenter.clone();
+        let hw = head_wanted.clone();
         let handle = thread::spawn(move || {
-            let result = match mode {
-                EngineMode::HeadCamera => crate::device::run_pose_engine(&s, &rc, &tx),
-                EngineMode::Gaze => crate::device::run_gaze_engine(&s, &tx),
-            };
-            if let Err(e) = result {
-                eprintln!("tobii engine ({mode:?}) stopped: {e:?}");
+            if let Err(e) = crate::device::run_gaze_engine(&s, &rc, &hw, &tx) {
+                eprintln!("tobii engine stopped: {e:?}");
             }
         });
         Engine {
             stop,
             recenter,
+            head_wanted,
             rx,
             pending: VecDeque::new(),
             handle: Some(handle),
-            mode,
         }
-    }
-
-    pub fn mode(&self) -> EngineMode {
-        self.mode
     }
 
     /// Ask the head tracker to recalibrate its rest pose on the next frames.
     pub fn request_recenter(&self) {
         self.recenter.store(true, Ordering::Relaxed);
+    }
+
+    /// Run head-pose inference on the image stream (costs CPU) while some
+    /// client consumes head pose; frames are dropped otherwise.
+    pub fn set_head_wanted(&self, wanted: bool) {
+        self.head_wanted.store(wanted, Ordering::Relaxed);
     }
 
     /// Is the device thread still running (false once it has exited/failed)?

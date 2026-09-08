@@ -28,6 +28,24 @@ const CALIB_FRAMES: usize = 30;
 const CLAMP_DEG: f64 = 45.0;
 const CROP_HALF: f32 = 160.0;
 const FOCAL: f64 = 457.0; // ~63deg vertical FOV on a 560px frame (matches MediaPipe)
+/// The device's own 280x280 IR stream (EP 0x83, stream 0x50e), upscaled 2x to
+/// 560x560 so the same crop/landmark pipeline applies. Focal length fitted on
+/// the Windows captures: iris pixels vs projected 0x83 eyeball centres give
+/// f = 376 px in the 280 frame (r² 0.999), i.e. 752 px at 560.
+const IMAGE83_FOCAL: f64 = 752.0;
+const IMAGE83_CY_FRAC: f32 = 0.5;
+/// Face crop (half-size, px) for the 2x-upscaled 0x50e stream. The face is only
+/// ~150 px wide at 560 (65-75 cm), so the 320-px UVC crop leaves it at <50%
+/// fill and the landmark score goes negative beyond ~38° yaw / ~13° right
+/// roll. Replaying the Windows sweeps: 105-115 lose 0 frames on all six
+/// captures; 100 loses 13 (yaw), 120 loses 18 (roll), 160 loses 18+27.
+const IMAGE83_CROP_HALF: f32 = 110.0;
+/// The tracker camera looks up ~20° at the user (the device's S frame is
+/// tilted 20.0° relative to the display frame). Relative head rotations are
+/// expressed in the upright (display) frame, so yaw is a turn about the true
+/// vertical: with the camera-frame decomposition a 30° turn read as 28° yaw +
+/// 11° roll and a 20° tilt as 19° roll + 7° yaw. Override: TOBII_CAMERA_TILT_DEG.
+const CAMERA_TILT_DEG: f64 = 20.0;
 
 pub(crate) struct FaceModel {
     session: Session,
@@ -186,6 +204,36 @@ pub(crate) fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
             0.0,
         ]
     }
+}
+
+const IDENTITY3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Inverse of `euler_deg`: R = Rz(roll) * Ry(yaw) * Rx(pitch), degrees in.
+fn from_euler_deg(e: &[f64; 3]) -> [[f64; 3]; 3] {
+    let (sa, ca) = e[0].to_radians().sin_cos();
+    let (sb, cb) = e[1].to_radians().sin_cos();
+    let (sg, cg) = e[2].to_radians().sin_cos();
+    [
+        [cg * cb, cg * sb * sa - sg * ca, cg * sb * ca + sg * sa],
+        [sg * cb, sg * sb * sa + cg * ca, sg * sb * ca - cg * sa],
+        [-sb, cb * sa, cb * ca],
+    ]
+}
+
+/// `T · R · R0^T · T^T`: the rotation that takes the rest pose `R0` to `R`,
+/// expressed in the upright frame (`T` = camera -> upright).
+fn relative_upright(r: &[[f64; 3]; 3], r0: &[[f64; 3]; 3], t: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    matmul3(&matmul3(t, &matmul3(r, &transpose3(r0))), &transpose3(t))
+}
+
+fn transpose3(r: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut o = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            o[i][j] = r[j][i];
+        }
+    }
+    o
 }
 
 fn matvec3(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
@@ -379,7 +427,43 @@ pub(crate) struct Tracker {
     debug: bool,
     roll_eyeline: bool,
     frame: u64,
+    /// Pinhole focal length (px) of the frames fed to `process`.
+    focal: f64,
+    /// Half-size (px) of the face crop fed to the landmark model.
+    crop_half: f32,
+    /// Initial crop centre as a fraction of the frame height.
+    cy_frac: f32,
+    /// Pose of the last processed frame before rest-pose subtraction and
+    /// smoothing: [tx, ty, tz (cm at the pivot), pitch, yaw, roll (deg)];
+    /// `None` when no face was found in it.
+    last_raw: Option<[f64; 6]>,
+    /// While the face is lost: index into `SEARCH_GRID` of the crop centre to
+    /// try on the next frame (one candidate per frame); `None` once tracking.
+    searching: Option<usize>,
+    /// Rest-pose rotation (head -> camera) captured at calibration. Angles are
+    /// reported from the relative rotation `T · R · rot0^T · T^T`, i.e. in the
+    /// upright frame (`T` undoes the camera tilt): subtracting euler angles per
+    /// axis instead would leak yaw into roll (and back) through the camera's
+    /// ~20° upward tilt (0.4 deg/deg).
+    rot0: Option<[[f64; 3]; 3]>,
+    /// `T` = Rx(camera tilt): camera frame -> upright frame.
+    untilt: [[f64; 3]; 3],
 }
+
+/// Crop centres (fractions of frame width/height) cycled while the face is
+/// lost. Centre first, then the cardinal offsets, then the corners; a 3x3 grid
+/// with a face-sized crop covers the whole frame within 9 frames (~0.3 s).
+const SEARCH_GRID: [(f32, f32); 9] = [
+    (0.5, 0.5),
+    (0.5, 0.25),
+    (0.5, 0.75),
+    (0.25, 0.5),
+    (0.75, 0.5),
+    (0.25, 0.25),
+    (0.75, 0.25),
+    (0.25, 0.75),
+    (0.75, 0.75),
+];
 
 fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key)
@@ -389,7 +473,18 @@ fn env_f64(key: &str, default: f64) -> f64 {
 }
 
 impl Tracker {
+    /// Tracker for the UVC camera path (560x560 frames, MediaPipe-like FOV).
     pub(crate) fn new() -> Result<Self> {
+        Self::with_geometry(FOCAL, CROP_HALF, 0.42)
+    }
+
+    /// Tracker for the 0x50e image stream: feed it 280x280 frames upscaled 2x
+    /// (`image83::upscale2x`), i.e. 560x560 at the fitted focal length.
+    pub(crate) fn new_image83() -> Result<Self> {
+        Self::with_geometry(IMAGE83_FOCAL, IMAGE83_CROP_HALF, IMAGE83_CY_FRAC)
+    }
+
+    pub(crate) fn with_geometry(focal: f64, crop_half: f32, cy_frac: f32) -> Result<Self> {
         let pivot = [
             0.0,
             env_f64("TOBII_PIVOT_DOWN", PIVOT_NECK_DOWN_CM),
@@ -416,12 +511,25 @@ impl Tracker {
             debug,
             roll_eyeline,
             frame: 0,
+            focal,
+            crop_half,
+            cy_frac,
+            last_raw: None,
+            searching: None,
+            rot0: None,
+            untilt: from_euler_deg(&[env_f64("TOBII_CAMERA_TILT_DEG", CAMERA_TILT_DEG), 0.0, 0.0]),
         })
+    }
+
+    /// Unfiltered pose of the last frame (see `last_raw`), for offline analysis.
+    pub(crate) fn last_raw(&self) -> Option<[f64; 6]> {
+        self.last_raw
     }
 
     /// Drop the calibrated rest pose so it recalibrates from the next frames.
     pub(crate) fn recenter(&mut self) {
         self.origin = None;
+        self.rot0 = None;
         self.accum.clear();
         self.have = false;
         eprintln!("recenter: recalibrating rest pose");
@@ -430,20 +538,31 @@ impl Tracker {
     pub(crate) fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
         if self.cx == 0.0 {
             self.cx = w as f32 / 2.0;
-            self.cy = h as f32 * 0.42;
+            self.cy = h as f32 * self.cy_frac;
         }
+        // While the face is lost, sweep the crop over a grid of candidate
+        // centres (one per frame); otherwise a face outside the initial crop
+        // would never be found. Once found, the crop follows the face.
+        if let Some(i) = self.searching {
+            let (fx, fy) = SEARCH_GRID[i % SEARCH_GRID.len()];
+            self.cx = w as f32 * fx;
+            self.cy = h as f32 * fy;
+        }
+        let crop_half = self.crop_half;
+        let focal = self.focal;
         let (pts, score) = self
             .model
-            .landmarks(gray, w, h, self.cx, self.cy, CROP_HALF)?;
+            .landmarks(gray, w, h, self.cx, self.cy, crop_half)?;
         if score < 0.0 {
-            // Face lost - re-centre the crop and wait.
-            self.cx = w as f32 / 2.0;
-            self.cy = h as f32 * 0.42;
+            // Face lost - try the next search position on the next frame.
+            self.searching = Some(self.searching.map_or(1, |i| i + 1));
+            self.last_raw = None;
             return Ok(None);
         }
+        self.searching = None;
 
         // Landmark centroid + spread in the 256 crop, mapped back to the frame.
-        let span = CROP_HALF * 2.0;
+        let span = crop_half * 2.0;
         let (mut mx, mut my) = (0.0f32, 0.0f32);
         for p in &pts {
             mx += p[0];
@@ -457,8 +576,8 @@ impl Tracker {
         }
         size /= pts.len() as f32;
         let _ = size;
-        let crop_x0 = self.cx - CROP_HALF;
-        let crop_y0 = self.cy - CROP_HALF;
+        let crop_x0 = self.cx - crop_half;
+        let crop_y0 = self.cy - crop_half;
         self.cx = crop_x0 + mx / IN as f32 * span; // follow the face next frame
         self.cy = crop_y0 + my / IN as f32 * span;
 
@@ -477,13 +596,13 @@ impl Tracker {
             .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
             .collect();
         let init_r = kabsch(&self.canonical, &observed);
-        let init_depth = FOCAL * spread3(&self.canonical) / spread2(&image2d).max(1e-6);
+        let init_depth = focal * spread3(&self.canonical) / spread2(&image2d).max(1e-6);
 
         // Perspective solve: metric, rotation-decoupled rotation + translation.
         let (r, t) = solve_pnp(
             &self.canonical,
             &image2d,
-            FOCAL,
+            focal,
             w as f64 / 2.0,
             h as f64 / 2.0,
             init_r,
@@ -510,6 +629,7 @@ impl Tracker {
         let rp = matvec3(&r, &self.pivot);
         let tp = [t[0] + rp[0], t[1] + rp[1], t[2] + rp[2]];
         let raw = [tp[0], tp[1], tp[2], mp[0], mp[1], mp[2]]; // translation in cm
+        self.last_raw = Some(raw);
 
         self.frame += 1;
         if self.debug && self.frame % 8 == 0 {
@@ -529,6 +649,9 @@ impl Tracker {
                     }
                 }
                 self.origin = Some(o);
+                // Rest rotation from the averaged eulers (undo the MediaPipe
+                // sign flip applied to `mp`).
+                self.rot0 = Some(from_euler_deg(&[o[3], -o[4], -o[5]]));
                 eprintln!("calibrated rest pose");
             }
             return Ok(None);
@@ -539,9 +662,17 @@ impl Tracker {
         let ty = (raw[1] - o[1]) * TRANS_SIGN[1] * TRANS_GAIN[1];
         let tz = (raw[2] - o[2]) * TRANS_SIGN[2] * TRANS_GAIN[2];
         let clamp = |v: f64| v.clamp(-CLAMP_DEG, CLAMP_DEG);
-        let pitch = clamp((raw[3] - o[3]) * ANGLE_SIGN[0]);
-        let yaw = clamp((raw[4] - o[4]) * ANGLE_SIGN[1]);
-        let roll = clamp((raw[5] - o[5]) * ANGLE_SIGN[2]);
+        // Relative rotation R · R0^T (R is head -> camera), expressed in the
+        // upright frame so yaw is about the true vertical.
+        let r_rel = relative_upright(&r, &self.rot0.unwrap_or(IDENTITY3), &self.untilt);
+        let er = euler_deg(&r_rel);
+        let mut rel = [er[0], -er[1], -er[2]]; // pitch, yaw, roll (MediaPipe sign)
+        if self.roll_eyeline {
+            rel[2] = raw[5] - o[5]; // eye-line roll is an image-plane measure
+        }
+        let pitch = clamp(rel[0] * ANGLE_SIGN[0]);
+        let yaw = clamp(rel[1] * ANGLE_SIGN[1]);
+        let roll = clamp(rel[2] * ANGLE_SIGN[2]);
         let (tx, ty, tz) = if SEND_TRANSLATION {
             (tx, ty, tz)
         } else {
@@ -564,6 +695,101 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_euler_round_trips_euler_deg() {
+        for e in [[-20.0, 30.0, 5.0], [10.0, -40.0, -12.0], [0.0, 0.0, 0.0]] {
+            let back = euler_deg(&from_euler_deg(&e));
+            for k in 0..3 {
+                assert!((back[k] - e[k]).abs() < 1e-9, "{e:?} -> {back:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn relative_rotation_does_not_leak_yaw_into_roll() {
+        // Camera looks up 20°: camera = Rx(-20) · upright. The head at rest is
+        // additionally pitched 8° down in the upright frame; it then turns 30°
+        // about the WORLD vertical and, separately, rolls 20°.
+        let tilt = from_euler_deg(&[20.0, 0.0, 0.0]); // upright -> camera is its transpose
+        let cam_from_up = transpose3(&tilt);
+        let rest_up = from_euler_deg(&[-8.0, 0.0, 0.0]);
+        let r0 = matmul3(&cam_from_up, &rest_up);
+        let turned = matmul3(&cam_from_up, &matmul3(&from_euler_deg(&[0.0, 30.0, 0.0]), &rest_up));
+        let naive = euler_deg(&turned);
+        let e0 = euler_deg(&r0);
+        assert!((naive[2] - e0[2]).abs() > 8.0, "per-axis subtraction leaks roll: {naive:?} - {e0:?}");
+        let e = euler_deg(&relative_upright(&turned, &r0, &tilt));
+        assert!(e[0].abs() < 1e-9 && (e[1] - 30.0).abs() < 1e-9 && e[2].abs() < 1e-9, "{e:?}");
+        let rolled = matmul3(&cam_from_up, &matmul3(&from_euler_deg(&[0.0, 0.0, 20.0]), &rest_up));
+        let e = euler_deg(&relative_upright(&rolled, &r0, &tilt));
+        assert!(e[1].abs() < 1e-9 && (e[2] - 20.0).abs() < 1e-9, "{e:?}");
+    }
+
+    /// A face far from the initial crop (frame shifted so the face sits in a
+    /// corner) must be found by the grid search within one sweep.
+    #[test]
+    fn image83_tracker_finds_face_outside_initial_crop() {
+        let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
+            return;
+        };
+        let msg = std::fs::read(path).unwrap();
+        let frame = crate::image83::decode_image_payload(&msg).unwrap();
+        let (w, h) = (frame.width, frame.height);
+        // Shift the 280 image by (-70, -60): the face (centre ~ (140, 130))
+        // moves to ~ (70, 70), i.e. outside the centred 110-px crop at 560.
+        let mut shifted = vec![0u8; w * h];
+        for y in 0..h - 60 {
+            for x in 0..w - 70 {
+                shifted[y * w + x] = frame.pixels[(y + 60) * w + (x + 70)];
+            }
+        }
+        let big = crate::image83::upscale2x(&shifted, w, h);
+        let mut t = Tracker::new_image83().unwrap();
+        let mut found_at = None;
+        for i in 0..12 {
+            t.process(&big, w * 2, h * 2).unwrap();
+            if t.last_raw().is_some() {
+                found_at = Some(i);
+                break;
+            }
+        }
+        assert!(matches!(found_at, Some(i) if i < SEARCH_GRID.len()), "face found within one sweep, got {found_at:?}");
+        assert!(t.cx < 300.0 && t.cy < 300.0, "crop re-seated onto the shifted face: ({}, {})", t.cx, t.cy);
+    }
+
+    /// Head pose from a real 0x50e frame (user's face, so the fixture is not
+    /// committed): set TOBII_IMAGE83_FIXTURE to a captured 78609-byte message.
+    #[test]
+    fn image83_frame_yields_a_face_pose() {
+        let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
+            return;
+        };
+        let msg = std::fs::read(path).unwrap();
+        let frame = crate::image83::decode_image_payload(&msg).unwrap();
+        let big = crate::image83::upscale2x(&frame.pixels, frame.width, frame.height);
+        let (w, h) = (frame.width * 2, frame.height * 2);
+        let mut fm = FaceModel::new().unwrap();
+        let (cx, cy) = (w as f32 / 2.0, h as f32 * IMAGE83_CY_FRAC);
+        let (pts, score) = fm.landmarks(&big, w, h, cx, cy, IMAGE83_CROP_HALF).unwrap();
+        assert!(score > 0.0, "face detected in the IR frame, score {score}");
+        let span = IMAGE83_CROP_HALF * 2.0;
+        let (x0, y0) = (cx - IMAGE83_CROP_HALF, cy - IMAGE83_CROP_HALF);
+        let canon = canonical_f64();
+        let image2d: Vec<[f64; 2]> = pts
+            .iter()
+            .map(|p| [(x0 + p[0] / IN as f32 * span) as f64, (y0 + p[1] / IN as f32 * span) as f64])
+            .collect();
+        let observed: Vec<[f64; 3]> =
+            pts.iter().map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
+        let init_r = kabsch(&canon, &observed);
+        let init_depth = IMAGE83_FOCAL * spread3(&canon) / spread2(&image2d);
+        let (r, t) = solve_pnp(&canon, &image2d, IMAGE83_FOCAL, w as f64 / 2.0, h as f64 / 2.0, init_r, init_depth);
+        let e = euler_deg(&r);
+        println!(">>> image83 score={score:.2} pitch/yaw/roll = {:.1}/{:.1}/{:.1}  t = {:.1}/{:.1}/{:.1} cm", e[0], e[1], e[2], t[0], t[1], t[2]);
+        assert!(t[2] > 30.0 && t[2] < 150.0, "depth in a plausible range, got {} cm", t[2]);
+        assert!(e[1].abs() < 45.0 && e[2].abs() < 45.0, "yaw/roll plausible");
+    }
 
     fn read_pgm(path: &str) -> (Vec<u8>, usize, usize) {
         let bytes = std::fs::read(path).unwrap();

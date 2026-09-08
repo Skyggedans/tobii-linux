@@ -11,6 +11,7 @@ pub mod decode;
 pub mod device;
 pub mod engine;
 pub mod ffi;
+pub mod image83;
 pub mod ipc;
 pub mod math;
 pub mod opentrack;
@@ -31,6 +32,7 @@ pub fn run() -> Result<()> {
         Command::ImportTsv { tsv_path, log_path } => analysis::import_tsv(tsv_path, log_path),
         Command::PoseCandidates { inputs } => analysis::pose_candidates(inputs),
         Command::CompareDecoded { inputs } => analysis::compare_decoded(inputs),
+        Command::HeadAxes { inputs } => analysis::head_axes(inputs),
         Command::ExtractCalibration { path, json_path } => {
             analysis::extract_calibration(path, json_path.as_deref())
         }
@@ -38,6 +40,8 @@ pub fn run() -> Result<()> {
         Command::Camera { .. } => device::run_camera(&opts),
         Command::Track { .. } => device::run_track(&opts),
         Command::Probe { .. } => device::run_probe(&opts),
+        Command::Image83 { .. } => device::run_image83(&opts),
+        Command::Image83Replay { path, csv } => device::run_image83_replay(path, csv.as_deref()),
         Command::Head83 { path, occs } => analysis::head83(path, occs),
     }
 }
