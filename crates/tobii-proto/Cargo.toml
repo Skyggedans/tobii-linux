@@ -8,9 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 # Pure decoding: no USB, no inference, no device. That is what makes this
-# crate's 23 tests run in milliseconds.
+# crate's tests run in milliseconds. tobii-ipc is std-only and supplies the
+# geometry vocabulary shared with the daemon and libtobii.so.
 [dependencies]
 anyhow.workspace = true
+tobii-ipc.workspace = true
 tracing.workspace = true
 
 [lints]

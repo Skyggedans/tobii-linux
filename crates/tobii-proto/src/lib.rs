@@ -5,15 +5,23 @@
 //!
 //! - [`protocol`] — message framing, the `init_packets` text format, the
 //!   bulk-read reassembler and the stream start/stop commands.
-//! - [`decode`] — the 0x500 gaze stream: TLV fields and the derived
-//!   [`decode::TrackingFrame`].
+//! - [`gaze83`] — the 0x500 gaze and 0x504 presence streams, decoded by field
+//!   key into what the Stream Engine reports.
+//! - [`facts`] — the device's answers during init (identity, geometry,
+//!   status) and its notifications.
+//! - [`calibration`] — the calibration commands and their payloads.
+//! - [`decode`] — the research decoder of the 0x500 stream (occurrence-indexed
+//!   TLV fields and the derived [`decode::TrackingFrame`]).
 //! - [`image83`] — the 0x50e IR image stream (280x280 8-bit frames).
 //! - [`tlv`] — the TLV encoding inside every message, including the keyed
 //!   fields of the stream messages.
 //! - [`log`] — the `TBI5LOG1` capture format, written live and replayed offline.
 //! - [`time`] — the wall clock those frames are stamped with.
 
+pub mod calibration;
 pub mod decode;
+pub mod facts;
+pub mod gaze83;
 pub mod image83;
 pub mod log;
 pub mod protocol;
