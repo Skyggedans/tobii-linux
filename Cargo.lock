@@ -715,6 +715,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-calib"
+version = "0.1.0"
+dependencies = [
+ "tobii-proto",
+]
+
+[[package]]
 name = "tobii-clients"
 version = "0.1.0"
 dependencies = [

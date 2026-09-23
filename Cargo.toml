@@ -22,6 +22,7 @@ ort = "2.0.0-rc.10"
 rusb = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tobii-calib = { path = "crates/tobii-calib" }
 tobii-ffi = { path = "crates/tobii-ffi" }
 tobii-pose = { path = "crates/tobii-pose" }
 tobii-proto = { path = "crates/tobii-proto" }

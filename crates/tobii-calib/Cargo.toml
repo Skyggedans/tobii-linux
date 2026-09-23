@@ -1,0 +1,18 @@
+[package]
+name = "tobii-calib"
+description = "The Tobii Eye Tracker 5 calibration blob: header, point list, validation and the per-user store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Dependency-free: libtobii.so links this for tobii_calibration_parse and must
+# stay small.
+[dependencies]
+
+[dev-dependencies]
+tobii-proto.workspace = true
+
+[lints]
+workspace = true
