@@ -511,43 +511,154 @@ const MAX_SIDE_MESSAGES: usize = 64;
 /// How long the init replay waits for each command's response.
 const INIT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Read until the response to `expected_seq` is complete, keeping other
-/// messages in `side`. `None` on timeout.
-fn await_response(
-    h: &mut rusb::DeviceHandle<UsbContext>,
-    asm: &mut BulkReassembler,
-    expected_seq: u32,
-    timeout: Duration,
-    side: &mut Vec<Vec<u8>>,
-) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; READ_BUF];
-    let mut msgs = Vec::new();
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        let Ok(n) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) else {
-            continue;
-        };
-        asm.push_into(&buf[..n], &mut msgs);
-        let mut found = None;
-        for msg in msgs.drain(..) {
-            if marker(&msg) == Some(MARKER_RESPONSE) && seq(&msg) == Some(expected_seq) {
-                found = Some(msg);
-            } else if marker(&msg) != Some(MARKER_RESPONSE) && side.len() < MAX_SIDE_MESSAGES {
-                side.push(msg);
-            }
-        }
-        if found.is_some() {
-            return found;
+/// How long one read waits while draining EP 0x83 between the pieces of a
+/// chunked command: only what the device already sent is wanted.
+const DRAIN_READ_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Most reads per drain, so a device that keeps streaming cannot hold the
+/// replay there.
+const MAX_DRAIN_READS: usize = 16;
+
+/// The init replay's read state: one reassembler and reusable buffers.
+struct InitReader {
+    asm: BulkReassembler,
+    buf: Vec<u8>,
+    msgs: Vec<Vec<u8>>,
+}
+
+impl InitReader {
+    fn new() -> Self {
+        Self {
+            asm: BulkReassembler::new(),
+            buf: vec![0u8; READ_BUF],
+            msgs: Vec::new(),
         }
     }
-    None
+
+    /// Read once, waiting up to `timeout`; the messages completed land in
+    /// `self.msgs`. `Ok(false)` when nothing came; an error other than the
+    /// timeout ends the waiting (retrying it would only spin: the next write
+    /// reports it).
+    fn read(
+        &mut self,
+        h: &mut rusb::DeviceHandle<UsbContext>,
+        timeout: Duration,
+    ) -> Result<bool, rusb::Error> {
+        match h.read_bulk(EP_IN, &mut self.buf, timeout) {
+            Ok(n) => {
+                self.asm.push_into(&self.buf[..n], &mut self.msgs);
+                Ok(true)
+            }
+            Err(rusb::Error::Timeout) => Ok(false),
+            Err(e) => {
+                debug!(error = ?e, "init: read failed");
+                Err(e)
+            }
+        }
+    }
+
+    /// Read until the response to `expected_seq` is complete, keeping other
+    /// messages in `side`. `None` on timeout.
+    fn await_response(
+        &mut self,
+        h: &mut rusb::DeviceHandle<UsbContext>,
+        expected_seq: u32,
+        timeout: Duration,
+        side: &mut Vec<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            match self.read(h, Duration::from_millis(200)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return None,
+            }
+            let mut found = None;
+            for msg in self.msgs.drain(..) {
+                if marker(&msg) == Some(MARKER_RESPONSE) && seq(&msg) == Some(expected_seq) {
+                    log_init_message(&msg);
+                    found = Some(msg);
+                } else {
+                    keep_side(msg, side);
+                }
+            }
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    /// Take whatever EP 0x83 already holds, keeping it in `side`.
+    fn drain(&mut self, h: &mut rusb::DeviceHandle<UsbContext>, side: &mut Vec<Vec<u8>>) {
+        for _ in 0..MAX_DRAIN_READS {
+            if !matches!(self.read(h, DRAIN_READ_TIMEOUT), Ok(true)) {
+                return;
+            }
+            for msg in self.msgs.drain(..) {
+                keep_side(msg, side);
+            }
+        }
+    }
+}
+
+/// Trace one message read during the init replay.
+fn log_init_message(msg: &[u8]) {
+    debug!(
+        len = msg.len(),
+        marker = ?marker(msg),
+        seq = ?seq(msg),
+        id = ?parse_message(msg).map(|m| m.id),
+        "IN"
+    );
+}
+
+/// Keep a message read during the init replay for the caller, unless it is a
+/// command response (those are matched by seq, not collected).
+fn keep_side(msg: Vec<u8>, side: &mut Vec<Vec<u8>>) {
+    log_init_message(&msg);
+    if marker(&msg) != Some(MARKER_RESPONSE) && side.len() < MAX_SIDE_MESSAGES {
+        side.push(msg);
+    }
+}
+
+/// What the init replay does after writing one packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterWrite {
+    /// More pieces of this command follow: take what the device sent.
+    Drain,
+    /// The command is complete: wait for its response.
+    Await(u32),
+    /// Nothing to wait for.
+    Continue,
+}
+
+/// The step after writing `packets[i]`, given the seq of the command being
+/// written (updated from `packets[i]` when it starts one).
+fn after_write(packets: &[InitPacket], i: usize, awaiting: &mut Option<u32>) -> AfterWrite {
+    if let Some(s) = packets.get(i).and_then(|p| command_seq(&p.data)) {
+        *awaiting = Some(s);
+    }
+    let command_complete = packets
+        .get(i + 1)
+        .is_none_or(|next| command_seq(&next.data).is_some());
+    if !command_complete {
+        AfterWrite::Drain
+    } else if let Some(s) = awaiting.take() {
+        AfterWrite::Await(s)
+    } else {
+        AfterWrite::Continue
+    }
 }
 
 /// Replay the init-packet sequence once on `h`, collecting each command's
 /// `0x52` response (best-effort: a missing one is logged and skipped).
 /// A command split over several writes is answered after its last piece, so
-/// the wait happens there. Returns early without error once `stop` is set; a
-/// failed write ends the replay with an error.
+/// the wait happens there. Between the pieces EP 0x83 is drained: the device
+/// sends a notification after the first piece of the calibration upload and
+/// stops accepting further pieces until the host has read it. Returns early
+/// without error once `stop` is set; a failed write ends the replay with an
+/// error.
 ///
 /// # Errors
 ///
@@ -559,25 +670,29 @@ pub fn replay_init_packets(
 ) -> Result<InitCapture> {
     let started = Instant::now();
     let mut capture = InitCapture::default();
-    let mut asm = BulkReassembler::new();
+    let mut reader = InitReader::new();
     let mut awaiting = None;
     for (i, pkt) in packets.iter().enumerate() {
         if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
             return Ok(capture);
         }
-        if let Some(s) = command_seq(&pkt.data) {
-            awaiting = Some(s);
-        }
         h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000))
-            .context("init packet write failed")?;
-        let command_complete = packets
-            .get(i + 1)
-            .is_none_or(|next| command_seq(&next.data).is_some());
-        if command_complete && let Some(s) = awaiting.take() {
-            match await_response(h, &mut asm, s, INIT_RESPONSE_TIMEOUT, &mut capture.side) {
-                Some(rsp) => capture.responses.push(rsp),
-                None => debug!(seq = s, "init: no response"),
+            .with_context(|| {
+                format!(
+                    "init packet {i} write failed (command seq {:?}, {} ms in)",
+                    command_seq(&pkt.data).or(awaiting),
+                    started.elapsed().as_millis()
+                )
+            })?;
+        match after_write(packets, i, &mut awaiting) {
+            AfterWrite::Drain => reader.drain(h, &mut capture.side),
+            AfterWrite::Await(s) => {
+                match reader.await_response(h, s, INIT_RESPONSE_TIMEOUT, &mut capture.side) {
+                    Some(rsp) => capture.responses.push(rsp),
+                    None => debug!(seq = s, "init: no response"),
+                }
             }
+            AfterWrite::Continue => {}
         }
         thread::sleep(Duration::from_millis(2));
     }
@@ -615,23 +730,40 @@ fn wait_for_gaze_stream_with(
 ) -> bool {
     let mut buf = vec![0u8; READ_BUF];
     let mut msgs = Vec::new();
+    let mut seen = 0usize;
     let start = Instant::now();
     while start.elapsed() < dur && !stop.load(Ordering::Relaxed) {
-        if let Ok(n) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
-            asm.push_into(&buf[..n], &mut msgs);
-            for msg in &msgs {
-                if stream_id(msg) == Some(STREAM_ID_GAZE)
-                    && parse_message(msg)
-                        .as_ref()
-                        .and_then(decode_gaze_frame)
-                        .is_some()
-                {
-                    return true;
+        match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
+            Ok(n) => {
+                asm.push_into(&buf[..n], &mut msgs);
+                for msg in &msgs {
+                    seen += 1;
+                    if stream_id(msg) == Some(STREAM_ID_GAZE)
+                        && parse_message(msg)
+                            .as_ref()
+                            .and_then(decode_gaze_frame)
+                            .is_some()
+                    {
+                        return true;
+                    }
+                    debug!(
+                        len = msg.len(),
+                        marker = ?marker(msg),
+                        stream = ?stream_id(msg),
+                        "arming: not a gaze frame"
+                    );
+                    side(msg);
                 }
-                side(msg);
+            }
+            Err(rusb::Error::Timeout) => {}
+            Err(e) => {
+                // Not a stream that is merely slow to start: re-open.
+                debug!(error = ?e, "arming: read failed");
+                return false;
             }
         }
     }
+    debug!(messages = seen, "arming: no gaze frame");
     false
 }
 
@@ -1073,5 +1205,25 @@ mod tests {
             facts.track_box.is_some() && facts.display_area.is_some() && facts.mounting.is_some()
         );
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
+    }
+
+    #[test]
+    fn the_replay_drains_between_the_pieces_of_the_calibration_upload() {
+        let packets = crate::calibration::embedded_packets().expect("embedded");
+        let mut awaiting = None;
+        let steps: Vec<AfterWrite> = (0..packets.len())
+            .map(|i| after_write(&packets, i, &mut awaiting))
+            .collect();
+
+        // 38 single-write commands, each awaited by its own seq.
+        for (i, step) in steps[..38].iter().enumerate() {
+            assert_eq!(*step, AfterWrite::Await(u32::try_from(i + 1).expect("seq")));
+        }
+        // The calibration upload (seq 39) spans 162 writes. The device stops
+        // taking them while its notification is unread, so every write but
+        // the last drains; the response is awaited after the last.
+        assert!(steps[38..199].iter().all(|s| *s == AfterWrite::Drain));
+        assert_eq!(steps[199], AfterWrite::Await(39));
+        assert_eq!(steps[200..], [AfterWrite::Await(40), AfterWrite::Await(41)]);
     }
 }
