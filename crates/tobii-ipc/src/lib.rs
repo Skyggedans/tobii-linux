@@ -1,39 +1,93 @@
 //! Tiny dependency-free IPC between the daemon (`tobiid`), thin executables,
 //! and the `libtobii.so` client. Length-prefixed binary frames over a Unix
 //! domain socket. One frame = `u32 LE length` + `1 byte tag` + body.
+//!
+//! | tag | direction | body |
+//! |---|---|---|
+//! | `0x01` SUBSCRIBE | client -> daemon | `u32 LE` stream mask (a legacy 1-byte `u8` mask is accepted) |
+//! | `0x02` RECENTER | client -> daemon | none |
+//! | `0x03` REQUEST | client -> daemon | `u32 id`, `u8 kind`, payload ([`request`]) |
+//! | `0x10` SUBSCRIBED | daemon -> client | `u8 ok` |
+//! | `0x11` REPLY | daemon -> client | `u32 id`, `u8 status`, payload |
+//! | `0x20` HEAD .. `0x27` NOTIFICATION | daemon -> client | samples ([`ServerMsg`]) |
+//!
+//! Sample timestamps are the device clock in microseconds.
+//!
+//! The SUBSCRIBE mask is written as `u32 LE`, whose first byte is the low
+//! byte of the mask: a daemon that reads only one byte still sees every
+//! stream below bit 8, so old and new peers interoperate either way.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-// Stream subscription bits (client -> daemon), OR-ed into the SUBSCRIBE body.
+pub mod geometry;
+pub mod request;
+mod sample;
+mod wire;
+
+pub use sample::{
+    EyePair, EyePoint, GazeData, GazeDataEye, Image, Notification, NotificationValue, ServerMsg,
+    decode_server, encode_eye_position, encode_gaze, encode_gaze_data, encode_gaze_origin,
+    encode_head, encode_image, encode_notification, encode_presence, encode_reply,
+    encode_subscribed, notification,
+};
+
+// Stream subscription bits (client -> daemon), OR-ed into the SUBSCRIBE mask.
 
 /// Subscribe to head pose ([`TAG_HEAD`] frames).
-pub const STREAM_HEAD: u8 = 1 << 0;
+pub const STREAM_HEAD: u32 = 1 << 0;
 /// Subscribe to gaze points ([`TAG_GAZE`] frames).
-pub const STREAM_GAZE: u8 = 1 << 1;
-/// Subscribe to user presence ([`TAG_PRESENCE`] frames).
-pub const STREAM_PRESENCE: u8 = 1 << 2;
+pub const STREAM_GAZE: u32 = 1 << 1;
+/// Subscribe to user presence ([`TAG_PRESENCE`] frames, on change).
+pub const STREAM_PRESENCE: u32 = 1 << 2;
+/// Subscribe to gaze origins ([`TAG_GAZE_ORIGIN`] frames).
+pub const STREAM_GAZE_ORIGIN: u32 = 1 << 3;
+/// Subscribe to track-box-normalised eye positions ([`TAG_EYE_POSITION`]).
+pub const STREAM_EYE_POSITION: u32 = 1 << 4;
+/// Subscribe to per-eye gaze data ([`TAG_GAZE_DATA`] frames).
+pub const STREAM_GAZE_DATA: u32 = 1 << 5;
+/// Subscribe to IR camera frames ([`TAG_IMAGE`], ~2.6 MB/s).
+pub const STREAM_IMAGE: u32 = 1 << 6;
+/// Subscribe to device notifications ([`TAG_NOTIFICATION`] frames).
+pub const STREAM_NOTIFICATIONS: u32 = 1 << 7;
 
 // Frame tags (first body byte).
 
-/// Client -> daemon: `u8 streams` bitmask (`STREAM_*`); `0` unsubscribes.
+/// Client -> daemon: `u32 LE` stream mask (`STREAM_*`); `0` unsubscribes.
 pub const TAG_SUBSCRIBE: u8 = 0x01;
 /// Client -> daemon: reset the head rest pose. No payload.
 pub const TAG_RECENTER: u8 = 0x02;
+/// Client -> daemon: `u32 id`, `u8 kind`, payload (see [`request`]).
+pub const TAG_REQUEST: u8 = 0x03;
 /// Daemon -> client: `u8` ok(1) / busy(0), in reply to a SUBSCRIBE.
 pub const TAG_SUBSCRIBED: u8 = 0x10;
+/// Daemon -> client: `u32 id`, `u8 status`, payload, in reply to a REQUEST.
+pub const TAG_REPLY: u8 = 0x11;
 /// Daemon -> client: `i64 ts_us`, `3 x f32` position (mm), `3 x f32` rotation (rad).
 pub const TAG_HEAD: u8 = 0x20;
-/// Daemon -> client: `i64 ts_us`, `u8 valid`, `2 x f32` xy (0..1), then an
-/// optional `2 x f32` pupil-diameter tail (mm, left/right).
+/// Daemon -> client: `i64 ts_us`, `u8 valid`, `2 x f32` xy, then an optional
+/// `2 x f32` pupil-diameter tail (mm, left/right).
 pub const TAG_GAZE: u8 = 0x21;
 /// Daemon -> client: `i64 ts_us`, `u8 status` (`PRESENCE_*`).
 pub const TAG_PRESENCE: u8 = 0x22;
+/// Daemon -> client: `i64 ts_us`, then per eye `u8 valid` + `3 x f32` (mm,
+/// display frame).
+pub const TAG_GAZE_ORIGIN: u8 = 0x23;
+/// Daemon -> client: as [`TAG_GAZE_ORIGIN`], track-box-normalised.
+pub const TAG_EYE_POSITION: u8 = 0x24;
+/// Daemon -> client: a [`GazeData`] sample.
+pub const TAG_GAZE_DATA: u8 = 0x25;
+/// Daemon -> client: `i64 ts_us`, `u32 width`, `u32 height`, `u8 bpp`, pixels.
+pub const TAG_IMAGE: u8 = 0x26;
+/// Daemon -> client: `u8 type`, `u8 value_type`, value (a [`Notification`]).
+pub const TAG_NOTIFICATION: u8 = 0x27;
 
 // Presence status values carried by TAG_PRESENCE (Stream-Engine numbering).
 
+/// Presence has not been reported yet.
+pub const PRESENCE_UNKNOWN: u8 = 0;
 /// No user in front of the tracker.
 pub const PRESENCE_AWAY: u8 = 1;
 /// A user is in front of the tracker.
@@ -100,45 +154,6 @@ fn spawn_daemon() {
     }
 }
 
-/// A decoded sample as delivered by the daemon to a client.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
-pub enum ServerMsg {
-    /// Reply to a SUBSCRIBE frame.
-    Subscribed {
-        /// `true` if the subscription was accepted; `false` if the daemon is busy.
-        ok: bool,
-    },
-    /// Head pose.
-    Head {
-        /// Device timestamp, microseconds.
-        ts_us: i64,
-        /// Translation `[x, y, z]` in millimetres.
-        pos_mm: [f32; 3],
-        /// Rotation `[pitch, yaw, roll]` in radians (Stream-Engine axis order).
-        rot_rad: [f32; 3],
-    },
-    /// Gaze point.
-    Gaze {
-        /// Device timestamp, microseconds.
-        ts_us: i64,
-        /// Whether `xy` holds a usable gaze point.
-        valid: bool,
-        /// Gaze point in normalised screen coordinates, `0..1` per axis.
-        xy: [f32; 2],
-        /// Pupil diameter `[left, right]` in millimetres; `NaN` when the daemon
-        /// did not send the optional tail.
-        pupil_mm: [f32; 2],
-    },
-    /// User presence.
-    Presence {
-        /// Device timestamp, microseconds.
-        ts_us: i64,
-        /// One of [`PRESENCE_AWAY`] / [`PRESENCE_PRESENT`].
-        status: u8,
-    },
-}
-
 /// Write one length-prefixed frame (`u32 LE length` + `body`) and flush.
 ///
 /// # Errors
@@ -175,8 +190,11 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 
 /// Client -> daemon SUBSCRIBE body for the given `STREAM_*` bitmask.
 #[must_use]
-pub fn encode_subscribe(streams: u8) -> Vec<u8> {
-    vec![TAG_SUBSCRIBE, streams]
+pub fn encode_subscribe(streams: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(5);
+    body.push(TAG_SUBSCRIBE);
+    body.extend_from_slice(&streams.to_le_bytes());
+    body
 }
 
 /// Client -> daemon RECENTER body.
@@ -185,95 +203,13 @@ pub fn encode_recenter() -> Vec<u8> {
     vec![TAG_RECENTER]
 }
 
-/// Daemon -> client SUBSCRIBED reply body.
+/// Decode the streams bitmask from a client SUBSCRIBE frame body: a `u32 LE`
+/// mask, or the legacy single `u8`.
 #[must_use]
-pub fn encode_subscribed(ok: bool) -> Vec<u8> {
-    vec![TAG_SUBSCRIBED, u8::from(ok)]
-}
-
-/// Daemon -> client HEAD body: position in mm, rotation in radians.
-#[must_use]
-pub fn encode_head(ts_us: i64, pos_mm: [f32; 3], rot_rad: [f32; 3]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(33);
-    v.push(TAG_HEAD);
-    v.extend_from_slice(&ts_us.to_le_bytes());
-    for x in pos_mm.iter().chain(rot_rad.iter()) {
-        v.extend_from_slice(&x.to_le_bytes());
-    }
-    v
-}
-
-/// Daemon -> client GAZE body, including the pupil tail.
-#[must_use]
-pub fn encode_gaze(ts_us: i64, valid: bool, xy: [f32; 2], pupil_mm: [f32; 2]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(26);
-    v.push(TAG_GAZE);
-    v.extend_from_slice(&ts_us.to_le_bytes());
-    v.push(u8::from(valid));
-    for x in xy.iter().chain(pupil_mm.iter()) {
-        v.extend_from_slice(&x.to_le_bytes());
-    }
-    v
-}
-
-/// Daemon -> client PRESENCE body (`status` is a `PRESENCE_*` value).
-#[must_use]
-pub fn encode_presence(ts_us: i64, status: u8) -> Vec<u8> {
-    let mut v = Vec::with_capacity(10);
-    v.push(TAG_PRESENCE);
-    v.extend_from_slice(&ts_us.to_le_bytes());
-    v.push(status);
-    v
-}
-
-/// Little-endian `i64` at byte offset `o`, or `None` if `b` is too short.
-fn rd_i64(b: &[u8], o: usize) -> Option<i64> {
-    let bytes: [u8; 8] = b.get(o..o.checked_add(8)?)?.try_into().ok()?;
-    Some(i64::from_le_bytes(bytes))
-}
-
-/// Little-endian `f32` at byte offset `o`, or `None` if `b` is too short.
-fn rd_f32(b: &[u8], o: usize) -> Option<f32> {
-    let bytes: [u8; 4] = b.get(o..o.checked_add(4)?)?.try_into().ok()?;
-    Some(f32::from_le_bytes(bytes))
-}
-
-/// Decode a daemon -> client frame body. `None` for an unknown tag or a body
-/// too short for its tag.
-#[must_use]
-pub fn decode_server(body: &[u8]) -> Option<ServerMsg> {
-    match *body.first()? {
-        TAG_SUBSCRIBED => Some(ServerMsg::Subscribed {
-            ok: *body.get(1)? != 0,
-        }),
-        TAG_HEAD => Some(ServerMsg::Head {
-            ts_us: rd_i64(body, 1)?,
-            pos_mm: [rd_f32(body, 9)?, rd_f32(body, 13)?, rd_f32(body, 17)?],
-            rot_rad: [rd_f32(body, 21)?, rd_f32(body, 25)?, rd_f32(body, 29)?],
-        }),
-        TAG_GAZE => Some(ServerMsg::Gaze {
-            ts_us: rd_i64(body, 1)?,
-            valid: *body.get(9)? != 0,
-            xy: [rd_f32(body, 10)?, rd_f32(body, 14)?],
-            // Pupil is an optional tail: older daemons omit it (18-byte frame).
-            pupil_mm: match (rd_f32(body, 18), rd_f32(body, 22)) {
-                (Some(l), Some(r)) => [l, r],
-                _ => [f32::NAN, f32::NAN],
-            },
-        }),
-        TAG_PRESENCE => Some(ServerMsg::Presence {
-            ts_us: rd_i64(body, 1)?,
-            status: *body.get(9)?,
-        }),
-        _ => None,
-    }
-}
-
-/// Decode the streams bitmask from a client SUBSCRIBE frame body.
-#[must_use]
-pub fn decode_subscribe(body: &[u8]) -> Option<u8> {
+pub fn decode_subscribe(body: &[u8]) -> Option<u32> {
     match body {
-        [TAG_SUBSCRIBE, streams, ..] => Some(*streams),
+        [TAG_SUBSCRIBE, a, b, c, d, ..] => Some(u32::from_le_bytes([*a, *b, *c, *d])),
+        [TAG_SUBSCRIBE, streams] => Some(u32::from(*streams)),
         _ => None,
     }
 }
@@ -361,12 +297,25 @@ mod tests {
 
     #[test]
     fn subscribe_frame_round_trips() {
-        assert_eq!(
-            decode_subscribe(&encode_subscribe(STREAM_HEAD | STREAM_GAZE)),
-            Some(3)
-        );
+        let body = encode_subscribe(STREAM_HEAD | STREAM_GAZE | STREAM_NOTIFICATIONS);
+        assert_eq!(body.len(), 5);
+        assert_eq!(decode_subscribe(&body), Some(0x83));
         assert_eq!(decode_subscribe(&[TAG_SUBSCRIBE]), None);
         assert_eq!(decode_subscribe(&[TAG_RECENTER, 1]), None);
+    }
+
+    /// paperwm-gaze (GJS) and older clients send a single mask byte.
+    #[test]
+    fn legacy_one_byte_subscribe_is_accepted() {
+        assert_eq!(decode_subscribe(&[TAG_SUBSCRIBE, 0x05]), Some(0x05));
+    }
+
+    /// An older daemon reads only the byte after the tag: the low byte of the
+    /// new little-endian mask, which carries every stream it knows.
+    #[test]
+    fn new_subscribe_is_readable_by_a_one_byte_decoder() {
+        let body = encode_subscribe(STREAM_HEAD | STREAM_PRESENCE);
+        assert_eq!(body.get(1), Some(&0x05));
     }
 
     #[test]
@@ -378,8 +327,169 @@ mod tests {
         assert_eq!(read_frame(&mut cursor).unwrap(), Some(vec![TAG_RECENTER]));
         assert_eq!(
             read_frame(&mut cursor).unwrap(),
-            Some(vec![TAG_SUBSCRIBE, STREAM_PRESENCE])
+            Some(encode_subscribe(STREAM_PRESENCE))
         );
         assert_eq!(read_frame(&mut cursor).unwrap(), None);
+    }
+
+    fn pair() -> EyePair {
+        EyePair {
+            ts_us: 9_613_320_391,
+            left: EyePoint {
+                valid: true,
+                xyz: [-57.9, 112.5, 618.3],
+            },
+            right: EyePoint {
+                valid: false,
+                xyz: [0.0; 3],
+            },
+        }
+    }
+
+    #[test]
+    fn eye_pair_frames_round_trip() {
+        assert_eq!(
+            decode_server(&encode_gaze_origin(&pair())),
+            Some(ServerMsg::GazeOrigin(pair()))
+        );
+        assert_eq!(
+            decode_server(&encode_eye_position(&pair())),
+            Some(ServerMsg::EyePosition(pair()))
+        );
+        let body = encode_gaze_origin(&pair());
+        assert_eq!(decode_server(&body[..body.len() - 1]), None);
+    }
+
+    #[test]
+    fn gaze_data_round_trips() {
+        let eye = GazeDataEye {
+            gaze_origin_valid: true,
+            gaze_origin_mm: [1.0, 2.0, 3.0],
+            gaze_origin_in_track_box: [0.4, 0.5, 0.6],
+            gaze_point_valid: true,
+            gaze_point_mm: [4.0, 5.0, 6.0],
+            gaze_point_on_display: [0.25, 0.75],
+            eyeball_center_valid: false,
+            eyeball_center_mm: [7.0, 8.0, 9.0],
+            pupil_valid: true,
+            pupil_diameter_mm: 3.5,
+        };
+        let data = GazeData {
+            timestamp_tracker_us: 1,
+            timestamp_system_us: 2,
+            left: eye,
+            right: GazeDataEye {
+                pupil_valid: false,
+                ..eye
+            },
+        };
+        assert_eq!(
+            decode_server(&encode_gaze_data(&data)),
+            Some(ServerMsg::GazeData(Box::new(data)))
+        );
+    }
+
+    #[test]
+    fn image_round_trips() {
+        let pixels: Vec<u8> = (0..=255).collect();
+        let body = encode_image(42, 16, 16, 8, &pixels);
+        match decode_server(&body) {
+            Some(ServerMsg::Image(image)) => {
+                assert_eq!((image.ts_us, image.width, image.height), (42, 16, 16));
+                assert_eq!(image.bits_per_pixel, 8);
+                assert_eq!(image.pixels, pixels);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notifications_round_trip_every_value_type() {
+        let area = geometry::DisplayArea {
+            top_left_mm: [-298.5, 336.0, 115.0],
+            top_right_mm: [298.5, 336.0, 115.0],
+            bottom_left_mm: [-298.5, 10.25, -3.0],
+        };
+        let values = [
+            NotificationValue::None,
+            NotificationValue::Float(33.0),
+            NotificationValue::State(true),
+            NotificationValue::DisplayArea(area),
+            NotificationValue::Uint(0x7186_ba7d),
+            NotificationValue::EnabledEye(2),
+            NotificationValue::String("fault".into()),
+        ];
+        for value in values {
+            let n = Notification {
+                kind: notification::CALIBRATION_ID_CHANGED,
+                value,
+            };
+            assert_eq!(
+                decode_server(&encode_notification(&n)),
+                Some(ServerMsg::Notification(n))
+            );
+        }
+    }
+
+    #[test]
+    fn requests_and_replies_round_trip() {
+        let body = request::encode_request(7, request::kind::STATE, &request::encode_u32(6));
+        let req = request::decode_request(&body).unwrap();
+        assert_eq!((req.id, req.kind), (7, request::kind::STATE));
+        assert_eq!(request::decode_u32(req.payload), Some(6));
+        assert_eq!(request::decode_request(&[TAG_REQUEST, 1, 0]), None);
+
+        assert_eq!(
+            decode_server(&encode_reply(7, request::status::OK, &[1, 2, 3])),
+            Some(ServerMsg::Reply {
+                request_id: 7,
+                status: 0,
+                payload: vec![1, 2, 3],
+            })
+        );
+    }
+
+    #[test]
+    fn request_payloads_round_trip() {
+        use request::*;
+        let info = DeviceInfo {
+            serial_number: "SERIAL-0001".into(),
+            model: "IS5_Large_Eyetracker_5".into(),
+            generation: "IS5".into(),
+            firmware_version: "02a1a6a977".into(),
+        };
+        assert_eq!(decode_device_info(&encode_device_info(&info)), Some(info));
+
+        let mut track_box = geometry::TrackBox::default();
+        track_box.corners_mm[0] = [125.0, 100.0, 450.0];
+        track_box.corners_mm[7] = [250.0, -200.0, 900.0];
+        assert_eq!(
+            decode_track_box(&encode_track_box(&track_box)),
+            Some(track_box)
+        );
+
+        let mounting = geometry::GeometryMounting {
+            guides: 2,
+            width_mm: 184.0,
+            angle_deg: 20.0,
+            external_offset_mm: [0.0, -0.5, 13.5],
+            internal_offset_mm: [0.0, 5.5, 9.5],
+        };
+        assert_eq!(
+            decode_geometry_mounting(&encode_geometry_mounting(&mounting)),
+            Some(mounting)
+        );
+
+        let sync = Timesync {
+            host_start_us: 10,
+            device_us: 20,
+            host_end_us: 30,
+        };
+        assert_eq!(decode_timesync(&encode_timesync(&sync)), Some(sync));
+        assert_eq!(
+            decode_point_2d(&encode_point_2d(0.1, 0.9)),
+            Some((0.1, 0.9))
+        );
+        assert_eq!(decode_display_area(&[0; 35]), None);
     }
 }

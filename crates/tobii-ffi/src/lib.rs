@@ -83,7 +83,7 @@ pub struct Device {
     rx: Receiver<ServerMsg>,
     pending: VecDeque<ServerMsg>,
     reader: Option<JoinHandle<()>>,
-    streams: u8,
+    streams: u32,
     head: Option<(HeadPoseFn, *mut c_void)>,
     gaze: Option<(GazePointFn, *mut c_void)>,
     presence: Option<(PresenceFn, *mut c_void)>,
@@ -139,7 +139,7 @@ impl Device {
 
     /// Drop `bit` from the subscription and resend the mask, so the daemon
     /// stops sending (and computing) that stream for us.
-    fn unsubscribe(&mut self, bit: u8) -> Status {
+    fn unsubscribe(&mut self, bit: u32) -> Status {
         self.streams &= !bit;
         match self.resend_subscription() {
             Ok(_) => TOBII_ERROR_NO_ERROR,
@@ -148,7 +148,7 @@ impl Device {
     }
 
     /// Add `bit` to the subscription, resend, and wait for the daemon's ack.
-    fn subscribe(&mut self, bit: u8) -> Status {
+    fn subscribe(&mut self, bit: u32) -> Status {
         self.streams |= bit;
         match self.resend_subscription() {
             Ok(true) => TOBII_ERROR_NO_ERROR,

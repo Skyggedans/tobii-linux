@@ -49,7 +49,7 @@ extern "C" fn on_shutdown(_sig: libc::c_int) {
 
 struct Client {
     id: u64,
-    streams: u8,
+    streams: u32,
     out: UnixStream,
 }
 
@@ -293,7 +293,7 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
 /// Register the client's streams, starting the engine if it isn't running.
 /// Always succeeds (the one engine serves every stream); `streams == 0`
 /// unsubscribes.
-fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u8) -> bool {
+fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) -> bool {
     if streams == 0 {
         // Unsubscribed from everything: release the client's streams (and the
         // engine / head inference if nobody else needs them).
@@ -320,7 +320,7 @@ fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u8) -> bool {
 /// across ticks so the per-frame path does not reallocate.
 fn pump(state: &Mutex<State>) {
     let mut samples: Vec<Sample> = Vec::new();
-    let mut frames: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut frames: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut dead: Vec<u64> = Vec::new();
     loop {
         samples.clear();
@@ -360,7 +360,7 @@ fn pump(state: &Mutex<State>) {
 // reason: the wire format is f32; the f64 -> f32 narrowing is the intended
 // precision of the IPC protocol.
 #[allow(clippy::cast_possible_truncation)]
-fn push_sample_frames(s: &Sample, out: &mut Vec<(u8, Vec<u8>)>) {
+fn push_sample_frames(s: &Sample, out: &mut Vec<(u32, Vec<u8>)>) {
     match s {
         Sample::Pose(p) => {
             // cm -> mm; rotation about x=pitch, y=yaw, z=roll in radians.
