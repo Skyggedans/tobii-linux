@@ -30,7 +30,7 @@ use tobii_ipc::request::{kind, status};
 use winit::event_loop::EventLoop;
 
 use crate::sequence::{Backend, DryRun, Timing, UiEvent};
-use crate::ui::{MonitorChoice, Ui};
+use crate::ui::{MonitorChoice, Signals, Ui};
 
 const USAGE: &str = "\
 usage: tobii-calibrate [options]
@@ -112,6 +112,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options> {
     if o.rounds == 0 {
         bail!("--rounds must be at least 1");
     }
+    if o.windowed && !o.dry_run {
+        // Targets in a window are not where the tracker expects them.
+        bail!("--windowed only goes with --dry-run: a calibration needs the whole monitor");
+    }
     Ok(o)
 }
 
@@ -140,6 +144,9 @@ fn run() -> Result<()> {
         .build()
         .context("no display to open a window on")?;
     let abort = Arc::new(AtomicBool::new(false));
+    // Whether the window is fullscreen on its monitor: the points wait for
+    // it (a window needs no placing).
+    let placed = Arc::new(AtomicBool::new(o.windowed));
     let (answers, setup_answers) = mpsc::channel();
     // The setup measures the window, so it needs the whole monitor.
     let display_setup = o.display_setup && !o.windowed;
@@ -158,6 +165,7 @@ fn run() -> Result<()> {
         let proxy = event_loop.create_proxy();
         let gaze_proxy = event_loop.create_proxy();
         let abort = Arc::clone(&abort);
+        let placed = Arc::clone(&placed);
         let (rounds, dry_run, export) = (o.rounds, o.dry_run, o.export.clone());
         thread::spawn(move || {
             let emit = |e: UiEvent| {
@@ -172,18 +180,20 @@ fn run() -> Result<()> {
                 .map(|c| Box::new(c) as Box<dyn Backend>)
             };
             let setup = display_setup.then_some(&setup_answers);
-            let outcome = backend
-                .and_then(|mut b| sequence::run(b.as_mut(), rounds, timing, setup, &abort, &emit));
-            let reported = outcome.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+            let outcome = backend.and_then(|mut b| {
+                sequence::run(b.as_mut(), rounds, timing, setup, &placed, &abort, &emit)
+            });
+            let reported = match &outcome {
+                Ok(summary) => match &export {
+                    Some(path) => std::fs::write(path, &summary.blob).map_err(|e| {
+                        format!("the calibration is kept, but could not be exported to {path}: {e}")
+                    }),
+                    None => Ok(()),
+                },
+                Err(e) => Err(format!("{e:#}")),
+            };
             match outcome {
-                Ok(summary) => {
-                    if let Some(path) = &export
-                        && let Err(e) = std::fs::write(path, &summary.blob)
-                    {
-                        tracing::warn!(path, error = %e, "could not export the calibration");
-                    }
-                    emit(UiEvent::Finished(summary));
-                }
+                Ok(summary) => emit(UiEvent::Finished(summary)),
                 Err(e) => emit(UiEvent::Failed(format!("{e:#}"))),
             }
             let _ = done.send(reported);
@@ -193,7 +203,10 @@ fn run() -> Result<()> {
     }
 
     let mut app = Ui::new(
-        Arc::clone(&abort),
+        Signals {
+            abort: Arc::clone(&abort),
+            placed,
+        },
         o.monitor,
         o.list_monitors,
         o.windowed,
@@ -208,16 +221,20 @@ fn run() -> Result<()> {
     // Esc or a closed window: have the worker stop the session (it checks
     // between steps) and wait for it, within reason.
     abort.store(true, std::sync::atomic::Ordering::Relaxed);
-    match worker_done.recv_timeout(WORKER_GRACE) {
-        Ok(Err(reason)) => bail!(reason),
-        Ok(Ok(())) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            bail!("the calibration did not wind down in time; the daemon ends it when this exits");
-        }
+    let worker = worker_done.recv_timeout(WORKER_GRACE);
+    // The window's own failure (no such monitor, no window) comes first: the
+    // worker then only saw the abort that followed it.
+    if let Some(reason) = window_failed {
+        bail!(reason);
     }
-    match window_failed {
-        Some(reason) => bail!(reason),
-        None => Ok(()),
+    match worker {
+        Ok(Err(reason)) => bail!(reason),
+        Ok(Ok(())) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            bail!(
+                "the calibration did not wind down in time; the daemon discards it when this exits"
+            )
+        }
     }
 }
 
@@ -266,5 +283,7 @@ mod tests {
         assert!(parse(&["--rounds", "0"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
         assert!(parse(&["--export"]).is_err());
+        assert!(parse(&["--windowed"]).is_err());
+        assert!(parse(&["--windowed", "--dry-run"]).is_ok());
     }
 }

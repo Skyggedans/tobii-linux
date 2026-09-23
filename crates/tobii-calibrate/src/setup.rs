@@ -174,7 +174,9 @@ impl Ticks {
 
     /// Both moved by `dx`, as far as the window allows.
     pub(crate) fn shifted(self, dx: f64, width_px: f64) -> Self {
-        let dx = dx.clamp(-self.left, width_px - self.right);
+        // (A pair wider than a window that shrank moves no further right.)
+        let lowest = -self.left;
+        let dx = dx.clamp(lowest, (width_px - self.right).max(lowest));
         Self {
             left: self.left + dx,
             right: self.right + dx,
@@ -334,6 +336,13 @@ mod tests {
         assert!(crossed.right - crossed.left >= W * MIN_SPACING - 1e-9);
         let squeezed = t.widened(-10_000.0, W);
         assert!(squeezed.right - squeezed.left >= W * MIN_SPACING - 1e-9);
+        // The window shrank under a pair being dragged: no panic.
+        let wide = Ticks {
+            left: 1255.0,
+            right: 2585.0,
+        };
+        let _ = wide.shifted(-50.0, 1080.0);
+        let _ = wide.shifted(50.0, 1080.0);
     }
 
     #[test]

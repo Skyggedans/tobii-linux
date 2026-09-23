@@ -22,8 +22,8 @@ use anyhow::{Context, Result, bail};
 use tobii_calib::STIMULUS_POINTS;
 use tobii_ipc::geometry::{DisplayArea, GeometryMounting, display_area_basic};
 use tobii_ipc::request::{
-    decode_display_area, decode_geometry_mounting, encode_display_area, encode_point_2d, kind,
-    status,
+    STOP_DISCARD, STOP_KEEP, decode_display_area, decode_geometry_mounting, encode_display_area,
+    encode_point_2d, kind, status,
 };
 
 use crate::ipc::{Connection, Reply};
@@ -292,15 +292,19 @@ fn mean_error(blob: &[u8]) -> Option<f32> {
     (!errors.is_empty()).then(|| errors.iter().sum::<f32>() / n)
 }
 
-/// What the error of a session that computed nothing adds.
+/// What the error of a session adds: it was discarded.
 const NOT_CALIBRATED: &str = "not calibrated; the previous calibration stays";
+
+/// How often a worker waiting for the window to be in place looks again.
+const PLACEMENT_POLL: Duration = Duration::from_millis(100);
 
 /// Run a session, reporting progress through `emit`. With `setup`, the
 /// display setup opens it and its answer arrives there: the calibration is
-/// only valid for the display area it is made on. `abort` (Esc) stops the
-/// session between steps, and the error then says which calibration is in
-/// use: the previous one (the daemon also puts back the display area it was
-/// made on) when nothing was computed, else the one computed so far.
+/// only valid for the display area it is made on. Points are shown only
+/// while `placed` (the window fullscreen on its monitor). `abort` (Esc)
+/// stops the session between steps. Only a session that runs to its end is
+/// kept; any other ends discarded, and the daemon puts back the calibration
+/// and display area it started from.
 ///
 /// # Errors
 /// Fails when the tracker refuses a step, stops answering, or `abort` is set.
@@ -309,6 +313,7 @@ pub(crate) fn run(
     rounds: usize,
     timing: Timing,
     setup: Option<&Receiver<Choice>>,
+    placed: &AtomicBool,
     abort: &AtomicBool,
     emit: &dyn Fn(UiEvent),
 ) -> Result<Summary> {
@@ -319,7 +324,6 @@ pub(crate) fn run(
         .and_then(|r| expect_ok(r, "could not start"))
         .context(NOT_CALIBRATED)?;
 
-    let mut computed = false;
     let result = (|| {
         let mut rounds = rounds;
         if let Some(answers) = setup
@@ -331,29 +335,58 @@ pub(crate) fn run(
             tracing::info!("the display area changed: calibrating two rounds");
             rounds = 2;
         }
-        collect_and_compute(backend, rounds, timing, abort, emit, &mut computed)
+        let summary = collect_and_compute(backend, rounds, timing, placed, abort, emit)?;
+        // Esc during the last compute still means: do not keep it.
+        // Relaxed: a pure signal from the UI thread.
+        if abort.load(Ordering::Relaxed) {
+            bail!("aborted");
+        }
+        Ok(summary)
     })();
-    // Stopping also restores the previous calibration, and display area,
-    // when nothing was computed.
-    let stopped = backend.request(kind::CALIBRATION_STOP, &[], Duration::from_secs(20));
-    let summary = result.context(if computed {
-        "stopped early; the calibration computed so far is in use"
+    let stop = if result.is_ok() {
+        STOP_KEEP
     } else {
-        NOT_CALIBRATED
-    })?;
-    if let Err(e) = stopped.and_then(|r| expect_ok(r, "could not stop")) {
-        tracing::warn!(error = %e, "stopping the calibration");
-    }
+        STOP_DISCARD
+    };
+    let stopped = backend
+        .request(kind::CALIBRATION_STOP, stop, Duration::from_secs(20))
+        .and_then(|r| expect_ok(r, "could not stop"));
+    let summary = result.context(NOT_CALIBRATED)?;
+    // Nothing is kept unless the stop went through.
+    stopped.context("the calibration was not kept")?;
     Ok(summary)
+}
+
+/// Wait until the window is in place for the points (or `abort`).
+fn wait_until_placed(
+    placed: &AtomicBool,
+    abort: &AtomicBool,
+    emit: &dyn Fn(UiEvent),
+) -> Result<()> {
+    let mut told = false;
+    // Relaxed: pure signals from the UI thread.
+    while !placed.load(Ordering::Relaxed) {
+        if abort.load(Ordering::Relaxed) {
+            bail!("aborted");
+        }
+        if !told {
+            emit(UiEvent::Status(
+                "waiting for the window to be fullscreen on its monitor...".into(),
+            ));
+            told = true;
+        }
+        thread::sleep(PLACEMENT_POLL);
+    }
+    Ok(())
 }
 
 fn collect_and_compute(
     backend: &mut dyn Backend,
     rounds: usize,
     timing: Timing,
+    placed: &AtomicBool,
     abort: &AtomicBool,
     emit: &dyn Fn(UiEvent),
-    computed: &mut bool,
 ) -> Result<Summary> {
     let batches = plan(rounds);
     let total = batches.iter().map(Vec::len).sum();
@@ -362,6 +395,7 @@ fn collect_and_compute(
     let mut id = 0;
     for batch in &batches {
         for &at in batch {
+            wait_until_placed(placed, abort, emit)?;
             step += 1;
             for (phase, pause) in [(Phase::Travel, timing.travel), (Phase::Dwell, timing.dwell)] {
                 emit(UiEvent::Target {
@@ -400,7 +434,6 @@ fn collect_and_compute(
         emit(UiEvent::Computing);
         let reply = backend.request(kind::CALIBRATION_COMPUTE, &[], Duration::from_secs(20))?;
         let payload = expect_ok(reply, "could not compute")?;
-        *computed = true;
         id = tobii_ipc::request::decode_u32(&payload).unwrap_or(id);
     }
     let reply = backend.request(kind::CALIBRATION_RETRIEVE, &[], Duration::from_secs(8))?;
@@ -442,6 +475,9 @@ mod tests {
         }
     }
 
+    /// The window in place, for sessions that do not test placement.
+    static PLACED: AtomicBool = AtomicBool::new(true);
+
     const QUICK: Timing = Timing {
         travel: Duration::ZERO,
         dwell: Duration::ZERO,
@@ -456,6 +492,7 @@ mod tests {
             1,
             QUICK,
             None,
+            &PLACED,
             &AtomicBool::new(false),
             &|e| {
                 events.lock().expect("events").push(e);
@@ -496,6 +533,7 @@ mod tests {
             1,
             QUICK,
             None,
+            &PLACED,
             &AtomicBool::new(false),
             &|_| {},
         )
@@ -595,6 +633,7 @@ mod tests {
             2,
             QUICK,
             Some(&rx),
+            &PLACED,
             &AtomicBool::new(false),
             &|e| {
                 events.lock().expect("events").push(e);
@@ -645,6 +684,7 @@ mod tests {
             1,
             QUICK,
             Some(&rx),
+            &PLACED,
             &AtomicBool::new(true),
             &|_| {},
         )
@@ -677,6 +717,7 @@ mod tests {
             1,
             QUICK,
             Some(&rx),
+            &PLACED,
             &AtomicBool::new(false),
             &|_| {},
         )
@@ -697,6 +738,7 @@ mod tests {
             1,
             QUICK,
             Some(&rx),
+            &PLACED,
             &AtomicBool::new(false),
             &|_| {},
         )
@@ -722,7 +764,8 @@ mod tests {
             abort_on: Some((kind::CALIBRATION_COLLECT_2D, std::sync::Arc::clone(&abort))),
             ..SetupDevice::new()
         };
-        let err = run(&mut device, 1, QUICK, Some(&rx), &abort, &|_| {}).expect_err("aborted");
+        let err =
+            run(&mut device, 1, QUICK, Some(&rx), &PLACED, &abort, &|_| {}).expect_err("aborted");
         assert!(
             format!("{err:#}").contains("previous calibration stays"),
             "{err:#}"
@@ -739,9 +782,10 @@ mod tests {
             abort_on: Some((kind::CALIBRATION_COMPUTE, std::sync::Arc::clone(&abort))),
             ..SetupDevice::new()
         };
-        let err = run(&mut device, 1, QUICK, Some(&rx), &abort, &|_| {}).expect_err("aborted");
+        let err =
+            run(&mut device, 1, QUICK, Some(&rx), &PLACED, &abort, &|_| {}).expect_err("aborted");
         assert!(
-            format!("{err:#}").contains("computed so far is in use"),
+            format!("{err:#}").contains("previous calibration stays"),
             "{err:#}"
         );
         assert_eq!(device.count(kind::CALIBRATION_COMPUTE), 1);
@@ -761,6 +805,7 @@ mod tests {
             1,
             QUICK,
             Some(&rx),
+            &PLACED,
             &AtomicBool::new(false),
             &|e| {
                 events.lock().expect("events").push(e);
@@ -787,6 +832,7 @@ mod tests {
                 1,
                 QUICK,
                 Some(&rx),
+                &PLACED,
                 &AtomicBool::new(false),
                 &|_| {},
             )
@@ -810,6 +856,7 @@ mod tests {
             2,
             QUICK,
             None,
+            &PLACED,
             &AtomicBool::new(true),
             &|_| {},
         )
@@ -819,5 +866,93 @@ mod tests {
             backend.0.into_inner().expect("log"),
             vec![kind::CALIBRATION_START, kind::CALIBRATION_STOP]
         );
+    }
+
+    #[test]
+    fn only_a_session_run_to_its_end_is_kept() {
+        let rx = answered(CHOICE);
+        let mut device = SetupDevice::new();
+        run(
+            &mut device,
+            1,
+            QUICK,
+            Some(&rx),
+            &PLACED,
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("session");
+        let (kind, payload) = device.log.last().expect("stop");
+        assert_eq!(
+            (*kind, payload.as_slice()),
+            (kind::CALIBRATION_STOP, STOP_KEEP)
+        );
+
+        let rx = answered(CHOICE);
+        let mut device = SetupDevice {
+            collect: status::OPERATION_FAILED,
+            ..SetupDevice::new()
+        };
+        let _ = run(
+            &mut device,
+            1,
+            QUICK,
+            Some(&rx),
+            &PLACED,
+            &AtomicBool::new(false),
+            &|_| {},
+        );
+        let (kind, payload) = device.log.last().expect("stop");
+        assert_eq!(
+            (*kind, payload.as_slice()),
+            (kind::CALIBRATION_STOP, STOP_DISCARD)
+        );
+    }
+
+    #[test]
+    fn points_wait_for_the_window_to_be_in_place() {
+        let placed = std::sync::Arc::new(AtomicBool::new(false));
+        let later = std::sync::Arc::clone(&placed);
+        let mover = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            later.store(true, Ordering::Relaxed);
+        });
+        let mut device = SetupDevice::new();
+        let events = Mutex::new(Vec::new());
+        run(
+            &mut device,
+            1,
+            QUICK,
+            None,
+            &placed,
+            &AtomicBool::new(false),
+            &|e| {
+                events.lock().expect("events").push(e);
+            },
+        )
+        .expect("session");
+        mover.join().expect("mover");
+        let waited =
+            events.lock().expect("events").iter().any(
+                |e| matches!(e, UiEvent::Status(t) if t.contains("fullscreen on its monitor")),
+            );
+        assert!(waited);
+
+        // Never in place and then Esc: nothing collected, the session discarded.
+        let mut device = SetupDevice::new();
+        let abort = AtomicBool::new(false);
+        let never = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(150));
+                abort.store(true, Ordering::Relaxed);
+            });
+            let err =
+                run(&mut device, 1, QUICK, None, &never, &abort, &|_| {}).expect_err("aborted");
+            assert_eq!(err.root_cause().to_string(), "aborted");
+        });
+        assert_eq!(device.count(kind::CALIBRATION_COLLECT_2D), 0);
+        let (_, payload) = device.log.last().expect("stop");
+        assert_eq!(payload.as_slice(), STOP_DISCARD);
     }
 }

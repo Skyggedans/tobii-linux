@@ -92,9 +92,19 @@ enum Drag {
     },
 }
 
+/// What the window and the calibration worker signal each other.
+pub(crate) struct Signals {
+    /// Set by the window (Esc, closed): the worker stops the session.
+    pub(crate) abort: Arc<AtomicBool>,
+    /// Set by the window while it is fullscreen on its monitor: the worker
+    /// shows points only then.
+    pub(crate) placed: Arc<AtomicBool>,
+}
+
 /// The winit application.
 pub(crate) struct Ui {
     abort: Arc<AtomicBool>,
+    placed: Arc<AtomicBool>,
     monitor: MonitorChoice,
     list_only: bool,
     windowed: bool,
@@ -120,6 +130,8 @@ pub(crate) struct Ui {
     answers: Sender<Choice>,
     /// Name of the monitor the window is on, to find its EDID.
     monitor_name: Option<String>,
+    /// How many monitors there are.
+    monitor_count: usize,
     /// The monitor the fullscreen window must stay on.
     target: Option<MonitorHandle>,
     /// When the window was made: the compositor gets a moment to place it.
@@ -242,7 +254,7 @@ impl Bounds {
 
 impl Ui {
     pub(crate) fn new(
-        abort: Arc<AtomicBool>,
+        signals: Signals,
         monitor: MonitorChoice,
         list_only: bool,
         windowed: bool,
@@ -251,7 +263,8 @@ impl Ui {
         answers: Sender<Choice>,
     ) -> Self {
         Self {
-            abort,
+            abort: signals.abort,
+            placed: signals.placed,
             monitor,
             list_only,
             windowed,
@@ -269,6 +282,7 @@ impl Ui {
             dirty: false,
             answers,
             monitor_name: None,
+            monitor_count: 0,
             target: None,
             created: None,
             placement_tries: 0,
@@ -291,19 +305,24 @@ impl Ui {
 
     /// Where the window is, if it is not fullscreen on the monitor it was
     /// opened on (and the compositor has said where it is), with that
-    /// monitor.
+    /// monitor. A mirror of the monitor (same place and size) counts as it;
+    /// fullscreen means covering the monitor, whatever the window system
+    /// believes it asked for (X11 reports the request, not the outcome).
     fn misplaced_now(&self) -> Option<(String, MonitorHandle)> {
         let target = self.target.clone()?;
         let window = self.window.as_ref()?;
         let current = window.current_monitor()?;
-        if current.name() != target.name() {
+        let same_place = current.position() == target.position() && current.size() == target.size();
+        if current.name() != target.name() && !same_place {
             let on = current.name().unwrap_or_else(|| "another monitor".into());
             return Some((on, target));
         }
-        window
-            .fullscreen()
-            .is_none()
-            .then(|| ("a window, not fullscreen".to_owned(), target))
+        let (size, full) = (window.inner_size(), target.size());
+        let covers = |have: u32, want: u32| f64::from(have) >= f64::from(want) * 0.98;
+        let fullscreen = window.fullscreen().is_some()
+            && covers(size.width, full.width)
+            && covers(size.height, full.height);
+        (!fullscreen).then(|| ("a window, not fullscreen".to_owned(), target))
     }
 
     /// Keep the fullscreen window on its monitor: send it back a few times
@@ -312,12 +331,16 @@ impl Ui {
     /// again.
     fn keep_on_target(&mut self) -> Option<Instant> {
         let now = Instant::now();
+        self.target.as_ref()?;
         if let Some(created) = self.created
             && now < created + 2 * PLACEMENT_PAUSE
         {
             return Some(created + 2 * PLACEMENT_PAUSE);
         }
-        let Some((on, target)) = self.misplaced_now() else {
+        let misplaced = self.misplaced_now();
+        // Relaxed: a pure signal to the worker.
+        self.placed.store(misplaced.is_none(), Ordering::Relaxed);
+        let Some((on, target)) = misplaced else {
             if self.misplaced.take().is_some() {
                 tracing::info!("the window is back on its monitor");
                 self.epoch += 1;
@@ -380,7 +403,8 @@ impl Ui {
     /// (or the tracker's current area).
     fn setup_screen(&self, req: crate::sequence::SetupRequest) -> Option<Screen> {
         let (width, height) = self.window_size()?;
-        let monitor_mm = crate::edid::monitor_size_mm(self.monitor_name.as_deref());
+        let monitor_mm =
+            crate::edid::monitor_size_mm(self.monitor_name.as_deref(), self.monitor_count);
         tracing::info!(
             monitor = self.monitor_name.as_deref().unwrap_or("?"),
             ?monitor_mm,
@@ -894,6 +918,7 @@ impl ApplicationHandler<UiEvent> for Ui {
                 return;
             };
             self.monitor_name = monitor.name();
+            self.monitor_count = event_loop.available_monitors().count();
             self.target = Some(monitor.clone());
             self.created = Some(Instant::now());
             attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
@@ -984,7 +1009,11 @@ impl ApplicationHandler<UiEvent> for Ui {
                 ..
             } => self.setup_button(state),
             WindowEvent::RedrawRequested => self.draw(),
-            WindowEvent::Resized(_) => self.request_frame(),
+            WindowEvent::Resized(_) => {
+                // Whatever the window held may be gone: repaint all of it.
+                self.presented = None;
+                self.request_frame();
+            }
             _ => {}
         }
     }

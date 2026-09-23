@@ -8,9 +8,10 @@ use std::fs;
 const DRM_DIR: &str = "/sys/class/drm";
 
 /// The size in millimetres (width, height) of the monitor on the connector
-/// the window system calls `name`. When the names cannot be matched, the
-/// size is still known if every connected monitor reports the same one.
-pub(crate) fn monitor_size_mm(name: Option<&str>) -> Option<(f64, f64)> {
+/// the window system calls `name`, among `monitors`. When the names cannot
+/// be matched, the size is still known if every one of the monitors reports
+/// the same one.
+pub(crate) fn monitor_size_mm(name: Option<&str>, monitors: usize) -> Option<(f64, f64)> {
     let mut found = Vec::new();
     for entry in fs::read_dir(DRM_DIR).ok()?.flatten() {
         let file_name = entry.file_name();
@@ -29,7 +30,7 @@ pub(crate) fn monitor_size_mm(name: Option<&str>) -> Option<(f64, f64)> {
             found.push((connector.to_owned(), size));
         }
     }
-    pick(name, &found)
+    pick(name, &found, monitors)
 }
 
 /// The kernel names HDMI connectors `HDMI-A-<n>`, GNOME `HDMI-<n>`; the
@@ -38,11 +39,15 @@ fn same_connector(kernel: &str, name: &str) -> bool {
     kernel == name || kernel.replacen("HDMI-A-", "HDMI-", 1) == name
 }
 
-fn pick(name: Option<&str>, found: &[(String, (f64, f64))]) -> Option<(f64, f64)> {
+fn pick(name: Option<&str>, found: &[(String, (f64, f64))], monitors: usize) -> Option<(f64, f64)> {
     if let Some(name) = name
         && let Some((_, size)) = found.iter().find(|(c, _)| same_connector(c, name))
     {
         return Some(*size);
+    }
+    // A monitor with no EDID here could be the one: then nothing is known.
+    if found.len() < monitors.max(1) {
+        return None;
     }
     let (_, first) = found.first()?;
     found
@@ -51,8 +56,12 @@ fn pick(name: Option<&str>, found: &[(String, (f64, f64))]) -> Option<(f64, f64)
         .then_some(*first)
 }
 
+/// Sizes TVs and projectors put in their EDID for an aspect ratio, not a
+/// size.
+const PLACEHOLDERS: [(u16, u16); 2] = [(1600, 900), (1600, 1000)];
+
 /// The image size an EDID declares: the preferred timing's size in mm, else
-/// the basic block's size in cm.
+/// the basic block's size in cm; none for a known placeholder.
 fn size_from_edid(edid: &[u8]) -> Option<(f64, f64)> {
     const HEADER: [u8; 8] = [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
     if edid.get(..8)? != HEADER {
@@ -62,11 +71,12 @@ fn size_from_edid(edid: &[u8]) -> Option<(f64, f64)> {
     let is_timing = timing[0] != 0 || timing[1] != 0;
     let w = u16::from(timing[12]) | (u16::from(timing[14] & 0xf0) << 4);
     let h = u16::from(timing[13]) | (u16::from(timing[14] & 0x0f) << 8);
-    if is_timing && w > 0 && h > 0 {
-        return Some((f64::from(w), f64::from(h)));
-    }
-    let (w, h) = (edid[21], edid[22]);
-    (w > 0 && h > 0).then(|| (f64::from(w) * 10.0, f64::from(h) * 10.0))
+    let (w, h) = if is_timing && w > 0 && h > 0 {
+        (w, h)
+    } else {
+        (u16::from(edid[21]) * 10, u16::from(edid[22]) * 10)
+    };
+    (w > 0 && h > 0 && !PLACEHOLDERS.contains(&(w, h))).then(|| (f64::from(w), f64::from(h)))
 }
 
 #[cfg(test)]
@@ -97,6 +107,9 @@ mod tests {
             Some((600.0, 340.0))
         );
         assert_eq!(size_from_edid(&edid((0, 0), (0, 0))), None);
+        // Aspect ratios in the size fields.
+        assert_eq!(size_from_edid(&edid((160, 90), (0, 0))), None);
+        assert_eq!(size_from_edid(&edid((60, 34), (1600, 900))), None);
         assert_eq!(size_from_edid(&[0; 64]), None);
         assert_eq!(size_from_edid(&[]), None);
     }
@@ -107,18 +120,20 @@ mod tests {
             ("DP-3".to_owned(), (597.0, 336.0)),
             ("HDMI-A-4".to_owned(), (527.0, 296.0)),
         ];
-        assert_eq!(pick(Some("HDMI-4"), &found), Some((527.0, 296.0)));
-        assert_eq!(pick(Some("HDMI-A-4"), &found), Some((527.0, 296.0)));
-        assert_eq!(pick(Some("DP-3"), &found), Some((597.0, 336.0)));
+        assert_eq!(pick(Some("HDMI-4"), &found, 2), Some((527.0, 296.0)));
+        assert_eq!(pick(Some("HDMI-A-4"), &found, 2), Some((527.0, 296.0)));
+        assert_eq!(pick(Some("DP-3"), &found, 2), Some((597.0, 336.0)));
         // Unknown name, monitors that differ: not guessed.
-        assert_eq!(pick(Some("DP-1"), &found), None);
-        assert_eq!(pick(None, &found), None);
+        assert_eq!(pick(Some("DP-1"), &found, 2), None);
+        assert_eq!(pick(None, &found, 2), None);
         // Unknown name, all the same: that size.
         let same = vec![
             ("DP-3".to_owned(), (597.0, 336.0)),
             ("HDMI-A-4".to_owned(), (597.0, 336.0)),
         ];
-        assert_eq!(pick(Some("XWAYLAND0"), &same), Some((597.0, 336.0)));
-        assert_eq!(pick(Some("DP-3"), &[]), None);
+        assert_eq!(pick(Some("XWAYLAND0"), &same, 2), Some((597.0, 336.0)));
+        // ...unless some monitor has no EDID here: it could be the one.
+        assert_eq!(pick(Some("HDMI-0"), &same[..1], 2), None);
+        assert_eq!(pick(Some("DP-3"), &[], 1), None);
     }
 }
