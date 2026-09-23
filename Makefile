@@ -21,7 +21,7 @@ REL         := target/release
 # is log analysis, UVC-camera work or diagnostics, none of which the driver
 # needs. Run it from $(REL). It is still removed by `uninstall` for anyone who
 # installed it with an older Makefile.
-BINS        := tobiid tobii-opentrack tobii-gaze-keys
+BINS        := tobiid tobii-opentrack tobii-gaze-keys tobii-calibrate
 LEGACY_BINS := tobii5-init-replay
 LIB         := libtobii.so
 INCSRC      := crates/tobii-ffi/include

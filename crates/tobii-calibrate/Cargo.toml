@@ -1,0 +1,23 @@
+[package]
+name = "tobii-calibrate"
+description = "Fullscreen calibration for the Tobii Eye Tracker 5 on Linux (Wayland and X11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A crate of its own because the window stack (winit + softbuffer) is far
+# heavier than anything the thin clients in tobii-clients need.
+[dependencies]
+anyhow.workspace = true
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+softbuffer = "0.4"
+tobii-calib.workspace = true
+tobii-ipc.workspace = true
+tobii-log.workspace = true
+tracing.workspace = true
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }
+
+[lints]
+workspace = true
