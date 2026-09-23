@@ -216,6 +216,7 @@ fn run() -> Result<()> {
     );
     event_loop.run_app(&mut app).context("window event loop")?;
     let window_failed = app.failed.take();
+    let escaped = app.escaped;
     // Close the window now, not after the wait below.
     drop(app);
     // Esc or a closed window: have the worker stop the session (it checks
@@ -229,7 +230,13 @@ fn run() -> Result<()> {
     }
     match worker {
         Ok(Err(reason)) => bail!(reason),
-        Ok(Ok(())) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+        Ok(Ok(())) => {
+            if escaped {
+                println!("the calibration was kept: it was saved before the window closed");
+            }
+            Ok(())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             bail!(
                 "the calibration did not wind down in time; the daemon discards it when this exits"

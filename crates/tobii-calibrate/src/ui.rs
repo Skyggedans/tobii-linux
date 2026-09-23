@@ -147,6 +147,8 @@ pub(crate) struct Ui {
     shift: bool,
     /// Set when the session ended badly, for the exit code.
     pub(crate) failed: Option<String>,
+    /// The user closed the window (Esc or the window's close).
+    pub(crate) escaped: bool,
 }
 
 /// The last presented frame, for working out what the next one changes.
@@ -292,6 +294,7 @@ impl Ui {
             drag: None,
             shift: false,
             failed: None,
+            escaped: false,
         }
     }
 
@@ -311,17 +314,22 @@ impl Ui {
     fn misplaced_now(&self) -> Option<(String, MonitorHandle)> {
         let target = self.target.clone()?;
         let window = self.window.as_ref()?;
-        let current = window.current_monitor()?;
+        let Some(current) = window.current_monitor() else {
+            return Some(("no monitor".to_owned(), target));
+        };
         let same_place = current.position() == target.position() && current.size() == target.size();
         if current.name() != target.name() && !same_place {
             let on = current.name().unwrap_or_else(|| "another monitor".into());
             return Some((on, target));
         }
         let (size, full) = (window.inner_size(), target.size());
-        let covers = |have: u32, want: u32| f64::from(have) >= f64::from(want) * 0.98;
+        let covers = |w: u32, h: u32| {
+            f64::from(size.width) >= f64::from(w) * 0.98
+                && f64::from(size.height) >= f64::from(h) * 0.98
+        };
+        // Wayland reports a turned monitor's mode unturned.
         let fullscreen = window.fullscreen().is_some()
-            && covers(size.width, full.width)
-            && covers(size.height, full.height);
+            && (covers(full.width, full.height) || covers(full.height, full.width));
         (!fullscreen).then(|| ("a window, not fullscreen".to_owned(), target))
     }
 
@@ -986,6 +994,7 @@ impl ApplicationHandler<UiEvent> for Ui {
             WindowEvent::CloseRequested => {
                 // Relaxed: a pure signal to the worker.
                 self.abort.store(true, Ordering::Relaxed);
+                self.escaped = true;
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -994,6 +1003,7 @@ impl ApplicationHandler<UiEvent> for Ui {
             {
                 // Relaxed: a pure signal to the worker.
                 self.abort.store(true, Ordering::Relaxed);
+                self.escaped = true;
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {

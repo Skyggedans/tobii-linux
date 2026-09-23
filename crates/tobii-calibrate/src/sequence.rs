@@ -344,6 +344,7 @@ pub(crate) fn run(
         Ok(summary)
     })();
     let stop = if result.is_ok() {
+        emit(UiEvent::Status("saving the calibration...".into()));
         STOP_KEEP
     } else {
         STOP_DISCARD
@@ -395,20 +396,29 @@ fn collect_and_compute(
     let mut id = 0;
     for batch in &batches {
         for &at in batch {
-            wait_until_placed(placed, abort, emit)?;
             step += 1;
-            for (phase, pause) in [(Phase::Travel, timing.travel), (Phase::Dwell, timing.dwell)] {
-                emit(UiEvent::Target {
-                    at,
-                    from: previous,
-                    phase,
-                    step,
-                    total,
-                });
-                thread::sleep(pause);
+            loop {
+                wait_until_placed(placed, abort, emit)?;
+                for (phase, pause) in [(Phase::Travel, timing.travel), (Phase::Dwell, timing.dwell)]
+                {
+                    emit(UiEvent::Target {
+                        at,
+                        from: previous,
+                        phase,
+                        step,
+                        total,
+                    });
+                    thread::sleep(pause);
+                    // Relaxed: a pure signal from the UI thread.
+                    if abort.load(Ordering::Relaxed) {
+                        bail!("aborted");
+                    }
+                }
+                // Moved while the dot travelled or waited: show it again
+                // where it is meant to be before collecting.
                 // Relaxed: a pure signal from the UI thread.
-                if abort.load(Ordering::Relaxed) {
-                    bail!("aborted");
+                if placed.load(Ordering::Relaxed) {
+                    break;
                 }
             }
             emit(UiEvent::Target {
@@ -954,5 +964,82 @@ mod tests {
         assert_eq!(device.count(kind::CALIBRATION_COLLECT_2D), 0);
         let (_, payload) = device.log.last().expect("stop");
         assert_eq!(payload.as_slice(), STOP_DISCARD);
+    }
+
+    #[test]
+    fn esc_after_the_last_compute_still_discards() {
+        let rx = answered(CHOICE);
+        let abort = std::sync::Arc::new(AtomicBool::new(false));
+        let mut device = SetupDevice {
+            // The read-back follows the last compute.
+            abort_on: Some((kind::CALIBRATION_RETRIEVE, std::sync::Arc::clone(&abort))),
+            ..SetupDevice::new()
+        };
+        let err =
+            run(&mut device, 2, QUICK, Some(&rx), &PLACED, &abort, &|_| {}).expect_err("aborted");
+        assert!(
+            format!("{err:#}").contains("previous calibration stays"),
+            "{err:#}"
+        );
+        assert_eq!(device.count(kind::CALIBRATION_COMPUTE), 6);
+        let (_, payload) = device.log.last().expect("stop");
+        assert_eq!(payload.as_slice(), STOP_DISCARD);
+    }
+
+    #[test]
+    fn a_window_moved_during_a_dwell_gets_the_point_shown_again() {
+        let placed = std::sync::Arc::new(AtomicBool::new(true));
+        let moved = AtomicBool::new(false);
+        let mut device = SetupDevice::new();
+        let events = Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            run(
+                &mut device,
+                1,
+                QUICK,
+                None,
+                &placed,
+                &AtomicBool::new(false),
+                &|e| {
+                    // The window leaves its monitor as the first dot starts to
+                    // wait, and comes back a moment later.
+                    if matches!(
+                        e,
+                        UiEvent::Target {
+                            step: 1,
+                            phase: Phase::Dwell,
+                            ..
+                        }
+                    ) && !moved.swap(true, Ordering::Relaxed)
+                    {
+                        placed.store(false, Ordering::Relaxed);
+                        let back = std::sync::Arc::clone(&placed);
+                        scope.spawn(move || {
+                            thread::sleep(Duration::from_millis(50));
+                            back.store(true, Ordering::Relaxed);
+                        });
+                    }
+                    events.lock().expect("events").push(e);
+                },
+            )
+            .expect("session");
+        });
+        let first_travels = events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    UiEvent::Target {
+                        step: 1,
+                        phase: Phase::Travel,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(first_travels, 2, "the first point was shown again");
+        assert_eq!(device.count(kind::CALIBRATION_COLLECT_2D), 7);
     }
 }
