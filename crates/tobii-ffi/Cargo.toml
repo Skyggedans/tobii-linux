@@ -16,8 +16,12 @@ name = "tobii"
 crate-type = ["cdylib"]
 
 [dependencies]
+tobii-calib.workspace = true
 tobii-ipc.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tobii-proto.workspace = true
 
 [lints]
 workspace = true

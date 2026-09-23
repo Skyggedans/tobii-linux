@@ -1,7 +1,7 @@
 # Build and install the Tobii Linux stack.
 #
 #   make build            # cargo build --release
-#   make install          # binaries + libtobii.so + udev rule (sudo) + user units
+#   make install          # binaries + libtobii.so + headers + udev rule (sudo) + user units
 #   make enable           # start the always-on user service now
 #   make uninstall        # remove everything installed by `make install`
 #
@@ -11,6 +11,7 @@
 PREFIX      ?= /usr/local
 BINDIR      ?= $(PREFIX)/bin
 LIBDIR      ?= $(PREFIX)/lib
+INCLUDEDIR  ?= $(PREFIX)/include
 UDEVDIR     ?= /etc/udev/rules.d
 USERUNITDIR ?= $(HOME)/.config/systemd/user
 SUDO        ?= sudo
@@ -23,8 +24,18 @@ REL         := target/release
 BINS        := tobiid tobii-opentrack tobii-gaze-keys
 LEGACY_BINS := tobii5-init-replay
 LIB         := libtobii.so
+INCSRC      := crates/tobii-ffi/include
+ABI_SMOKE   := crates/tobii-ffi/abi-smoke.c
 
-.PHONY: build check verify-abi install install-bin install-udev install-units enable enable-keys disable uninstall clean
+# The entry points libtobii.so presents to C — every export of the Stream
+# Engine 4.1.0.3 DLL plus tobii_recenter — and the headers that declare them
+# are its whole contract with consumers such as OpenTrack's tracker-tobii.
+# `verify-abi` checks both against the built library.
+ABI_LIST    := crates/tobii-ffi/abi-symbols.txt
+ABI_SYMBOLS := $(shell sed 's/ *\#.*//; /^$$/d' $(ABI_LIST))
+HEADERS     := $(wildcard $(INCSRC)/tobii/*.h)
+
+.PHONY: build check verify-abi install install-bin install-headers install-udev install-units enable enable-keys disable uninstall clean
 
 build:
 	cargo build --release --workspace
@@ -36,13 +47,24 @@ check:
 	cargo test --workspace
 	cargo doc --no-deps --workspace
 
-# libtobii.so must keep presenting the 13 Stream-Engine entry points.
+# libtobii.so must keep exporting exactly the listed entry points, and a
+# Stream-Engine-shaped C program must still compile against the headers, link
+# against the library and get the answers they promise. abi-smoke takes the
+# address of every listed symbol through the headers (so each must be declared
+# with C linkage and exported) and needs neither the daemon nor a tracker.
 verify-abi: build
-	@n=$$(nm -D --defined-only $(REL)/$(LIB) | grep -c ' T tobii_'); \
-	 [ "$$n" = 13 ] || { echo "libtobii.so exports $$n tobii_* symbols, expected 13"; exit 1; }
-	@echo "libtobii.so exports 13 tobii_* symbols"
+	@nm -D --defined-only $(REL)/$(LIB) \
+		| awk '$$2 == "T" && $$3 ~ /^tobii_/ { print $$3 }' | sort > $(REL)/abi-actual.txt
+	@printf '%s\n' $(ABI_SYMBOLS) | sort > $(REL)/abi-expected.txt
+	@diff -u $(REL)/abi-expected.txt $(REL)/abi-actual.txt \
+		|| { echo "libtobii.so no longer exports exactly $(ABI_LIST)"; exit 1; }
+	@echo "libtobii.so exports all $(words $(ABI_SYMBOLS)) listed tobii_* symbols"
+	@printf 'X(%s)\n' $(ABI_SYMBOLS) > $(REL)/abi-symbols.inc
+	@$(CC) -std=c11 -Wall -Wextra -Werror -I$(INCSRC) -I$(REL) $(ABI_SMOKE) \
+		-L$(REL) -ltobii -Wl,-rpath,$(abspath $(REL)) -lm -o $(REL)/abi-smoke
+	@$(REL)/abi-smoke
 
-install: build install-bin install-udev install-units
+install: build install-bin install-headers install-udev install-units
 	@echo
 	@echo "Installed. Start the daemon with:  make enable"
 	@echo "(or socket activation:  systemctl --user enable --now tobiid.socket)"
@@ -53,6 +75,12 @@ install-bin:
 	$(SUDO) install -m 0755 $(addprefix $(REL)/,$(BINS)) $(BINDIR)/
 	$(SUDO) install -m 0644 $(REL)/$(LIB) $(LIBDIR)/
 	$(SUDO) ldconfig || true
+
+# The C headers a Stream Engine client compiles against, e.g.
+#   cmake .. -DSDK_TOBII=$(PREFIX)   in OpenTrack's tracker-tobii
+install-headers:
+	$(SUDO) install -d $(INCLUDEDIR)/tobii
+	$(SUDO) install -m 0644 $(HEADERS) $(INCLUDEDIR)/tobii/
 
 install-udev:
 	$(SUDO) install -m 0644 systemd/99-tobii-uaccess.rules $(UDEVDIR)/
@@ -88,6 +116,8 @@ uninstall: disable
 	-rm -f $(USERUNITDIR)/tobiid.service $(USERUNITDIR)/tobiid.socket $(USERUNITDIR)/tobii-gaze-keys.service
 	systemctl --user daemon-reload
 	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS) $(LEGACY_BINS)) $(LIBDIR)/$(LIB)
+	$(SUDO) rm -f $(addprefix $(INCLUDEDIR)/tobii/,$(notdir $(HEADERS)))
+	-$(SUDO) rmdir $(INCLUDEDIR)/tobii 2>/dev/null
 	$(SUDO) rm -f $(UDEVDIR)/99-tobii-uaccess.rules $(UDEVDIR)/99-tobii-no-uvcvideo.rules $(UDEVDIR)/99-tobii-uinput.rules
 	$(SUDO) udevadm control --reload || true
 	$(SUDO) ldconfig || true

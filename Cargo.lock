@@ -736,7 +736,9 @@ dependencies = [
 name = "tobii-ffi"
 version = "0.1.0"
 dependencies = [
+ "tobii-calib",
  "tobii-ipc",
+ "tobii-proto",
  "tracing",
 ]
 
