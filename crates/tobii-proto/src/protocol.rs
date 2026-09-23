@@ -126,6 +126,61 @@ pub fn seq(buf: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(buf.get(12..16)?.try_into().ok()?))
 }
 
+fn be_word(buf: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        buf.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Length of the message prefix plus the six-word header; the payload starts
+/// here.
+pub const HEADER_LEN: usize = 32;
+
+/// A device->host (or host->device) message split into its header words and
+/// payload.
+///
+/// Layout after the 8-byte prefix, as BE u32 words: marker, seq, status,
+/// id, 0, payload length. `id` is the command for a 0x51/0x52, the stream id
+/// for a 0x53 and the notification id for a 0x4e; `status` is 1 on every
+/// response ever captured and 0 elsewhere. The payload is `00 00` + TLVs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Message<'a> {
+    /// One of the `MARKER_*` values.
+    pub marker: u32,
+    /// Sequence number (commands and their responses).
+    pub seq: u32,
+    /// The response status word.
+    pub status: u32,
+    /// Command, stream or notification id.
+    pub id: u32,
+    /// Declared payload length; larger than `payload.len()` for the head of
+    /// a chunked response.
+    pub payload_len: u32,
+    /// The payload bytes present in this message.
+    pub payload: &'a [u8],
+}
+
+impl<'a> Message<'a> {
+    /// The payload's TLV entries.
+    #[must_use]
+    pub fn tlvs(&self) -> crate::tlv::TlvIter<'a> {
+        crate::tlv::payload_tlvs(self.payload)
+    }
+}
+
+/// Split a whole message (prefix included) into header and payload.
+#[must_use]
+pub fn parse_message(buf: &[u8]) -> Option<Message<'_>> {
+    Some(Message {
+        marker: be_word(buf, 8)?,
+        seq: be_word(buf, 12)?,
+        status: be_word(buf, 16)?,
+        id: be_word(buf, 20)?,
+        payload_len: be_word(buf, 28)?,
+        payload: buf.get(HEADER_LEN..)?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Stream multiplexing on EP 0x83.
 //
@@ -164,6 +219,44 @@ const MIN_MESSAGE_LEN: u32 = 12;
 /// far beyond that means we lost sync and should drop the buffer.
 const MAX_MESSAGE_LEN: u32 = 1 << 20;
 
+/// Upper bound on one continuation of a chunked response (a calibration blob
+/// is ~660 KB and arrives as a single continuation).
+const CONTINUATION_MAX_LEN: u32 = 4 << 20;
+
+/// A continuation carries the 8-byte prefix but no header: whatever follows
+/// the prefix is payload, so its "marker" word is arbitrary data.
+fn looks_like_continuation(b: &[u8]) -> bool {
+    b.len() >= 8
+        && b[..4] == [1, 0, 0, 0]
+        && matches!(declared_len(b), Some(n) if (9..=CONTINUATION_MAX_LEN).contains(&n))
+}
+
+fn is_known_marker(b: &[u8]) -> bool {
+    matches!(
+        marker(b),
+        Some(MARKER_COMMAND | MARKER_RESPONSE | MARKER_STREAM | MARKER_NOTIFICATION)
+    )
+}
+
+/// A response whose declared payload is larger than the message: the rest
+/// follows in continuation messages.
+fn missing_payload(msg: &[u8]) -> usize {
+    if marker(msg) != Some(MARKER_RESPONSE) {
+        return 0;
+    }
+    let declared = be_word(msg, 28)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    declared.saturating_sub(msg.len().saturating_sub(HEADER_LEN))
+}
+
+/// The head of a chunked response and how many payload bytes it still lacks.
+#[derive(Debug)]
+struct Continuation {
+    msg: Vec<u8>,
+    remaining: usize,
+}
+
 /// Every device->host message starts with the tag `01 00 00 00`, a plausible
 /// total length, and one of the known markers.
 fn looks_like_prefix(b: &[u8]) -> bool {
@@ -183,9 +276,17 @@ fn looks_like_prefix(b: &[u8]) -> bool {
 /// can split one message across reads. This stitches by the declared length
 /// in the message prefix and resyncs by dropping bytes when the prefix is
 /// implausible.
+///
+/// Large responses (a calibration read, ~660 KB) are chunked by the device:
+/// a normal 0x52 message whose header declares more payload than it carries,
+/// then continuation messages that have the 8-byte prefix but no header.
+/// Those are appended to the head and the response is emitted whole, as if it
+/// had been one message; stream messages that arrive in between still come
+/// out on their own, in order.
 #[derive(Debug, Default)]
 pub struct BulkReassembler {
     pending: Vec<u8>,
+    continuation: Option<Continuation>,
 }
 
 impl BulkReassembler {
@@ -217,6 +318,15 @@ impl BulkReassembler {
         }
         self.pending.extend_from_slice(data);
         loop {
+            if self.continuation.is_some()
+                && looks_like_continuation(&self.pending)
+                && (self.pending.len() < 12 || !is_known_marker(&self.pending))
+            {
+                if !self.take_continuation(out) {
+                    return;
+                }
+                continue;
+            }
             if self.pending.len() < 12 {
                 return;
             }
@@ -250,8 +360,68 @@ impl BulkReassembler {
             }
             let rest = self.pending.split_off(total);
             let msg = std::mem::replace(&mut self.pending, rest);
+            let remaining = missing_payload(&msg);
+            if remaining > 0 {
+                if self.continuation.is_some() {
+                    tracing::warn!(
+                        "new chunked response before the last one completed; dropping it"
+                    );
+                }
+                self.continuation = Some(Continuation { msg, remaining });
+            } else {
+                out.push(msg);
+            }
+        }
+    }
+
+    /// Consume one continuation at the head of `pending`. Returns `false` when
+    /// it is not complete yet.
+    fn take_continuation(&mut self, out: &mut Vec<Vec<u8>>) -> bool {
+        let Some(total) = declared_len(&self.pending).and_then(|n| usize::try_from(n).ok()) else {
+            return false;
+        };
+        if self.pending.len() < total {
+            return false;
+        }
+        let rest = self.pending.split_off(total);
+        let chunk = std::mem::replace(&mut self.pending, rest);
+        let body = &chunk[8..];
+        let Some(head) = self.continuation.as_mut() else {
+            return true;
+        };
+        if body.len() > head.remaining {
+            tracing::warn!(
+                got = body.len(),
+                expected = head.remaining,
+                "continuation longer than the response declared; dropping the response"
+            );
+            self.continuation = None;
+            return true;
+        }
+        head.msg.extend_from_slice(body);
+        head.remaining -= body.len();
+        if head.remaining == 0
+            && let Some(done) = self.continuation.take()
+        {
+            let mut msg = done.msg;
+            // The emitted message is whole: make its prefix length agree.
+            if let Ok(len) = u32::try_from(msg.len()) {
+                msg[4..8].copy_from_slice(&len.to_le_bytes());
+            }
             out.push(msg);
         }
+        true
+    }
+
+    /// Drop a chunked response in progress (its command timed out).
+    pub fn abort_continuation(&mut self) {
+        self.continuation = None;
+    }
+
+    /// Whether a chunked response is being collected.
+    #[must_use]
+    pub fn in_continuation(&self) -> bool {
+        self.continuation.is_some()
     }
 
     /// Bytes buffered but not yet forming a message.
@@ -261,47 +431,116 @@ impl BulkReassembler {
     }
 }
 
-const CMD_STREAM_START: u32 = 1220;
-const CMD_STREAM_STOP: u32 = 1230;
+// ---------------------------------------------------------------------------
+// Host->device commands on EP 0x05.
+//
+// A command message is six BE u32 words (marker 0x51, seq, 0, command, 0,
+// payload length) followed by the payload. On the wire it is cut into pieces
+// of at most `OUT_CHUNK_BODY_MAX` bytes, each written as its own bulk
+// transfer behind the 8-byte prefix `00 00 00 00` + LE u32 piece length; the
+// device answers once, after the last piece.
+// ---------------------------------------------------------------------------
 
-/// Bytes from the marker through the payload-length word of a command:
-/// six BE u32 words (marker, seq, 0, command, 0, payload length).
-const CMD_HEADER_LEN: u32 = 4 * 6;
+/// Largest command piece after the prefix: 4095-byte bulk writes, as the
+/// Windows engine sends them.
+pub const OUT_CHUNK_BODY_MAX: usize = 4087;
 
-/// Build a host->device command message on EP 0x05 for the stream start/stop
-/// commands, mirroring the last lines of `init_packets_ep.txt`:
-/// prefix `00 00 00 00` + LE u32 (body length), then BE marker 0x51, seq,
-/// 0, command, 0, payload length, and the TLV payload
-/// `00 00` + type 2/len 4/stream id [+ type 0x17/len 4/0 for start].
+/// Command ids seen in the Windows captures.
+pub mod cmd {
+    /// Read the stream catalogue.
+    pub const STREAM_CATALOGUE: u32 = 1200;
+    /// Start a stream.
+    pub const STREAM_START: u32 = 1220;
+    /// Stop a stream.
+    pub const STREAM_STOP: u32 = 1230;
+    /// Device property strings.
+    pub const PROPERTIES: u32 = 1330;
+    /// Track box.
+    pub const TRACK_BOX: u32 = 1400;
+    /// Device identity strings: serial, model, generation, firmware.
+    pub const DEVICE_STRINGS: u32 = 1420;
+    /// Read the display area.
+    pub const DISPLAY_AREA_GET: u32 = 1430;
+    /// Write the display area.
+    pub const DISPLAY_AREA_SET: u32 = 1440;
+    /// Status strings (index 7 is the calibration id).
+    pub const STATUS: u32 = 1490;
+    /// Output rate pair.
+    pub const OUTPUT_RATE: u32 = 1650;
+    /// Mounting geometry.
+    pub const MOUNTING: u32 = 2110;
+}
+
+/// Notification ids seen in the Windows captures.
+pub mod notify {
+    /// The display area changed: three corners.
+    pub const DISPLAY_AREA: u32 = 1450;
+    /// Unknown; `u32 3` once at init, the value command 3170 also returns.
+    pub const STATE_3180: u32 = 3180;
+    /// A new calibration is active: `u32` calibration id.
+    pub const CALIBRATION_ID: u32 = 3220;
+}
+
+/// Bytes from the marker through the payload-length word of a command.
+const CMD_HEADER_LEN: usize = 4 * 6;
+
+/// A command message without the wire prefix: header words, then `payload`
+/// (which begins with `00 00`, see [`crate::tlv::TlvWriter`]).
+#[must_use]
+pub fn command_message(cmd: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
+    // A payload is at most a calibration blob (< 4 MiB).
+    let payload_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    let mut v = Vec::with_capacity(CMD_HEADER_LEN + payload.len());
+    for word in [MARKER_COMMAND, seq, 0, cmd, 0, payload_len] {
+        v.extend_from_slice(&word.to_be_bytes());
+    }
+    v.extend_from_slice(payload);
+    v
+}
+
+/// A command as the bulk writes that carry it, each already prefixed.
+#[must_use]
+pub fn chunk_command(cmd: u32, seq: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    command_message(cmd, seq, payload)
+        .chunks(OUT_CHUNK_BODY_MAX)
+        .map(|piece| {
+            let mut w = Vec::with_capacity(8 + piece.len());
+            w.extend_from_slice(&[0, 0, 0, 0]);
+            // `piece.len() <= OUT_CHUNK_BODY_MAX`.
+            w.extend_from_slice(&u32::try_from(piece.len()).unwrap_or(0).to_le_bytes());
+            w.extend_from_slice(piece);
+            w
+        })
+        .collect()
+}
+
+/// A command that fits in one bulk write.
+fn single_packet(cmd: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
+    chunk_command(cmd, seq, payload).swap_remove(0)
+}
+
+/// Build the stream start/stop commands, mirroring the last lines of
+/// `init_packets_ep.txt`: payload `00 00` + type 2/len 4/stream id
+/// [+ type 0x17/len 4/0 for start].
 fn stream_command_packet(cmd: u32, seq: u32, id: u32, with_flags: bool) -> Vec<u8> {
     let mut payload = vec![0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04];
     payload.extend_from_slice(&id.to_be_bytes());
     if with_flags {
         payload.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]);
     }
-    let payload_len =
-        u32::try_from(payload.len()).expect("invariant: stream command payload is 11 or 20 bytes");
-    let body_len = CMD_HEADER_LEN + payload_len;
-    let mut v = Vec::with_capacity(8 + payload.len() + 4 * 6);
-    v.extend_from_slice(&[0, 0, 0, 0]);
-    v.extend_from_slice(&body_len.to_le_bytes());
-    for word in [MARKER_COMMAND, seq, 0, cmd, 0, payload_len] {
-        v.extend_from_slice(&word.to_be_bytes());
-    }
-    v.extend_from_slice(&payload);
-    v
+    single_packet(cmd, seq, &payload)
 }
 
 /// Command 1220: start streaming `id` (e.g. `STREAM_ID_IMAGE`).
 #[must_use]
 pub fn stream_start_packet(seq: u32, id: u32) -> Vec<u8> {
-    stream_command_packet(CMD_STREAM_START, seq, id, true)
+    stream_command_packet(cmd::STREAM_START, seq, id, true)
 }
 
 /// Command 1230: stop streaming `id`.
 #[must_use]
 pub fn stream_stop_packet(seq: u32, id: u32) -> Vec<u8> {
-    stream_command_packet(CMD_STREAM_STOP, seq, id, false)
+    stream_command_packet(cmd::STREAM_STOP, seq, id, false)
 }
 
 #[cfg(test)]
@@ -439,6 +678,105 @@ mod tests {
         assert_eq!(img.len(), expected.len());
         assert_eq!(&img[39..43], &[0, 0, 0x05, 0x0e]);
         assert_eq!(&img[12..16], &[0, 0, 0, 0x2a]);
+    }
+
+    /// The 1110 calibration upload in the init replay is 162 bulk writes;
+    /// re-chunking the reassembled command must give back every one of them.
+    #[test]
+    fn chunk_command_reproduces_the_captured_calibration_upload() {
+        let packets = parse_init_packets(crate::INIT_PACKETS).expect("init file parses");
+        let run: Vec<&[u8]> = packets[38..200].iter().map(|p| p.data.as_slice()).collect();
+        let message: Vec<u8> = run.iter().flat_map(|p| p[8..].iter().copied()).collect();
+        let prefixed = [&[0u8; 8][..], &message].concat();
+        let head = parse_message(&prefixed).expect("header");
+        assert_eq!(
+            (head.marker, head.id, head.seq),
+            (MARKER_COMMAND, 1110, 0x27)
+        );
+
+        let chunks = chunk_command(1110, 0x27, &message[24..]);
+
+        assert_eq!(chunks.len(), 162);
+        for (i, (got, want)) in chunks.iter().zip(&run).enumerate() {
+            assert_eq!(got.as_slice(), *want, "chunk {i}");
+        }
+    }
+
+    #[test]
+    fn parse_message_splits_header_and_payload() {
+        let rsp = crate::fixture!("init-rsp-1420");
+        let m = parse_message(&rsp).expect("response");
+        assert_eq!(
+            (m.marker, m.seq, m.status, m.id),
+            (MARKER_RESPONSE, 3, 1, 1420)
+        );
+        assert_eq!(
+            m.payload.len(),
+            usize::try_from(m.payload_len).expect("fits")
+        );
+        assert_eq!(m.tlvs().count(), 4);
+
+        let n = crate::fixture!("init-notify-3180");
+        let m = parse_message(&n).expect("notification");
+        assert_eq!((m.marker, m.id), (MARKER_NOTIFICATION, notify::STATE_3180));
+        assert_eq!(m.tlvs().next().and_then(|t| t.u32()), Some(3));
+    }
+
+    /// The device splits a calibration read: a 0x52 head declaring 659067
+    /// payload bytes but carrying 11, then header-less continuations. The
+    /// reassembler must emit one whole response and keep interleaved stream
+    /// messages separate.
+    #[test]
+    fn reassembler_joins_a_chunked_response() {
+        let head = crate::fixture!("calib-rsp-1100-head");
+        let declared =
+            usize::try_from(parse_message(&head).expect("head").payload_len).expect("fits");
+        let carried = head.len() - HEADER_LEN;
+        let blob: Vec<u8> = (0..declared - carried)
+            .map(|i| u8::try_from(i * 7 % 251).expect("below 251"))
+            .collect();
+        let split = blob.len() - 564;
+        let continuation = |body: &[u8]| {
+            let mut c = vec![1, 0, 0, 0];
+            c.extend_from_slice(&u32::try_from(body.len() + 8).expect("fits").to_le_bytes());
+            c.extend_from_slice(body);
+            c
+        };
+        let gaze = msg(STREAM_ID_GAZE, 40);
+        let mut wire = head.clone();
+        wire.extend(continuation(&blob[..split]));
+        wire.extend(gaze.clone());
+        wire.extend(continuation(&blob[split..]));
+
+        for read_size in [wire.len(), 16384, 1] {
+            let mut r = BulkReassembler::new();
+            let mut got = Vec::new();
+            for piece in wire.chunks(read_size) {
+                got.extend(r.push(piece));
+            }
+            assert_eq!(got.len(), 2, "read size {read_size}");
+            assert_eq!(got[0], gaze);
+            let whole = parse_message(&got[1]).expect("response");
+            assert_eq!((whole.id, whole.seq), (1100, 43));
+            assert_eq!(whole.payload.len(), declared);
+            assert_eq!(&whole.payload[carried..], blob.as_slice());
+            assert_eq!(
+                declared_len(&got[1]),
+                Some(u32::try_from(got[1].len()).expect("fits"))
+            );
+            assert!(!r.in_continuation());
+        }
+    }
+
+    #[test]
+    fn aborting_a_chunked_response_resumes_normal_parsing() {
+        let head = crate::fixture!("calib-rsp-1100-head");
+        let mut r = BulkReassembler::new();
+        assert!(r.push(&head).is_empty());
+        assert!(r.in_continuation());
+        r.abort_continuation();
+        let gaze = msg(STREAM_ID_GAZE, 40);
+        assert_eq!(r.push(&gaze), vec![gaze]);
     }
 
     #[test]
