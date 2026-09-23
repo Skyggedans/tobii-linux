@@ -995,12 +995,18 @@ impl Pump<'_> {
                 let _ = reply.send(Err(CommandError::Usb(e.to_string())));
                 return;
             }
-            if i + 1 < pieces.len()
-                && let Ok(n) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(1))
-            {
-                asm.push_into(&buf[..n], &mut msgs);
-                for msg in msgs.drain(..) {
-                    self.deliver(classify(&msg));
+            if i + 1 < pieces.len() {
+                // The device stops taking pieces while what it sent is unread
+                // (see `replay_init_packets`); with the streams running that
+                // includes image frames, so take everything it has.
+                for _ in 0..PIECE_DRAIN_READS {
+                    let Ok(n) = h.read_bulk(EP_IN, &mut buf, PIECE_DRAIN_TIMEOUT) else {
+                        break;
+                    };
+                    asm.push_into(&buf[..n], &mut msgs);
+                    for msg in msgs.drain(..) {
+                        self.deliver(classify(&msg));
+                    }
                 }
             }
         }
@@ -1020,6 +1026,16 @@ impl Pump<'_> {
         }
     }
 }
+
+/// How long one read waits between the pieces of a command while the
+/// streams run: long enough for a whole 78 KB image message (about 2 ms on
+/// the wire), so that a read is not cut off halfway through one and the
+/// device's queue really empties. (A 1 ms read stalled a 164-piece
+/// calibration upload that started as the image stream came up.)
+const PIECE_DRAIN_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// Most reads between two pieces of a command.
+const PIECE_DRAIN_READS: usize = 8;
 
 /// Presence state the 0x504 stream uses for "a user is present".
 const PRESENCE_STATE_PRESENT: u32 = 2;
