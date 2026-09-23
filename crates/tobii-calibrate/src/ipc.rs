@@ -2,6 +2,7 @@
 //! forwarded as they arrive (the verification view draws them).
 
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,12 +71,27 @@ impl Connection {
         })
     }
 
-    /// Block until the tracker streams (a cold start takes several seconds).
-    pub(crate) fn wait_for_gaze(&self, timeout: Duration) -> Result<()> {
-        match self.gaze_seen.recv_timeout(timeout) {
-            Ok(()) => Ok(()),
-            Err(RecvTimeoutError::Timeout) => bail!("no gaze from the tracker within {timeout:?}"),
-            Err(RecvTimeoutError::Disconnected) => bail!("tobiid closed the connection"),
+    /// Block until the tracker streams (a cold start takes several seconds),
+    /// or `abort` is set.
+    pub(crate) fn wait_for_gaze(&self, timeout: Duration, abort: &AtomicBool) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Relaxed: a pure signal from the UI thread.
+            if abort.load(Ordering::Relaxed) {
+                bail!("aborted");
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self
+                .gaze_seen
+                .recv_timeout(left.min(Duration::from_millis(100)))
+            {
+                Ok(()) => return Ok(()),
+                Err(RecvTimeoutError::Timeout) if left.is_zero() => {
+                    bail!("no gaze from the tracker within {timeout:?}")
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => bail!("tobiid closed the connection"),
+            }
         }
     }
 

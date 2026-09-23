@@ -1,17 +1,19 @@
 //! The calibration window: fullscreen on the chosen monitor, drawn in
-//! software. It only displays what the worker reports (targets, progress,
-//! the result) and turns Esc into an abort.
+//! software. It displays what the worker reports (targets, progress, the
+//! result), runs the display setup (ticks moved by mouse and keyboard, the
+//! answer sent back to the worker) and turns Esc into an abort.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use tobii_calib::STIMULUS_POINTS;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
@@ -19,6 +21,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::draw::{Canvas, rgb};
 use crate::sequence::{Phase, Summary, Timing, UiEvent};
+use crate::setup::{Choice, Start, Ticks};
 
 const BACKGROUND: u32 = rgb(22, 22, 26);
 const FOREGROUND: u32 = rgb(230, 230, 235);
@@ -52,6 +55,41 @@ enum Screen {
     Computing,
     Finished(Summary),
     Failed(String),
+    DisplaySetup(Setup),
+}
+
+/// The display setup on screen: what it started from and where the ticks are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Setup {
+    start: Start,
+    ticks: Ticks,
+    /// The window width `ticks` are measured in.
+    width_px: f64,
+}
+
+impl Setup {
+    /// The ticks on a `width_px × height_px` window: they scale with its
+    /// width, and are refitted to it (see [`Start::fit`]).
+    fn ticks_for(&self, width_px: f64, height_px: f64) -> Ticks {
+        let k = width_px / self.width_px;
+        let scaled = Ticks {
+            left: self.ticks.left * k,
+            right: self.ticks.right * k,
+        };
+        self.start.fit(scaled, width_px, height_px)
+    }
+}
+
+/// What a mouse drag on the setup screen moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Drag {
+    Left,
+    Right,
+    /// Both ticks, as they were when the drag started at `grabbed_x`.
+    Both {
+        grabbed_x: f64,
+        from: Ticks,
+    },
 }
 
 /// The winit application.
@@ -76,6 +114,25 @@ pub(crate) struct Ui {
     redraw_pending: bool,
     /// What the last presented frame showed.
     presented: Option<Presented>,
+    /// Something changed on a still screen; draw it at the next paced frame.
+    dirty: bool,
+    /// The display setup's answer, for the worker.
+    answers: Sender<Choice>,
+    /// Name of the monitor the window is on, to find its EDID.
+    monitor_name: Option<String>,
+    /// The monitor the fullscreen window must stay on.
+    target: Option<MonitorHandle>,
+    /// When the window was made: the compositor gets a moment to place it.
+    created: Option<Instant>,
+    /// Tries so far at moving the window back to `target`, and the last.
+    placement_tries: u32,
+    placement_last: Option<Instant>,
+    /// The window stayed on another monitor: the one it belongs on.
+    misplaced: Option<String>,
+    /// Last pointer position across the window, physical pixels.
+    pointer_x: Option<f64>,
+    drag: Option<Drag>,
+    shift: bool,
     /// Set when the session ended badly, for the exit code.
     pub(crate) failed: Option<String>,
 }
@@ -88,6 +145,24 @@ struct Presented {
     moving: Option<Bounds>,
 }
 
+/// What to hand the compositor as damage: `None` for the whole surface (a
+/// new screen or size, or a redraw the window did not ask for), else what
+/// moved since the last frame (`Some(None)`: nothing did).
+fn damage(
+    last: Option<Presented>,
+    epoch: u64,
+    size: (usize, usize),
+    moving: Option<Bounds>,
+    asked: bool,
+) -> Option<Option<Bounds>> {
+    match last {
+        Some(last) if asked && last.epoch == epoch && last.size == size => {
+            Some(Bounds::union(last.moving, moving))
+        }
+        _ => None,
+    }
+}
+
 /// Animation frame interval (60 Hz). On Wayland the compositor's frame
 /// callbacks pace drawing too; this also bounds the other backends. Each
 /// frame of a 4K window is 33 MB for the compositor to take in, so drawing
@@ -97,6 +172,12 @@ const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 /// How often the loop looks again while a frame it asked for has not been
 /// drawn (a hidden window gets no frame callbacks on Wayland).
 const PENDING_CHECK: Duration = Duration::from_millis(100);
+
+/// How many times the window is sent back to the monitor it was opened on
+/// when the compositor puts it on another one (`PaperWM` moves a new window to
+/// the monitor in use), and the pause between tries.
+const PLACEMENT_TRIES: u32 = 5;
+const PLACEMENT_PAUSE: Duration = Duration::from_millis(500);
 
 /// Whether to ask for a frame now, and when to wake up next: frames at most
 /// every [`FRAME_INTERVAL`], never a wake-up in the past.
@@ -167,6 +248,7 @@ impl Ui {
         windowed: bool,
         timing: Timing,
         verify: Duration,
+        answers: Sender<Choice>,
     ) -> Self {
         Self {
             abort,
@@ -184,8 +266,237 @@ impl Ui {
             next_frame: Instant::now(),
             redraw_pending: false,
             presented: None,
+            dirty: false,
+            answers,
+            monitor_name: None,
+            target: None,
+            created: None,
+            placement_tries: 0,
+            placement_last: None,
+            misplaced: None,
+            pointer_x: None,
+            drag: None,
+            shift: false,
             failed: None,
         }
+    }
+
+    /// The display setup, while it is on screen.
+    fn setup(&self) -> Option<Setup> {
+        match self.screen {
+            Screen::DisplaySetup(setup) => Some(setup),
+            _ => None,
+        }
+    }
+
+    /// Where the window is, if it is not fullscreen on the monitor it was
+    /// opened on (and the compositor has said where it is), with that
+    /// monitor.
+    fn misplaced_now(&self) -> Option<(String, MonitorHandle)> {
+        let target = self.target.clone()?;
+        let window = self.window.as_ref()?;
+        let current = window.current_monitor()?;
+        if current.name() != target.name() {
+            let on = current.name().unwrap_or_else(|| "another monitor".into());
+            return Some((on, target));
+        }
+        window
+            .fullscreen()
+            .is_none()
+            .then(|| ("a window, not fullscreen".to_owned(), target))
+    }
+
+    /// Keep the fullscreen window on its monitor: send it back a few times
+    /// if the compositor moved it, then warn on screen (a calibration shown
+    /// on another monitor would be saved all the same). Returns when to look
+    /// again.
+    fn keep_on_target(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        if let Some(created) = self.created
+            && now < created + 2 * PLACEMENT_PAUSE
+        {
+            return Some(created + 2 * PLACEMENT_PAUSE);
+        }
+        let Some((on, target)) = self.misplaced_now() else {
+            if self.misplaced.take().is_some() {
+                tracing::info!("the window is back on its monitor");
+                self.epoch += 1;
+                self.request_frame();
+            }
+            return None;
+        };
+        if let Some(last) = self.placement_last
+            && now < last + PLACEMENT_PAUSE
+        {
+            return Some(last + PLACEMENT_PAUSE);
+        }
+        if self.placement_tries < PLACEMENT_TRIES {
+            self.placement_tries += 1;
+            self.placement_last = Some(now);
+            tracing::warn!(
+                on,
+                wanted = target.name().as_deref().unwrap_or("?"),
+                attempt = self.placement_tries,
+                "the window is not fullscreen on its monitor: asking again"
+            );
+            if let Some(window) = &self.window {
+                // Out of fullscreen first: asking for the state the window
+                // is believed to have already is a no-op (winit on X11).
+                window.set_fullscreen(None);
+                window.set_fullscreen(Some(Fullscreen::Borderless(Some(target))));
+            }
+            return Some(now + PLACEMENT_PAUSE);
+        }
+        if self.misplaced.is_none() {
+            let wanted = target.name().unwrap_or_else(|| "its monitor".into());
+            tracing::warn!(wanted, "the window stays off its monitor");
+            self.misplaced = Some(wanted);
+            self.epoch += 1;
+            self.request_frame();
+        }
+        None
+    }
+
+    /// The window's size in physical pixels.
+    fn window_size(&self) -> Option<(f64, f64)> {
+        let size = self.window.as_ref()?.inner_size();
+        Some((f64::from(size.width), f64::from(size.height)))
+    }
+
+    /// Put `screen` up: drawn at once, the pointer shown only for the setup.
+    fn show(&mut self, screen: Screen) {
+        tracing::debug!(screen = screen_name(&screen), "screen");
+        if let Some(w) = &self.window {
+            w.set_cursor_visible(matches!(screen, Screen::DisplaySetup(_)));
+        }
+        self.screen = screen;
+        self.drag = None;
+        self.epoch += 1;
+        self.since = Instant::now();
+        self.request_frame();
+    }
+
+    /// The setup screen for `req`, its ticks placed from the monitor's EDID
+    /// (or the tracker's current area).
+    fn setup_screen(&self, req: crate::sequence::SetupRequest) -> Option<Screen> {
+        let (width, height) = self.window_size()?;
+        let monitor_mm = crate::edid::monitor_size_mm(self.monitor_name.as_deref());
+        tracing::info!(
+            monitor = self.monitor_name.as_deref().unwrap_or("?"),
+            ?monitor_mm,
+            guide_mm = req.guide_mm,
+            "display setup"
+        );
+        let start = Start {
+            guide_mm: req.guide_mm,
+            monitor_mm,
+            current: req.current,
+        };
+        Some(Screen::DisplaySetup(Setup {
+            start,
+            ticks: start.ticks(width, height),
+            width_px: width,
+        }))
+    }
+
+    /// Move the setup's ticks to `ticks` (measured on a window `width_px`
+    /// wide) and have them drawn.
+    fn set_ticks(&mut self, ticks: Ticks, width_px: f64) {
+        if let Screen::DisplaySetup(setup) = &mut self.screen {
+            setup.ticks = ticks;
+            setup.width_px = width_px;
+            self.dirty = true;
+        }
+    }
+
+    /// A key on the setup screen: arrows move the ticks together, up and
+    /// down spread them (unless the EDID fixes their spacing), Shift makes
+    /// the steps ten pixels; Enter answers.
+    fn setup_key(&mut self, key: &Key) {
+        let (Some(setup), Some((width, height))) = (self.setup(), self.window_size()) else {
+            return;
+        };
+        let step = if self.shift { 10.0 } else { 1.0 };
+        let ticks = setup.ticks_for(width, height);
+        let spreads = !setup.start.spacing_fixed(width, height);
+        let moved = match key {
+            Key::Named(NamedKey::ArrowLeft) => ticks.shifted(-step, width),
+            Key::Named(NamedKey::ArrowRight) => ticks.shifted(step, width),
+            Key::Named(NamedKey::ArrowUp) if spreads => ticks.widened(step, width),
+            Key::Named(NamedKey::ArrowDown) if spreads => ticks.widened(-step, width),
+            Key::Named(NamedKey::Enter) => return self.confirm_setup(),
+            _ => return,
+        };
+        self.set_ticks(moved, width);
+    }
+
+    /// The pointer moved: carry what is being dragged.
+    fn setup_pointer(&mut self, x: f64) {
+        self.pointer_x = Some(x);
+        let (Some(drag), Some(setup), Some((width, height))) =
+            (self.drag, self.setup(), self.window_size())
+        else {
+            return;
+        };
+        let ticks = setup.ticks_for(width, height);
+        let moved = match drag {
+            Drag::Left => ticks.with_left(x, width),
+            Drag::Right => ticks.with_right(x, width),
+            Drag::Both { grabbed_x, from } => from.shifted(x - grabbed_x, width),
+        };
+        self.set_ticks(moved, width);
+    }
+
+    /// A press on a tick drags that tick (when their spacing is free);
+    /// anywhere else, both.
+    fn setup_button(&mut self, state: ElementState) {
+        if state == ElementState::Released {
+            self.drag = None;
+            return;
+        }
+        let (Some(x), Some(setup), Some((width, height))) =
+            (self.pointer_x, self.setup(), self.window_size())
+        else {
+            return;
+        };
+        let ticks = setup.ticks_for(width, height);
+        let single = !setup.start.spacing_fixed(width, height);
+        let reach = (height / 100.0 * 1.5).max(12.0);
+        let (to_left, to_right) = ((x - ticks.left).abs(), (x - ticks.right).abs());
+        self.drag = Some(if single && to_left <= reach && to_left <= to_right {
+            Drag::Left
+        } else if single && to_right <= reach {
+            Drag::Right
+        } else {
+            Drag::Both {
+                grabbed_x: x,
+                from: ticks,
+            }
+        });
+    }
+
+    /// Enter on the setup screen: send the answer and wait for the worker.
+    /// Not while the window is on another monitor: the ticks would measure
+    /// that one.
+    fn confirm_setup(&mut self) {
+        if let Some((on, _)) = self.misplaced_now() {
+            tracing::warn!(on, "not confirming the display setup off its monitor");
+            return;
+        }
+        let (Some(setup), Some((width, height))) = (self.setup(), self.window_size()) else {
+            return;
+        };
+        let Some(choice) = setup
+            .start
+            .choice(setup.ticks_for(width, height), width, height)
+        else {
+            return;
+        };
+        tracing::info!(?choice, "display setup confirmed");
+        if self.answers.send(choice).is_err() {
+            tracing::warn!("the calibration worker is gone");
+        }
+        self.show(Screen::Status("setting the display area...".into()));
     }
 
     /// Ask for a frame as soon as the backend allows.
@@ -211,7 +522,10 @@ impl Ui {
     }
 
     fn draw(&mut self) {
-        self.redraw_pending = false;
+        // A redraw this window did not ask for (an X11 expose, a configure)
+        // may need the whole surface back, not just what moved.
+        let asked = std::mem::take(&mut self.redraw_pending);
+        self.dirty = false;
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -242,18 +556,16 @@ impl Ui {
             height,
         };
         paint(&mut c, &self.screen, elapsed, self.timing, self.gaze);
+        if let Some(wanted) = &self.misplaced {
+            paint_misplaced(&mut c, wanted);
+        }
         let painted = started.elapsed();
 
         // The whole frame is repainted, but only what moved since the last
         // one is handed to the compositor as damage: a few KB instead of
         // the whole surface. A new screen or size is damaged whole.
         let moving = moving_bounds(&self.screen, elapsed, self.timing, self.gaze, width, height);
-        let damage = match self.presented {
-            Some(last) if last.epoch == self.epoch && last.size == (width, height) => {
-                Some(Bounds::union(last.moving, moving))
-            }
-            _ => None,
-        };
+        let damage = damage(self.presented, self.epoch, (width, height), moving, asked);
         self.presented = Some(Presented {
             epoch: self.epoch,
             size: (width, height),
@@ -284,8 +596,12 @@ impl Ui {
         );
     }
 
+    /// Screens that change by themselves; the rest are drawn on events.
     fn animating(&self) -> bool {
-        !matches!(self.screen, Screen::Status(_) | Screen::Failed(_))
+        !matches!(
+            self.screen,
+            Screen::Status(_) | Screen::Failed(_) | Screen::DisplaySetup(_)
+        )
     }
 }
 
@@ -297,7 +613,34 @@ fn screen_name(screen: &Screen) -> &'static str {
         Screen::Computing => "computing",
         Screen::Finished(_) => "finished",
         Screen::Failed(_) => "failed",
+        Screen::DisplaySetup(_) => "display setup",
     }
+}
+
+/// Where the setup screen draws: the ticks from `tick_top` to the bottom
+/// edge (right above the tracker), the live reading at `reading_y` above.
+fn setup_layout(height: usize) -> (usize, usize) {
+    let tick_top = height - height / 10;
+    (tick_top, tick_top.saturating_sub(3 * 8 * scale_for(height)))
+}
+
+/// The live reading of the setup screen.
+fn describe(choice: &Choice) -> String {
+    let side = if choice.offset_x_mm.abs() < 0.05 {
+        "under its centre".to_owned()
+    } else {
+        // The monitor's centre right of the tracker: the tracker is left.
+        let side = if choice.offset_x_mm > 0.0 {
+            "left"
+        } else {
+            "right"
+        };
+        format!("{:.1} mm {side} of its centre", choice.offset_x_mm.abs())
+    };
+    format!(
+        "screen {:.0} x {:.0} mm, tracker {side}",
+        choice.width_mm, choice.height_mm
+    )
 }
 
 /// A point in normalised display coordinates, in pixels.
@@ -372,6 +715,13 @@ fn moving_bounds(
         Screen::Finished(_) => gaze.and_then(|(g, _)| {
             let (x, y) = to_pixels(g, width, height);
             Bounds::around(x, y, unit * 0.9 + 2.0, width, height)
+        }),
+        // The ticks move anywhere along the bottom; the reading changes too.
+        Screen::DisplaySetup(_) => Some(Bounds {
+            x0: 0,
+            y0: setup_layout(height).1,
+            x1: width,
+            y1: height,
         }),
         Screen::Status(_) | Screen::Failed(_) => None,
     }
@@ -467,13 +817,52 @@ fn paint(
         }
         Screen::Failed(text) => {
             c.text_centered(h / 2, s, WARNING, text);
-            c.text_centered(
-                h / 2 + 12 * s,
-                s,
-                MUTED,
-                "the previous calibration is kept; Esc to close",
-            );
+            c.text_centered(h / 2 + 12 * s, s, MUTED, "Esc to close");
         }
+        Screen::DisplaySetup(setup) => paint_setup(c, setup, s, unit),
+    }
+}
+
+/// The warning over every screen while the window is on the wrong monitor.
+fn paint_misplaced(c: &mut Canvas<'_>, wanted: &str) {
+    let s = scale_for(c.height);
+    c.text_centered(
+        2 * 8 * s,
+        s,
+        WARNING,
+        &format!("this belongs fullscreen on {wanted}: move it there, or press Esc"),
+    );
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // reason: screen-sized values
+fn paint_setup(c: &mut Canvas<'_>, setup: &Setup, s: usize, unit: f32) {
+    let (w, h) = (c.width, c.height);
+    let ticks = setup.ticks_for(w as f64, h as f64);
+    c.text_centered(
+        h / 3,
+        s,
+        FOREGROUND,
+        "line the two ticks up with the two white marks on the eye tracker",
+    );
+    let hint = if setup.start.spacing_fixed(w as f64, h as f64) {
+        "drag them, or Left/Right to move them (Shift: faster)"
+    } else {
+        "drag them, or Left/Right: move, Up/Down: spread, Shift: faster"
+    };
+    c.text_centered(h / 3 + 12 * s, s, MUTED, hint);
+    c.text_centered(
+        h / 3 + 24 * s,
+        s,
+        MUTED,
+        "Enter when they line up, Esc to cancel",
+    );
+    let (tick_top, reading_y) = setup_layout(h);
+    if let Some(choice) = setup.start.choice(ticks, w as f64, h as f64) {
+        c.text_centered(reading_y, s, ACCENT, &describe(&choice));
+    }
+    let half = (unit * 0.1).max(1.0);
+    for x in [ticks.left, ticks.right] {
+        c.vbar(x as f32, half, tick_top, h, FOREGROUND);
     }
 }
 
@@ -504,6 +893,9 @@ impl ApplicationHandler<UiEvent> for Ui {
                 event_loop.exit();
                 return;
             };
+            self.monitor_name = monitor.name();
+            self.target = Some(monitor.clone());
+            self.created = Some(Instant::now());
             attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
         }
         let window = match event_loop.create_window(attributes) {
@@ -555,15 +947,12 @@ impl ApplicationHandler<UiEvent> for Ui {
                 self.failed = Some(text.clone());
                 Some(Screen::Failed(text))
             }
+            UiEvent::DisplaySetup(req) => self.setup_screen(req),
         };
         // A gaze sample only shows on an animating screen, whose next paced
         // frame picks it up; a new screen is drawn at once.
         if let Some(screen) = next {
-            tracing::debug!(screen = screen_name(&screen), "screen");
-            self.screen = screen;
-            self.epoch += 1;
-            self.since = Instant::now();
-            self.request_frame();
+            self.show(screen);
         }
     }
 
@@ -582,6 +971,18 @@ impl ApplicationHandler<UiEvent> for Ui {
                 self.abort.store(true, Ordering::Relaxed);
                 event_loop.exit();
             }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                self.setup_key(&event.logical_key);
+            }
+            WindowEvent::ModifiersChanged(m) => self.shift = m.state().shift_key(),
+            WindowEvent::CursorMoved { position, .. } => self.setup_pointer(position.x),
+            // A button release may never come: stop dragging.
+            WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => self.drag = None,
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => self.setup_button(state),
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Resized(_) => self.request_frame(),
             _ => {}
@@ -593,16 +994,19 @@ impl ApplicationHandler<UiEvent> for Ui {
             event_loop.exit();
             return;
         }
-        if self.animating() {
+        let placement = self.keep_on_target();
+        if self.animating() || self.dirty {
             // Asking for a redraw wakes the loop at once, so frames must be
             // paced here rather than by the wake-up time alone.
             let (request, wake) = pace(Instant::now(), self.next_frame, self.redraw_pending);
             if request {
                 self.request_frame();
             }
+            let wake = placement.map_or(wake, |p| p.min(wake));
             event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
         } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop
+                .set_control_flow(placement.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
     }
 }
@@ -641,6 +1045,7 @@ mod tests {
                 blob: Vec::new(),
             }),
             Screen::Failed("no".into()),
+            Screen::DisplaySetup(setup_screen(320.0)),
         ];
         let mut px = vec![0u32; 320 * 200];
         for screen in &screens {
@@ -692,12 +1097,20 @@ mod tests {
 
     type Frame = (Duration, Option<([f32; 2], bool)>);
 
+    const W: usize = 640;
+    const H: usize = 360;
+
     /// Paint two frames of `screen`; every pixel that differs must lie in the
     /// damage the second frame reports.
     fn assert_damage_covers_changes(screen: &Screen, a: Frame, b: Frame) {
-        const W: usize = 640;
-        const H: usize = 360;
-        let frame = |(elapsed, gaze): Frame| {
+        assert_damage_covers_changes_between((screen, a), (screen, b));
+    }
+
+    /// The same for two frames of one screen whose state changed in between
+    /// (the setup's ticks moved).
+    fn assert_damage_covers_changes_between(a: (&Screen, Frame), b: (&Screen, Frame)) {
+        let screen = b.0;
+        let frame = |(screen, (elapsed, gaze)): (&Screen, Frame)| {
             let mut px = vec![0u32; W * H];
             let mut c = Canvas {
                 pixels: &mut px,
@@ -709,8 +1122,8 @@ mod tests {
         };
         let (pa, pb) = (frame(a), frame(b));
         let damage = Bounds::union(
-            moving_bounds(screen, a.0, TIMING, a.1, W, H),
-            moving_bounds(screen, b.0, TIMING, b.1, W, H),
+            moving_bounds(a.0, a.1.0, TIMING, a.1.1, W, H),
+            moving_bounds(b.0, b.1.0, TIMING, b.1.1, W, H),
         );
         let mut changed = 0;
         for y in 0..H {
@@ -762,6 +1175,94 @@ mod tests {
         ] {
             assert_damage_covers_changes(&finished, (ms(100), seen), (ms(117), next));
         }
+    }
+
+    /// A setup screen; `monitor_mm` fixes the spacing (a believable EDID).
+    fn setup_with(width_px: f64, monitor_mm: Option<(f64, f64)>) -> Setup {
+        let start = Start {
+            guide_mm: 184.0,
+            monitor_mm,
+            current: None,
+        };
+        Setup {
+            start,
+            ticks: start.ticks(width_px, width_px * 9.0 / 16.0),
+            width_px,
+        }
+    }
+
+    fn setup_screen(width_px: f64) -> Setup {
+        setup_with(width_px, Some((597.0, 336.0)))
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // reason: small sizes
+    fn moving_the_setup_ticks_damages_only_the_bottom_band() {
+        let w = W as f64;
+        let frame = (Duration::ZERO, None);
+        let fixed = setup_screen(w);
+        let free = setup_with(w, None);
+        for (before, ticks) in [
+            (fixed, fixed.ticks.shifted(-37.0, w)),
+            (fixed, fixed.ticks.shifted(80.0, w)),
+            (free, free.ticks.widened(25.0, w)),
+            (free, free.ticks.with_right(w, w)),
+        ] {
+            let after = Screen::DisplaySetup(Setup { ticks, ..before });
+            assert_damage_covers_changes_between(
+                (&Screen::DisplaySetup(before), frame),
+                (&after, frame),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // reason: small sizes
+    fn a_fixed_pair_cannot_be_spread() {
+        let w = W as f64;
+        let h = H as f64;
+        let fixed = setup_screen(w);
+        let spread = Setup {
+            ticks: fixed.ticks.widened(25.0, w),
+            ..fixed
+        };
+        assert_eq!(spread.ticks_for(w, h), fixed.ticks_for(w, h));
+    }
+
+    #[test]
+    fn the_reading_says_where_the_tracker_is() {
+        let at = |offset_x_mm| {
+            describe(&Choice {
+                width_mm: 597.0,
+                height_mm: 336.0,
+                offset_x_mm,
+            })
+        };
+        assert_eq!(
+            at(1.0),
+            "screen 597 x 336 mm, tracker 1.0 mm left of its centre"
+        );
+        assert_eq!(
+            at(-12.34),
+            "screen 597 x 336 mm, tracker 12.3 mm right of its centre"
+        );
+        assert_eq!(at(0.01), "screen 597 x 336 mm, tracker under its centre");
+    }
+
+    #[test]
+    fn a_redraw_the_window_did_not_ask_for_damages_everything() {
+        let last = Some(Presented {
+            epoch: 3,
+            size: (640, 360),
+            moving: Bounds::around(100.0, 100.0, 5.0, 640, 360),
+        });
+        let moving = Bounds::around(120.0, 100.0, 5.0, 640, 360);
+        assert_eq!(damage(last, 3, (640, 360), moving, false), None);
+        assert_eq!(damage(last, 4, (640, 360), moving, true), None);
+        assert_eq!(damage(last, 3, (641, 360), moving, true), None);
+        assert_eq!(damage(None, 3, (640, 360), moving, true), None);
+        let partial = damage(last, 3, (640, 360), moving, true).expect("partial");
+        assert_eq!(partial, Bounds::union(last.and_then(|l| l.moving), moving));
     }
 
     #[test]

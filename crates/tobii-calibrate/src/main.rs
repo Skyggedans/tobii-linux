@@ -1,21 +1,27 @@
 //! `tobii-calibrate`: calibrate the Tobii Eye Tracker 5 on Linux.
 //!
-//! Shows the 7-point pattern fullscreen on one monitor (two rounds by
-//! default), has `tobiid` collect each point and compute the calibration,
-//! and shows the result with a live gaze dot to check it. The daemon saves
+//! First the display setup: two ticks at the bottom of the screen, lined up
+//! with the two white marks on the tracker, tell the tracker the monitor's
+//! size and where it sits under it (the display area; the daemon keeps it).
+//! Then the 7-point pattern fullscreen on that monitor (two rounds by
+//! default): `tobiid` collects each point and computes the calibration, and
+//! the result is shown with a live gaze dot to check it. The daemon saves
 //! the calibration and uploads it at every later start; `--reset` goes back
 //! to the calibration built into the driver.
 //!
 //! Talks to the daemon directly over its socket, like the other clients.
 
 mod draw;
+mod edid;
 mod ipc;
 mod sequence;
+mod setup;
 mod ui;
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -32,6 +38,8 @@ usage: tobii-calibrate [options]
   --monitor N|NAME   calibrate on this monitor (see --list-monitors);
                      default: the primary one
   --list-monitors    print the monitors and exit
+  --no-display-setup keep the display area the tracker has (skip lining up
+                     the ticks with the marks on the tracker)
   --rounds N         rounds of the 7-point pattern (default 2: the tracker
                      keeps the last 14 points)
   --dwell-ms N       time to settle on each point before collecting (1000)
@@ -51,6 +59,7 @@ struct Options {
     reset: bool,
     dry_run: bool,
     windowed: bool,
+    display_setup: bool,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options> {
@@ -64,6 +73,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options> {
         reset: false,
         dry_run: false,
         windowed: false,
+        display_setup: true,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| {
@@ -91,6 +101,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options> {
             "--reset" => o.reset = true,
             "--dry-run" => o.dry_run = true,
             "--windowed" => o.windowed = true,
+            "--no-display-setup" => o.display_setup = false,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -116,6 +127,10 @@ fn reset() -> Result<()> {
     Ok(())
 }
 
+/// How long closing the window waits for the worker to wind the session
+/// down (a pending collect or compute answers within seconds).
+const WORKER_GRACE: Duration = Duration::from_secs(25);
+
 fn run() -> Result<()> {
     let o = parse_args(std::env::args().skip(1))?;
     if o.reset {
@@ -125,11 +140,20 @@ fn run() -> Result<()> {
         .build()
         .context("no display to open a window on")?;
     let abort = Arc::new(AtomicBool::new(false));
+    let (answers, setup_answers) = mpsc::channel();
+    // The setup measures the window, so it needs the whole monitor.
+    let display_setup = o.display_setup && !o.windowed;
+    if o.display_setup && o.windowed {
+        tracing::info!("--windowed: skipping the display setup");
+    }
     let timing = Timing {
         travel: Duration::from_millis(350),
         dwell: o.dwell,
     };
 
+    // The worker reports how the session ended, so that closing the window
+    // waits for it to stop the session, and the outcome reaches the terminal.
+    let (done, worker_done) = mpsc::channel::<Result<(), String>>();
     if !o.list_monitors {
         let proxy = event_loop.create_proxy();
         let gaze_proxy = event_loop.create_proxy();
@@ -147,8 +171,10 @@ fn run() -> Result<()> {
                 }))
                 .map(|c| Box::new(c) as Box<dyn Backend>)
             };
-            let outcome =
-                backend.and_then(|mut b| sequence::run(b.as_mut(), rounds, timing, &abort, &emit));
+            let setup = display_setup.then_some(&setup_answers);
+            let outcome = backend
+                .and_then(|mut b| sequence::run(b.as_mut(), rounds, timing, setup, &abort, &emit));
+            let reported = outcome.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
             match outcome {
                 Ok(summary) => {
                     if let Some(path) = &export
@@ -160,19 +186,36 @@ fn run() -> Result<()> {
                 }
                 Err(e) => emit(UiEvent::Failed(format!("{e:#}"))),
             }
+            let _ = done.send(reported);
         });
+    } else {
+        drop(done);
     }
 
     let mut app = Ui::new(
-        abort,
+        Arc::clone(&abort),
         o.monitor,
         o.list_monitors,
         o.windowed,
         timing,
         o.verify,
+        answers,
     );
     event_loop.run_app(&mut app).context("window event loop")?;
-    match app.failed {
+    let window_failed = app.failed.take();
+    // Close the window now, not after the wait below.
+    drop(app);
+    // Esc or a closed window: have the worker stop the session (it checks
+    // between steps) and wait for it, within reason.
+    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+    match worker_done.recv_timeout(WORKER_GRACE) {
+        Ok(Err(reason)) => bail!(reason),
+        Ok(Ok(())) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            bail!("the calibration did not wind down in time; the daemon ends it when this exits");
+        }
+    }
+    match window_failed {
         Some(reason) => bail!(reason),
         None => Ok(()),
     }
@@ -207,13 +250,15 @@ mod tests {
             "--dwell-ms",
             "600",
             "--dry-run",
+            "--no-display-setup",
         ])
         .expect("options");
         assert_eq!(o.monitor, MonitorChoice::Index(1));
         assert_eq!(
-            (o.rounds, o.dwell, o.dry_run),
-            (3, Duration::from_millis(600), true)
+            (o.rounds, o.dwell, o.dry_run, o.display_setup),
+            (3, Duration::from_millis(600), true, false)
         );
+        assert!(parse(&[]).expect("defaults").display_setup);
         assert_eq!(
             parse(&["--monitor", "DP-2"]).expect("name").monitor,
             MonitorChoice::Name("DP-2".into())

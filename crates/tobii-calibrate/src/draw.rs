@@ -112,6 +112,28 @@ impl Canvas<'_> {
         });
     }
 
+    /// A vertical bar centred on `cx` (sub-pixel positions anti-aliased),
+    /// `half_width` either side, over rows `y0..y1`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    // reason: pixel coordinates are small and clamped to the canvas
+    pub(crate) fn vbar(&mut self, cx: f32, half_width: f32, y0: usize, y1: usize, color: u32) {
+        let (left, right) = (cx - half_width, cx + half_width);
+        let x0 = left.floor().max(0.0) as usize;
+        let x1 = (right.ceil().max(0.0) as usize).min(self.width);
+        for x in x0..x1 {
+            let covered = (right.min(x as f32 + 1.0) - left.max(x as f32)).clamp(0.0, 1.0);
+            if covered > 0.0 {
+                for y in y0..y1.min(self.height) {
+                    self.put(x, y, color, covered);
+                }
+            }
+        }
+    }
+
     /// `text` in the 8x8 font, each font pixel `scale` screen pixels, with its
     /// top-left corner at `(x, y)`. Characters the font lacks are skipped.
     pub(crate) fn text(&mut self, x: usize, y: usize, scale: usize, color: u32, text: &str) {
@@ -152,6 +174,26 @@ mod tests {
 
     fn lit(pixels: &[u32]) -> usize {
         pixels.iter().filter(|p| **p != 0).count()
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: exact coverage fractions
+    fn a_bar_between_pixels_shares_them() {
+        let mut px = vec![0u32; 20 * 4];
+        let mut c = Canvas {
+            pixels: &mut px,
+            width: 20,
+            height: 4,
+        };
+        // 2 px wide, centred on 10.5: a full pixel 10, halves of 9 and 11.
+        c.vbar(10.5, 1.0, 1, 3, rgb(0, 0, 200));
+        let row: Vec<u32> = (0..20).map(|x| px[20 + x] & 0xff).collect();
+        assert_eq!(
+            (row[8], row[9], row[10], row[11], row[12]),
+            (0, 100, 200, 100, 0)
+        );
+        assert_eq!(px[10] & 0xff, 0, "row 0 is outside the bar");
+        assert_eq!(px[3 * 20 + 10] & 0xff, 0, "row 3 is outside the bar");
     }
 
     #[test]
