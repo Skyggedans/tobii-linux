@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 rusb.workspace = true
+tobii-ipc.workspace = true
 tobii-log.workspace = true
 tobii-pose.workspace = true
 tobii-proto.workspace = true

@@ -6,8 +6,10 @@
 
 mod analysis;
 mod cli;
+mod compare_dll;
 mod dashboard;
 mod devcmd;
+mod ipc_probe;
 mod math;
 mod opentrack;
 mod sinks;
@@ -36,6 +38,15 @@ fn run() -> Result<()> {
         Command::Image83 { .. } => devcmd::run_image83(&opts),
         Command::Image83Replay { path, csv } => devcmd::run_image83_replay(path, csv.as_deref()),
         Command::Head83 { path, occs } => analysis::head83(path, occs),
+        Command::CompareDll {
+            log_path,
+            jsonl_path,
+        } => compare_dll::compare_dll(log_path, jsonl_path),
+        Command::IpcProbe {
+            streams,
+            secs,
+            set_display,
+        } => ipc_probe::run(*streams, *secs, *set_display),
     }
 }
 
