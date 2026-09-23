@@ -27,7 +27,9 @@ pub mod kind {
     pub const TIMESYNC: u8 = 7;
     /// Start a calibration session: payload `u8 tobii_enabled_eye_t`.
     pub const CALIBRATION_START: u8 = 0x10;
-    /// End the calibration session.
+    /// End the calibration session: payload [`super::STOP_KEEP`] (keep
+    /// what it computed) or [`super::STOP_DISCARD`] (put back what was
+    /// there before it).
     pub const CALIBRATION_STOP: u8 = 0x11;
     /// Collect a 2-D point: payload `f32 x, f32 y` (normalised display).
     pub const CALIBRATION_COLLECT_2D: u8 = 0x12;
@@ -42,6 +44,13 @@ pub mod kind {
     /// Clear the points collected in this session.
     pub const CALIBRATION_CLEAR: u8 = 0x17;
 }
+
+/// [`kind::CALIBRATION_STOP`] payload: keep the session's calibration (and
+/// the display area it was made on). What `tobii_calibration_stop` sends.
+pub const STOP_KEEP: &[u8] = &[];
+/// [`kind::CALIBRATION_STOP`] payload: discard the session, putting back the
+/// calibration and display area it started from.
+pub const STOP_DISCARD: &[u8] = &[1];
 
 /// `tobii_state_t` ids understood by [`kind::STATE`].
 pub mod state {

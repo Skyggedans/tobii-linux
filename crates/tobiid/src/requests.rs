@@ -143,10 +143,10 @@ fn facts(
 /// what it replaces is remembered, so that a session ending without a
 /// calibration can put it back (see [`crate::calibration`]).
 fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Reply {
-    let (device, display_id, before) = {
+    let (device, display_id) = {
         let mut st = lock_state(state);
-        if st.calibration.owner().is_some_and(|owner| owner != client) {
-            return Reply::err(status::CALIBRATION_BUSY);
+        if let Err(code) = st.calibration.display_access(client) {
+            return Reply::err(code);
         }
         // A client's area supersedes TOBII_DISPLAY_MM for this run: do not
         // let the variable's write, queued at the next device init, undo it.
@@ -155,12 +155,13 @@ fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Rep
             device: st.facts.as_ref().and_then(|f| f.display_area),
             configured: st.display_override,
         };
+        st.calibration.note_display_before(client, before);
         let display_id = st
             .facts
             .as_ref()
             .and_then(|f| f.display_id)
             .unwrap_or(DEFAULT_DISPLAY_ID);
-        (st.device_for(client), display_id, before)
+        (st.device_for(client), display_id)
     };
     let Some(device) = device else {
         return Reply::err(status::CONNECTION_FAILED);
@@ -174,7 +175,7 @@ fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Rep
     if result.is_ok() {
         let file = {
             let mut st = lock_state(state);
-            let save_now = st.calibration.note_display_change(client, before, area);
+            let save_now = st.calibration.note_display_set(client, area);
             st.display_override = Some(area);
             if let Some(engine) = st.engine.as_ref() {
                 engine.set_display_area_override(Some(area));
@@ -212,8 +213,8 @@ pub(crate) fn save_display_area(path: &std::path::Path, area: &DisplayArea) {
 }
 
 /// Put the display area back as it was before a calibration session that
-/// computed nothing changed it: on `device` (when there is one) and for
-/// later inits. The saved file never had the session's area.
+/// did not commit changed it: on `device` (when there is one) and for later
+/// inits. The saved file never had the session's area.
 pub(crate) fn put_display_back(
     state: &Mutex<State>,
     device: Option<&dyn crate::device::DeviceCommands>,
@@ -254,7 +255,7 @@ pub(crate) fn put_display_configuration_back(
         facts.display_area = before.device;
         st.facts = Some(Arc::new(facts));
     }
-    info!("display area put back: the calibration session computed nothing");
+    info!("display area put back: the calibration session did not commit");
 }
 
 /// Width of a display area, for the log.

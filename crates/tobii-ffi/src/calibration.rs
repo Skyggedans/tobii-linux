@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 use std::time::Duration;
 
-use tobii_ipc::request::{encode_point_2d, kind};
+use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
 
 use crate::device::{Api, Device, device_mut};
 use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
@@ -60,15 +60,16 @@ pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_ey
     unsafe { request(device, kind::CALIBRATION_START, &[eye], START_TIMEOUT) }
 }
 
-/// End the session. If nothing was computed, the previous calibration is
-/// restored.
+/// End the session, keeping the calibration it computed last (and the
+/// display area set during it). If nothing was computed, the previous
+/// calibration is restored.
 ///
 /// # Safety
 /// As `tobii_calibration_start`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_stop(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::CALIBRATION_STOP, &[], STOP_TIMEOUT) }
+    unsafe { request(device, kind::CALIBRATION_STOP, STOP_KEEP, STOP_TIMEOUT) }
 }
 
 /// Collect the user's gaze at `(x, y)` (normalised display coordinates)
