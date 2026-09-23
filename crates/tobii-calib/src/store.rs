@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::blob::{self, BlobError, BlobInfo};
 
@@ -45,20 +46,35 @@ pub fn configured() -> Location {
 }
 
 fn locate(overridden: Option<OsString>, xdg: Option<OsString>, home: Option<OsString>) -> Location {
-    let non_empty = |v: Option<OsString>| v.filter(|s| !s.is_empty());
-    if let Some(value) = non_empty(overridden) {
+    if let Some(value) = overridden.filter(|s| !s.is_empty()) {
         return if value == EMBEDDED {
             Location::Embedded
         } else {
             Location::File(PathBuf::from(value))
         };
     }
-    let config = non_empty(xdg)
-        .map(PathBuf::from)
-        .or_else(|| non_empty(home).map(|h| PathBuf::from(h).join(".config")));
-    config.map_or(Location::Embedded, |dir| {
-        Location::File(dir.join("tobii").join("calibration.bin"))
+    tobii_dir(xdg, home).map_or(Location::Embedded, |dir| {
+        Location::File(dir.join("calibration.bin"))
     })
+}
+
+/// The per-user directory the Tobii files live in:
+/// `$XDG_CONFIG_HOME/tobii`, else `$HOME/.config/tobii`; `None` when neither
+/// is set.
+#[must_use]
+pub fn config_dir() -> Option<PathBuf> {
+    tobii_dir(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn tobii_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let non_empty = |v: Option<OsString>| v.filter(|s| !s.is_empty());
+    non_empty(xdg)
+        .map(PathBuf::from)
+        .or_else(|| non_empty(home).map(|h| PathBuf::from(h).join(".config")))
+        .map(|dir| dir.join("tobii"))
 }
 
 /// The rollback copy kept next to `path`.
@@ -135,25 +151,57 @@ pub fn load(path: &Path) -> Result<Option<(Vec<u8>, BlobInfo)>, StoreError> {
 /// directory or file cannot be written.
 pub fn save(path: &Path, blob: &[u8]) -> Result<BlobInfo, StoreError> {
     let info = blob::validate(blob)?;
+    write_atomic(path, blob)?;
+    Ok(info)
+}
+
+/// Tells apart the temporary files of writes running at the same time.
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Write `contents` to `path` atomically (a synced temporary file renamed
+/// over it), creating the directory and keeping the file it replaces as
+/// [`previous_path`].
+///
+/// # Errors
+///
+/// When the directory or file cannot be written.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
-    let mut tmp_name = path.file_name().map(OsString::from).unwrap_or_default();
-    tmp_name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
+    let tmp_path = |what: &str| {
+        let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+        // Relaxed: only uniqueness matters.
+        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        name.push(format!(".{what}-{}-{n}", std::process::id()));
+        path.with_file_name(name)
+    };
+    let tmp = tmp_path("tmp");
     {
         let mut file = fs::File::create(&tmp)?;
-        file.write_all(blob)?;
+        file.write_all(contents)?;
         file.sync_all()?;
     }
-    if path.exists() {
-        fs::rename(path, previous_path(path))?;
+    // The old file becomes `.prev` by a copy renamed into place, so `path`
+    // itself is never missing, even with another write under way.
+    let prev = tmp_path("prev");
+    match fs::copy(path, &prev) {
+        Ok(_) => {
+            fs::File::open(&prev)?.sync_all()?;
+            fs::rename(&prev, previous_path(path))?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = fs::remove_file(&prev);
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     fs::rename(&tmp, path)?;
     // Make the renames durable; failing to sync a directory is not fatal.
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
     }
-    Ok(info)
+    Ok(())
 }
 
 /// Remove the calibration at `path` (the `.prev` copy stays). Absent is fine.
@@ -196,6 +244,30 @@ mod tests {
             Location::File("/h/.config/tobii/calibration.bin".into())
         );
         assert_eq!(locate(None, None, None), Location::Embedded);
+        assert_eq!(tobii_dir(None, os("/h")), Some("/h/.config/tobii".into()));
+        assert_eq!(tobii_dir(os("/x"), os("/h")), Some("/x/tobii".into()));
+    }
+
+    #[test]
+    fn concurrent_writes_leave_one_whole_file() {
+        let dir = std::env::temp_dir().join(format!("tobii-store-{}", std::process::id()));
+        let path = dir.join("f");
+        let writers: Vec<_> = (0..8u8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        write_atomic(&path, &[t; 64]).expect("write");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer");
+        }
+        let body = fs::read(&path).expect("the file survives");
+        assert!(body.len() == 64 && body.iter().all(|b| *b == body[0]));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A scratch directory under the system temp dir, removed on drop.
