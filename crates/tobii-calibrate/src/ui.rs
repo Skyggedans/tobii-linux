@@ -65,10 +65,98 @@ pub(crate) struct Ui {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     screen: Screen,
+    /// Counts screen changes, so a frame knows whether it continues the
+    /// last one (and only the moving parts need repainting on screen).
+    epoch: u64,
     since: Instant,
     gaze: Option<([f32; 2], bool)>,
+    /// When the next animation frame is due.
+    next_frame: Instant,
+    /// A frame was asked for and has not been drawn yet.
+    redraw_pending: bool,
+    /// What the last presented frame showed.
+    presented: Option<Presented>,
     /// Set when the session ended badly, for the exit code.
     pub(crate) failed: Option<String>,
+}
+
+/// The last presented frame, for working out what the next one changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Presented {
+    epoch: u64,
+    size: (usize, usize),
+    moving: Option<Bounds>,
+}
+
+/// Animation frame interval (60 Hz). On Wayland the compositor's frame
+/// callbacks pace drawing too; this also bounds the other backends. Each
+/// frame of a 4K window is 33 MB for the compositor to take in, so drawing
+/// unpaced (hundreds of frames a second) stalls the whole desktop.
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
+/// How often the loop looks again while a frame it asked for has not been
+/// drawn (a hidden window gets no frame callbacks on Wayland).
+const PENDING_CHECK: Duration = Duration::from_millis(100);
+
+/// Whether to ask for a frame now, and when to wake up next: frames at most
+/// every [`FRAME_INTERVAL`], never a wake-up in the past.
+fn pace(now: Instant, next_frame: Instant, pending: bool) -> (bool, Instant) {
+    if pending {
+        (false, now + PENDING_CHECK)
+    } else if now >= next_frame {
+        (true, now + PENDING_CHECK)
+    } else {
+        (false, next_frame)
+    }
+}
+
+/// A pixel rectangle `[x0, x1) × [y0, y1)` inside the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bounds {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+impl Bounds {
+    /// The square of half-size `half` around `(cx, cy)`, clipped to a
+    /// `width × height` surface; `None` when it lies outside.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // reason: clamped to the surface first
+    fn around(cx: f32, cy: f32, half: f32, width: usize, height: usize) -> Option<Self> {
+        #[allow(clippy::cast_precision_loss)] // reason: screen sizes are far below 2^24
+        let clamp = |v: f32, max: usize| v.clamp(0.0, max as f32) as usize;
+        let b = Self {
+            x0: clamp((cx - half).floor(), width),
+            y0: clamp((cy - half).floor(), height),
+            x1: clamp((cx + half).ceil() + 1.0, width),
+            y1: clamp((cy + half).ceil() + 1.0, height),
+        };
+        (b.x0 < b.x1 && b.y0 < b.y1).then_some(b)
+    }
+
+    /// The smallest rectangle holding both.
+    fn union(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(Self {
+                x0: a.x0.min(b.x0),
+                y0: a.y0.min(b.y0),
+                x1: a.x1.max(b.x1),
+                y1: a.y1.max(b.y1),
+            }),
+            (a, None) => a,
+            (None, b) => b,
+        }
+    }
+
+    fn rect(self) -> Option<softbuffer::Rect> {
+        Some(softbuffer::Rect {
+            x: u32::try_from(self.x0).ok()?,
+            y: u32::try_from(self.y0).ok()?,
+            width: NonZeroU32::new(u32::try_from(self.x1 - self.x0).ok()?)?,
+            height: NonZeroU32::new(u32::try_from(self.y1 - self.y0).ok()?)?,
+        })
+    }
 }
 
 impl Ui {
@@ -90,9 +178,21 @@ impl Ui {
             window: None,
             surface: None,
             screen: Screen::Status("starting...".into()),
+            epoch: 0,
             since: Instant::now(),
             gaze: None,
+            next_frame: Instant::now(),
+            redraw_pending: false,
+            presented: None,
             failed: None,
+        }
+    }
+
+    /// Ask for a frame as soon as the backend allows.
+    fn request_frame(&mut self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+            self.redraw_pending = true;
         }
     }
 
@@ -111,37 +211,92 @@ impl Ui {
     }
 
     fn draw(&mut self) {
+        self.redraw_pending = false;
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            tracing::debug!(?size, "frame skipped: empty window");
             return;
         };
-        if surface.resize(w, h).is_err() {
+        let started = Instant::now();
+        self.next_frame = started + FRAME_INTERVAL;
+        if let Err(e) = surface.resize(w, h) {
+            tracing::warn!(error = %e, ?size, "frame skipped: resize failed");
             return;
         }
-        let Ok(mut buffer) = surface.buffer_mut() else {
-            return;
+        let mut buffer = match surface.buffer_mut() {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, "frame skipped: no buffer");
+                return;
+            }
         };
+        let waited = started.elapsed();
         let (width, height) = (size.width as usize, size.height as usize);
+        let elapsed = self.since.elapsed();
         let mut c = Canvas {
             pixels: &mut buffer,
             width,
             height,
         };
-        paint(
-            &mut c,
-            &self.screen,
-            self.since.elapsed(),
-            self.timing,
-            self.gaze,
+        paint(&mut c, &self.screen, elapsed, self.timing, self.gaze);
+        let painted = started.elapsed();
+
+        // The whole frame is repainted, but only what moved since the last
+        // one is handed to the compositor as damage: a few KB instead of
+        // the whole surface. A new screen or size is damaged whole.
+        let moving = moving_bounds(&self.screen, elapsed, self.timing, self.gaze, width, height);
+        let damage = match self.presented {
+            Some(last) if last.epoch == self.epoch && last.size == (width, height) => {
+                Some(Bounds::union(last.moving, moving))
+            }
+            _ => None,
+        };
+        self.presented = Some(Presented {
+            epoch: self.epoch,
+            size: (width, height),
+            moving,
+        });
+        // Wayland: pace the next redraw by the compositor's frame callback.
+        window.pre_present_notify();
+        let result = match damage {
+            None => buffer.present(),
+            Some(changed) => {
+                let rects: Vec<softbuffer::Rect> =
+                    changed.and_then(Bounds::rect).into_iter().collect();
+                buffer.present_with_damage(&rects)
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "frame not presented");
+        }
+        tracing::trace!(
+            screen = screen_name(&self.screen),
+            width,
+            height,
+            damage = ?damage,
+            buffer_ms = waited.as_millis(),
+            paint_ms = (painted - waited).as_millis(),
+            total_ms = started.elapsed().as_millis(),
+            "frame"
         );
-        let _ = buffer.present();
     }
 
     fn animating(&self) -> bool {
         !matches!(self.screen, Screen::Status(_) | Screen::Failed(_))
+    }
+}
+
+/// A short name of a screen, for the log.
+fn screen_name(screen: &Screen) -> &'static str {
+    match screen {
+        Screen::Status(_) => "status",
+        Screen::Target { .. } => "target",
+        Screen::Computing => "computing",
+        Screen::Finished(_) => "finished",
+        Screen::Failed(_) => "failed",
     }
 }
 
@@ -161,6 +316,64 @@ fn fraction(elapsed: Duration, of: Duration) -> f32 {
         1.0
     } else {
         (elapsed.as_secs_f32() / of.as_secs_f32()).min(1.0)
+    }
+}
+
+/// Where a target is drawn: travelling from `from` to `at`, then resting.
+fn target_position(
+    at: [f32; 2],
+    from: [f32; 2],
+    phase: Phase,
+    elapsed: Duration,
+    timing: Timing,
+) -> [f32; 2] {
+    let t = match phase {
+        Phase::Travel => ease(fraction(elapsed, timing.travel)),
+        _ => 1.0,
+    };
+    [
+        from[0] + (at[0] - from[0]) * t,
+        from[1] + (at[1] - from[1]) * t,
+    ]
+}
+
+/// Everything on `screen` that changes from frame to frame, in pixels: the
+/// target and its ring, the spinner, the gaze dot. The rest of a screen is
+/// the same in every frame. Sized by the largest shape [`paint`] draws
+/// there, plus antialiasing.
+fn moving_bounds(
+    screen: &Screen,
+    elapsed: Duration,
+    timing: Timing,
+    gaze: Option<([f32; 2], bool)>,
+    width: usize,
+    height: usize,
+) -> Option<Bounds> {
+    #[allow(clippy::cast_precision_loss)] // reason: small sizes
+    let unit = height as f32 / 100.0;
+    match screen {
+        Screen::Target {
+            at, from, phase, ..
+        } => {
+            let (x, y) = to_pixels(
+                target_position(*at, *from, *phase, elapsed, timing),
+                width,
+                height,
+            );
+            // The dwell ring at its widest: radius 5.2, thickness 0.35.
+            Bounds::around(x, y, unit * 5.4 + 2.0, width, height)
+        }
+        Screen::Computing => {
+            #[allow(clippy::cast_precision_loss)] // reason: small sizes
+            let (x, y) = (width as f32 / 2.0, height as f32 / 2.0);
+            // The spinner: radius 4, thickness 0.5.
+            Bounds::around(x, y, unit * 4.3 + 2.0, width, height)
+        }
+        Screen::Finished(_) => gaze.and_then(|(g, _)| {
+            let (x, y) = to_pixels(g, width, height);
+            Bounds::around(x, y, unit * 0.9 + 2.0, width, height)
+        }),
+        Screen::Status(_) | Screen::Failed(_) => None,
     }
 }
 
@@ -190,14 +403,7 @@ fn paint(
             step,
             total,
         } => {
-            let t = match phase {
-                Phase::Travel => ease(fraction(elapsed, timing.travel)),
-                _ => 1.0,
-            };
-            let pos = [
-                from[0] + (at[0] - from[0]) * t,
-                from[1] + (at[1] - from[1]) * t,
-            ];
+            let pos = target_position(*at, *from, *phase, elapsed, timing);
             let (x, y) = to_pixels(pos, w, h);
             match phase {
                 Phase::Travel => c.disc(x, y, unit * 1.2, FOREGROUND),
@@ -319,8 +525,8 @@ impl ApplicationHandler<UiEvent> for Ui {
                 return;
             }
         }
-        window.request_redraw();
         self.window = Some(window);
+        self.request_frame();
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
@@ -350,12 +556,14 @@ impl ApplicationHandler<UiEvent> for Ui {
                 Some(Screen::Failed(text))
             }
         };
+        // A gaze sample only shows on an animating screen, whose next paced
+        // frame picks it up; a new screen is drawn at once.
         if let Some(screen) = next {
+            tracing::debug!(screen = screen_name(&screen), "screen");
             self.screen = screen;
+            self.epoch += 1;
             self.since = Instant::now();
-        }
-        if let Some(w) = &self.window {
-            w.request_redraw();
+            self.request_frame();
         }
     }
 
@@ -375,11 +583,7 @@ impl ApplicationHandler<UiEvent> for Ui {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => self.draw(),
-            WindowEvent::Resized(_) => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
+            WindowEvent::Resized(_) => self.request_frame(),
             _ => {}
         }
     }
@@ -390,12 +594,13 @@ impl ApplicationHandler<UiEvent> for Ui {
             return;
         }
         if self.animating() {
-            if let Some(w) = &self.window {
-                w.request_redraw();
+            // Asking for a redraw wakes the loop at once, so frames must be
+            // paced here rather than by the wake-up time alone.
+            let (request, wake) = pace(Instant::now(), self.next_frame, self.redraw_pending);
+            if request {
+                self.request_frame();
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -453,5 +658,123 @@ mod tests {
             );
         }
         assert!(px.iter().any(|p| *p != BACKGROUND));
+    }
+
+    #[test]
+    fn a_loop_woken_by_every_redraw_request_still_draws_at_most_60_frames_a_second() {
+        // Asking for a redraw wakes the loop at once: model the loop running
+        // flat out, each requested frame drawn straight away.
+        let start = Instant::now();
+        let (mut now, mut next_frame, mut frames) = (start, start, 0);
+        while now < start + Duration::from_secs(1) {
+            let (request, wake) = pace(now, next_frame, false);
+            assert!(wake > now, "the loop must not wake in the past");
+            if request {
+                frames += 1;
+                next_frame = now + FRAME_INTERVAL;
+                now += Duration::from_micros(100);
+            } else {
+                now = wake;
+            }
+        }
+        assert!((59..=61).contains(&frames), "{frames} frames");
+
+        // A frame asked for and not drawn yet (no frame callback from the
+        // compositor): look again later, do not ask again or spin.
+        let (request, wake) = pace(start, start, true);
+        assert!(!request && wake > start);
+    }
+
+    const TIMING: Timing = Timing {
+        travel: Duration::from_millis(300),
+        dwell: Duration::from_millis(1000),
+    };
+
+    type Frame = (Duration, Option<([f32; 2], bool)>);
+
+    /// Paint two frames of `screen`; every pixel that differs must lie in the
+    /// damage the second frame reports.
+    fn assert_damage_covers_changes(screen: &Screen, a: Frame, b: Frame) {
+        const W: usize = 640;
+        const H: usize = 360;
+        let frame = |(elapsed, gaze): Frame| {
+            let mut px = vec![0u32; W * H];
+            let mut c = Canvas {
+                pixels: &mut px,
+                width: W,
+                height: H,
+            };
+            paint(&mut c, screen, elapsed, TIMING, gaze);
+            px
+        };
+        let (pa, pb) = (frame(a), frame(b));
+        let damage = Bounds::union(
+            moving_bounds(screen, a.0, TIMING, a.1, W, H),
+            moving_bounds(screen, b.0, TIMING, b.1, W, H),
+        );
+        let mut changed = 0;
+        for y in 0..H {
+            for x in 0..W {
+                if pa[y * W + x] != pb[y * W + x] {
+                    changed += 1;
+                    let d = damage.expect("pixels changed but nothing is damaged");
+                    assert!(
+                        (d.x0..d.x1).contains(&x) && (d.y0..d.y1).contains(&y),
+                        "pixel ({x}, {y}) changed outside {d:?} on {screen:?}"
+                    );
+                }
+            }
+        }
+        assert!(changed > 0, "the two frames of {screen:?} should differ");
+    }
+
+    #[test]
+    fn damage_covers_everything_that_moves() {
+        let ms = Duration::from_millis;
+        let target = |phase| Screen::Target {
+            at: [0.9, 0.1],
+            from: [0.5, 0.5],
+            phase,
+            step: 2,
+            total: 14,
+        };
+        let seen = Some(([0.3, 0.4], true));
+        for (screen, a, b) in [
+            (target(Phase::Travel), (ms(100), None), (ms(117), None)),
+            (target(Phase::Dwell), (ms(0), None), (ms(17), None)),
+            (target(Phase::Dwell), (ms(500), None), (ms(517), None)),
+            (target(Phase::Collecting), (ms(100), None), (ms(117), None)),
+            (Screen::Computing, (ms(100), None), (ms(117), None)),
+        ] {
+            assert_damage_covers_changes(&screen, a, b);
+        }
+        let finished = Screen::Finished(Summary {
+            id: 7,
+            points: 14,
+            mean_error: Some(0.02),
+            blob: Vec::new(),
+        });
+        for next in [
+            Some(([0.32, 0.45], false)),
+            None,
+            Some(([-1.0, -1.0], false)),
+            Some(([0.95, 0.99], true)),
+        ] {
+            assert_damage_covers_changes(&finished, (ms(100), seen), (ms(117), next));
+        }
+    }
+
+    #[test]
+    fn bounds_are_clipped_to_the_surface() {
+        assert_eq!(Bounds::around(-50.0, -50.0, 10.0, 640, 360), None);
+        assert_eq!(
+            Bounds::around(5.0, 355.0, 10.0, 640, 360),
+            Some(Bounds {
+                x0: 0,
+                y0: 345,
+                x1: 16,
+                y1: 360
+            })
+        );
     }
 }
