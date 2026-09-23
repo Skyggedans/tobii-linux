@@ -362,9 +362,13 @@ calibration. Outside a calibration session, a display area set through
 skips the setup, and so does `--windowed` (it needs the whole monitor).
 
 Then a dot travels through the 7-point pattern twice; look at its centre
-until the ring closes and the spinner finishes. The daemon has the tracker compute the
-calibration, saves it to `~/.config/tobii/calibration.bin` (the previous one
-is kept as `calibration.bin.prev`), and uploads it at every later start. The
+until the ring closes and the spinner finishes. The daemon has the tracker
+compute the calibration after each batch, and when the session ends normally
+saves the last one to `~/.config/tobii/calibration.bin` (the previous one is
+kept as `calibration.bin.prev`), with the display area it was made on, and
+uploads it at every later start. A session that does not run to its end
+(Esc, a failure, the client dying, the daemon or tracker going away) leaves
+nothing behind: the calibration and display area it started from stay. The
 result screen shows the targets and your live gaze to check it.
 
 - `--rounds 1` for a quick 7-point pass (half the tracker's 14 stored points
@@ -372,7 +376,8 @@ result screen shows the targets and your live gaze to check it.
 - `--reset` goes back to the built-in calibration; or delete the file, or set
   `TOBII_CALIBRATION=embedded`. `mv calibration.bin.prev calibration.bin` (and
   a daemon restart) restores the previous one.
-- `--dry-run --windowed` shows the screens without a tracker.
+- `--dry-run --windowed` shows the screens without a tracker (`--windowed`
+  only goes with `--dry-run`: a calibration needs the whole monitor).
 - Only one client can calibrate at a time; a second one is told the tracker is
   busy. If the calibrating client dies, the daemon stops the session and puts
   the previous calibration back.
@@ -383,10 +388,8 @@ If the compositor opens the window on another monitor, or not fullscreen
 (PaperWM puts new windows on the monitor in use), `tobii-calibrate` asks for
 the right one again; if the window stays off it, it says so on screen and
 will not take the display setup until the window is fullscreen on the right
-monitor (with PaperWM, Super+Shift+Ctrl+Left/Right moves it). Esc stops the
-session; when it stopped before anything was computed, the previous
-calibration and display area stay, and the message on exit says which
-calibration is in use.
+monitor (with PaperWM, Super+Shift+Ctrl+Left/Right moves it); the points
+wait for it too.
 
 ### Recenter (recalibrate the head rest pose)
 
