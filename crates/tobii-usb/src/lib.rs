@@ -6,7 +6,11 @@
 //! head-pose inference on the images. [`engine`] wraps that in a background
 //! thread producing [`engine::Sample`]s, which is what the daemon consumes.
 //!
+//! [`calibration`] adapts the embedded init capture to the user: their saved
+//! calibration and display area replace the capture author's.
+//!
 //! The init capture is embedded, so the binaries need no runtime data files.
 
+pub mod calibration;
 pub mod device;
 pub mod engine;

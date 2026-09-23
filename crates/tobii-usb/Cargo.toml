@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 rusb.workspace = true
+tobii-calib.workspace = true
+tobii-ipc.workspace = true
 tobii-pose.workspace = true
 tobii-proto.workspace = true
 tracing.workspace = true

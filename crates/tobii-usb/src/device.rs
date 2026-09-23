@@ -15,13 +15,19 @@ use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
 use tracing::{debug, error, info, warn};
 
-use crate::engine::{GazeSample, PoseSample, Sample};
-use tobii_proto::decode::{TrackingFrame, decode_stream_payload};
+use crate::engine::{
+    CommandError, CommandResponse, GazeSample, PoseSample, PresenceSample, QueuedCommand, Sample,
+    Shared,
+};
+use std::sync::mpsc::Receiver;
+use tobii_proto::facts::{DeviceFacts, DeviceNotification, decode_notification};
+use tobii_proto::gaze83::{GazeFrame, PresenceFrame, decode_gaze_frame, decode_presence_frame};
 use tobii_proto::image83::{ImageFrame, decode_image_payload, upscale2x_into};
 use tobii_proto::log::{PacketLog, log_packet};
 use tobii_proto::protocol::{
-    BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, declared_len, marker,
-    parse_init_packets, seq, stream_id, stream_start_packet, stream_stop_packet,
+    BulkReassembler, InitPacket, MARKER_COMMAND, MARKER_NOTIFICATION, MARKER_RESPONSE,
+    MARKER_STREAM, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, chunk_command,
+    declared_len, marker, parse_message, seq, stream_id, stream_start_packet, stream_stop_packet,
 };
 use tobii_proto::time::now_us;
 
@@ -167,7 +173,7 @@ pub fn vendor_control_deinit(h: &mut rusb::DeviceHandle<UsbContext>) {
 /// only `0x51` command packets get one.
 #[must_use]
 pub fn command_seq(data: &[u8]) -> Option<u32> {
-    if marker(data) == Some(0x51) {
+    if marker(data) == Some(MARKER_COMMAND) {
         seq(data)
     } else {
         None
@@ -184,7 +190,7 @@ pub enum ResponseEcho {
 }
 
 /// Read EP `0x83` until the `0x52` response carrying `expected_seq` arrives,
-/// logging every message read meanwhile to `log`.
+/// logging every message read meanwhile to `log`, and return that response.
 ///
 /// # Errors
 ///
@@ -194,7 +200,7 @@ pub fn wait_for_response_seq(
     expected_seq: u32,
     log: &mut Option<PacketLog>,
     echo: ResponseEcho,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let mut buf = [0u8; 8192];
 
     loop {
@@ -222,8 +228,8 @@ pub fn wait_for_response_seq(
                     ),
                 }
 
-                if marker(data) == Some(0x52) && seq(data) == Some(expected_seq) {
-                    return Ok(());
+                if marker(data) == Some(MARKER_RESPONSE) && seq(data) == Some(expected_seq) {
+                    return Ok(data.to_vec());
                 }
             }
             Err(e) => {
@@ -282,11 +288,6 @@ fn is_tobii_present(ctx: &UsbContext) -> bool {
         .unwrap_or(false)
 }
 
-/// Drive the 0x83 streams for the daemon engine: own the device, decode gaze +
-/// presence and the 0x50e IR image stream (head pose), and push samples to `tx`
-/// until `stop` is set. The UVC camera is *not* claimed here — doing so would
-/// throttle the 0x83 streams.
-///
 /// A cold gaze start normally arms on the *second* fresh open (the first accepts
 /// the init but doesn't stream — a firmware quirk, not stale state). A USB reset
 /// up front doesn't change that (verified: start behaves identically with and
@@ -298,22 +299,20 @@ fn is_tobii_present(ctx: &UsbContext) -> bool {
 const RESET_ESCALATION_ATTEMPT: usize = 3;
 
 /// Own the device for the daemon engine and stream samples into `tx` until
-/// `stop` is set (see the note on the reset-escalation constant below).
-///
-/// `stop`, `recenter` and `head_wanted` are pure signals (no data is
-/// published through them), so every access uses `Ordering::Relaxed`.
+/// `shared.stop` is set, running the commands that arrive on `commands` in
+/// between (see the note on the reset-escalation constant above).
 ///
 /// # Errors
 ///
 /// Returns the last attempt's error once the device fails to stream after
 /// [`MAX_REPLAY_ATTEMPTS`] opens, or immediately on a non-retryable USB error.
-pub fn run_gaze_engine(
-    stop: &Arc<AtomicBool>,
-    recenter: &Arc<AtomicBool>,
-    head_wanted: &Arc<AtomicBool>,
+pub(crate) fn run_gaze_engine(
+    shared: &Arc<Shared>,
+    commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
 ) -> Result<()> {
     let ctx = UsbContext::new()?;
+    let stop = &shared.stop;
 
     // Head pose from the 0x50e image stream runs on its own thread so a slow
     // inference never blocks the USB reader (an unread IN buffer stalls the
@@ -323,11 +322,9 @@ pub fn run_gaze_engine(
     // No worker (and no ONNX session) when the image stream is disabled.
     let worker = is_image_stream_enabled().then(|| {
         let mailbox = mailbox.clone();
-        let stop = stop.clone();
-        let recenter = recenter.clone();
-        let head_wanted = head_wanted.clone();
+        let shared = Arc::clone(shared);
         let tx = tx.clone();
-        thread::spawn(move || pose_worker(&mailbox, &stop, &recenter, &head_wanted, &tx))
+        thread::spawn(move || pose_worker(&mailbox, &shared, &tx))
     });
 
     let result = (|| {
@@ -344,7 +341,7 @@ pub fn run_gaze_engine(
                 );
                 reset_device_baseline(&ctx);
             }
-            match gaze_engine_attempt(&ctx, stop, tx, &mailbox) {
+            match gaze_engine_attempt(&ctx, shared, commands, tx, &mailbox) {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_REPLAY_ATTEMPTS && !stop.load(Ordering::Relaxed) => {
                     // A cold device accepts the first init but doesn't start
@@ -382,28 +379,22 @@ pub fn run_gaze_engine(
 }
 
 /// Single-slot hand-off of the newest image frame to the pose worker.
-type PoseMailbox = Arc<(Mutex<Option<ImageFrame>>, Condvar)>;
+type PoseMailbox = Arc<(Mutex<Option<Arc<ImageFrame>>>, Condvar)>;
 
 /// Replace the mailbox slot with `frame` (dropping any frame the worker
 /// has not taken yet) and wake the worker.
 ///
-/// The slot only ever holds an `Option<ImageFrame>` that is written whole,
-/// so a poisoned lock (a panicking worker) leaves nothing half-updated and
-/// the guard is reused rather than propagating the panic to the USB reader.
-fn mailbox_put(mailbox: &PoseMailbox, frame: ImageFrame) {
+/// The slot only ever holds an `Option` that is written whole, so a poisoned
+/// lock (a panicking worker) leaves nothing half-updated and the guard is
+/// reused rather than propagating the panic to the USB reader.
+fn mailbox_put(mailbox: &PoseMailbox, frame: Arc<ImageFrame>) {
     let (lock, cv) = &**mailbox;
     *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
     cv.notify_one();
 }
 
 /// Head-pose inference loop over 0x50e frames (see `run_gaze_engine`).
-fn pose_worker(
-    mailbox: &PoseMailbox,
-    stop: &AtomicBool,
-    recenter: &AtomicBool,
-    head_wanted: &AtomicBool,
-    tx: &Sender<Sample>,
-) {
+fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
     let mut tracker = match tobii_pose::track::Tracker::new_image83() {
         Ok(t) => t,
         Err(e) => {
@@ -428,11 +419,11 @@ fn pose_worker(
     let (lock, cv) = &**mailbox;
     // Relaxed everywhere below: the flags are pure signals; the frame itself
     // is handed over under the mailbox mutex.
-    while !stop.load(Ordering::Relaxed) {
+    while !shared.stop.load(Ordering::Relaxed) {
         let frame = {
             // Poisoning cannot leave the slot half-written (see `mailbox_put`).
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            while slot.is_none() && !stop.load(Ordering::Relaxed) {
+            while slot.is_none() && !shared.stop.load(Ordering::Relaxed) {
                 slot = cv
                     .wait_timeout(slot, Duration::from_millis(200))
                     .unwrap_or_else(PoisonError::into_inner)
@@ -441,10 +432,10 @@ fn pose_worker(
             slot.take()
         };
         let Some(frame) = frame else { continue };
-        if recenter.swap(false, Ordering::Relaxed) {
+        if shared.recenter.swap(false, Ordering::Relaxed) {
             tracker.recenter();
         }
-        let wanted = head_wanted.load(Ordering::Relaxed);
+        let wanted = shared.head_wanted.load(Ordering::Relaxed);
         if was_wanted == Some(false) && wanted {
             tracker.recenter();
         }
@@ -458,7 +449,7 @@ fn pose_worker(
             Ok(Some(p)) => {
                 posed += 1;
                 let _ = tx.send(Sample::Pose(PoseSample {
-                    timestamp_us: to_i64_us(now_us()),
+                    timestamp_us: to_i64_us(frame.device_ts_us),
                     pos_cm: [p[0], p[1], p[2]],
                     rot_deg: [p[3], p[4], p[5]],
                 }));
@@ -484,11 +475,12 @@ fn pose_worker(
     }
 }
 
-/// One open+init+read of the 0x83 stream, pushing gaze samples until `stop` or a
+/// One open+init+read of the 0x83 stream, pushing samples until `stop` or a
 /// failure. Bails with `StreamStartupTimeout` if no stream packet arrives in 5s.
 fn gaze_engine_attempt(
     ctx: &UsbContext,
-    stop: &AtomicBool,
+    shared: &Shared,
+    commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
     mailbox: &PoseMailbox,
 ) -> Result<()> {
@@ -498,14 +490,64 @@ fn gaze_engine_attempt(
     // inside vendor_control_init). Guarantee the Windows-style stop (request 66)
     // on every exit — clean stop, error, or timeout — so the device isn't left
     // mid-stream and the next open starts from a defined state.
-    let result = gaze_stream_loop(&mut h, stop, tx, mailbox);
+    let result = gaze_stream_loop(&mut h, shared, commands, tx, mailbox);
     vendor_control_deinit(&mut h);
     result
 }
 
-/// Replay the init-packet sequence once on `h`, waiting (best-effort) for
-/// each command's `0x52` echo. Returns early without error once `stop` is
-/// set; a failed write ends the replay with an error.
+/// What the init replay collected: each command's response, and the other
+/// messages (stream, notification) that arrived while it waited.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitCapture {
+    /// The 0x52 responses, in command order.
+    pub responses: Vec<Vec<u8>>,
+    /// Stream and notification messages read in between (bounded).
+    pub side: Vec<Vec<u8>>,
+}
+
+/// How many non-response messages the init replay keeps for its caller.
+const MAX_SIDE_MESSAGES: usize = 64;
+
+/// How long the init replay waits for each command's response.
+const INIT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Read until the response to `expected_seq` is complete, keeping other
+/// messages in `side`. `None` on timeout.
+fn await_response(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    asm: &mut BulkReassembler,
+    expected_seq: u32,
+    timeout: Duration,
+    side: &mut Vec<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; READ_BUF];
+    let mut msgs = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let Ok(n) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) else {
+            continue;
+        };
+        asm.push_into(&buf[..n], &mut msgs);
+        let mut found = None;
+        for msg in msgs.drain(..) {
+            if marker(&msg) == Some(MARKER_RESPONSE) && seq(&msg) == Some(expected_seq) {
+                found = Some(msg);
+            } else if marker(&msg) != Some(MARKER_RESPONSE) && side.len() < MAX_SIDE_MESSAGES {
+                side.push(msg);
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Replay the init-packet sequence once on `h`, collecting each command's
+/// `0x52` response (best-effort: a missing one is logged and skipped).
+/// A command split over several writes is answered after its last piece, so
+/// the wait happens there. Returns early without error once `stop` is set; a
+/// failed write ends the replay with an error.
 ///
 /// # Errors
 ///
@@ -514,21 +556,37 @@ pub fn replay_init_packets(
     h: &mut rusb::DeviceHandle<UsbContext>,
     packets: &[InitPacket],
     stop: Option<&AtomicBool>,
-) -> Result<()> {
-    let mut no_log: Option<PacketLog> = None;
-    for pkt in packets {
+) -> Result<InitCapture> {
+    let started = Instant::now();
+    let mut capture = InitCapture::default();
+    let mut asm = BulkReassembler::new();
+    let mut awaiting = None;
+    for (i, pkt) in packets.iter().enumerate() {
         if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
-            return Ok(());
+            return Ok(capture);
         }
-        let expected_seq = command_seq(&pkt.data);
+        if let Some(s) = command_seq(&pkt.data) {
+            awaiting = Some(s);
+        }
         h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000))
             .context("init packet write failed")?;
-        if let Some(s) = expected_seq {
-            let _ = wait_for_response_seq(h, s, &mut no_log, ResponseEcho::Log);
+        let command_complete = packets
+            .get(i + 1)
+            .is_none_or(|next| command_seq(&next.data).is_some());
+        if command_complete && let Some(s) = awaiting.take() {
+            match await_response(h, &mut asm, s, INIT_RESPONSE_TIMEOUT, &mut capture.side) {
+                Some(rsp) => capture.responses.push(rsp),
+                None => debug!(seq = s, "init: no response"),
+            }
         }
         thread::sleep(Duration::from_millis(2));
     }
-    Ok(())
+    debug!(
+        elapsed_ms = started.elapsed().as_millis(),
+        responses = capture.responses.len(),
+        "init replay done"
+    );
+    Ok(capture)
 }
 
 /// Read 0x83 for up to `dur`, returning true as soon as a decodable GAZE
@@ -544,6 +602,17 @@ pub fn wait_for_gaze_stream(
     dur: Duration,
     asm: &mut BulkReassembler,
 ) -> bool {
+    wait_for_gaze_stream_with(h, stop, dur, asm, |_| {})
+}
+
+/// [`wait_for_gaze_stream`], handing every other message to `side`.
+fn wait_for_gaze_stream_with(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    stop: &AtomicBool,
+    dur: Duration,
+    asm: &mut BulkReassembler,
+    mut side: impl FnMut(&[u8]),
+) -> bool {
     let mut buf = vec![0u8; READ_BUF];
     let mut msgs = Vec::new();
     let start = Instant::now();
@@ -552,10 +621,14 @@ pub fn wait_for_gaze_stream(
             asm.push_into(&buf[..n], &mut msgs);
             for msg in &msgs {
                 if stream_id(msg) == Some(STREAM_ID_GAZE)
-                    && decode_stream_payload(msg).is_ok_and(|d| !d.is_empty())
+                    && parse_message(msg)
+                        .as_ref()
+                        .and_then(decode_gaze_frame)
+                        .is_some()
                 {
                     return true;
                 }
+                side(msg);
             }
         }
     }
@@ -585,7 +658,7 @@ fn to_i64_us(us: u64) -> i64 {
 pub fn next_command_seq(packets: &[InitPacket]) -> u32 {
     packets
         .iter()
-        .filter(|p| marker(&p.data) == Some(0x51))
+        .filter(|p| marker(&p.data) == Some(MARKER_COMMAND))
         .filter_map(|p| seq(&p.data))
         .max()
         .map_or(0x100, |s| s + 1)
@@ -607,7 +680,10 @@ fn send_command(
     let start = Instant::now();
     while start.elapsed() < deadline {
         match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
-            Ok(n) if marker(&buf[..n]) == Some(0x52) && seq(&buf[..n]) == Some(expected) => {
+            Ok(n)
+                if marker(&buf[..n]) == Some(MARKER_RESPONSE)
+                    && seq(&buf[..n]) == Some(expected) =>
+            {
                 return Ok(());
             }
             Ok(_) | Err(rusb::Error::Timeout) => {}
@@ -645,6 +721,177 @@ pub fn stop_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32
     .with_context(|| format!("stop stream {id:#x}"))
 }
 
+/// A message from EP 0x83, classified.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Incoming {
+    /// A 0x500 gaze frame (boxed: the largest variant by far).
+    Gaze(Box<GazeFrame>),
+    /// A 0x504 presence change.
+    Presence(PresenceFrame),
+    /// A 0x50e IR frame.
+    Image(ImageFrame),
+    /// A command response.
+    Response {
+        seq: u32,
+        status: u32,
+        payload: Vec<u8>,
+    },
+    /// A notification.
+    Notification(DeviceNotification),
+    /// Anything else.
+    Other,
+}
+
+/// Classify one whole message from EP 0x83.
+pub(crate) fn classify(msg: &[u8]) -> Incoming {
+    let Some(m) = parse_message(msg) else {
+        return Incoming::Other;
+    };
+    match (m.marker, m.id) {
+        (MARKER_STREAM, STREAM_ID_GAZE) => {
+            decode_gaze_frame(&m).map_or(Incoming::Other, |f| Incoming::Gaze(Box::new(f)))
+        }
+        (MARKER_STREAM, STREAM_ID_PRESENCE) => {
+            decode_presence_frame(&m).map_or(Incoming::Other, Incoming::Presence)
+        }
+        (MARKER_STREAM, STREAM_ID_IMAGE) => {
+            decode_image_payload(msg).map_or(Incoming::Other, Incoming::Image)
+        }
+        (MARKER_RESPONSE, _) => Incoming::Response {
+            seq: m.seq,
+            status: m.status,
+            payload: m.payload.to_vec(),
+        },
+        (MARKER_NOTIFICATION, _) => {
+            decode_notification(&m).map_or(Incoming::Other, Incoming::Notification)
+        }
+        _ => Incoming::Other,
+    }
+}
+
+/// A command written to the device and not yet answered.
+#[derive(Debug)]
+struct Outstanding {
+    seq: u32,
+    deadline: Instant,
+    reply: Sender<Result<CommandResponse, CommandError>>,
+}
+
+/// The live half of one attempt: reads EP 0x83, turns messages into samples,
+/// and runs queued device commands one at a time between reads.
+struct Pump<'a> {
+    shared: &'a Shared,
+    commands: &'a Receiver<QueuedCommand>,
+    tx: &'a Sender<Sample>,
+    mailbox: &'a PoseMailbox,
+    cmd_seq: u32,
+    outstanding: Option<Outstanding>,
+    image_live: bool,
+    last_gaze: Instant,
+}
+
+impl Pump<'_> {
+    /// Route one message outside of command matching: samples to `tx`, image
+    /// frames to the pose worker.
+    fn deliver(&mut self, incoming: Incoming) {
+        match incoming {
+            Incoming::Gaze(frame) => {
+                self.last_gaze = Instant::now();
+                let _ = self.tx.send(Sample::Gaze(Box::new(GazeSample {
+                    frame: *frame,
+                    host_rx_us: to_i64_us(now_us()),
+                })));
+            }
+            Incoming::Presence(p) => {
+                let _ = self.tx.send(Sample::Presence(PresenceSample {
+                    timestamp_us: to_i64_us(p.device_ts_us),
+                    present: p.state == PRESENCE_STATE_PRESENT,
+                }));
+            }
+            Incoming::Image(frame) => {
+                if !self.image_live {
+                    info!(
+                        width = frame.width,
+                        height = frame.height,
+                        "gaze: image stream 0x50e live"
+                    );
+                    self.image_live = true;
+                }
+                let frame = Arc::new(frame);
+                // Relaxed: a pure signal.
+                if self.shared.image_wanted.load(Ordering::Relaxed) {
+                    let _ = self.tx.send(Sample::Image(Arc::clone(&frame)));
+                }
+                mailbox_put(self.mailbox, frame);
+            }
+            Incoming::Notification(n) => {
+                debug!(notification = ?n, "device notification");
+                let _ = self.tx.send(Sample::Notification(n));
+            }
+            Incoming::Response {
+                seq,
+                status,
+                payload,
+            } => {
+                if let Some(o) = self.outstanding.take_if(|o| o.seq == seq) {
+                    let _ = o.reply.send(Ok(CommandResponse { status, payload }));
+                } else {
+                    debug!(seq, "unsolicited response");
+                }
+            }
+            Incoming::Other => {}
+        }
+    }
+
+    /// Write the next queued command, if none is outstanding. Reads between
+    /// the pieces of a large command so the stream keeps draining.
+    fn send_next(&mut self, h: &mut rusb::DeviceHandle<UsbContext>, asm: &mut BulkReassembler) {
+        if self.outstanding.is_some() {
+            return;
+        }
+        let Ok(QueuedCommand { command, reply }) = self.commands.try_recv() else {
+            return;
+        };
+        let seq = self.cmd_seq;
+        self.cmd_seq += 1;
+        let pieces = chunk_command(command.cmd, seq, &command.payload);
+        debug!(cmd = command.cmd, seq, pieces = pieces.len(), "command");
+        let mut buf = vec![0u8; READ_BUF];
+        let mut msgs = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            if let Err(e) = h.write_bulk(EP_OUT, piece, Duration::from_millis(2000)) {
+                let _ = reply.send(Err(CommandError::Usb(e.to_string())));
+                return;
+            }
+            if i + 1 < pieces.len()
+                && let Ok(n) = h.read_bulk(EP_IN, &mut buf, Duration::from_millis(1))
+            {
+                asm.push_into(&buf[..n], &mut msgs);
+                for msg in msgs.drain(..) {
+                    self.deliver(classify(&msg));
+                }
+            }
+        }
+        self.outstanding = Some(Outstanding {
+            seq,
+            deadline: Instant::now() + command.timeout,
+            reply,
+        });
+    }
+
+    /// Fail the outstanding command once its deadline has passed.
+    fn expire(&mut self, asm: &mut BulkReassembler) {
+        if let Some(o) = self.outstanding.take_if(|o| Instant::now() >= o.deadline) {
+            warn!(seq = o.seq, "device command timed out");
+            asm.abort_continuation();
+            let _ = o.reply.send(Err(CommandError::Timeout));
+        }
+    }
+}
+
+/// Presence state the 0x504 stream uses for "a user is present".
+const PRESENCE_STATE_PRESENT: u32 = 2;
+
 /// Replay the init packets, start the image stream, then pump 0x83 until `stop`
 /// or failure. Split out from `gaze_engine_attempt` so the caller can always
 /// run the device teardown after this returns, regardless of how it exits.
@@ -657,22 +904,50 @@ pub fn stop_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32
 /// actually primes it.
 fn gaze_stream_loop(
     h: &mut rusb::DeviceHandle<UsbContext>,
-    stop: &AtomicBool,
+    shared: &Shared,
+    commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
     mailbox: &PoseMailbox,
 ) -> Result<()> {
-    const INIT_PACKETS: &str = include_str!("../init_packets_ep.txt");
-    let packets = parse_init_packets(INIT_PACKETS)?;
-    replay_init_packets(h, &packets, Some(stop))?;
+    let stop = &shared.stop;
+    let display_override = shared.display_override();
+    let packets = crate::calibration::init_packets(display_override.as_ref())?;
+    let capture = replay_init_packets(h, &packets, Some(stop))?;
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
+    let mut facts =
+        DeviceFacts::from_messages(capture.responses.iter().filter_map(|r| parse_message(r)));
+    if let Some(area) = display_override {
+        facts.display_area = Some(area);
+    }
+    info!(
+        model = %facts.info.model,
+        firmware = %facts.info.firmware_version,
+        calibration_id = ?facts.calibration_id,
+        "device ready"
+    );
+    let _ = tx.send(Sample::DeviceReady(Arc::new(facts)));
+
+    let mut pump = Pump {
+        shared,
+        commands,
+        tx,
+        mailbox,
+        cmd_seq: next_command_seq(&packets),
+        outstanding: None,
+        image_live: false,
+        last_gaze: Instant::now(),
+    };
+    for msg in &capture.side {
+        pump.deliver(classify(msg));
+    }
+
     // The Windows Stream Engine subscribes the image stream right after its
     // init; we do the same. Failure here is not fatal — gaze still works.
-    let mut cmd_seq = next_command_seq(&packets);
     let mut image = is_image_stream_enabled();
     if image {
-        match start_stream(h, cmd_seq, STREAM_ID_IMAGE) {
+        match start_stream(h, pump.cmd_seq, STREAM_ID_IMAGE) {
             Ok(()) => info!("gaze: image stream 0x50e requested (head pose via IR frames)"),
             Err(e) => {
                 warn!(
@@ -682,93 +957,121 @@ fn gaze_stream_loop(
                 image = false;
             }
         }
-        cmd_seq += 1;
+        pump.cmd_seq += 1;
     }
     // The device's first 0x53 frame lands ~3s after a good init; give it margin.
     let mut asm = BulkReassembler::new();
-    if !wait_for_gaze_stream(h, stop, Duration::from_secs_f64(4.5), &mut asm) {
+    let mut early = Vec::new();
+    let armed = wait_for_gaze_stream_with(h, stop, Duration::from_secs_f64(4.5), &mut asm, |msg| {
+        if early.len() < MAX_SIDE_MESSAGES {
+            early.push(msg.to_vec());
+        }
+    });
+    for msg in &early {
+        pump.deliver(classify(msg));
+    }
+    if !armed {
         if image {
-            let _ = stop_stream(h, cmd_seq, STREAM_ID_IMAGE);
+            let _ = stop_stream(h, pump.cmd_seq, STREAM_ID_IMAGE);
         }
         anyhow::bail!(StreamStartupTimeout);
     }
 
-    let result = pump_streams(h, stop, tx, mailbox, &mut asm);
+    let result = pump_streams(h, &mut pump, &mut asm);
+    if let Some(o) = pump.outstanding.take() {
+        let _ = o.reply.send(Err(CommandError::EngineGone));
+    }
     if image {
         // Mirror the Windows shutdown (1230 for 0x50e before the vendor stop).
-        let _ = stop_stream(h, cmd_seq, STREAM_ID_IMAGE);
+        let _ = stop_stream(h, pump.cmd_seq, STREAM_ID_IMAGE);
     }
     result
 }
 
-/// Demultiplex EP 0x83: gaze frames -> `GazeSample`s, image frames -> the pose
-/// worker's mailbox, everything else (presence 0x504, responses) ignored.
+/// Demultiplex EP 0x83 until `stop` or failure, running queued commands in
+/// between reads.
 fn pump_streams(
     h: &mut rusb::DeviceHandle<UsbContext>,
-    stop: &AtomicBool,
-    tx: &Sender<Sample>,
-    mailbox: &PoseMailbox,
+    pump: &mut Pump<'_>,
     asm: &mut BulkReassembler,
 ) -> Result<()> {
     let mut buf = vec![0u8; READ_BUF];
-    let mut packet_no = 0u64;
-    let mut image_live = false;
     // Reused across reads (mem-reuse-collections).
     let mut msgs = Vec::new();
-    let mut last_gaze = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
-        if last_gaze.elapsed() > GAZE_LIVENESS_TIMEOUT {
+    pump.last_gaze = Instant::now();
+    while !pump.shared.stop.load(Ordering::Relaxed) {
+        // A command the device is working on (a calibration point takes most
+        // of a second) must not be mistaken for a dead stream.
+        if pump.outstanding.is_none() && pump.last_gaze.elapsed() > GAZE_LIVENESS_TIMEOUT {
             warn!(timeout = ?GAZE_LIVENESS_TIMEOUT, "gaze: no gaze frame; re-opening the device");
             anyhow::bail!(StreamStartupTimeout);
         }
-        match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(500)) {
+        pump.send_next(h, asm);
+        pump.expire(asm);
+        match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(100)) {
             Ok(n) if n > 0 => {
                 asm.push_into(&buf[..n], &mut msgs);
-                for msg in &msgs {
-                    match stream_id(msg) {
-                        Some(STREAM_ID_GAZE) => {
-                            let decoded = decode_stream_payload(msg)?;
-                            if decoded.is_empty() {
-                                continue;
-                            }
-                            last_gaze = Instant::now();
-                            let frame = TrackingFrame::from_decoded(packet_no, &decoded);
-                            packet_no += 1;
-                            let _ = tx.send(Sample::Gaze(GazeSample {
-                                timestamp_us: to_i64_us(frame.ts_us),
-                                gaze_valid: frame.gaze_valid,
-                                gaze_norm: [
-                                    frame.gaze_norm_x.unwrap_or(0.0),
-                                    frame.gaze_norm_y.unwrap_or(0.0),
-                                ],
-                                present: frame.gaze_valid,
-                                pupil_mm: [
-                                    frame.pupil_left.unwrap_or(f64::NAN),
-                                    frame.pupil_right.unwrap_or(f64::NAN),
-                                ],
-                            }));
-                        }
-                        Some(STREAM_ID_IMAGE) => {
-                            if let Some(frame) = decode_image_payload(msg) {
-                                if !image_live {
-                                    info!(
-                                        width = frame.width,
-                                        height = frame.height,
-                                        "gaze: image stream 0x50e live"
-                                    );
-                                    image_live = true;
-                                }
-                                mailbox_put(mailbox, frame);
-                            }
-                        }
-                        _ => {}
-                    }
+                for msg in msgs.drain(..) {
+                    pump.deliver(classify(&msg));
                 }
             }
-            Ok(_) => {}
-            Err(rusb::Error::Timeout) => continue,
+            Ok(_) | Err(rusb::Error::Timeout) => {}
             Err(e) => return Err(e.into()),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tobii_proto::protocol::hex_to_bytes;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = format!(
+            "{}/../tobii-proto/fixtures/{name}.hex",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        hex_to_bytes(&std::fs::read_to_string(path).expect("fixture")).expect("hex")
+    }
+
+    #[test]
+    fn classifies_every_kind_of_message() {
+        assert!(
+            matches!(classify(&fixture("session1-gaze-frame")), Incoming::Gaze(f) if f.frame_counter == 43_780)
+        );
+        assert!(
+            matches!(classify(&fixture("init-presence")), Incoming::Presence(p) if p.state == 2)
+        );
+        assert!(matches!(
+            classify(&fixture("change-display-rsp-1440")),
+            Incoming::Response {
+                seq: 0x2a,
+                status: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify(&fixture("change-display-notify-1450")),
+            Incoming::Notification(DeviceNotification::DisplayAreaChanged(_))
+        ));
+        assert_eq!(classify(&[1, 2, 3]), Incoming::Other);
+    }
+
+    #[test]
+    fn init_responses_become_device_facts() {
+        let responses = [
+            fixture("init-rsp-1420"),
+            fixture("init-rsp-1400"),
+            fixture("init-rsp-1430"),
+            fixture("init-rsp-2110"),
+            fixture("init-rsp-1490"),
+        ];
+        let facts = DeviceFacts::from_messages(responses.iter().filter_map(|r| parse_message(r)));
+        assert_eq!(facts.info.generation, "IS5");
+        assert!(
+            facts.track_box.is_some() && facts.display_area.is_some() && facts.mounting.is_some()
+        );
+        assert_eq!(facts.calibration_id, Some(1_904_654_973));
+    }
 }

@@ -1,7 +1,12 @@
-//! The Tobii daemon: claims the device and serves head/gaze/presence streams to
-//! clients over a Unix socket. Run it directly, or let a client auto-spawn it.
+//! The Tobii daemon: claims the device, serves its streams to clients over a
+//! Unix socket and answers their requests (device info, geometry, display
+//! area, calibration). Run it directly, or let a client auto-spawn it.
 
+mod calibration;
 mod daemon;
+mod device;
+mod frames;
+mod requests;
 
 fn main() {
     tobii_log::init();

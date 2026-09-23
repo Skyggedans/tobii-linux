@@ -1,14 +1,19 @@
 //! `tobiid`: the single process that claims the Tobii device. It owns one
-//! `Engine`, accepts client connections over a Unix socket, and fans out
-//! samples to subscribed clients. Head pose, gaze and presence are all served
+//! `Engine`, accepts client connections over a Unix socket, fans out samples
+//! to subscribed clients and answers their requests. Every stream is served
 //! by that one engine (the device's 0x50e IR image stream gives head pose
-//! concurrently with gaze — see `engine`); head-pose inference is switched on
-//! only while some client subscribes to it.
+//! concurrently with gaze — see `engine`); head-pose inference and image
+//! fan-out are switched on only while some client subscribes to them.
+//!
+//! Only the pump thread writes to client sockets: replies are queued in the
+//! client's outbox and sent ahead of the next samples, so a reply can never
+//! interleave with a sample frame.
 //!
 //! Log lines go through `tracing` (the `tobiid` binary installs the
 //! subscriber; under systemd stderr lands in the journal).
 
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,12 +23,18 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
+use tobii_ipc::geometry::DisplayArea;
+use tobii_ipc::request::decode_request;
 use tobii_ipc::{
-    self, PRESENCE_AWAY, PRESENCE_PRESENT, STREAM_GAZE, STREAM_HEAD, STREAM_PRESENCE,
-    decode_subscribe, encode_gaze, encode_head, encode_presence, encode_subscribed, read_frame,
-    write_frame,
+    self, STREAM_HEAD, STREAM_IMAGE, STREAM_PRESENCE, decode_subscribe, encode_reply,
+    encode_subscribed, read_frame, write_frame,
 };
-use tobii_usb::engine::{Engine, Sample};
+use tobii_proto::facts::{DeviceFacts, DeviceNotification};
+use tobii_usb::engine::{Engine, PresenceSample, Sample};
+
+use crate::calibration::Calibration;
+use crate::device::DeviceCommands;
+use crate::frames::{presence_frame, push_sample_frames};
 
 /// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
 static RECENTER_SIGNAL: AtomicBool = AtomicBool::new(false);
@@ -47,49 +58,169 @@ extern "C" fn on_shutdown(_sig: libc::c_int) {
     SHUTDOWN_SIGNAL.store(true, Ordering::Relaxed);
 }
 
-struct Client {
-    id: u64,
-    streams: u32,
+pub(crate) struct Client {
+    pub(crate) id: u64,
+    pub(crate) streams: u32,
     out: UnixStream,
+    /// Frames for this client only (replies, a cached presence), written by
+    /// the pump ahead of the next samples.
+    outbox: VecDeque<Vec<u8>>,
+    /// Made a request: keep the device up while it is connected, as an open
+    /// `tobii_device_t` does.
+    pub(crate) holds_device: bool,
 }
 
-struct State {
-    engine: Option<Engine>,
-    clients: Vec<Client>,
+pub(crate) struct State {
+    pub(crate) engine: Option<Engine>,
+    pub(crate) clients: Vec<Client>,
     /// Keep the engine running even with no clients, so the device stays warm
     /// and client connects are instant (`TOBII_PREWARM`).
     prewarm: bool,
+    /// What the device reported at its last init (kept across restarts).
+    pub(crate) facts: Option<Arc<DeviceFacts>>,
+    /// The last presence change, replayed to each new presence subscriber
+    /// (the device reports presence only when it changes).
+    last_presence: Option<PresenceSample>,
+    /// The newest `(device_us, host_us)` pair seen on the gaze stream.
+    pub(crate) clock: Option<(i64, i64)>,
+    /// The display area a client set, re-applied at every device init.
+    pub(crate) display_override: Option<DisplayArea>,
+    /// `TOBII_DISPLAY_MM`: the monitor to configure once the mounting is known.
+    pub(crate) display_request: Option<crate::requests::DisplaySize>,
+    /// The calibration session, if any, and the active calibration id.
+    pub(crate) calibration: Calibration,
+    /// Stand-in for the engine's command queue in tests.
+    #[cfg(test)]
+    pub(crate) fake_device: Option<Arc<dyn DeviceCommands>>,
 }
 
 impl State {
-    /// True if some client consumes a stream, or pre-warm is set.
-    fn is_engine_wanted(&self) -> bool {
-        self.prewarm || self.clients.iter().any(|c| c.streams != 0)
+    pub(crate) fn new(prewarm: bool) -> Self {
+        Self {
+            engine: None,
+            clients: Vec::new(),
+            prewarm,
+            facts: None,
+            last_presence: None,
+            clock: None,
+            display_override: None,
+            display_request: crate::requests::DisplaySize::from_env(),
+            calibration: Calibration::default(),
+            #[cfg(test)]
+            fake_device: None,
+        }
     }
 
-    /// Stop the engine once no client consumes any stream — unless pre-warm is
-    /// configured, in which case keep (or restart) it. Also drops a dead engine
-    /// so it can be restarted.
+    /// Every stream some client subscribes to.
+    fn wanted_mask(&self) -> u32 {
+        self.clients.iter().fold(0, |m, c| m | c.streams)
+    }
+
+    /// True if some client consumes a stream or holds the device, or
+    /// pre-warm is set.
+    fn is_engine_wanted(&self) -> bool {
+        self.prewarm
+            || self
+                .clients
+                .iter()
+                .any(|c| c.streams != 0 || c.holds_device)
+    }
+
+    /// Stop the engine once nobody needs it — unless pre-warm is configured,
+    /// in which case keep (or restart) it. Also drops a dead engine so it can
+    /// be restarted.
     fn reconcile(&mut self) {
         if self.engine.as_ref().is_some_and(|e| !e.is_alive()) {
             self.engine = None;
+            crate::calibration::on_engine_lost(self);
         }
         if self.prewarm {
-            if self.engine.is_none() {
-                self.engine = Some(Engine::start());
-            }
-        } else if self.clients.iter().all(|c| c.streams == 0) {
+            self.ensure_engine();
+        } else if !self.is_engine_wanted() {
             self.engine = None;
+            crate::calibration::on_engine_lost(self);
         }
-        self.sync_head_wanted();
+        self.sync_wanted();
     }
 
-    /// Tell the engine whether anyone consumes head pose, so the gaze engine
-    /// runs (or skips) the per-frame head-pose inference accordingly.
-    fn sync_head_wanted(&self) {
+    /// Start the engine if it is not running.
+    pub(crate) fn ensure_engine(&mut self) {
+        if self.engine.as_ref().is_none_or(|e| !e.is_alive()) {
+            self.engine = Some(Engine::start_with(self.display_override));
+            self.sync_wanted();
+        }
+    }
+
+    /// Tell the engine which optional work anyone consumes: head-pose
+    /// inference, and IR frames for image subscribers.
+    fn sync_wanted(&self) {
         if let Some(engine) = self.engine.as_ref() {
-            let wanted = self.clients.iter().any(|c| c.streams & STREAM_HEAD != 0);
-            engine.set_head_wanted(wanted);
+            let wanted = self.wanted_mask();
+            engine.set_head_wanted(wanted & STREAM_HEAD != 0);
+            engine.set_image_wanted(wanted & STREAM_IMAGE != 0);
+        }
+    }
+
+    /// The device's command queue, starting the engine if needed and pinning
+    /// it to `client`.
+    pub(crate) fn device_for(&mut self, client: u64) -> Option<Arc<dyn DeviceCommands>> {
+        if let Some(c) = self.clients.iter_mut().find(|c| c.id == client) {
+            c.holds_device = true;
+        }
+        #[cfg(test)]
+        if let Some(fake) = &self.fake_device {
+            return Some(Arc::clone(fake));
+        }
+        self.ensure_engine();
+        self.engine
+            .as_ref()
+            .map(|e| Arc::new(e.commands()) as Arc<dyn DeviceCommands>)
+    }
+
+    /// Queue `body` for one client.
+    pub(crate) fn send_to(&mut self, client: u64, body: Vec<u8>) {
+        if let Some(c) = self.clients.iter_mut().find(|c| c.id == client) {
+            c.outbox.push_back(body);
+        }
+    }
+
+    /// Queue `body` for every client subscribed to `stream`.
+    pub(crate) fn broadcast(&mut self, stream: u32, body: &[u8]) {
+        for c in self.clients.iter_mut().filter(|c| c.streams & stream != 0) {
+            c.outbox.push_back(body.to_vec());
+        }
+    }
+
+    /// Fold a sample into the daemon's own state.
+    fn observe(&mut self, sample: &Sample) {
+        match sample {
+            Sample::DeviceReady(facts) => {
+                let mut facts = (**facts).clone();
+                if let Some(area) = self.display_override {
+                    facts.display_area = Some(area);
+                }
+                if let Some(id) = facts.calibration_id {
+                    self.calibration.id = Some(id);
+                }
+                self.facts = Some(Arc::new(facts));
+                crate::requests::apply_display_request(self);
+            }
+            Sample::Presence(p) => self.last_presence = Some(*p),
+            Sample::Gaze(g) => {
+                let device = i64::try_from(g.frame.device_ts_us).unwrap_or(i64::MAX);
+                self.clock = Some((device, g.host_rx_us));
+            }
+            Sample::Notification(DeviceNotification::DisplayAreaChanged(area)) => {
+                if let Some(facts) = &self.facts {
+                    let mut facts = (**facts).clone();
+                    facts.display_area = Some(*area);
+                    self.facts = Some(Arc::new(facts));
+                }
+            }
+            Sample::Notification(DeviceNotification::CalibrationIdChanged(id)) => {
+                self.calibration.id = Some(*id);
+            }
+            _ => {}
         }
     }
 }
@@ -98,7 +229,7 @@ impl State {
 /// here leaves `State` consistent at each statement (the engine is an
 /// `Option`, clients a plain list), so a panic while holding the lock cannot
 /// leave it half-updated; continuing beats taking the whole daemon down.
-fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
+pub(crate) fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -155,17 +286,13 @@ pub fn run() -> Result<()> {
     let listener = obtain_listener()?;
 
     let prewarm = is_prewarm_enabled();
-    let state = Arc::new(Mutex::new(State {
-        engine: None,
-        clients: Vec::new(),
-        prewarm,
-    }));
+    let state = Arc::new(Mutex::new(State::new(prewarm)));
 
     // Pre-warm: bring the device up now (pays the cold-start lottery once) and
     // keep it streaming so later client connects are instant.
     if prewarm {
         info!("pre-warming device");
-        lock_state(&state).engine = Some(Engine::start());
+        lock_state(&state).ensure_engine();
     }
 
     // Watchdog: if the device thread died (a cold start that exhausted its
@@ -180,8 +307,9 @@ pub fn run() -> Result<()> {
                 // Don't spin (reloading the model) on an unplugged device.
                 if !running && st.is_engine_wanted() && tobii_usb::device::is_device_present() {
                     warn!("engine not running but wanted; restarting");
-                    st.engine = Some(Engine::start());
-                    st.sync_head_wanted();
+                    crate::calibration::on_engine_lost(&mut st);
+                    st.engine = None;
+                    st.ensure_engine();
                 }
             }
         });
@@ -258,23 +386,23 @@ fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<State>>) {
             id,
             streams: 0,
             out,
+            outbox: VecDeque::new(),
+            holds_device: false,
         });
         let state = Arc::clone(state);
         thread::spawn(move || client_reader(&state, id, stream));
     }
 }
 
-/// One per connection: handle SUBSCRIBE frames and detect disconnect.
+/// One per connection: handle SUBSCRIBE, RECENTER and REQUEST frames and
+/// detect disconnect. Replies go through the client's outbox.
 fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
     // Loop ends on EOF or a read error.
     while let Ok(Some(body)) = read_frame(&mut stream) {
         match body.first().copied() {
             Some(tobii_ipc::TAG_SUBSCRIBE) => {
                 if let Some(streams) = decode_subscribe(&body) {
-                    let ok = handle_subscribe(state, id, streams);
-                    // A failed reply means the client is gone; the next read
-                    // ends the loop.
-                    let _ = write_frame(&mut stream, &encode_subscribed(ok));
+                    handle_subscribe(state, id, streams);
                 }
             }
             Some(tobii_ipc::TAG_RECENTER) => {
@@ -282,42 +410,55 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
                     engine.request_recenter();
                 }
             }
+            Some(tobii_ipc::TAG_REQUEST) => {
+                if let Some(request) = decode_request(&body) {
+                    // Runs without the state lock held while the device works.
+                    let reply = crate::requests::handle(state, id, &request);
+                    lock_state(state)
+                        .send_to(id, encode_reply(request.id, reply.status, &reply.payload));
+                }
+            }
             _ => {}
         }
     }
+    crate::calibration::on_client_gone(state, id);
     let mut st = lock_state(state);
     st.clients.retain(|c| c.id != id);
     st.reconcile();
 }
 
-/// Register the client's streams, starting the engine if it isn't running.
-/// Always succeeds (the one engine serves every stream); `streams == 0`
-/// unsubscribes.
-fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) -> bool {
-    if streams == 0 {
-        // Unsubscribed from everything: release the client's streams (and the
-        // engine / head inference if nobody else needs them).
-        let mut st = lock_state(state);
-        if let Some(c) = st.clients.iter_mut().find(|c| c.id == id) {
-            c.streams = 0;
-        }
-        st.reconcile();
-        return true;
-    }
+/// Register the client's streams, starting the engine if it isn't running,
+/// and acknowledge. Always succeeds (the one engine serves every stream);
+/// `streams == 0` unsubscribes. A new presence subscriber is told the current
+/// presence straight away, since the device reports it only on change.
+fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
     let mut st = lock_state(state);
-    if st.engine.as_ref().is_none_or(|e| !e.is_alive()) {
-        st.engine = Some(Engine::start());
-    }
+    let before = st
+        .clients
+        .iter()
+        .find(|c| c.id == id)
+        .map_or(0, |c| c.streams);
     if let Some(c) = st.clients.iter_mut().find(|c| c.id == id) {
         c.streams = streams;
     }
-    st.sync_head_wanted();
-    true
+    if streams == 0 {
+        st.reconcile();
+    } else {
+        st.ensure_engine();
+        st.sync_wanted();
+    }
+    st.send_to(id, encode_subscribed(true));
+    if streams & !before & STREAM_PRESENCE != 0
+        && let Some(p) = st.last_presence
+    {
+        st.send_to(id, presence_frame(&p));
+    }
 }
 
-/// Fan-out loop: every 8 ms drain the engine, encode each sample once and
-/// write it to every client subscribed to that stream. The buffers live
-/// across ticks so the per-frame path does not reallocate.
+/// Fan-out loop: every 8 ms flush each client's outbox, then drain the
+/// engine, encode each sample once and write it to every client subscribed
+/// to that stream. The buffers live across ticks so the per-frame path does
+/// not reallocate.
 fn pump(state: &Mutex<State>) {
     let mut samples: Vec<Sample> = Vec::new();
     let mut frames: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -330,21 +471,30 @@ fn pump(state: &Mutex<State>) {
             let mut st = lock_state(state);
             if let Some(engine) = st.engine.as_mut() {
                 engine.drain_into(&mut samples);
-                if !samples.is_empty() {
-                    // Pre-encode frames, then write to matching clients.
-                    for s in &samples {
-                        push_sample_frames(s, &mut frames);
+            }
+            let wanted = st.wanted_mask();
+            for s in &samples {
+                st.observe(s);
+            }
+            let display = st.facts.as_ref().and_then(|f| f.display_area);
+            for s in &samples {
+                push_sample_frames(s, wanted, display.as_ref(), &mut frames);
+            }
+            for client in &mut st.clients {
+                let mut ok = true;
+                while ok && let Some(body) = client.outbox.pop_front() {
+                    ok = write_frame(&mut client.out, &body).is_ok();
+                }
+                for (need, body) in &frames {
+                    if !ok {
+                        break;
                     }
-                    for client in &mut st.clients {
-                        for (need, body) in &frames {
-                            if client.streams & need != 0
-                                && write_frame(&mut client.out, body).is_err()
-                            {
-                                dead.push(client.id);
-                                break;
-                            }
-                        }
+                    if client.streams & need != 0 {
+                        ok = write_frame(&mut client.out, body).is_ok();
                     }
+                }
+                if !ok {
+                    dead.push(client.id);
                 }
             }
             if !dead.is_empty() {
@@ -356,45 +506,57 @@ fn pump(state: &Mutex<State>) {
     }
 }
 
-/// Append an engine sample's (required-stream-bit, frame-body) pairs to `out`.
-// reason: the wire format is f32; the f64 -> f32 narrowing is the intended
-// precision of the IPC protocol.
-#[allow(clippy::cast_possible_truncation)]
-fn push_sample_frames(s: &Sample, out: &mut Vec<(u32, Vec<u8>)>) {
-    match s {
-        Sample::Pose(p) => {
-            // cm -> mm; rotation about x=pitch, y=yaw, z=roll in radians.
-            let pos = [
-                (p.pos_cm[0] * 10.0) as f32,
-                (p.pos_cm[1] * 10.0) as f32,
-                (p.pos_cm[2] * 10.0) as f32,
-            ];
-            let rot = [
-                p.rot_deg[1].to_radians() as f32,
-                p.rot_deg[0].to_radians() as f32,
-                p.rot_deg[2].to_radians() as f32,
-            ];
-            out.push((STREAM_HEAD, encode_head(p.timestamp_us, pos, rot)));
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A state with one connected client (its socket's peer is dropped; the
+    /// pump never runs in these tests).
+    pub(crate) fn state_with_client(id: u64) -> State {
+        let (out, _peer) = UnixStream::pair().expect("socket pair");
+        let mut st = State::new(false);
+        st.clients.push(Client {
+            id,
+            streams: 0,
+            out,
+            outbox: VecDeque::new(),
+            holds_device: false,
+        });
+        st
+    }
+
+    pub(crate) fn outbox(st: &State, id: u64) -> Vec<Vec<u8>> {
+        st.clients
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.outbox.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_new_presence_subscriber_gets_the_last_state() {
+        let state = Mutex::new(state_with_client(1));
+        {
+            let mut st = lock_state(&state);
+            st.observe(&Sample::Presence(PresenceSample::new(77, true)));
+            // No engine in tests: keep reconcile/ensure_engine from starting one.
+            st.prewarm = false;
         }
-        Sample::Gaze(g) => {
-            let xy = [
-                ((g.gaze_norm[0] + 1.0) * 0.5).clamp(0.0, 1.0) as f32,
-                ((g.gaze_norm[1] + 1.0) * 0.5).clamp(0.0, 1.0) as f32,
-            ];
-            let status = if g.present {
-                PRESENCE_PRESENT
-            } else {
-                PRESENCE_AWAY
-            };
-            let pupil = [g.pupil_mm[0] as f32, g.pupil_mm[1] as f32];
-            out.push((
-                STREAM_GAZE,
-                encode_gaze(g.timestamp_us, g.gaze_valid, xy, pupil),
-            ));
-            out.push((STREAM_PRESENCE, encode_presence(g.timestamp_us, status)));
+        // Subscribe without touching the engine: set the mask directly and
+        // run the presence replay the way handle_subscribe does.
+        let mut st = lock_state(&state);
+        if let Some(c) = st.clients.iter_mut().find(|c| c.id == 1) {
+            c.streams = STREAM_PRESENCE;
         }
-        // `Sample` is #[non_exhaustive]: a kind added by a newer engine is
-        // dropped rather than breaking the wire protocol.
-        _ => {}
+        let p = st.last_presence.expect("cached");
+        st.send_to(1, presence_frame(&p));
+        let sent = outbox(&st, 1);
+        assert_eq!(
+            tobii_ipc::decode_server(&sent[0]),
+            Some(tobii_ipc::ServerMsg::Presence {
+                ts_us: 77,
+                status: tobii_ipc::PRESENCE_PRESENT
+            })
+        );
     }
 }

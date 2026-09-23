@@ -789,6 +789,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusb",
+ "tobii-calib",
+ "tobii-ipc",
  "tobii-pose",
  "tobii-proto",
  "tracing",
@@ -800,8 +802,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+ "tobii-calib",
  "tobii-ipc",
  "tobii-log",
+ "tobii-proto",
  "tobii-usb",
  "tracing",
 ]

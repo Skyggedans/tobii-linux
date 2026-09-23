@@ -1,25 +1,37 @@
 //! Background engine that owns the USB device and produces tracking samples:
-//! gaze point + user presence from the 0x83 gaze stream (~33 Hz) plus
+//! gaze from the 0x83 gaze stream (~33 Hz), presence from the 0x504 stream,
 //! gaze-independent 6DOF head pose from the device's own 280x280 IR image
 //! stream (0x50e), which the firmware multiplexes on the same endpoint
-//! concurrently. Head-pose inference only runs while a client wants it
-//! (`set_head_wanted`).
+//! concurrently, and the device's notifications. Head-pose inference only runs
+//! while a client wants it (`set_head_wanted`).
+//!
+//! Besides streaming, the engine runs device commands for its owner
+//! ([`Engine::commands`]): they are queued to the USB thread, which writes
+//! them between reads and matches the device's answer by sequence number, so
+//! the streams keep flowing while a slow command (a calibration point takes
+//! most of a second) is outstanding.
 //!
 //! The UVC camera (interface 2) is never used by the engine: streaming it
 //! throttles the 0x83 streams from ~33 Hz to <1 Hz (firmware mode, not
 //! bandwidth — verified with `probe`). The UVC path survives only in the
 //! standalone research subcommands (`camera`, `track`, `probe`).
 //!
-//! The `stop` / `recenter` / `head_wanted` flags are pure signals (no data is
-//! published alongside them), so every access uses `Ordering::Relaxed`.
+//! The `stop` / `recenter` / `head_wanted` / `image_wanted` flags are pure
+//! signals (no data is published alongside them), so every access uses
+//! `Ordering::Relaxed`.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use tobii_ipc::geometry::DisplayArea;
+use tobii_proto::facts::{DeviceFacts, DeviceNotification};
+use tobii_proto::gaze83::GazeFrame;
+use tobii_proto::image83::ImageFrame;
 use tracing::error;
 
 /// One 6DOF head-pose estimate from the IR image stream.
@@ -34,30 +46,166 @@ pub struct PoseSample {
     pub rot_deg: [f64; 3],
 }
 
-/// One gaze + presence sample from the 0x83 gaze stream.
+/// One decoded 0x500 gaze frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct GazeSample {
+    /// Everything the frame carries, device timestamp included.
+    pub frame: GazeFrame,
+    /// Host wall clock when the frame was read, microseconds.
+    pub host_rx_us: i64,
+}
+
+impl GazeSample {
+    /// A sample of `frame` read at host time `host_rx_us`.
+    #[must_use]
+    pub fn new(frame: GazeFrame, host_rx_us: i64) -> Self {
+        Self { frame, host_rx_us }
+    }
+}
+
+/// A presence change from the 0x504 stream (sent at stream start and on
+/// change only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PresenceSample {
     /// Device timestamp, microseconds.
     pub timestamp_us: i64,
-    /// Whether `gaze_norm` holds a usable gaze point.
-    pub gaze_valid: bool,
-    /// Gaze point in normalised screen coordinates, roughly `[-1, 1]` per axis.
-    pub gaze_norm: [f64; 2],
-    /// User presence as reported by the device.
+    /// Whether a user is in front of the tracker.
     pub present: bool,
-    /// Pupil diameter `[left, right]` in millimetres; `NaN` if unavailable.
-    pub pupil_mm: [f64; 2],
+}
+
+impl PresenceSample {
+    /// Presence `present` at device time `timestamp_us`.
+    #[must_use]
+    pub fn new(timestamp_us: i64, present: bool) -> Self {
+        Self {
+            timestamp_us,
+            present,
+        }
+    }
 }
 
 /// One item out of the engine.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Sample {
     /// Head pose (only while head pose is wanted, see [`Engine::set_head_wanted`]).
     Pose(PoseSample),
-    /// Gaze point and presence.
-    Gaze(GazeSample),
+    /// A gaze frame (boxed: it is ten times the size of the other samples).
+    Gaze(Box<GazeSample>),
+    /// A presence change.
+    Presence(PresenceSample),
+    /// An IR frame (only while images are wanted, see [`Engine::set_image_wanted`]).
+    Image(Arc<ImageFrame>),
+    /// A device notification.
+    Notification(DeviceNotification),
+    /// The device finished its init; what it reported about itself.
+    DeviceReady(Arc<DeviceFacts>),
+}
+
+/// A command for the device: id and TLV payload (empty for a parameterless
+/// command), plus how long the device may take to answer once it is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCommand {
+    /// Command id.
+    pub cmd: u32,
+    /// Payload (`00 00` + TLVs), or empty.
+    pub payload: Vec<u8>,
+    /// Answer deadline, counted from the write.
+    pub timeout: Duration,
+}
+
+/// The device's answer to a [`DeviceCommand`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResponse {
+    /// The response's status word (1 on every answer ever captured).
+    pub status: u32,
+    /// The whole payload, chunked responses joined.
+    pub payload: Vec<u8>,
+}
+
+/// Why a command got no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommandError {
+    /// The device did not answer in time.
+    Timeout,
+    /// The engine stopped (device lost or shutting down).
+    EngineGone,
+    /// The command could not be written.
+    Usb(String),
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("device did not answer in time"),
+            Self::EngineGone => f.write_str("engine stopped"),
+            Self::Usb(e) => write!(f, "USB write failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+/// A command waiting for the USB thread, with where to send its answer.
+#[derive(Debug)]
+pub(crate) struct QueuedCommand {
+    pub(crate) command: DeviceCommand,
+    pub(crate) reply: Sender<Result<CommandResponse, CommandError>>,
+}
+
+/// How long a command may wait for the USB thread to reach it (queued behind
+/// others, or the device still initialising) before its own deadline starts.
+const QUEUE_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// Runs commands on the engine's device; cheap to clone and usable from any
+/// thread.
+#[derive(Debug, Clone)]
+pub struct Commands(Sender<QueuedCommand>);
+
+impl Commands {
+    /// Send `command` and block until the device answers.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError::Timeout`] when no answer arrives within the command's
+    /// timeout (plus time spent queued), [`CommandError::EngineGone`] when
+    /// the engine stops first, [`CommandError::Usb`] when the write fails.
+    pub fn run(&self, command: DeviceCommand) -> Result<CommandResponse, CommandError> {
+        let deadline = command.timeout + QUEUE_ALLOWANCE;
+        let (reply, answer) = mpsc::channel();
+        self.0
+            .send(QueuedCommand { command, reply })
+            .map_err(|_| CommandError::EngineGone)?;
+        match answer.recv_timeout(deadline) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(CommandError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(CommandError::EngineGone),
+        }
+    }
+}
+
+/// State shared between the [`Engine`] handle and its USB thread.
+#[derive(Debug, Default)]
+pub(crate) struct Shared {
+    pub(crate) stop: AtomicBool,
+    pub(crate) recenter: AtomicBool,
+    pub(crate) head_wanted: AtomicBool,
+    pub(crate) image_wanted: AtomicBool,
+    /// Display area to write in place of the one in the init replay.
+    pub(crate) display_override: Mutex<Option<DisplayArea>>,
+}
+
+impl Shared {
+    pub(crate) fn display_override(&self) -> Option<DisplayArea> {
+        // Written whole; a poisoned lock cannot hold a torn value.
+        *self
+            .display_override
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Owns the device thread. The daemon drives `wait`/`drain` from a single
@@ -65,9 +213,8 @@ pub enum Sample {
 /// and lock-free.
 #[derive(Debug)]
 pub struct Engine {
-    stop: Arc<AtomicBool>,
-    recenter: Arc<AtomicBool>,
-    head_wanted: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+    commands: Commands,
     rx: Receiver<Sample>,
     pending: VecDeque<Sample>,
     handle: Option<JoinHandle<()>>,
@@ -78,39 +225,67 @@ impl Engine {
     /// are logged once; [`Engine::is_alive`] turns false when it has exited.
     #[must_use]
     pub fn start() -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let recenter = Arc::new(AtomicBool::new(false));
-        let head_wanted = Arc::new(AtomicBool::new(false));
+        Self::start_with(None)
+    }
+
+    /// Like [`Engine::start`], writing `display_area` instead of the display
+    /// area embedded in the init replay.
+    #[must_use]
+    pub fn start_with(display_area: Option<DisplayArea>) -> Self {
+        let shared = Arc::new(Shared {
+            display_override: Mutex::new(display_area),
+            ..Shared::default()
+        });
         let (tx, rx) = mpsc::channel();
-        let s = Arc::clone(&stop);
-        let rc = Arc::clone(&recenter);
-        let hw = Arc::clone(&head_wanted);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let thread_shared = Arc::clone(&shared);
         let handle = thread::spawn(move || {
-            if let Err(e) = crate::device::run_gaze_engine(&s, &rc, &hw, &tx) {
+            if let Err(e) = crate::device::run_gaze_engine(&thread_shared, &cmd_rx, &tx) {
                 error!(error = %format_args!("{e:#}"), "tobii engine stopped");
             }
         });
         Engine {
-            stop,
-            recenter,
-            head_wanted,
+            shared,
+            commands: Commands(cmd_tx),
             rx,
             pending: VecDeque::new(),
             handle: Some(handle),
         }
     }
 
+    /// A handle for running device commands.
+    #[must_use]
+    pub fn commands(&self) -> Commands {
+        self.commands.clone()
+    }
+
     /// Ask the head tracker to recalibrate its rest pose on the next frames.
     pub fn request_recenter(&self) {
         // Relaxed: a pure signal, no data is published with it.
-        self.recenter.store(true, Ordering::Relaxed);
+        self.shared.recenter.store(true, Ordering::Relaxed);
     }
 
     /// Run head-pose inference on the image stream (costs CPU) while some
     /// client consumes head pose; frames are dropped otherwise.
     pub fn set_head_wanted(&self, wanted: bool) {
         // Relaxed: a pure signal, no data is published with it.
-        self.head_wanted.store(wanted, Ordering::Relaxed);
+        self.shared.head_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    /// Emit [`Sample::Image`] for every IR frame while some client wants them.
+    pub fn set_image_wanted(&self, wanted: bool) {
+        // Relaxed: a pure signal, no data is published with it.
+        self.shared.image_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    /// Keep `area` as the display area across device re-inits (the init
+    /// replay would otherwise restore the one it embeds).
+    pub fn set_display_area_override(&self, area: Option<DisplayArea>) {
+        *self
+            .shared
+            .display_override
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = area;
     }
 
     /// Is the device thread still running (false once it has exited/failed)?
@@ -153,7 +328,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         // Relaxed: a pure signal; the join below is the synchronisation point.
-        self.stop.store(true, Ordering::Relaxed);
+        self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             // A panicked device thread has already logged; nothing to recover.
             let _ = h.join();
