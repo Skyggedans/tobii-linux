@@ -13,11 +13,19 @@
 //! A session belongs to the client that started it: others get
 //! `CALIBRATION_BUSY`, and when the owner disconnects the session is stopped
 //! as if it had asked.
+//!
+//! The owner may set the display area during the session (a calibration only
+//! holds for the display area it is made on). It goes to the device at once
+//! but to disk only with the first calibration computed on it, so the saved
+//! display area and calibration always belong together. Should the session
+//! end without computing, its calibration is the previous one, so the device
+//! and later inits get the previous display area back too.
 
 use std::sync::Mutex;
 use std::time::Duration;
 
 use tobii_calib::store::{self, Location};
+use tobii_ipc::geometry::DisplayArea;
 use tobii_ipc::request::{decode_point_2d, encode_u32, kind, status};
 use tobii_ipc::{
     Notification, NotificationValue, STREAM_NOTIFICATIONS, encode_notification, notification,
@@ -61,13 +69,51 @@ impl Calibration {
     pub(crate) fn is_active(&self) -> bool {
         self.session.is_some()
     }
+
+    /// The client whose session is running.
+    pub(crate) fn owner(&self) -> Option<u64> {
+        self.session.as_ref().map(|s| s.owner)
+    }
+
+    /// `client` set the display area to `area`. Inside that client's
+    /// session, before anything is computed, the area it replaced is
+    /// remembered (the first change only) and saving waits for a compute:
+    /// `false`. Otherwise the area is to be saved now: `true`.
+    pub(crate) fn note_display_change(
+        &mut self,
+        client: u64,
+        before: DisplayBefore,
+        area: DisplayArea,
+    ) -> bool {
+        match self.session.as_mut() {
+            Some(s) if s.owner == client && s.computed.is_none() => {
+                s.display_before.get_or_insert(before);
+                s.unsaved_display = Some(area);
+                false
+            }
+            _ => true,
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The display area as it was before a session's owner changed it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DisplayBefore {
+    /// What the device had; written back.
+    pub(crate) device: Option<DisplayArea>,
+    /// What later inits wrote then (the daemon's override).
+    pub(crate) configured: Option<DisplayArea>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct Session {
     owner: u64,
     /// The calibration this session computed, once it has.
     computed: Option<Vec<u8>>,
+    /// The display area the owner replaced, while nothing is computed.
+    display_before: Option<DisplayBefore>,
+    /// The display area the owner set, saved with the first compute.
+    unsaved_display: Option<DisplayArea>,
 }
 
 fn broadcast_state(st: &mut State, active: bool) {
@@ -203,6 +249,8 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
         st.calibration.session = Some(Session {
             owner: client,
             computed: None,
+            display_before: None,
+            unsaved_display: None,
         });
         (device, st.calibration.location.clone())
     };
@@ -236,11 +284,18 @@ fn compute(state: &Mutex<State>, client: u64) -> Result<Vec<u8>, u8> {
         Err(e) => warn!(error = %e, "computed calibration does not validate; not saved"),
     }
     let mut st = lock_state(state);
-    if let Some(s) = st.calibration.session.as_mut() {
+    let unsaved = st.calibration.session.as_mut().and_then(|s| {
         s.computed = Some(blob);
-    }
+        s.unsaved_display.take()
+    });
     if id.is_some() {
         st.calibration.id = id;
+    }
+    let file = st.display_file.clone();
+    drop(st);
+    // The display area this calibration was made on goes to disk with it.
+    if let (Some(area), Some(path)) = (unsaved, file) {
+        crate::requests::save_display_area(&path, &area);
     }
     info!(client, id, "calibration computed");
     Ok(encode_u32(id.unwrap_or(0)))
@@ -274,7 +329,10 @@ fn apply(state: &Mutex<State>, client: u64, payload: &[u8]) -> Result<Vec<u8>, u
 fn stop(state: &Mutex<State>, client: u64) -> Result<Vec<u8>, u8> {
     let (device, session, location) = prepare(state, client, &Access::Owner)?;
     let stopped = run(device.as_ref(), cmd::STOP, Vec::new(), QUICK);
-    let active = match session.and_then(|s| s.computed) {
+    let (computed, display_before) =
+        session.map_or((None, None), |s| (s.computed, s.display_before));
+    let restore_display = display_before.filter(|_| computed.is_none());
+    let active = match computed {
         Some(blob) => Ok(blob),
         None => current_blob(&location),
     };
@@ -285,6 +343,9 @@ fn stop(state: &Mutex<State>, client: u64) -> Result<Vec<u8>, u8> {
             status = code,
             "could not write the calibration back after stopping"
         );
+    }
+    if let Some(before) = &restore_display {
+        crate::requests::put_display_back(state, Some(device.as_ref()), before);
     }
     let mut st = lock_state(state);
     st.calibration.session = None;
@@ -313,7 +374,13 @@ pub(crate) fn on_client_gone(state: &Mutex<State>, client: u64) {
 /// saved calibration, which is the pre-session one unless a compute saved a
 /// new one).
 pub(crate) fn on_engine_lost(st: &mut State) {
-    if st.calibration.session.take().is_some() {
+    if let Some(session) = st.calibration.session.take() {
+        if session.computed.is_none()
+            && let Some(before) = &session.display_before
+        {
+            // No device to write to: the next init writes what is configured.
+            crate::requests::put_display_configuration_back(st, before);
+        }
         broadcast_state(st, false);
     }
 }
@@ -518,5 +585,131 @@ mod tests {
             ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &outside).status,
             status::INVALID_PARAMETER
         );
+    }
+
+    fn area(width_mm: f64) -> DisplayArea {
+        let mounting = tobii_ipc::geometry::GeometryMounting {
+            guides: 2,
+            width_mm: 184.0,
+            angle_deg: 20.0,
+            external_offset_mm: [0.0, -0.16, 13.85],
+            internal_offset_mm: [0.0, 5.38, 9.86],
+        };
+        // As the wire carries it (f32), so it compares equal after a set.
+        let a = tobii_ipc::geometry::display_area_basic(width_mm, 336.0, 0.0, &mounting);
+        tobii_ipc::request::decode_display_area(&tobii_ipc::request::encode_display_area(&a))
+            .expect("area")
+    }
+
+    fn set_area(s: &Setup, client: u64, a: &DisplayArea) -> Reply {
+        let payload = tobii_ipc::request::encode_display_area(a);
+        crate::requests::handle(
+            &s.state,
+            client,
+            &tobii_ipc::request::Request {
+                id: 1,
+                kind: kind::DISPLAY_AREA_SET,
+                payload: &payload,
+            },
+        )
+    }
+
+    /// A session's owner has an older area configured and on the device,
+    /// nothing saved, and a display file to save to.
+    fn display_setup(tag: &str) -> (Setup, std::path::PathBuf, DisplayArea) {
+        let s = setup(tag);
+        let file = s.dir.join("display-area");
+        let old = area(633.6);
+        {
+            let mut st = lock_state(&s.state);
+            st.display_file = Some(file.clone());
+            st.display_override = Some(old);
+            st.facts = Some(Arc::new(tobii_proto::facts::DeviceFacts {
+                display_area: Some(old),
+                ..Default::default()
+            }));
+        }
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        (s, file, old)
+    }
+
+    fn display_writes(s: &Setup) -> usize {
+        s.device
+            .log
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|c| **c == tobii_proto::protocol::cmd::DISPLAY_AREA_SET)
+            .count()
+    }
+
+    #[test]
+    fn a_session_that_computes_nothing_puts_the_display_area_back() {
+        let (s, file, old) = display_setup("area-back");
+        assert_eq!(
+            set_area(&s, 2, &area(597.0)).status,
+            status::CALIBRATION_BUSY,
+            "only the owner changes the area during its session"
+        );
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+        assert!(!file.exists(), "saved only with a calibration made on it");
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, &[]),
+            Reply::ok(Vec::new())
+        );
+
+        assert_eq!(display_writes(&s), 2, "set, then put back");
+        let st = lock_state(&s.state);
+        assert_eq!(st.display_override, Some(old));
+        assert_eq!(st.facts.as_ref().and_then(|f| f.display_area), Some(old));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_session_that_computed_keeps_its_display_area() {
+        let (s, file, _) = display_setup("area-kept");
+        let new = area(597.0);
+        assert_eq!(set_area(&s, 1, &new), Reply::ok(Vec::new()));
+        assert!(!file.exists());
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+        assert_eq!(crate::display::load(&file).expect("load"), Some(new));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, &[]),
+            Reply::ok(Vec::new())
+        );
+
+        assert_eq!(display_writes(&s), 1);
+        assert_eq!(lock_state(&s.state).display_override, Some(new));
+        assert_eq!(crate::display::load(&file).expect("load"), Some(new));
+    }
+
+    #[test]
+    fn losing_the_engine_mid_session_puts_the_display_configuration_back() {
+        let (s, file, old) = display_setup("area-engine");
+        crate::display::save(&file, &area(520.0)).expect("save");
+        // The saved area before the change is what goes back to disk.
+        let saved_before = crate::display::load(&file).expect("load");
+        // A new session, with that file in place.
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, &[]),
+            Reply::ok(Vec::new())
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+
+        on_engine_lost(&mut lock_state(&s.state));
+
+        assert_eq!(lock_state(&s.state).display_override, Some(old));
+        assert_eq!(crate::display::load(&file).expect("load"), saved_before);
     }
 }

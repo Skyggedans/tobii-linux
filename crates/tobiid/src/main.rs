@@ -5,6 +5,7 @@
 mod calibration;
 mod daemon;
 mod device;
+mod display;
 mod frames;
 mod requests;
 

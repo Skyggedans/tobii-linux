@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -83,10 +84,14 @@ pub(crate) struct State {
     last_presence: Option<PresenceSample>,
     /// The newest `(device_us, host_us)` pair seen on the gaze stream.
     pub(crate) clock: Option<(i64, i64)>,
-    /// The display area a client set, re-applied at every device init.
+    /// The display area a client set (or the saved one), re-applied at every
+    /// device init.
     pub(crate) display_override: Option<DisplayArea>,
     /// `TOBII_DISPLAY_MM`: the monitor to configure once the mounting is known.
     pub(crate) display_request: Option<crate::requests::DisplaySize>,
+    /// Where a display area a client sets is saved (see [`crate::display`]);
+    /// `None` keeps it in memory only.
+    pub(crate) display_file: Option<PathBuf>,
     /// The calibration session, if any, and the active calibration id.
     pub(crate) calibration: Calibration,
     /// Stand-in for the engine's command queue in tests.
@@ -105,6 +110,7 @@ impl State {
             clock: None,
             display_override: None,
             display_request: crate::requests::DisplaySize::from_env(),
+            display_file: None,
             calibration: Calibration::default(),
             #[cfg(test)]
             fake_device: None,
@@ -287,6 +293,11 @@ pub fn run() -> Result<()> {
 
     let prewarm = is_prewarm_enabled();
     let state = Arc::new(Mutex::new(State::new(prewarm)));
+    {
+        let mut st = lock_state(&state);
+        st.display_file = crate::display::default_path();
+        crate::requests::restore_saved_display_area(&mut st);
+    }
 
     // Pre-warm: bring the device up now (pays the cold-start lottery once) and
     // keep it streaming so later client connects are instant.

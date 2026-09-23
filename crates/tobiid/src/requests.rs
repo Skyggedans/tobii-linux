@@ -136,20 +136,31 @@ fn facts(
     }
 }
 
-/// Write a display area to the device and keep it across re-inits.
+/// Write a display area to the device and, once it accepts it, keep it
+/// across re-inits and sessions. Refused while another client calibrates
+/// (its calibration is being made on the current area). During the caller's
+/// own session it is saved only with the calibration computed on it, and
+/// what it replaces is remembered, so that a session ending without a
+/// calibration can put it back (see [`crate::calibration`]).
 fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Reply {
-    let (device, display_id) = {
+    let (device, display_id, before) = {
         let mut st = lock_state(state);
-        st.display_override = Some(area);
-        if let Some(engine) = st.engine.as_ref() {
-            engine.set_display_area_override(Some(area));
+        if st.calibration.owner().is_some_and(|owner| owner != client) {
+            return Reply::err(status::CALIBRATION_BUSY);
         }
+        // A client's area supersedes TOBII_DISPLAY_MM for this run: do not
+        // let the variable's write, queued at the next device init, undo it.
+        st.display_request = None;
+        let before = crate::calibration::DisplayBefore {
+            device: st.facts.as_ref().and_then(|f| f.display_area),
+            configured: st.display_override,
+        };
         let display_id = st
             .facts
             .as_ref()
             .and_then(|f| f.display_id)
             .unwrap_or(DEFAULT_DISPLAY_ID);
-        (st.device_for(client), display_id)
+        (st.device_for(client), display_id, before)
     };
     let Some(device) = device else {
         return Reply::err(status::CONNECTION_FAILED);
@@ -161,14 +172,125 @@ fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Rep
         DISPLAY_AREA_TIMEOUT,
     );
     if result.is_ok() {
-        let mut st = lock_state(state);
-        if let Some(facts) = st.facts.as_ref() {
-            let mut facts = (**facts).clone();
-            facts.display_area = Some(area);
-            st.facts = Some(Arc::new(facts));
+        let file = {
+            let mut st = lock_state(state);
+            let save_now = st.calibration.note_display_change(client, before, area);
+            st.display_override = Some(area);
+            if let Some(engine) = st.engine.as_ref() {
+                engine.set_display_area_override(Some(area));
+            }
+            if let Some(facts) = st.facts.as_ref() {
+                let mut facts = (**facts).clone();
+                facts.display_area = Some(area);
+                st.facts = Some(Arc::new(facts));
+            }
+            st.display_file.clone().filter(|_| save_now)
+        };
+        // Kept across sessions, as the Stream Engine does.
+        if let Some(path) = file {
+            save_display_area(&path, &area);
         }
     }
     result.map(|_| Vec::new()).into()
+}
+
+/// Save `area` at `path`. The device has it already, so failing only costs
+/// it at the next start. The same area again is not written (it would push
+/// the rollback copy out).
+pub(crate) fn save_display_area(path: &std::path::Path, area: &DisplayArea) {
+    if crate::display::load(path).ok().flatten() == Some(*area) {
+        return;
+    }
+    match crate::display::save(path, area) {
+        Ok(()) => info!(
+            path = %path.display(),
+            width_mm = width_mm(area),
+            "display area saved"
+        ),
+        Err(e) => warn!(path = %path.display(), error = %e, "could not save the display area"),
+    }
+}
+
+/// Put the display area back as it was before a calibration session that
+/// computed nothing changed it: on `device` (when there is one) and for
+/// later inits. The saved file never had the session's area.
+pub(crate) fn put_display_back(
+    state: &Mutex<State>,
+    device: Option<&dyn crate::device::DeviceCommands>,
+    before: &crate::calibration::DisplayBefore,
+) {
+    if let (Some(device), Some(area)) = (device, before.device) {
+        let display_id = lock_state(state)
+            .facts
+            .as_ref()
+            .and_then(|f| f.display_id)
+            .unwrap_or(DEFAULT_DISPLAY_ID);
+        if let Err(code) = crate::device::run(
+            device,
+            cmd::DISPLAY_AREA_SET,
+            display_area_set_payload(&area, display_id),
+            DISPLAY_AREA_TIMEOUT,
+        ) {
+            warn!(
+                status = code,
+                "could not put the display area back on the device"
+            );
+        }
+    }
+    put_display_configuration_back(&mut lock_state(state), before);
+}
+
+/// The configuration half of [`put_display_back`]: what later inits write.
+pub(crate) fn put_display_configuration_back(
+    st: &mut State,
+    before: &crate::calibration::DisplayBefore,
+) {
+    st.display_override = before.configured;
+    if let Some(engine) = st.engine.as_ref() {
+        engine.set_display_area_override(before.configured);
+    }
+    if let Some(facts) = st.facts.as_ref() {
+        let mut facts = (**facts).clone();
+        facts.display_area = before.device;
+        st.facts = Some(Arc::new(facts));
+    }
+    info!("display area put back: the calibration session computed nothing");
+}
+
+/// Width of a display area, for the log.
+fn width_mm(area: &DisplayArea) -> f64 {
+    (0..3)
+        .map(|i| (area.top_right_mm[i] - area.top_left_mm[i]).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// At start: configure the saved display area, so the engine's first init
+/// already writes it. It wins over `TOBII_DISPLAY_MM`: it was set on the
+/// device later (the calibration saved with it was made on it), and the
+/// variable only fills in while nothing is saved.
+pub(crate) fn restore_saved_display_area(st: &mut State) {
+    let Some(path) = st.display_file.clone() else {
+        return;
+    };
+    match crate::display::load(&path) {
+        Ok(Some(area)) => {
+            info!(
+                path = %path.display(),
+                width_mm = width_mm(&area),
+                "display area: using the saved one"
+            );
+            if st.display_request.is_some() {
+                info!(
+                    path = %path.display(),
+                    "TOBII_DISPLAY_MM is ignored while a display area is saved; delete the file to use it"
+                );
+            }
+            st.display_override = Some(area);
+        }
+        Ok(None) => {}
+        Err(e) => warn!(path = %path.display(), error = %e, "ignoring the saved display area"),
+    }
 }
 
 /// A monitor size from `TOBII_DISPLAY_MM=<width>x<height>[+<offset_x>]` (mm):
@@ -299,6 +421,94 @@ mod tests {
         let sync = request::decode_timesync(&reply.payload).expect("timesync");
         assert_eq!(sync.device_us, 5_000_000);
         assert!(sync.host_start_us < sync.host_end_us);
+    }
+
+    /// Answers every command with `status`.
+    struct Answering(u32);
+
+    impl crate::device::DeviceCommands for Answering {
+        fn run(
+            &self,
+            _cmd: u32,
+            _payload: Vec<u8>,
+            _timeout: Duration,
+        ) -> Result<tobii_usb::engine::CommandResponse, tobii_usb::engine::CommandError> {
+            Ok(tobii_usb::engine::CommandResponse {
+                status: self.0,
+                payload: Vec::new(),
+            })
+        }
+    }
+
+    /// Set `area` on a device answering `device_status`; the reply and
+    /// what the daemon now configures at init.
+    fn set_area(
+        device_status: u32,
+        path: &std::path::Path,
+        area: &DisplayArea,
+    ) -> (Reply, Option<DisplayArea>) {
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(device_status)));
+        st.display_file = Some(path.to_path_buf());
+        let state = Mutex::new(st);
+        let payload = encode_display_area(area);
+        let reply = handle(
+            &state,
+            1,
+            &Request {
+                id: 1,
+                kind: kind::DISPLAY_AREA_SET,
+                payload: &payload,
+            },
+        );
+        (reply, lock_state(&state).display_override)
+    }
+
+    #[test]
+    fn a_display_area_the_device_accepts_is_saved_and_restored_at_start() {
+        let dir = std::env::temp_dir().join(format!("tobiid-area-{}", std::process::id()));
+        let path = dir.join("display-area");
+        let area = display_area_basic(
+            597.0,
+            336.0,
+            1.0,
+            &tobii_ipc::geometry::GeometryMounting {
+                guides: 2,
+                width_mm: 184.0,
+                angle_deg: 20.0,
+                external_offset_mm: [0.0, -0.16, 13.85],
+                internal_offset_mm: [0.0, 5.38, 9.86],
+            },
+        );
+
+        let (reply, configured) = set_area(2, &path, &area);
+        assert_eq!(reply, Reply::err(status::OPERATION_FAILED));
+        assert!(!path.exists(), "a refused area is not saved");
+        assert_eq!(configured, None, "nor configured for the next init");
+        // Saved as received: the wire carries f32.
+        let (reply, configured) = set_area(1, &path, &area);
+        let area = decode_display_area(&encode_display_area(&area)).expect("wire");
+        assert_eq!((reply, configured), (Reply::ok(Vec::new()), Some(area)));
+        assert_eq!(crate::display::load(&path).expect("load"), Some(area));
+
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.display_file = Some(path.clone());
+        st.display_request = None;
+        restore_saved_display_area(&mut st);
+        assert_eq!(st.display_override, Some(area));
+
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.display_file = Some(path.clone());
+        st.display_request = DisplaySize::parse("600x340");
+        restore_saved_display_area(&mut st);
+        assert_eq!(st.display_override, Some(area), "the saved area wins");
+
+        // The same area again leaves the rollback copy alone.
+        let prev = tobii_calib::store::previous_path(&path);
+        let _ = std::fs::remove_file(&prev);
+        assert_eq!(set_area(1, &path, &area).0, Reply::ok(Vec::new()));
+        assert!(!prev.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
