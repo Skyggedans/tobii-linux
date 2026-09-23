@@ -3,8 +3,8 @@
 A Linux driver stack for the **Tobii Eye Tracker 5** (USB `2104:0313`), built
 by reverse-engineering the device's USB protocol. It gives you gaze, user
 presence and gaze-independent 6-DOF head pose — all at 33 Hz, all at the same
-time — through a daemon, a Stream-Engine-shaped C ABI, and a couple of thin
-clients.
+time — plus calibration, through a daemon, a drop-in `libtobii.so` for Tobii's
+Stream Engine 4.1 C API, and a few thin clients.
 
 Tobii ships no Linux support for this device. Everything here was recovered
 from USB captures of the Windows Stream Engine.
@@ -17,8 +17,17 @@ from USB captures of the Windows Stream Engine.
 | Signal | Rate | Source |
 |---|---|---|
 | Gaze point + validity | 33 Hz | the device's processed `0x500` stream |
+| Per-eye gaze origin, eye position, gaze data | 33 Hz | the same stream |
 | User presence | on change | the `0x504` stream |
 | Head pose, 6 DOF | 33 Hz | face landmarks on the device's own IR frames |
+| IR camera image, 280×280 | 33 Hz | the `0x50e` stream |
+| Device info, track box, display area, notifications | on request / change | the device's own answers |
+| Calibration | on demand | `tobii-calibrate`, saved per user |
+
+Everything the Stream Engine reports is reproduced bit for bit: replaying a
+captured Windows session through the decoder gives exactly the gaze points
+and gaze origins the Stream Engine delivered for it (5 284 of 5 284 frames,
+error 0; `tobii5-init-replay compare-dll`).
 
 The head pose is **gaze-independent**: turning your eyes does not move it.
 
@@ -42,8 +51,9 @@ themselves; the tooling for it is in `tobii-tools`.
 
 ```bash
 cargo build --release --workspace     # or: make build
-make install                          # binaries + libtobii.so + udev rules + user units
+make install                          # binaries + libtobii.so + headers + udev rules + user units
 make enable                           # start the daemon now
+tobii-calibrate                       # calibrate for your eyes (once)
 ```
 
 Then either link against `libtobii.so`, or run a client:
@@ -63,37 +73,57 @@ binaries need no runtime data files.
 ## Architecture
 
 ```
-libtobii.so ──┐
-tobii-opentrack ──┼── unix socket ──► tobiid ──USB──► Tobii ET5
-tobii-gaze-keys ──┘                      │
-                                  EP 0x83: gaze 0x500 + IR image 0x50e
+libtobii.so ─────┐
+tobii-opentrack ─┤
+tobii-gaze-keys ─┼── unix socket ──► tobiid ──USB──► Tobii ET5
+tobii-calibrate ─┘                      │
+                              EP 0x83: gaze 0x500, presence 0x504, IR image 0x50e
 ```
 
 `tobiid` is the only process that claims the device; everyone else is a client,
-so several consumers can read gaze and head pose at once. `libtobii.so` presents
-the 13 entry points of Tobii's Stream Engine C ABI (`tobii_api_create`,
-`tobii_head_pose_subscribe`, …) backed by that daemon.
+so several consumers can read gaze and head pose at once.
+
+`libtobii.so` exports **all 153 entry points** of Tobii's
+`tobii_stream_engine.dll` 4.1.0.3, with its signatures, error numbering and
+struct layouts, plus a `tobii_recenter` extension — so any Stream Engine client
+links and runs. The ABI was recovered from the DLL itself (`tools/abi/`) and
+the archived 4.1.0 reference. What stands behind the entry points:
+
+| | Entry points |
+|---|---|
+| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, IR image and notification streams; device info, track box, display area (get/set), mounting, states; 2-D calibration |
+| Answered locally | API version, system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing |
+| `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power and pause, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration |
+
+The headers are in `crates/tobii-ffi/include/tobii/` (installed to
+`/usr/local/include/tobii/`); OpenTrack's `tracker-tobii` plugin builds against
+them unchanged (INSTALL.md §8).
 
 ### Workspace
 
-Nine crates, split so the driver never compiles the research tooling and
-`libtobii.so` links neither ONNX Runtime nor the embedded assets (it is 0.4 MB
+Eleven crates, split so the driver never compiles the research tooling and
+`libtobii.so` links neither ONNX Runtime nor the embedded assets (it is 0.45 MB
 rather than 20 MB).
 
 | Crate | Holds | Heavy deps |
 |---|---|---|
-| `tobii-proto` | wire formats: framing, the gaze stream, the IR frames, the capture log | none |
+| `tobii-proto` | wire formats: framing, TLV, commands, the gaze/presence/image streams, device facts, the capture log | none |
 | `tobii-pose` | face landmarks and the head-pose fit; owns the model | `ort` |
 | `tobii-usb` | USB transport and the live `0x83` engine; owns the init capture | `rusb` |
-| `tobii-ipc` | the daemon protocol | none (std only) |
+| `tobii-ipc` | the daemon protocol and the display geometry | none (std only) |
+| `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
 | `tobii-log` | shared `tracing` setup | — |
 | `tobiid` | the daemon | — |
 | `tobii-ffi` | `libtobii.so` (cdylib) | — |
 | `tobii-clients` | `tobii-opentrack`, `tobii-gaze-keys` | — |
+| `tobii-calibrate` | the calibration window | `winit`, `softbuffer` |
 | `tobii-tools` | `tobii5-init-replay`: log analysis, UVC camera, diagnostics | all of the above |
 
 `make check` runs fmt, clippy with `-D warnings`, the tests and rustdoc.
-`make verify-abi` asserts `libtobii.so` still exports its 13 symbols.
+`make verify-abi` asserts `libtobii.so` exports exactly the 154 symbols in
+`crates/tobii-ffi/abi-symbols.txt`, then compiles and runs
+`crates/tobii-ffi/abi-smoke.c` against the headers: it takes the address of
+every symbol through them and checks versions, rejections and struct layouts.
 
 ## Research tooling
 
@@ -107,6 +137,9 @@ target/release/tobii5-init-replay probe                      # 0x83 vs UVC concu
 target/release/tobii5-init-replay image83-replay log.bin --csv out.csv
 target/release/tobii5-init-replay analyze-log log.bin        # blind field scan
 target/release/tobii5-init-replay head-axes yaw:a.bin roll:b.bin
+target/release/tobii5-init-replay compare-dll session.bin session.jsonl  # decoder vs the DLL
+target/release/tobii5-init-replay ipc-probe --secs 5         # ask the running daemon everything
+tools/abi/dll_abi.py headers                                 # headers vs tobii_stream_engine.dll
 ```
 
 ## Extras
@@ -114,7 +147,8 @@ target/release/tobii5-init-replay head-axes yaw:a.bin roll:b.bin
 - **[paperwm-gaze/](paperwm-gaze/)** — a GNOME Shell extension that lets you
   pick a window on the PaperWM Alt+Tab minimap by looking at it.
 - **[tools/splice_calibration.py](tools/splice_calibration.py)** — injects a
-  calibration blob into a captured init sequence.
+  calibration blob into a captured init sequence (superseded by
+  `tobii-calibrate`, kept for research).
 
 ## Limitations
 
@@ -124,8 +158,14 @@ target/release/tobii5-init-replay head-axes yaw:a.bin roll:b.bin
   firmware. Nothing in the driver uses UVC any more, but keep the shipped
   `99-tobii-no-uvcvideo.rules` in place so nothing else grabs it.
 - Head pose needs a face in frame; it reports nothing when you look away.
-- The calibration embedded in `init_packets_ep.txt` is the author's. Recapture
-  your own init sequence for best accuracy.
+- Until you run `tobii-calibrate`, the calibration in use is the one embedded
+  in `init_packets_ep.txt` — the author's. Likewise the display area is the
+  author's 27" monitor until you set yours (`TOBII_DISPLAY_MM`, or
+  `tobii_set_display_area`).
+- The calibration sequence mirrors the one captured from Windows; 3-D and
+  per-eye calibration were never captured and are not supported.
+- The ET5 reports no pupil diameter; `tobii_gaze_data_t.pupil_validity` is
+  always invalid.
 
 ## License
 
