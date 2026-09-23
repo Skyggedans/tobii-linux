@@ -234,7 +234,7 @@ tracker runs in the daemon, not in the client):
 | `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
 | `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s (an `info` event with `frames_per_s`/`poses_per_s`/`mean_ms` fields) |
 | `RUST_LOG` | `info` | log filter for all binaries (`debug`, `tobii=debug,ort=warn`, …); see §6 |
-| `TOBII_DISPLAY_MM` | unset | your monitor as `<width>x<height>[+<offset_x>]` in mm, e.g. `597x336`: once the tracker reports its mounting, the daemon computes the display area (the Stream Engine's `tobii_calculate_display_area_basic`) and writes it, replacing the capture author's monitor that the init replay configures. Gaze coordinates are relative to this area. `offset_x` is how far right of the tracker the screen centre is. |
+| `TOBII_DISPLAY_MM` | unset | your monitor as `<width>x<height>[+<offset_x>]` in mm, e.g. `597x336`: once the tracker reports its mounting, the daemon computes the display area (the Stream Engine's `tobii_calculate_display_area_basic`) and writes it, replacing the capture author's monitor that the init replay configures. Gaze coordinates are relative to this area. `offset_x` is how far right of the tracker the screen centre is. Usually unneeded: `tobii-calibrate` sets the display area and the daemon keeps it (§8a); a saved display area wins over this variable, which only fills in while nothing is saved (delete `~/.config/tobii/display-area` to use it). |
 | `TOBII_CALIBRATION` | unset | where the calibration is kept (default `$XDG_CONFIG_HOME/tobii/calibration.bin`), or `embedded` to use the built-in one (§8a) |
 | `TOBII_CAMERA_TILT_DEG` | `20` | upward tilt of the tracker camera; head angles are reported in the upright frame (yaw about the true vertical), so a turn does not leak into roll |
 
@@ -285,7 +285,8 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   device), presence (on change), head pose (mm, radians about x/y/z), the IR
   image (280×280, `tobii_image_subscribe`), notifications (display area,
   calibration), device info, track box, display area (get and set — kept
-  across re-inits), mounting, states, capabilities, and 2-D calibration.
+  across re-inits and, like the Stream Engine, across sessions), mounting,
+  states, capabilities, and 2-D calibration.
   Timestamps are the device clock. Everything the ET5 was never observed doing
   (wearable, face id, illumination, power, firmware, diagnostics, 3-D and
   per-eye calibration) returns `TOBII_ERROR_NOT_SUPPORTED`.
@@ -334,15 +335,34 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
 ### 8a. Calibration
 
 The tracker needs calibrating once per user. Until then it runs on the
-calibration embedded in the init capture, which is the author's.
+calibration embedded in the init capture, which is the author's, and on the
+author's monitor.
 
 ```bash
 tobii-calibrate --list-monitors         # which monitor is the tracker on?
-tobii-calibrate --monitor 0             # 14 points, ~40 s; Esc cancels
+tobii-calibrate --monitor 0             # display setup, then 14 points; Esc cancels
 ```
 
-A dot travels through the 7-point pattern twice; look at its centre until the
-ring closes and the spinner finishes. The daemon has the tracker compute the
+First the display setup: two white ticks at the bottom edge of the screen,
+to be lined up with the two white marks on the tracker's front (drag them,
+or Left/Right to move them, Shift for bigger steps; Enter when they line
+up). The monitor's size comes from its EDID, so the ticks keep the marks'
+distance apart and only tell where the tracker sits under the screen; for a
+monitor without a believable EDID (some TVs and projectors) Up/Down spread
+them too, and their spacing measures the screen. The ticks start where the
+current setting puts them, so usually Enter is all it takes. A calibration
+only holds for the display area it is made on, so the setup runs inside the
+calibration session, before the points: the daemon writes the display area
+to the tracker at once, and saves it (in `~/.config/tobii/display-area`, for
+every later start) together with the first calibration computed on it. If
+the session ends without a calibration (Esc, a failure, the client dying),
+the tracker gets the previous display area back along with the previous
+calibration. Outside a calibration session, a display area set through
+`tobii_set_display_area` is saved at once. `--no-display-setup`
+skips the setup, and so does `--windowed` (it needs the whole monitor).
+
+Then a dot travels through the 7-point pattern twice; look at its centre
+until the ring closes and the spinner finishes. The daemon has the tracker compute the
 calibration, saves it to `~/.config/tobii/calibration.bin` (the previous one
 is kept as `calibration.bin.prev`), and uploads it at every later start. The
 result screen shows the targets and your live gaze to check it.
@@ -359,8 +379,14 @@ result screen shows the targets and your live gaze to check it.
 - Stream Engine applications can calibrate too, through `tobii_calibration_*`
   in `libtobii.so`; the result is saved the same way.
 
-Set your monitor's size too (`TOBII_DISPLAY_MM`, §7), or gaze coordinates are
-relative to the capture author's 27" screen.
+If the compositor opens the window on another monitor, or not fullscreen
+(PaperWM puts new windows on the monitor in use), `tobii-calibrate` asks for
+the right one again; if the window stays off it, it says so on screen and
+will not take the display setup until the window is fullscreen on the right
+monitor (with PaperWM, Super+Shift+Ctrl+Left/Right moves it). Esc stops the
+session; when it stopped before anything was computed, the previous
+calibration and display area stay, and the message on exit says which
+calibration is in use.
 
 ### Recenter (recalibrate the head rest pose)
 

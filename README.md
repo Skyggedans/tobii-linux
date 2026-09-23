@@ -160,8 +160,9 @@ tools/abi/dll_abi.py headers                                 # headers vs tobii_
 - Head pose needs a face in frame; it reports nothing when you look away.
 - Until you run `tobii-calibrate`, the calibration in use is the one embedded
   in `init_packets_ep.txt` — the author's. Likewise the display area is the
-  author's 27" monitor until you set yours (`TOBII_DISPLAY_MM`, or
-  `tobii_set_display_area`).
+  author's 27" monitor until you set yours: `tobii-calibrate` does it first
+  (you line two ticks up with the marks on the tracker), and the daemon keeps
+  whatever display area is set (`~/.config/tobii/display-area`).
 - The calibration sequence mirrors the one captured from Windows; 3-D and
   per-eye calibration were never captured and are not supported.
 - The ET5 reports no pupil diameter; `tobii_gaze_data_t.pupil_validity` is
