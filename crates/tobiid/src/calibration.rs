@@ -162,17 +162,25 @@ fn current_blob(location: &Location) -> Result<Vec<u8>, u8> {
     })
 }
 
-/// Save a blob the device produced or a client supplied; failing to save is
-/// reported but does not fail the request (the device has it either way).
-fn save(location: &Location, blob: &[u8]) {
+/// Save a blob the device produced or a client supplied. Whether it went to
+/// disk: `false` when it could not be written or nothing is saved
+/// (`TOBII_CALIBRATION=embedded`).
+fn save(location: &Location, blob: &[u8]) -> bool {
     match location {
         Location::File(path) => match store::save(path, blob) {
             Ok(info) => {
                 info!(path = %path.display(), id = info.id, points = info.points, "calibration saved");
+                true
             }
-            Err(e) => warn!(path = %path.display(), error = %e, "calibration not saved"),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "calibration not saved");
+                false
+            }
         },
-        Location::Embedded => info!("calibration not saved (TOBII_CALIBRATION=embedded)"),
+        Location::Embedded => {
+            info!("calibration not saved (TOBII_CALIBRATION=embedded)");
+            false
+        }
     }
 }
 
@@ -208,7 +216,13 @@ fn prepare(state: &Mutex<State>, client: u64, access: &Access) -> Result<Prepare
     let session = st.calibration.session.clone();
     match (access, &session) {
         (Access::Owner, Some(s)) if s.owner == client => {}
-        (Access::Owner, _) => return Err(status::CALIBRATION_NOT_STARTED),
+        (Access::Owner, _) => {
+            // A client whose session died with the engine now knows it.
+            if st.calibration.orphaned == Some(client) {
+                st.calibration.orphaned = None;
+            }
+            return Err(status::CALIBRATION_NOT_STARTED);
+        }
         (Access::NotBusy, Some(s)) if s.owner != client => return Err(status::CALIBRATION_BUSY),
         _ => {}
     }
@@ -286,7 +300,9 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
             display_before: None,
             unsaved_display: None,
         });
-        st.calibration.orphaned = None;
+        if st.calibration.orphaned == Some(client) {
+            st.calibration.orphaned = None;
+        }
         device
     };
     let seeded = run(device.as_ref(), cmd::START, Vec::new(), QUICK)
@@ -354,6 +370,14 @@ fn apply(state: &Mutex<State>, client: u64, payload: &[u8]) -> Result<Vec<u8>, u
     if let Some(id) = tobii_calib::blob::calibration_id(&blob) {
         st.calibration.id = Some(id);
     }
+    // Applied inside the caller's own session: that is now what the
+    // session goes back to, and what it computed before is superseded.
+    if let Some(s) = st.calibration.session.as_mut()
+        && s.owner == client
+    {
+        s.previous = blob;
+        s.computed = None;
+    }
     Ok(Vec::new())
 }
 
@@ -366,24 +390,38 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
         return Err(status::CALIBRATION_NOT_STARTED);
     }
     let (device, session, location) = prepare(state, client, &Access::Owner)?;
-    let stopped = run(device.as_ref(), cmd::STOP, Vec::new(), QUICK);
     let Some(session) = session else {
         return Err(status::CALIBRATION_NOT_STARTED);
     };
-    let commit = session.computed.clone().filter(|_| keep);
-    let active = commit.as_ref().unwrap_or(&session.previous);
-    if let Err(code) = run(device.as_ref(), cmd::WRITE, write_payload(active), SLOW) {
+    // What 1020 leaves the device running was never established; the write
+    // that follows decides, so a refused 1020 alone does not fail the stop.
+    if let Err(code) = run(device.as_ref(), cmd::STOP, Vec::new(), QUICK) {
         warn!(
             status = code,
-            "could not write the calibration back after stopping"
+            "the device did not take the calibration stop"
         );
     }
+    let commit = session.computed.clone().filter(|_| keep);
+    let active = commit.as_ref().unwrap_or(&session.previous);
+    let written = run(device.as_ref(), cmd::WRITE, write_payload(active), SLOW);
+    if let Err(code) = written {
+        warn!(
+            status = code,
+            "could not write the calibration after stopping; the device takes the saved one at its next start"
+        );
+    }
+    let mut outcome = written.map(|_| Vec::new());
     match &commit {
         Some(blob) => {
-            save(&location, blob);
-            let file = lock_state(state).display_file.clone();
-            if let (Some(area), Some(path)) = (session.unsaved_display, file) {
-                crate::requests::save_display_area(&path, &area);
+            // The display area only goes to disk with the calibration made
+            // on it.
+            if save(&location, blob) {
+                let file = lock_state(state).display_file.clone();
+                if let (Some(area), Some(path)) = (session.unsaved_display, file) {
+                    crate::requests::save_display_area(&path, &area);
+                }
+            } else if matches!(location, Location::File(_)) {
+                outcome = Err(status::OPERATION_FAILED);
             }
         }
         None => {
@@ -393,13 +431,16 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
         }
     }
     let mut st = lock_state(state);
-    if let Some(id) = tobii_calib::blob::calibration_id(active) {
-        st.calibration.id = Some(id);
-    }
+    // Unknown when the write failed.
+    st.calibration.id = if outcome.is_ok() {
+        tobii_calib::blob::calibration_id(active)
+    } else {
+        None
+    };
     st.calibration.session = None;
     broadcast_state(&mut st, false);
     info!(client, kept = commit.is_some(), "calibration stopped");
-    stopped.map(|_| Vec::new())
+    outcome
 }
 
 /// A client disconnected: a session it owned is discarded (it never said to
@@ -451,6 +492,8 @@ mod tests {
     struct FakeDevice {
         blob: Vec<u8>,
         log: Mutex<Vec<u32>>,
+        /// A command the device refuses.
+        refuse: Mutex<Option<u32>>,
     }
 
     impl DeviceCommands for FakeDevice {
@@ -461,6 +504,12 @@ mod tests {
             _timeout: Duration,
         ) -> Result<CommandResponse, CommandError> {
             self.log.lock().expect("log").push(cmd);
+            if *self.refuse.lock().expect("refuse") == Some(cmd) {
+                return Ok(CommandResponse {
+                    status: 2,
+                    payload: Vec::new(),
+                });
+            }
             let payload = if cmd == cmd::READ {
                 write_payload(&self.blob)
             } else {
@@ -490,6 +539,7 @@ mod tests {
         let device = Arc::new(FakeDevice {
             blob,
             log: Mutex::new(Vec::new()),
+            refuse: Mutex::new(None),
         });
         let mut st = crate::daemon::tests::state_with_client(1);
         st.clients
@@ -800,7 +850,7 @@ mod tests {
 
     #[test]
     fn a_client_going_away_discards_its_session() {
-        let (s, file, old) = display_setup("gone");
+        let (s, file, old) = display_setup("gone-discard");
         assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
         assert_eq!(
             ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
@@ -845,5 +895,109 @@ mod tests {
             ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
             Reply::ok(Vec::new())
         );
+    }
+
+    #[test]
+    fn an_apply_inside_the_session_is_what_it_goes_back_to() {
+        let s = setup("apply-in-session");
+        let path = s.dir.join("calibration.bin");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        let applied = s.device.blob.clone();
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_APPLY, &applied).status,
+            status::OK
+        );
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_DISCARD),
+            Reply::ok(Vec::new())
+        );
+
+        // Device and disk agree on the applied calibration.
+        assert_eq!(lock_state(&s.state).calibration.id, Some(0x1234_5678));
+        let (saved, _) = store::load(&path).expect("load").expect("saved");
+        assert_eq!(saved, applied);
+    }
+
+    #[test]
+    fn a_refused_stop_command_alone_does_not_fail_a_kept_session() {
+        let s = setup("stop-refused");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+        *s.device.refuse.lock().expect("refuse") = Some(cmd::STOP);
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::ok(Vec::new())
+        );
+        assert!(s.dir.join("calibration.bin").exists());
+    }
+
+    #[test]
+    fn a_failed_write_at_stop_is_reported_and_the_id_unknown() {
+        let s = setup("write-refused");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        *s.device.refuse.lock().expect("refuse") = Some(cmd::WRITE);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_DISCARD).status,
+            status::OPERATION_FAILED
+        );
+        assert_eq!(lock_state(&s.state).calibration.id, None);
+    }
+
+    #[test]
+    fn the_display_area_is_saved_only_with_its_calibration() {
+        let (s, file, _) = display_setup("unsavable");
+        // The calibration cannot be written: its path is a directory.
+        std::fs::create_dir_all(s.dir.join("calibration.bin")).expect("dir");
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP).status,
+            status::OPERATION_FAILED
+        );
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn the_orphan_mark_lasts_until_its_client_is_told() {
+        let (s, _, _) = display_setup("orphan-told");
+        on_engine_lost(&mut lock_state(&s.state));
+        // Another client's session does not lift it.
+        assert_eq!(
+            ask(&s, 2, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        assert_eq!(
+            ask(&s, 2, kind::CALIBRATION_STOP, STOP_DISCARD),
+            Reply::ok(Vec::new())
+        );
+        assert_eq!(
+            set_area(&s, 1, &area(597.0)).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+        // Its own request answered "not started" does.
+        let point = tobii_ipc::request::encode_point_2d(0.5, 0.5);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &point).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
     }
 }

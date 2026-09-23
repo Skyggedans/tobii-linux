@@ -105,7 +105,8 @@ pub unsafe extern "C" fn tobii_calibration_clear(device: *mut Device) -> Status 
 }
 
 /// Compute a calibration from the collected points and make it active. The
-/// daemon saves it as the user's calibration, used from then on.
+/// daemon saves the last one computed when the session is stopped with
+/// `tobii_calibration_stop`, as the user's calibration from then on.
 ///
 /// # Safety
 /// As `tobii_calibration_start`.
