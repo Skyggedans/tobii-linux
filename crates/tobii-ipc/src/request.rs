@@ -28,6 +28,11 @@ pub mod kind {
     /// The tracker's stream catalogue: reply is a list of
     /// [`super::StreamType`] (see [`super::encode_stream_types`]).
     pub const STREAM_TYPES: u8 = 8;
+    /// Pause (payload `u8 1`) or resume (`u8 0`) the device; reply is empty.
+    /// One state for every client: the last request wins, any client may
+    /// resume, and the device resumes when the client that paused it goes
+    /// away or the device is re-initialised.
+    pub const DEVICE_PAUSE: u8 = 0x0a;
     /// The device's name: reply is its bytes, at most
     /// [`super::DEVICE_NAME_MAX`] and no NUL. The name a client set, else
     /// the model.
@@ -71,6 +76,8 @@ pub const DEVICE_NAME_MAX: usize = 63;
 
 /// `tobii_state_t` ids understood by [`kind::STATE`].
 pub mod state {
+    /// Reply `u8`: whether the device is paused.
+    pub const DEVICE_PAUSED: u32 = 2;
     /// Reply `u32`: the active calibration id.
     pub const CALIBRATION_ID: u32 = 6;
     /// Reply `u8`: whether a calibration session is running.

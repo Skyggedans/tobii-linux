@@ -25,7 +25,9 @@
 //! last 14).
 //!
 //! A session belongs to the client that started it: others get
-//! `CALIBRATION_BUSY`. The owner may set the display area during the session
+//! `CALIBRATION_BUSY`. None starts while the device is paused or a pause is
+//! on its way (`NOT_AVAILABLE`), and a pause waits for no session (see
+//! [`crate::pause`]). The owner may set the display area during the session
 //! (a calibration only holds for the display area it is made on): it goes to
 //! the device at once and is saved with the calibration when the session
 //! commits; otherwise the previous area goes back too.
@@ -304,6 +306,10 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
             Some(s) if s.owner == client => return Reply::err(status::CALIBRATION_ALREADY_STARTED),
             Some(_) => return Reply::err(status::CALIBRATION_BUSY),
             None => {}
+        }
+        // A paused device sends no gaze to calibrate with.
+        if st.paused || st.pausing {
+            return Reply::err(status::NOT_AVAILABLE);
         }
         let Some(device) = st.device_for(client) else {
             return Reply::err(status::CONNECTION_FAILED);

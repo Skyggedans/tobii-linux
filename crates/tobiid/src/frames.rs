@@ -132,6 +132,8 @@ pub(crate) fn notification_of(n: &DeviceNotification) -> Option<Notification> {
             kind: notification::CALIBRATION_ID_CHANGED,
             value: NotificationValue::Uint(*id),
         }),
+        // The daemon reports the pause itself (see `pause`).
+        DeviceNotification::DevicePausedChanged(_) => None,
         _ => None,
     }
 }

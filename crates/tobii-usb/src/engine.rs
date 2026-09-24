@@ -16,9 +16,9 @@
 //! bandwidth — verified with `probe`). The UVC path survives only in the
 //! standalone research subcommands (`camera`, `track`, `probe`).
 //!
-//! The `stop` / `recenter` / `head_wanted` / `image_wanted` flags are pure
-//! signals (no data is published alongside them), so every access uses
-//! `Ordering::Relaxed`.
+//! The `stop` / `recenter` / `head_wanted` / `image_wanted` / `paused` flags
+//! are pure signals (no data is published alongside them), so every access
+//! uses `Ordering::Relaxed`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -210,6 +210,8 @@ pub(crate) struct Shared {
     pub(crate) recenter: AtomicBool,
     pub(crate) head_wanted: AtomicBool,
     pub(crate) image_wanted: AtomicBool,
+    /// The device was told to pause: its streams are expected to stop.
+    pub(crate) paused: AtomicBool,
     /// Display area to write in place of the one in the init replay.
     pub(crate) display_override: Mutex<Option<DisplayArea>>,
 }
@@ -292,6 +294,17 @@ impl Engine {
     pub fn set_image_wanted(&self, wanted: bool) {
         // Relaxed: a pure signal, no data is published with it.
         self.shared.image_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    /// Tell the engine whether the device is paused. A paused device sends no
+    /// gaze, so the engine does not take the silence for a dead stream; after
+    /// a resume it gives the stream a longer grace to come back. The owner
+    /// sets this before it sends the pause and clears it once the device is
+    /// resumed (or given up on: a device still paused is then re-opened,
+    /// which resumes it).
+    pub fn set_paused(&self, paused: bool) {
+        // Relaxed: a pure signal, no data is published with it.
+        self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
     /// Keep `area` as the display area across device re-inits (the init

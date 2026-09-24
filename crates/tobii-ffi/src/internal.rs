@@ -2,14 +2,16 @@
 //! does not cover (all but `tobii_calibration_stimulus_points_get`, which
 //! lives with calibration). Their argument counts come from the DLL (see
 //! `tools/abi`); their types are best-effort, which is safe because only the
-//! field-of-use, image, internal-stream, timesync and stream-type functions
-//! below read their arguments.
+//! field-of-use, image, internal-stream, timesync, stream-type and pause
+//! functions below read their arguments.
 
 use std::ffi::c_void;
+use std::time::Duration;
 
 use tobii_ipc::request::{self, decode_stream_types, decode_timesync, kind};
 
 use crate::api::{FACTS_TIMEOUT, write_supported};
+use crate::calibration::request;
 use crate::device::{Device, device_mut};
 use crate::status::{
     Status, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
@@ -137,7 +139,8 @@ pub unsafe extern "C" fn tobii_internal_stream_supported(
 /// The DLL instead times a round trip to its service, and its own offset
 /// estimator skips pairs wider than 6 ms, though it still returns them. The
 /// host clock is `tobii_system_clock`'s, `CLOCK_REALTIME` rather than the
-/// DLL's monotonic QPC. Nothing is written unless the call succeeds.
+/// DLL's monotonic QPC. Nothing is written unless the call succeeds;
+/// `TOBII_ERROR_NOT_AVAILABLE` while the tracker is paused.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `timesync` must be null or
@@ -262,6 +265,41 @@ pub unsafe extern "C" fn tobii_enumerate_stream_types(
     TOBII_ERROR_NO_ERROR
 }
 
+/// The daemon may wait 20 s for another pause or resume to finish, then
+/// 6 s for the device's answer, plus the 30 s a command may wait queued.
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pause the tracker: it stops sending data until resumed.
+///
+/// The pause is one state for the tracker, shared by every client, as in the
+/// DLL: the last call wins and any client may resume. Unlike the DLL, a
+/// pause the tracker accepts shows at once in `TOBII_STATE_DEVICE_PAUSED`
+/// and a `TOBII_NOTIFICATION_TYPE_DEVICE_PAUSED_STATE_CHANGED`
+/// notification. A pause ends when the client that paused last disconnects
+/// and whenever the tracker re-initialises. `TOBII_ERROR_CALIBRATION_BUSY`
+/// while a calibration session runs.
+///
+/// # Safety
+/// `device` must be null or a live handle that no other thread uses during
+/// the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_pause_device(device: *mut Device) -> Status {
+    // SAFETY: forwarded under the same contract.
+    unsafe { request(device, kind::DEVICE_PAUSE, &[1], PAUSE_TIMEOUT) }
+}
+
+/// Resume the tracker, whichever client paused it. A resume the tracker does
+/// not answer still succeeds: the daemon re-opens a tracker that stays
+/// silent, which resumes it.
+///
+/// # Safety
+/// As `tobii_pause_device`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_resume_device(device: *mut Device) -> Status {
+    // SAFETY: forwarded under the same contract.
+    unsafe { request(device, kind::DEVICE_PAUSE, &[0], PAUSE_TIMEOUT) }
+}
+
 type P = *mut c_void;
 type C = *const c_void;
 
@@ -313,12 +351,10 @@ not_supported! {
     fn tobii_multiple_faces_position_subscribe(device: P, callback: C, user_data: P);
     fn tobii_multiple_faces_position_unsubscribe(device: P);
     fn tobii_open_realm(device: P, realm: u32, key: C, key_size: u32);
-    fn tobii_pause_device(device: P);
     fn tobii_power_save_activate(device: P);
     fn tobii_power_save_deactivate(device: P);
     fn tobii_remote_wake_activate(device: P);
     fn tobii_remote_wake_deactivate(device: P);
-    fn tobii_resume_device(device: P);
     fn tobii_secondary_camera_image_subscribe(device: P, callback: C, user_data: P);
     fn tobii_secondary_camera_image_unsubscribe(device: P);
     fn tobii_send_custom_command(device: P, command: u32, data: C, size: usize, receiver: C, user_data: P);
@@ -569,6 +605,62 @@ mod tests {
             assert_eq!(
                 tobii_enumerate_stream_types(ptr::null_mut(), Some(collect_type), ptr::null_mut()),
                 TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+    }
+
+    #[test]
+    fn pause_and_resume_ask_the_daemon() {
+        use std::sync::{Arc, Mutex};
+        use tobii_ipc::encode_reply;
+        use tobii_ipc::request::decode_request;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let connect = crate::device::tests::fake_daemon(move |body| {
+            let req = decode_request(body).expect("request");
+            log.lock()
+                .expect("log")
+                .push((req.kind, req.payload.to_vec()));
+            vec![encode_reply(req.id, 0, &[])]
+        });
+        let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        // SAFETY: `d` is live and destroyed once; a null device is allowed.
+        unsafe {
+            assert_eq!(tobii_pause_device(d), TOBII_ERROR_NO_ERROR);
+            assert_eq!(tobii_resume_device(d), TOBII_ERROR_NO_ERROR);
+            assert_eq!(tobii_device_destroy(d), 0);
+            assert_eq!(
+                tobii_pause_device(ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_resume_device(ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+        }
+        assert_eq!(
+            *seen.lock().expect("log"),
+            vec![(kind::DEVICE_PAUSE, vec![1]), (kind::DEVICE_PAUSE, vec![0])]
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_carry_the_daemon_status() {
+        // The daemon says a calibration session runs.
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(
+            status::CALIBRATION_BUSY,
+            vec![],
+        )));
+        // SAFETY: `d` is live and destroyed once.
+        unsafe {
+            assert_eq!(
+                tobii_pause_device(d),
+                crate::status::TOBII_ERROR_CALIBRATION_BUSY
+            );
+            assert_eq!(
+                tobii_resume_device(d),
+                crate::status::TOBII_ERROR_CALIBRATION_BUSY
             );
             assert_eq!(tobii_device_destroy(d), 0);
         }

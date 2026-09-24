@@ -3,10 +3,10 @@
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
  * argument types are best guesses. Only the field-of-use, image,
- * internal-stream, timesync and stream-type functions are implemented; every
- * other entry point here returns TOBII_ERROR_NOT_SUPPORTED without reading its
- * arguments, so the guessed types cannot matter at runtime. Companion to
- * tobii/tobii.h.
+ * internal-stream, timesync, stream-type and pause functions are implemented;
+ * every other entry point here returns TOBII_ERROR_NOT_SUPPORTED without
+ * reading its arguments, so the guessed types cannot matter at runtime.
+ * Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -66,8 +66,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device
  * started if needed), and the bracket is a fixed 30 ms before the daemon
  * read it. The DLL times a round trip instead; its own offset estimator
  * skips pairs wider than 6 ms, though it still returns them with
- * TOBII_ERROR_NO_ERROR. Nothing is written unless the call succeeds. Layout
- * from the DLL (24 bytes); the field names follow the older public headers. */
+ * TOBII_ERROR_NO_ERROR. Nothing is written unless the call succeeds;
+ * TOBII_ERROR_NOT_AVAILABLE while the tracker is paused. Layout from the DLL
+ * (24 bytes); the field names follow the older public headers. */
 typedef struct tobii_timesync_data_t
 {
     int64_t system_start_us;
@@ -109,6 +110,20 @@ typedef void ( *tobii_stream_type_receiver_t )( tobii_stream_type_t const* strea
  * entry is valid during its call only. */
 TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_stream_types( tobii_device_t* device,
     tobii_stream_type_receiver_t receiver, void* user_data );
+
+/* Pause the tracker (it sends no data until resumed), or resume it. The pause
+ * is one state for the tracker, shared by every client as in the DLL: the
+ * last call wins and any client may resume. Unlike the DLL, a pause or resume
+ * the tracker accepts shows at once in TOBII_STATE_DEVICE_PAUSED and a
+ * TOBII_NOTIFICATION_TYPE_DEVICE_PAUSED_STATE_CHANGED notification. A pause
+ * ends when the client that paused last disconnects and whenever the tracker
+ * re-initialises. Pausing during a calibration session is
+ * TOBII_ERROR_CALIBRATION_BUSY, and no session starts while paused
+ * (TOBII_ERROR_NOT_AVAILABLE). A resume the tracker does not answer still
+ * succeeds: the daemon re-opens a tracker that stays silent, which resumes
+ * it. */
+TOBII_API tobii_error_t TOBII_CALL tobii_pause_device( tobii_device_t* device );
+TOBII_API tobii_error_t TOBII_CALL tobii_resume_device( tobii_device_t* device );
 
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED. Its point type is
  * unknown. */
@@ -164,12 +179,10 @@ TOBII_API tobii_error_t TOBII_CALL tobii_low_frequency_head_rotation_unsubscribe
 TOBII_API tobii_error_t TOBII_CALL tobii_multiple_faces_position_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_multiple_faces_position_unsubscribe( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_open_realm( tobii_device_t* device, uint32_t realm, void const* key, uint32_t key_size );
-TOBII_API tobii_error_t TOBII_CALL tobii_pause_device( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_power_save_activate( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_power_save_deactivate( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_remote_wake_activate( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_remote_wake_deactivate( tobii_device_t* device );
-TOBII_API tobii_error_t TOBII_CALL tobii_resume_device( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_secondary_camera_image_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_secondary_camera_image_unsubscribe( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_send_custom_command( tobii_device_t* device, uint32_t command, void const* data, size_t size, void const* receiver, void* user_data );

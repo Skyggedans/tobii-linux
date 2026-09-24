@@ -1,7 +1,7 @@
 //! Client requests: what the device reported about itself (identity,
 //! geometry, stream catalogue), its display area, states and clock.
 //! Calibration requests are handed to [`crate::calibration`], the device
-//! name to [`crate::name`].
+//! name to [`crate::name`], pause and resume to [`crate::pause`].
 //!
 //! Identity and geometry come from the facts collected during the engine's
 //! init, so answering them costs no USB traffic; a request made while the
@@ -102,12 +102,14 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
                 let active = lock_state(state).calibration.is_active();
                 Reply::ok(vec![u8::from(active)])
             }
+            Some(state::DEVICE_PAUSED) => Reply::ok(vec![u8::from(lock_state(state).paused)]),
             Some(_) => Reply::err(status::NOT_SUPPORTED),
             None => Reply::err(status::INVALID_PARAMETER),
         },
         kind::TIMESYNC => timesync(state, client),
         kind::DEVICE_NAME_GET => crate::name::get(state, client),
         kind::DEVICE_NAME_SET => crate::name::set(state, req.payload),
+        kind::DEVICE_PAUSE => crate::pause::handle(state, client, req.payload),
         k if (kind::CALIBRATION_START..=kind::CALIBRATION_CLEAR).contains(&k) => {
             crate::calibration::handle(state, client, k, req.payload)
         }
@@ -151,7 +153,8 @@ pub(crate) fn facts(
 /// Frames are counted rather than compared with the wall clock, which may
 /// step back meanwhile. Starts the engine if needed and, as the facts do,
 /// keeps it up while `client` stays connected. `TIMED_OUT` if no such frame
-/// arrives in time.
+/// arrives in time; `NOT_AVAILABLE` while the device is paused, since it
+/// sends none.
 fn timesync(state: &Mutex<State>, client: u64) -> Reply {
     let started = Instant::now();
     let asked = {
@@ -161,10 +164,13 @@ fn timesync(state: &Mutex<State>, client: u64) -> Reply {
     };
     loop {
         // Copied out, so that no guard is held across the sleep.
-        let (frames, clock) = {
+        let (frames, clock, paused) = {
             let st = lock_state(state);
-            (st.gaze_frames, st.clock)
+            (st.gaze_frames, st.clock, st.paused)
         };
+        if paused {
+            return Reply::err(status::NOT_AVAILABLE);
+        }
         // A stop clears `clock` after the count moved: wait for the next one.
         if frames != asked
             && let Some((device_us, host_us)) = clock
@@ -453,6 +459,9 @@ pub(crate) mod tests {
             Reply::ok(encode_u32(1_904_654_973))
         );
         assert_eq!(ask(state::CALIBRATION_ACTIVE), Reply::ok(vec![0]));
+        assert_eq!(ask(state::DEVICE_PAUSED), Reply::ok(vec![0]));
+        lock_state(&state).paused = true;
+        assert_eq!(ask(state::DEVICE_PAUSED), Reply::ok(vec![1]));
         assert_eq!(ask(3), Reply::err(status::NOT_SUPPORTED));
     }
 

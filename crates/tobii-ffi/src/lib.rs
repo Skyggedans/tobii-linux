@@ -87,7 +87,6 @@ mod tests {
                 crate::calibration::tobii_calibration_stimulus_points_get(n, n),
             ),
             ("open_realm", crate::internal::tobii_open_realm(n, 0, c, 0)),
-            ("pause_device", crate::internal::tobii_pause_device(n)),
             (
                 "send_custom_command",
                 crate::internal::tobii_send_custom_command(n, 0, c, 0, c, n),

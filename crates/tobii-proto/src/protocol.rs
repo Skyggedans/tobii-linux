@@ -490,12 +490,19 @@ pub mod cmd {
     pub const OUTPUT_RATE: u32 = 1650;
     /// Mounting geometry.
     pub const MOUNTING: u32 = 2110;
+    /// Pause (`u32 1`) or resume (`u32 0`) the device: the DLL's
+    /// `tracker_pause_device` and `tracker_resume_device` (0x180199450,
+    /// 0x18019e910). Every init replay resumes; a pause was never captured.
+    pub const DEVICE_PAUSE: u32 = 3100;
 }
 
-/// Notification ids seen in the Windows captures.
+/// Notification ids seen in the Windows captures, unless noted.
 pub mod notify {
     /// The display area changed: three corners.
     pub const DISPLAY_AREA: u32 = 1450;
+    /// The device paused (`u32 1`) or resumed (`u32 0`). From the DLL's
+    /// decoder (0x1801882b4), which rejects anything above 1; never captured.
+    pub const DEVICE_PAUSED: u32 = 3110;
     /// Unknown; `u32 3` once at init, the value command 3170 also returns.
     pub const STATE_3180: u32 = 3180;
     /// A new calibration is active: `u32` calibration id.

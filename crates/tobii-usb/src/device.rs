@@ -779,6 +779,58 @@ fn wait_for_gaze_stream_with(
 /// is torn down and the device re-opened (a stream that never armed, or died).
 const GAZE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest the gaze stream may take to come back after a resume before the
+/// device is re-opened (whose init replay resumes it).
+const RESUME_GRACE: Duration = Duration::from_secs(10);
+
+/// Whether the gaze stream has died and the device must be re-opened: no
+/// frame for [`GAZE_LIVENESS_TIMEOUT`], and, since a resume that no frame has
+/// followed yet (`since_resume`), not for [`RESUME_GRACE`] either. Never while
+/// a command is outstanding (a calibration point takes most of a second) or
+/// while the device is paused, when it sends nothing.
+fn stream_stalled(
+    outstanding: bool,
+    paused: bool,
+    since_gaze: Duration,
+    since_resume: Option<Duration>,
+) -> bool {
+    !outstanding
+        && !paused
+        && since_gaze > GAZE_LIVENESS_TIMEOUT
+        && since_resume.is_none_or(|t| t > RESUME_GRACE)
+}
+
+/// Catches a resume from the engine's pause hint, and keeps it until the
+/// next gaze frame. A new attempt starts unpaused: its init replay resumed
+/// the device.
+#[derive(Debug, Default)]
+struct ResumeWatch {
+    /// The pause hint as last seen.
+    paused: bool,
+    /// When the device was resumed, until the next gaze frame.
+    resumed_at: Option<Instant>,
+}
+
+impl ResumeWatch {
+    /// Note the pause hint as it reads at `now`.
+    fn note_hint(&mut self, paused: bool, now: Instant) {
+        if self.paused && !paused {
+            self.resumed_at = Some(now);
+        }
+        self.paused = paused;
+    }
+
+    /// A gaze frame came: the stream is back.
+    fn on_gaze(&mut self) {
+        self.resumed_at = None;
+    }
+
+    /// How long ago the resume that no frame has followed yet was.
+    fn since_resume(&self, now: Instant) -> Option<Duration> {
+        self.resumed_at.map(|t| now.saturating_duration_since(t))
+    }
+}
+
 /// `TOBII_NO_IMAGE=1` keeps the 0x50e image stream off (gaze only, as before).
 fn is_image_stream_enabled() -> bool {
     !is_env_flag_set("TOBII_NO_IMAGE")
@@ -931,6 +983,7 @@ struct Pump<'a> {
     outstanding: Option<Outstanding>,
     image_live: bool,
     last_gaze: Instant,
+    resume: ResumeWatch,
 }
 
 impl Pump<'_> {
@@ -940,6 +993,7 @@ impl Pump<'_> {
         match incoming {
             Incoming::Gaze(frame) => {
                 self.last_gaze = Instant::now();
+                self.resume.on_gaze();
                 let _ = self.tx.send(Sample::Gaze(Box::new(GazeSample {
                     frame: *frame,
                     host_rx_us: to_i64_us(now_us()),
@@ -1111,6 +1165,7 @@ fn gaze_stream_loop(
         outstanding: None,
         image_live: false,
         last_gaze: Instant::now(),
+        resume: ResumeWatch::default(),
     };
     for msg in &capture.side {
         pump.deliver(classify(msg));
@@ -1173,9 +1228,16 @@ fn pump_streams(
     let mut msgs = Vec::new();
     pump.last_gaze = Instant::now();
     while !pump.shared.stop.load(Ordering::Relaxed) {
-        // A command the device is working on (a calibration point takes most
-        // of a second) must not be mistaken for a dead stream.
-        if pump.outstanding.is_none() && pump.last_gaze.elapsed() > GAZE_LIVENESS_TIMEOUT {
+        // Relaxed: a pure signal.
+        let paused = pump.shared.paused.load(Ordering::Relaxed);
+        let now = Instant::now();
+        pump.resume.note_hint(paused, now);
+        if stream_stalled(
+            pump.outstanding.is_some(),
+            paused,
+            now.saturating_duration_since(pump.last_gaze),
+            pump.resume.since_resume(now),
+        ) {
             warn!(timeout = ?GAZE_LIVENESS_TIMEOUT, "gaze: no gaze frame; re-opening the device");
             anyhow::bail!(StreamStartupTimeout);
         }
@@ -1247,6 +1309,47 @@ mod tests {
             facts.track_box.is_some() && facts.display_area.is_some() && facts.mounting.is_some()
         );
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
+    }
+
+    #[test]
+    fn a_silent_stream_is_dead_unless_busy_paused_or_just_resumed() {
+        let secs = Duration::from_secs;
+        assert!(!stream_stalled(false, false, secs(4), None));
+        assert!(stream_stalled(false, false, secs(6), None));
+        assert!(
+            !stream_stalled(true, false, secs(60), None),
+            "a command outstanding"
+        );
+        assert!(!stream_stalled(false, true, secs(600), None), "paused");
+        assert!(
+            !stream_stalled(false, false, secs(60), Some(secs(9))),
+            "inside the grace after a resume"
+        );
+        assert!(stream_stalled(false, false, secs(60), Some(secs(11))));
+        assert!(
+            !stream_stalled(false, false, secs(4), Some(secs(11))),
+            "a frame came since"
+        );
+    }
+
+    #[test]
+    fn a_resume_is_watched_until_the_next_gaze_frame() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut w = ResumeWatch::default();
+        w.note_hint(false, at(0));
+        assert_eq!(w.since_resume(at(1)), None, "a new attempt is not resuming");
+
+        w.note_hint(true, at(1));
+        w.note_hint(true, at(2));
+        assert_eq!(w.since_resume(at(3)), None, "still paused");
+
+        w.note_hint(false, at(3));
+        w.note_hint(false, at(4));
+        assert_eq!(w.since_resume(at(7)), Some(Duration::from_secs(4)));
+
+        w.on_gaze();
+        assert_eq!(w.since_resume(at(8)), None);
     }
 
     #[test]

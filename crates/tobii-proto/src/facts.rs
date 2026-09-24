@@ -265,6 +265,13 @@ pub fn display_area_set_payload(area: &DisplayArea, display_id: u32) -> Vec<u8> 
         .finish()
 }
 
+/// Payload of command 3100: `u32 1` pauses the device, `u32 0` resumes it
+/// (the DLL's encoder at 0x18017efa0; the init replay sends the resume).
+#[must_use]
+pub fn device_pause_payload(paused: bool) -> Vec<u8> {
+    TlvWriter::new().u32(u32::from(paused)).finish()
+}
+
 /// A decoded 0x4e notification.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -273,6 +280,8 @@ pub enum DeviceNotification {
     DisplayAreaChanged(DisplayArea),
     /// A new calibration is active.
     CalibrationIdChanged(u32),
+    /// The device paused (`true`) or resumed.
+    DevicePausedChanged(bool),
     /// Anything else: its id and first `u32`, if any.
     Other {
         /// Notification id.
@@ -307,6 +316,11 @@ pub fn decode_notification(msg: &Message<'_>) -> Option<DeviceNotification> {
                 id: msg.id,
                 value: None,
             },
+        },
+        // The DLL rejects a value above 1.
+        notify::DEVICE_PAUSED => match first_u32() {
+            Some(v @ (0 | 1)) => DeviceNotification::DevicePausedChanged(v == 1),
+            value => DeviceNotification::Other { id: msg.id, value },
         },
         id => DeviceNotification::Other {
             id,
@@ -495,6 +509,70 @@ mod tests {
             Some(DeviceNotification::Other {
                 id: 3180,
                 value: Some(3)
+            })
+        );
+    }
+    /// The resume every init replay sends: seq 37 of `init_packets_ep.txt`,
+    /// which is `init.pcapng` frame 913.
+    #[test]
+    fn a_resume_is_the_captured_init_command() {
+        let frame_913 = crate::protocol::hex_to_bytes(
+            "000000002300000000000051000000250000000000000c1c000000000000000b0000020000000400000000",
+        )
+        .expect("hex");
+        let packets =
+            crate::protocol::parse_init_packets(crate::INIT_PACKETS).expect("init file parses");
+        assert_eq!(packets[36].data, frame_913);
+
+        let resume = device_pause_payload(false);
+
+        assert_eq!(resume, frame_913[32..]);
+        assert_eq!(
+            chunk_command(cmd::DEVICE_PAUSE, 0x25, &resume),
+            vec![frame_913]
+        );
+        assert_eq!(
+            device_pause_payload(true),
+            [0, 0, 0x02, 0, 0, 0, 4, 0, 0, 0, 1]
+        );
+    }
+
+    /// A 3110 carrying `payload`, laid out as the DLL decodes it (none was
+    /// ever captured).
+    fn paused_notification(payload: &[u8]) -> Vec<u8> {
+        let mut msg = chunk_command(notify::DEVICE_PAUSED, 0, payload).swap_remove(0);
+        msg[..4].copy_from_slice(&[1, 0, 0, 0]);
+        msg[8..12].copy_from_slice(&MARKER_NOTIFICATION.to_be_bytes());
+        msg
+    }
+
+    #[test]
+    fn decodes_a_synthetic_pause_notification() {
+        let decode = |payload: &[u8]| {
+            let msg = paused_notification(payload);
+            decode_notification(&parse_message(&msg).expect("msg"))
+        };
+        assert_eq!(
+            decode(&device_pause_payload(true)),
+            Some(DeviceNotification::DevicePausedChanged(true))
+        );
+        assert_eq!(
+            decode(&device_pause_payload(false)),
+            Some(DeviceNotification::DevicePausedChanged(false))
+        );
+        assert_eq!(
+            decode(&TlvWriter::new().u32(2).finish()),
+            Some(DeviceNotification::Other {
+                id: 3110,
+                value: Some(2)
+            }),
+            "the DLL rejects values above 1"
+        );
+        assert_eq!(
+            decode(&TlvWriter::new().finish()),
+            Some(DeviceNotification::Other {
+                id: 3110,
+                value: None
             })
         );
     }

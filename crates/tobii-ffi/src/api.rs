@@ -10,7 +10,7 @@ use crate::device::{Api, Device, device_mut};
 use crate::status::{
     Status, TOBII_ERROR_CONFLICTING_API_INSTANCES, TOBII_ERROR_CONNECTION_FAILED,
     TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
-    TOBII_ERROR_TIMED_OUT,
+    TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_TIMED_OUT,
 };
 use crate::types::{
     DeviceInfo, DeviceUrlReceiver, FieldOfUse, StateString, TOBII_CAPABILITY_CALIBRATION_2D,
@@ -18,10 +18,10 @@ use crate::types::{
     TOBII_CAPABILITY_COMPOUND_STREAM_USER_POSITION_GUIDE_Z, TOBII_CAPABILITY_DISPLAY_AREA_WRITABLE,
     TOBII_FIELD_OF_USE_ANALYTICAL, TOBII_FIELD_OF_USE_INTERACTIVE, TOBII_NOT_SUPPORTED,
     TOBII_STATE_BOOL_FALSE, TOBII_STATE_CALIBRATION_ACTIVE, TOBII_STATE_CALIBRATION_ID,
-    TOBII_STATE_FAULT, TOBII_STATE_WARNING, TOBII_STREAM_EYE_POSITION_NORMALIZED,
-    TOBII_STREAM_GAZE_DATA, TOBII_STREAM_GAZE_ORIGIN, TOBII_STREAM_GAZE_POINT,
-    TOBII_STREAM_HEAD_POSE, TOBII_STREAM_USER_PRESENCE, TOBII_SUPPORTED, TrackBox, Version,
-    copy_c_string,
+    TOBII_STATE_DEVICE_PAUSED, TOBII_STATE_FAULT, TOBII_STATE_WARNING,
+    TOBII_STREAM_EYE_POSITION_NORMALIZED, TOBII_STREAM_GAZE_DATA, TOBII_STREAM_GAZE_ORIGIN,
+    TOBII_STREAM_GAZE_POINT, TOBII_STREAM_HEAD_POSE, TOBII_STREAM_USER_PRESENCE, TOBII_SUPPORTED,
+    TrackBox, Version, copy_c_string,
 };
 
 /// The URL `tobii_enumerate_local_device_urls` reports. There is exactly one
@@ -467,9 +467,13 @@ fn query_state(d: &mut Device, state: u32) -> Result<Vec<u8>, Status> {
     d.request(kind::STATE, &request::encode_u32(state), STATE_TIMEOUT)
 }
 
-/// A boolean state. Power save, remote wake, paused, exclusive mode and the
-/// fault/warning flags are always false here; calibration-active comes from
-/// the daemon.
+/// A boolean state. Power save, remote wake, exclusive mode and the
+/// fault/warning flags are always false here; paused and calibration-active
+/// come from the daemon.
+///
+/// Unlike the DLL, which learns it from the tracker, the paused state
+/// changes as soon as the tracker accepts a pause or resume; a tracker
+/// re-init ends a pause. A daemon too old to know it answers false.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `value` must be null or valid
@@ -489,6 +493,11 @@ pub unsafe extern "C" fn tobii_get_state_bool(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     let answer = match state {
+        TOBII_STATE_DEVICE_PAUSED => match query_state(d, state) {
+            Ok(p) => u32::from(p.first().copied().unwrap_or(0)),
+            Err(TOBII_ERROR_NOT_SUPPORTED) => TOBII_STATE_BOOL_FALSE,
+            Err(status) => return status,
+        },
         s if s <= TOBII_STATE_WARNING => TOBII_STATE_BOOL_FALSE,
         TOBII_STATE_CALIBRATION_ACTIVE => match query_state(d, state) {
             Ok(p) => u32::from(p.first().copied().unwrap_or(0)),
@@ -501,7 +510,10 @@ pub unsafe extern "C" fn tobii_get_state_bool(
     TOBII_ERROR_NO_ERROR
 }
 
-/// A `u32` state: only the calibration id.
+/// A `u32` state: only the calibration id. `TOBII_STATE_DEVICE_PAUSED`, which
+/// an example in the 4.1 documentation reads this way, is
+/// `TOBII_ERROR_INVALID_PARAMETER`, as in the DLL (whose converter at
+/// 0x1800013e0 takes the calibration id only); it is a bool state.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `value` must be null or valid
@@ -806,10 +818,61 @@ mod tests {
                 tobii_get_state_uint32(d, 0, &raw mut v),
                 TOBII_ERROR_INVALID_PARAMETER
             );
+            assert_eq!(
+                tobii_get_state_uint32(d, TOBII_STATE_DEVICE_PAUSED, &raw mut v),
+                TOBII_ERROR_INVALID_PARAMETER,
+                "a bool state, as in the DLL"
+            );
             let mut s: StateString = [1; 512];
             assert_eq!(tobii_get_state_string(d, TOBII_STATE_FAULT, &raw mut s), 0);
             assert_eq!(s[0], 0);
             assert_eq!(tobii_device_destroy(d), 0);
         }
+    }
+
+    /// The paused state a daemon answering `status`/`payload` gives. It must
+    /// be asked for with STATE 2.
+    fn paused_state(status: u8, payload: Vec<u8>) -> (Status, u32) {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let connect = crate::device::tests::fake_daemon(move |body| {
+            let req = request::decode_request(body).expect("request");
+            log.lock()
+                .expect("log")
+                .push((req.kind, req.payload.to_vec()));
+            vec![tobii_ipc::encode_reply(req.id, status, &payload)]
+        });
+        let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        let mut v = 7u32;
+        // SAFETY: `d` is live and destroyed once; `v` a live local.
+        let got = unsafe {
+            let got = tobii_get_state_bool(d, TOBII_STATE_DEVICE_PAUSED, &raw mut v);
+            assert_eq!(tobii_device_destroy(d), 0);
+            got
+        };
+        assert_eq!(
+            *seen.lock().expect("log"),
+            [(
+                kind::STATE,
+                request::encode_u32(request::state::DEVICE_PAUSED)
+            )]
+        );
+        (got, v)
+    }
+
+    #[test]
+    fn the_paused_state_comes_from_the_daemon() {
+        assert_eq!(paused_state(0, vec![1]), (TOBII_ERROR_NO_ERROR, 1));
+        assert_eq!(paused_state(0, vec![0]), (TOBII_ERROR_NO_ERROR, 0));
+        assert_eq!(
+            paused_state(tobii_ipc::request::status::NOT_SUPPORTED, vec![]),
+            (TOBII_ERROR_NO_ERROR, TOBII_STATE_BOOL_FALSE),
+            "an older daemon"
+        );
+        assert_eq!(
+            paused_state(tobii_ipc::request::status::TIMED_OUT, vec![]),
+            (TOBII_ERROR_TIMED_OUT, 7)
+        );
     }
 }

@@ -120,6 +120,8 @@ int main( void )
     assert( tobii_timesync( NULL, &timesync ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( timesync.system_start_us == 1 && timesync.tracker_us == 3 );
     assert( tobii_enumerate_stream_types( NULL, NULL, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_pause_device( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_resume_device( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     tobii_device_name_t name = "unchanged";
     assert( tobii_set_device_name( NULL, name ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_get_device_name( NULL, &name ) == TOBII_ERROR_INVALID_PARAMETER );

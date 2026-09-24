@@ -87,7 +87,7 @@ fn is_calibration(cmd: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tobii_proto::protocol::cmd::DISPLAY_AREA_SET;
+    use tobii_proto::protocol::cmd::{DEVICE_PAUSE, DISPLAY_AREA_SET};
 
     /// Answers every command with one fixed outcome.
     struct Answering(Result<CommandResponse, CommandError>);
@@ -148,8 +148,7 @@ mod tests {
                 "cmd {cmd}"
             );
         }
-        // 3100: device pause.
-        for cmd in [1000, DISPLAY_AREA_SET, 3100] {
+        for cmd in [1000, DISPLAY_AREA_SET, DEVICE_PAUSE] {
             assert_eq!(
                 outcome(cmd, 1, ttp_error::BAD_STATE),
                 Err(status::OPERATION_FAILED),

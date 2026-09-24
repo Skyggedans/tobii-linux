@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
+use std::net::Shutdown;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -108,9 +109,26 @@ pub(crate) struct State {
     pub(crate) name_lock: Arc<Mutex<()>>,
     /// The calibration session, if any, and the active calibration id.
     pub(crate) calibration: Calibration,
+    /// Whether the device is paused, as clients are told (see
+    /// [`crate::pause`]).
+    pub(crate) paused: bool,
+    /// The client whose pause is in effect; the device resumes when it goes
+    /// away.
+    pub(crate) pause_holder: Option<u64>,
+    /// A pause is on its way to the device: no calibration may start.
+    pub(crate) pausing: bool,
+    /// Held while a pause or resume runs, so that the device and `paused`
+    /// agree. Taken before the state lock, never under it.
+    pub(crate) pause_lock: Arc<Mutex<()>>,
+    /// How many times the engine was lost. A pause the device accepted
+    /// counts only if no loss came in between: the next init resumes it.
+    pub(crate) engine_losses: u64,
     /// Stand-in for the engine's command queue in tests.
     #[cfg(test)]
     pub(crate) fake_device: Option<Arc<dyn DeviceCommands>>,
+    /// The pause hint last given to the engine, in tests.
+    #[cfg(test)]
+    pub(crate) pause_hint: Option<bool>,
 }
 
 impl State {
@@ -130,8 +148,15 @@ impl State {
             name_file: None,
             name_lock: Arc::default(),
             calibration: Calibration::default(),
+            paused: false,
+            pause_holder: None,
+            pausing: false,
+            pause_lock: Arc::default(),
+            engine_losses: 0,
             #[cfg(test)]
             fake_device: None,
+            #[cfg(test)]
+            pause_hint: None,
         }
     }
 
@@ -158,6 +183,7 @@ impl State {
             self.engine = None;
             self.clock = None;
             crate::calibration::on_engine_lost(self);
+            crate::pause::on_engine_lost(self);
         }
         if self.prewarm {
             self.ensure_engine();
@@ -165,14 +191,17 @@ impl State {
             self.engine = None;
             self.clock = None;
             crate::calibration::on_engine_lost(self);
+            crate::pause::on_engine_lost(self);
         }
         self.sync_wanted();
     }
 
-    /// Start the engine if it is not running.
+    /// Start the engine if it is not running. A dead engine it replaces
+    /// took the pause with it.
     pub(crate) fn ensure_engine(&mut self) {
         if self.engine.as_ref().is_none_or(|e| !e.is_alive()) {
             self.clock = None;
+            crate::pause::on_engine_lost(self);
             self.engine = Some(Engine::start_with(self.display_override));
             self.sync_wanted();
         }
@@ -204,6 +233,31 @@ impl State {
             .map(|e| Arc::new(e.commands()) as Arc<dyn DeviceCommands>)
     }
 
+    /// The running engine's command queue, if there is one. Unlike
+    /// [`Self::device_for`], it neither starts an engine nor pins one.
+    pub(crate) fn commands(&self) -> Option<Arc<dyn DeviceCommands>> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake_device {
+            return Some(Arc::clone(fake));
+        }
+        self.engine
+            .as_ref()
+            .filter(|e| e.is_alive())
+            .map(|e| Arc::new(e.commands()) as Arc<dyn DeviceCommands>)
+    }
+
+    /// Tell the engine whether the device is paused (see
+    /// [`Engine::set_paused`]).
+    pub(crate) fn set_pause_hint(&mut self, paused: bool) {
+        if let Some(engine) = self.engine.as_ref() {
+            engine.set_paused(paused);
+        }
+        #[cfg(test)]
+        {
+            self.pause_hint = Some(paused);
+        }
+    }
+
     /// Queue `body` for one client.
     pub(crate) fn send_to(&mut self, client: u64, body: Vec<u8>) {
         if let Some(c) = self.clients.iter_mut().find(|c| c.id == client) {
@@ -224,8 +278,10 @@ impl State {
         self.gaze_frames = self.gaze_frames.wrapping_add(1);
     }
 
-    /// Fold a sample into the daemon's own state.
-    fn observe(&mut self, sample: &Sample) {
+    /// Fold a sample into the daemon's own state. While the device is
+    /// paused, a frame that still arrives neither dates the clock pair nor
+    /// replaces the presence a new subscriber is told.
+    pub(crate) fn observe(&mut self, sample: &Sample) {
         match sample {
             Sample::DeviceReady(facts) => {
                 let mut facts = (**facts).clone();
@@ -238,9 +294,10 @@ impl State {
                 }
                 self.facts = Some(Arc::new(facts));
                 crate::requests::apply_display_request(self);
+                crate::pause::on_device_ready(self);
             }
-            Sample::Presence(p) => self.last_presence = Some(*p),
-            Sample::Gaze(g) => {
+            Sample::Presence(p) if !self.paused => self.last_presence = Some(*p),
+            Sample::Gaze(g) if !self.paused => {
                 let device = i64::try_from(g.frame.device_ts_us).unwrap_or(i64::MAX);
                 self.note_clock(device, g.host_rx_us);
             }
@@ -253,6 +310,9 @@ impl State {
             }
             Sample::Notification(DeviceNotification::CalibrationIdChanged(id)) => {
                 self.calibration.id = Some(*id);
+            }
+            Sample::Notification(DeviceNotification::DevicePausedChanged(paused)) => {
+                crate::pause::on_notification(*paused);
             }
             _ => {}
         }
@@ -356,13 +416,19 @@ pub fn run() -> Result<()> {
             loop {
                 thread::sleep(Duration::from_secs(3));
                 let mut st = lock_state(&state);
-                let running = st.engine.as_ref().is_some_and(Engine::is_alive);
-                // Don't spin (reloading the model) on an unplugged device.
-                if !running && st.is_engine_wanted() && tobii_usb::device::is_device_present() {
-                    warn!("engine not running but wanted; restarting");
+                // Dropped even while unplugged, so that clients hear of it.
+                if st.engine.as_ref().is_some_and(|e| !e.is_alive()) {
                     crate::calibration::on_engine_lost(&mut st);
+                    crate::pause::on_engine_lost(&mut st);
                     st.engine = None;
                     st.clock = None;
+                }
+                // Don't spin (reloading the model) on an unplugged device.
+                if st.engine.is_none()
+                    && st.is_engine_wanted()
+                    && tobii_usb::device::is_device_present()
+                {
+                    warn!("engine not running but wanted; restarting");
                     st.ensure_engine();
                 }
             }
@@ -475,6 +541,8 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
             _ => {}
         }
     }
+    // Resumed before the engine may stop below.
+    crate::pause::release(state, id);
     crate::calibration::on_client_gone(state, id);
     let mut st = lock_state(state);
     st.clients.retain(|c| c.id != id);
@@ -483,8 +551,7 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
 
 /// Register the client's streams, starting the engine if it isn't running,
 /// and acknowledge. Always succeeds (the one engine serves every stream);
-/// `streams == 0` unsubscribes. A new presence subscriber is told the current
-/// presence straight away, since the device reports it only on change.
+/// `streams == 0` unsubscribes.
 fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
     let mut st = lock_state(state);
     let before = st
@@ -502,7 +569,15 @@ fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
         st.sync_wanted();
     }
     st.send_to(id, encode_subscribed(true));
+    replay_presence(&mut st, id, before, streams);
+}
+
+/// A new presence subscriber is told the current presence straight away,
+/// since the device reports it only on change; not while the device is
+/// paused, when what it last reported may no longer hold.
+fn replay_presence(st: &mut State, id: u64, before: u32, streams: u32) {
     if streams & !before & STREAM_PRESENCE != 0
+        && !st.paused
         && let Some(p) = st.last_presence
     {
         st.send_to(id, presence_frame(&p));
@@ -552,6 +627,12 @@ fn pump(state: &Mutex<State>) {
                 }
             }
             if !dead.is_empty() {
+                // Its reader sees the end of the stream and cleans up after
+                // it (a pause it holds, its calibration session), even if
+                // the peer keeps the socket open without reading.
+                for c in st.clients.iter().filter(|c| dead.contains(&c.id)) {
+                    let _ = c.out.shutdown(Shutdown::Both);
+                }
                 st.clients.retain(|c| !dead.contains(&c.id));
                 st.reconcile();
             }
@@ -641,13 +722,12 @@ pub(crate) mod tests {
             st.prewarm = false;
         }
         // Subscribe without touching the engine: set the mask directly and
-        // run the presence replay the way handle_subscribe does.
+        // run the presence replay handle_subscribe runs.
         let mut st = lock_state(&state);
         if let Some(c) = st.clients.iter_mut().find(|c| c.id == 1) {
             c.streams = STREAM_PRESENCE;
         }
-        let p = st.last_presence.expect("cached");
-        st.send_to(1, presence_frame(&p));
+        replay_presence(&mut st, 1, 0, STREAM_PRESENCE);
         let sent = outbox(&st, 1);
         assert_eq!(
             tobii_ipc::decode_server(&sent[0]),
@@ -655,6 +735,28 @@ pub(crate) mod tests {
                 ts_us: 77,
                 status: tobii_ipc::PRESENCE_PRESENT
             })
+        );
+    }
+
+    #[test]
+    fn a_paused_device_replays_no_presence() {
+        let mut st = state_with_client(1);
+        st.observe(&Sample::Presence(PresenceSample::new(77, true)));
+        st.paused = true;
+
+        st.observe(&Sample::Presence(PresenceSample::new(88, false)));
+        replay_presence(&mut st, 1, 0, STREAM_PRESENCE);
+
+        assert!(outbox(&st, 1).is_empty());
+        st.paused = false;
+        replay_presence(&mut st, 1, 0, STREAM_PRESENCE);
+        assert_eq!(
+            tobii_ipc::decode_server(&outbox(&st, 1)[0]),
+            Some(tobii_ipc::ServerMsg::Presence {
+                ts_us: 77,
+                status: tobii_ipc::PRESENCE_PRESENT
+            }),
+            "the presence from before the pause is kept"
         );
     }
 }

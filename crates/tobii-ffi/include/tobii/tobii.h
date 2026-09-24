@@ -253,9 +253,12 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_device_info( tobii_device_t* device
 TOBII_API tobii_error_t TOBII_CALL tobii_get_track_box( tobii_device_t* device,
     tobii_track_box_t* track_box );
 
-/* Bool states 0..5 are always false; CALIBRATION_ACTIVE comes from the daemon.
- * The uint32 state is CALIBRATION_ID; the string states (FAULT, WARNING) are
- * always empty. */
+/* Bool states 0, 1, 3, 4 and 5 are always false; DEVICE_PAUSED and
+ * CALIBRATION_ACTIVE come from the daemon. Unlike the DLL, DEVICE_PAUSED
+ * changes as soon as the tracker accepts a pause or resume, and a tracker
+ * re-init ends a pause. The uint32 state is CALIBRATION_ID (DEVICE_PAUSED
+ * there is TOBII_ERROR_INVALID_PARAMETER, as in the DLL); the string states
+ * (FAULT, WARNING) are always empty. */
 TOBII_API tobii_error_t TOBII_CALL tobii_get_state_bool( tobii_device_t* device,
     tobii_state_t state, tobii_state_bool_t* value );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_state_uint32( tobii_device_t* device,

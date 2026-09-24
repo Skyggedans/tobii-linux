@@ -32,12 +32,17 @@ const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(8);
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEAR_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Run a calibration request on `device`, discarding the reply payload.
+/// Run a request on `device`, discarding the reply payload.
 ///
 /// # Safety
 /// `device` must be null or a live handle from `tobii_device_create` that no
 /// other thread uses during the call.
-unsafe fn request(device: *mut Device, request: u8, payload: &[u8], timeout: Duration) -> Status {
+pub(crate) unsafe fn request(
+    device: *mut Device,
+    request: u8,
+    payload: &[u8],
+    timeout: Duration,
+) -> Status {
     // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
     match unsafe { device_mut(device) } {
         Ok(d) => match d.request(request, payload, timeout) {
