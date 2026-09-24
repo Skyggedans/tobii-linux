@@ -145,8 +145,9 @@ pub const RESPONSE_STATUS_OK: u32 = 1;
 pub mod ttp_error {
     /// No error.
     pub const NONE: u32 = 0;
-    /// The device is not in a state to run the command (for a calibration
-    /// command: no session).
+    /// The device is not in a state to run the command (for a command that
+    /// needs a calibration session, taken to mean there is none; never
+    /// captured).
     pub const BAD_STATE: u32 = 0x2000_0508;
     /// The device rejected a parameter.
     pub const INVALID_PARAMETER: u32 = 0x2000_0509;

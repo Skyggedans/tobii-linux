@@ -14,6 +14,14 @@
 //! outside the display is refused before the session is looked at; the DLL
 //! checks the session first and sends any point unchecked.
 //!
+//! Collect, discard, clear and compute need the device's session: one the
+//! device refuses for a bad state is `CALIBRATION_NOT_STARTED`, as the Stream
+//! Engine documents for them. The daemon's session is left to its owner, who
+//! may still stop it (a device init ends it, see [`on_device_ready`]). A bad
+//! state anywhere else (the start, the stop's write-back, reading or writing
+//! the calibration) is `OPERATION_FAILED`. Provisional: the ET5 was never
+//! captured refusing a command.
+//!
 //! A session commits only when its owner stops it asking to keep the result
 //! ([`STOP_KEEP`], what `tobii_calibration_stop` sends): the last computed
 //! calibration then stays on the device and is saved as the user's, uploaded
@@ -49,7 +57,7 @@ use tobii_proto::calibration::{
 use tracing::{info, warn};
 
 use crate::daemon::{State, lock_state};
-use crate::device::{DeviceCommands, run};
+use crate::device::{DeviceCommands, run, run_in_session};
 use crate::requests::Reply;
 
 /// Commands the device answers at once (and collect, which takes ~0.9 s).
@@ -280,7 +288,9 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, request: u8, payload: &[
             point_2d(state, client, payload, cmd::DISCARD_2D, discard_payload)
         }
         kind::CALIBRATION_CLEAR => prepare(state, client, &Access::Owner)
-            .and_then(|(device, _, _)| run(device.as_ref(), cmd::CLEAR, Vec::new(), QUICK))
+            .and_then(|(device, _, _)| {
+                run_in_session(device.as_ref(), cmd::CLEAR, Vec::new(), QUICK)
+            })
             .map(|_| Vec::new())
             .into(),
         kind::CALIBRATION_COMPUTE => compute(state, client).into(),
@@ -307,7 +317,9 @@ fn point_2d(
         return Reply::err(status::INVALID_PARAMETER);
     };
     prepare(state, client, &Access::Owner)
-        .and_then(|(device, _, _)| run(device.as_ref(), command, build(x, y, EYES_BOTH), QUICK))
+        .and_then(|(device, _, _)| {
+            run_in_session(device.as_ref(), command, build(x, y, EYES_BOTH), QUICK)
+        })
         .map(|_| Vec::new())
         .into()
 }
@@ -394,7 +406,8 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
 
 fn compute(state: &Mutex<State>, client: u64) -> Result<Vec<u8>, u8> {
     let (device, _, _) = prepare(state, client, &Access::Owner)?;
-    run(device.as_ref(), cmd::COMPUTE, Vec::new(), SLOW)?;
+    run_in_session(device.as_ref(), cmd::COMPUTE, Vec::new(), SLOW)?;
+    // The read-back needs no session: a bad state there is a failed read.
     let blob = read_blob(device.as_ref())?;
     let id = tobii_calib::blob::calibration_id(&blob);
     let mut st = lock_state(state);
@@ -627,6 +640,7 @@ mod tests {
     use tobii_ipc::request::decode_u32;
     use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_payload};
     use tobii_proto::protocol::cmd::DISPLAY_AREA_SET;
+    use tobii_proto::protocol::ttp_error;
     use tobii_usb::engine::{CommandError, CommandResponse, Sample};
 
     /// What befalls the device while a command is on its way.
@@ -652,6 +666,8 @@ mod tests {
         payloads: Mutex<Vec<(u32, Vec<u8>)>>,
         /// A command the device refuses.
         refuse: Mutex<Option<u32>>,
+        /// A command the device refuses for a bad state (TTP `BAD_STATE`).
+        bad_state: Mutex<Option<u32>>,
         /// What befalls the device the next time it gets that command.
         mishap: Mutex<Option<(u32, Mishap)>>,
         /// The daemon's state, for a mishap to reach.
@@ -709,6 +725,12 @@ mod tests {
                     ..CommandResponse::ok(Vec::new())
                 });
             }
+            if *self.bad_state.lock().expect("bad state") == Some(cmd) {
+                return Ok(CommandResponse {
+                    error: ttp_error::BAD_STATE,
+                    ..CommandResponse::ok(Vec::new())
+                });
+            }
             let payload = if cmd == cmd::READ {
                 write_payload(&self.blob)
             } else {
@@ -749,6 +771,7 @@ mod tests {
                 log: Mutex::new(Vec::new()),
                 payloads: Mutex::new(Vec::new()),
                 refuse: Mutex::new(None),
+                bad_state: Mutex::new(None),
                 mishap: Mutex::new(None),
                 state: weak.clone(),
             });
@@ -855,6 +878,12 @@ mod tests {
 
     fn ask(s: &Setup, client: u64, k: u8, payload: &[u8]) -> Reply {
         handle(&s.state, client, k, payload)
+    }
+
+    /// Have the device refuse `command` for a bad state from now on (`None`:
+    /// no command).
+    fn refuse_for_bad_state(s: &Setup, command: Option<u32>) {
+        *s.device.bad_state.lock().expect("bad state") = command;
     }
 
     #[test]
@@ -1085,6 +1114,158 @@ mod tests {
             s.dir.join("calibration.bin").exists(),
             "what the session computed is still committed"
         );
+    }
+
+    #[test]
+    fn a_session_request_refused_for_a_bad_state_is_not_started_and_the_session_kept() {
+        let s = setup("bad-state-session");
+        let point = tobii_ipc::request::encode_point_2d(0.3, 0.3);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]).status,
+            status::OK
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+        forget_sent(&s);
+
+        for (k, payload, command) in [
+            (kind::CALIBRATION_COLLECT_2D, &point[..], cmd::COLLECT_2D),
+            (kind::CALIBRATION_DISCARD_2D, &point[..], cmd::DISCARD_2D),
+            (kind::CALIBRATION_CLEAR, &[][..], cmd::CLEAR),
+            (kind::CALIBRATION_COMPUTE, &[][..], cmd::COMPUTE),
+        ] {
+            refuse_for_bad_state(&s, Some(command));
+            assert_eq!(
+                ask(&s, 1, k, payload).status,
+                status::CALIBRATION_NOT_STARTED,
+                "kind {k}"
+            );
+            let st = lock_state(&s.state);
+            assert_eq!(
+                st.calibration.owner(),
+                Some(1),
+                "kind {k}: the session goes on"
+            );
+            assert_eq!(st.calibration.orphaned, None, "kind {k}: no orphan mark");
+        }
+
+        assert_eq!(
+            *s.device.log.lock().expect("log"),
+            vec![cmd::COLLECT_2D, cmd::DISCARD_2D, cmd::CLEAR, cmd::COMPUTE],
+            "nothing ends the session on the device"
+        );
+        refuse_for_bad_state(&s, None);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::ok(Vec::new()),
+            "its owner may still stop it"
+        );
+        assert!(
+            s.dir.join("calibration.bin").exists(),
+            "what the session computed before is committed"
+        );
+    }
+
+    #[test]
+    fn a_session_request_the_reinitialised_device_refuses_tells_the_owner_again() {
+        let s = setup("bad-state-reinit");
+        let point = tobii_ipc::request::encode_point_2d(0.3, 0.3);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]),
+            Reply::ok(Vec::new())
+        );
+        forget_sent(&s);
+        // The device re-initialises while the collect waits its turn, and
+        // then has no session for it.
+        befall(&s, cmd::COLLECT_2D, Mishap::Reinit);
+        refuse_for_bad_state(&s, Some(cmd::COLLECT_2D));
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &point).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+
+        {
+            let st = lock_state(&s.state);
+            assert!(!st.calibration.is_active(), "the init ended the session");
+            assert_eq!(
+                st.calibration.orphaned,
+                Some(1),
+                "the device's answer leaves the init's orphan mark"
+            );
+        }
+        assert!(stays_quiet(&s));
+        assert_eq!(
+            *s.device.log.lock().expect("log"),
+            vec![cmd::COLLECT_2D],
+            "no stop or write follows the refused collect"
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_DISCARD).status,
+            status::CALIBRATION_NOT_STARTED,
+            "the owner is told again"
+        );
+        assert_eq!(lock_state(&s.state).calibration.orphaned, None);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]),
+            Reply::ok(Vec::new()),
+            "and may start again"
+        );
+    }
+
+    #[test]
+    fn a_bad_state_where_no_session_is_needed_is_a_failed_operation() {
+        let s = setup("bad-state-elsewhere");
+        let path = s.dir.join("calibration.bin");
+        // Each of the start's own commands: 1060 and 1110 too.
+        for command in [cmd::START, cmd::CLEAR, cmd::WRITE] {
+            refuse_for_bad_state(&s, Some(command));
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]).status,
+                status::OPERATION_FAILED,
+                "cmd {command}"
+            );
+            assert!(
+                !lock_state(&s.state).calibration.is_active(),
+                "cmd {command}"
+            );
+        }
+        refuse_for_bad_state(&s, Some(cmd::READ));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_RETRIEVE, &[]).status,
+            status::OPERATION_FAILED
+        );
+        refuse_for_bad_state(&s, Some(cmd::WRITE));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_APPLY, &s.device.blob.clone()).status,
+            status::OPERATION_FAILED
+        );
+        assert!(
+            !path.exists(),
+            "a calibration the device refused is not saved"
+        );
+
+        refuse_for_bad_state(&s, None);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]),
+            Reply::ok(Vec::new())
+        );
+        // Only the compute itself needs the session, not its read-back.
+        refuse_for_bad_state(&s, Some(cmd::READ));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OPERATION_FAILED
+        );
+        assert_eq!(lock_state(&s.state).calibration.owner(), Some(1));
+        refuse_for_bad_state(&s, Some(cmd::WRITE));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_DISCARD).status,
+            status::OPERATION_FAILED,
+            "the stop ended a session: its write-back failed"
+        );
+        assert!(!lock_state(&s.state).calibration.is_active());
     }
 
     fn area(width_mm: f64) -> DisplayArea {
