@@ -147,7 +147,8 @@ const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(27);
 /// estimator skips pairs wider than 6 ms, though it still returns them. The
 /// host clock is `tobii_system_clock`'s, `CLOCK_REALTIME` rather than the
 /// DLL's monotonic QPC. Nothing is written unless the call succeeds;
-/// `TOBII_ERROR_NOT_AVAILABLE` while the tracker is paused.
+/// `TOBII_ERROR_NOT_AVAILABLE` while the tracker is paused,
+/// `TOBII_ERROR_CONNECTION_FAILED` when no tracker is plugged in.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `timesync` must be null or
@@ -479,7 +480,7 @@ not_supported! {
 mod tests {
     use super::*;
     use crate::api::tobii_device_destroy;
-    use crate::status::TOBII_ERROR_NOT_AVAILABLE;
+    use crate::status::{TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_NOT_AVAILABLE};
     use crate::types::{TOBII_NOT_SUPPORTED, TOBII_SUPPORTED};
     use std::ffi::CStr;
     use std::ptr;
@@ -571,6 +572,11 @@ mod tests {
             timesync_with(status::NOT_AVAILABLE, vec![]),
             (TOBII_ERROR_NOT_AVAILABLE, untouched),
             "the daemon's status passes through"
+        );
+        assert_eq!(
+            timesync_with(status::CONNECTION_FAILED, vec![]),
+            (TOBII_ERROR_CONNECTION_FAILED, untouched),
+            "no tracker"
         );
         assert_eq!(
             timesync_with(0, vec![1, 2, 3]),

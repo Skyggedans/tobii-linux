@@ -450,7 +450,12 @@ gaze has no rest pose.)
   first subscription or the first request that needs it (device info, a
   clock pair, a pause, …) and releases it when the last such client
   disconnects. Facts from the last init (device info, track box, the stream
-  catalogue, …) are answered even while the tracker is unplugged.
+  catalogue, …) are answered even while the tracker is unplugged. Requests
+  that need it live (a clock pair, a pause, a calibration, a display-area
+  write) then fail at once with `TOBII_ERROR_CONNECTION_FAILED`, from when
+  the daemon has given the tracker up (a few seconds after the unplug); the
+  daemon logs once that no tracker is on the bus and opens it once it is
+  plugged back in, for a client still connected.
 - **"It flies around."** You're talking to an **old daemon** (pre-rebuild) — it
   still has the previous code/units. Restart it (§5).
 - **"Rotations slide."** Tune `TOBII_PIVOT_DOWN` / `TOBII_PIVOT_BACK` (§7).

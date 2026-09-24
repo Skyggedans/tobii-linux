@@ -22,8 +22,9 @@ pub const TOBII_ERROR_INSUFFICIENT_LICENSE: Status = 2;
 pub const TOBII_ERROR_NOT_SUPPORTED: Status = 3;
 /// No device is available.
 pub const TOBII_ERROR_NOT_AVAILABLE: Status = 4;
-/// Returned here: the daemon could not be reached (or spawned), or the
-/// connection dropped.
+/// Returned here: the daemon could not be reached (or spawned), the
+/// connection dropped, or the daemon has no tracker for a call that needs
+/// one live (a clock pair, a pause, a calibration, a display-area write).
 pub const TOBII_ERROR_CONNECTION_FAILED: Status = 5;
 /// Returned here: no sample (or no daemon acknowledgement) arrived before the
 /// timeout.

@@ -126,6 +126,9 @@ pub(crate) struct State {
     /// Likewise a calibration start: one the device took counts only if no
     /// loss came in between (see [`crate::calibration`]).
     pub(crate) engine_losses: u64,
+    /// The log said the tracker is off the bus since an engine last
+    /// started: it says so once per absence, not at every request.
+    tracker_absence_logged: bool,
     /// Stand-in for the engine's command queue in tests.
     #[cfg(test)]
     pub(crate) fake_device: Option<Arc<dyn DeviceCommands>>,
@@ -133,10 +136,23 @@ pub(crate) struct State {
     #[cfg(test)]
     pub(crate) pause_hint: Option<bool>,
     /// The next device fetch in tests finds the engine dead: it goes
-    /// through [`Self::ensure_engine`], which drops it and, with a stand-in
-    /// device, starts no other.
+    /// through [`Self::ensure_engine`], which drops it and, for a tracker
+    /// on the bus, records a start in place of another (no engine starts in
+    /// tests); the stand-in stands for that one, and without a tracker it
+    /// goes too.
     #[cfg(test)]
     pub(crate) lose_engine_on_fetch: bool,
+    /// Whether a tracker is on the bus, in tests: none unless a test says
+    /// so.
+    #[cfg(test)]
+    pub(crate) fake_present: bool,
+    /// How many times the bus was looked at for the tracker, in tests.
+    #[cfg(test)]
+    pub(crate) presence_probes: u32,
+    /// The display area each engine was started with, in tests, where none
+    /// really starts: an engine would open the tracker.
+    #[cfg(test)]
+    pub(crate) engines_started: Vec<Option<DisplayArea>>,
 }
 
 impl State {
@@ -161,12 +177,19 @@ impl State {
             pausing: false,
             pause_lock: Arc::default(),
             engine_losses: 0,
+            tracker_absence_logged: false,
             #[cfg(test)]
             fake_device: None,
             #[cfg(test)]
             pause_hint: None,
             #[cfg(test)]
             lose_engine_on_fetch: false,
+            #[cfg(test)]
+            fake_present: false,
+            #[cfg(test)]
+            presence_probes: 0,
+            #[cfg(test)]
+            engines_started: Vec::new(),
         }
     }
 
@@ -185,35 +208,61 @@ impl State {
                 .any(|c| c.streams != 0 || c.holds_device)
     }
 
-    /// Stop the engine once nobody needs it — unless pre-warm is configured,
-    /// in which case keep (or restart) it. Also drops a dead engine so it can
-    /// be restarted.
+    /// Stop the engine once nobody needs it, unless pre-warm is configured.
+    /// Also drops a dead engine. Starting another, for pre-warm too, is left
+    /// to the watchdog, which looks for the tracker without the state lock
+    /// (the pump runs this under it).
     fn reconcile(&mut self) {
         if self.engine.is_some() {
             self.drop_engine_unless_alive();
         }
-        if self.prewarm {
-            self.ensure_engine();
-        } else if !self.is_engine_wanted() {
+        if !self.is_engine_wanted() {
             self.drop_engine();
         }
         self.sync_wanted();
     }
 
-    /// Start the engine if it is not running. A dead engine it replaces
-    /// took the calibration session and the pause with it, ended before the
-    /// new engine starts, so that its first init writes the display area
-    /// the session started from.
-    pub(crate) fn ensure_engine(&mut self) {
-        if self.drop_engine_unless_alive() {
-            // The stand-in device stands for the new engine in tests.
-            #[cfg(test)]
-            if self.fake_device.is_some() {
-                return;
-            }
+    /// Start the engine if it is not running and the tracker is on the bus,
+    /// as `tracker_on_bus` says (see [`look_for_tracker`]): without one, an
+    /// engine would only fail its opens and stop, and the watchdog starts
+    /// one once the tracker is plugged in while a client wants it. A dead
+    /// engine is dropped either way, and the calibration session and the
+    /// pause it took with it end before a new engine starts, so that its
+    /// first init writes the display area the session started from.
+    pub(crate) fn ensure_engine(&mut self, tracker_on_bus: bool) {
+        if !self.drop_engine_unless_alive() {
+            return;
+        }
+        if tracker_on_bus {
+            self.start_engine();
+        } else if !std::mem::replace(&mut self.tracker_absence_logged, true) {
+            info!("no tracker on the bus; the engine starts once it is plugged in");
+        }
+    }
+
+    /// Start an engine. In tests none starts, whatever the bus says: the
+    /// display area it would start with is recorded instead.
+    fn start_engine(&mut self) {
+        self.tracker_absence_logged = false;
+        #[cfg(not(test))]
+        {
             self.engine = Some(Engine::start_with(self.display_override));
             self.sync_wanted();
         }
+        #[cfg(test)]
+        {
+            self.engines_started.push(self.display_override);
+        }
+    }
+
+    /// Whether an engine runs to send gaze frames. In tests the stand-in
+    /// device stands for one, unless the next fetch is to find it dead.
+    pub(crate) fn is_engine_running(&self) -> bool {
+        #[cfg(test)]
+        if self.fake_device.is_some() {
+            return !self.lose_engine_on_fetch;
+        }
+        self.engine.as_ref().is_some_and(Engine::is_alive)
     }
 
     /// Drop the engine unless it is running (see [`Self::drop_engine`]).
@@ -248,23 +297,36 @@ impl State {
         }
     }
 
-    /// The device's command queue, starting the engine if needed and pinning
-    /// it to `client`.
-    pub(crate) fn device_for(&mut self, client: u64) -> Option<Arc<dyn DeviceCommands>> {
+    /// The device's command queue, starting the engine if needed (see
+    /// [`Self::ensure_engine`], which `tracker_on_bus` is for) and pinning
+    /// it to `client`. `None`, never a dead engine's queue, when no engine
+    /// runs: the tracker is off the bus. `client` holds the device all the
+    /// same, so the watchdog starts an engine for it once the tracker is
+    /// plugged in.
+    pub(crate) fn device_for(
+        &mut self,
+        client: u64,
+        tracker_on_bus: bool,
+    ) -> Option<Arc<dyn DeviceCommands>> {
         if let Some(c) = self.clients.iter_mut().find(|c| c.id == client) {
             c.holds_device = true;
         }
         #[cfg(test)]
         if let Some(fake) = self.fake_device.clone() {
             if std::mem::take(&mut self.lose_engine_on_fetch) {
-                self.ensure_engine();
+                let started = self.engines_started.len();
+                self.ensure_engine(tracker_on_bus);
+                // The stand-in stands for the engine started in place of
+                // the dead one: without a tracker, none is.
+                if self.engines_started.len() == started {
+                    self.fake_device = None;
+                    return None;
+                }
             }
             return Some(fake);
         }
-        self.ensure_engine();
-        self.engine
-            .as_ref()
-            .map(|e| Arc::new(e.commands()) as Arc<dyn DeviceCommands>)
+        self.ensure_engine(tracker_on_bus);
+        self.commands()
     }
 
     /// The running engine's command queue, if there is one. Unlike
@@ -372,6 +434,37 @@ fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
     }
 }
 
+/// Whether the tracker is on the bus (see
+/// [`tobii_usb::device::is_device_present`]), for a caller that does not
+/// hold the state lock: libusb scans the bus (a few milliseconds) without
+/// it.
+#[cfg(not(test))]
+pub(crate) fn is_tracker_present(_state: &Mutex<State>) -> bool {
+    tobii_usb::device::is_device_present()
+}
+
+/// Whether the tracker is on the bus: in tests, what the state's stand-in
+/// says, counted.
+#[cfg(test)]
+pub(crate) fn is_tracker_present(state: &Mutex<State>) -> bool {
+    let mut st = lock_state(state);
+    st.presence_probes += 1;
+    st.fake_present
+}
+
+/// Whether the tracker is on the bus, for [`State::ensure_engine`] and
+/// [`State::device_for`], looked for before the caller takes the state
+/// lock (see [`is_tracker_present`]). `true` without a look while an engine
+/// runs, since none is started then. The answer may be stale once the lock
+/// is taken, which does no harm: an engine started for a tracker just
+/// unplugged stops as any engine does, and the watchdog starts one for a
+/// tracker just plugged in.
+pub(crate) fn look_for_tracker(state: &Mutex<State>) -> bool {
+    // Its own statement, so that the guard goes before the bus is scanned.
+    let running = lock_state(state).is_engine_running();
+    running || is_tracker_present(state)
+}
+
 /// Lock the shared state, recovering from poisoning. Every critical section
 /// here leaves `State` consistent at each statement (the engine is an
 /// `Option`, clients a plain list), so a panic while holding the lock cannot
@@ -446,29 +539,19 @@ pub fn run() -> Result<()> {
     // keep it streaming so later client connects are instant.
     if prewarm {
         info!("pre-warming device");
-        lock_state(&state).ensure_engine();
+        let on_bus = is_tracker_present(&state);
+        lock_state(&state).ensure_engine(on_bus);
     }
 
     // Watchdog: if the device thread died (a cold start that exhausted its
-    // internal retries, an unplug, etc.) but it's still wanted, restart it.
+    // internal retries, an unplug, etc.), or none was started while the
+    // tracker was unplugged, but it's still wanted, restart it.
     {
         let state = Arc::clone(&state);
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(3));
-                let mut st = lock_state(&state);
-                // Dropped even while unplugged, so that clients hear of it.
-                if st.engine.is_some() {
-                    st.drop_engine_unless_alive();
-                }
-                // Don't spin (reloading the model) on an unplugged device.
-                if st.engine.is_none()
-                    && st.is_engine_wanted()
-                    && tobii_usb::device::is_device_present()
-                {
-                    warn!("engine not running but wanted; restarting");
-                    st.ensure_engine();
-                }
+                watch_engine(&state);
             }
         });
     }
@@ -523,6 +606,31 @@ pub fn run() -> Result<()> {
     }
     pump(&state);
     Ok(())
+}
+
+/// One watchdog pass: drop a dead engine, and start one if it is wanted and
+/// the tracker is on the bus, whether an engine died or none was started
+/// because the tracker was unplugged. The bus is scanned only when an
+/// engine is wanted, so that nothing spins (reloading the model) on an
+/// unplugged tracker, and once a pass, without the state lock.
+fn watch_engine(state: &Mutex<State>) {
+    let wanted = {
+        let mut st = lock_state(state);
+        // Dropped even while unplugged, so that clients hear of it.
+        if st.engine.is_some() {
+            st.drop_engine_unless_alive();
+        }
+        st.engine.is_none() && st.is_engine_wanted()
+    };
+    if !wanted || !is_tracker_present(state) {
+        return;
+    }
+    let mut st = lock_state(state);
+    // A request may have started one meanwhile.
+    if st.engine.is_none() && st.is_engine_wanted() {
+        warn!("engine not running but wanted; restarting");
+        st.start_engine();
+    }
 }
 
 /// Accept client connections forever, registering each with `state`.
@@ -587,10 +695,12 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
     st.reconcile();
 }
 
-/// Register the client's streams, starting the engine if it isn't running,
-/// and acknowledge. Always succeeds (the one engine serves every stream);
-/// `streams == 0` unsubscribes.
+/// Register the client's streams, starting the engine if it isn't running
+/// (and the tracker is on the bus; otherwise the watchdog starts it once the
+/// tracker is plugged in), and acknowledge. Always succeeds (the one engine
+/// serves every stream); `streams == 0` unsubscribes.
 fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
+    let on_bus = streams != 0 && look_for_tracker(state);
     let mut st = lock_state(state);
     let before = st
         .clients
@@ -603,7 +713,7 @@ fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
     if streams == 0 {
         st.reconcile();
     } else {
-        st.ensure_engine();
+        st.ensure_engine(on_bus);
         st.sync_wanted();
     }
     st.send_to(id, encode_subscribed(true));
@@ -755,15 +865,16 @@ pub(crate) mod tests {
         let mut st = lock_state(&state);
         st.note_clock(5_000_000, 1);
 
-        // No engine runs: one would start, with the display area configured
-        // by then.
-        st.ensure_engine();
+        // No engine runs: one starts, with the display area configured by
+        // then.
+        st.ensure_engine(true);
 
         assert_eq!(
-            st.display_override,
-            Some(old),
+            st.engines_started,
+            [Some(old)],
             "what the new engine's first init writes"
         );
+        assert_eq!(st.display_override, Some(old));
         assert!(!st.calibration.is_active());
         assert_eq!(
             st.calibration.display_access(1),
@@ -771,6 +882,126 @@ pub(crate) mod tests {
             "its owner is told on its next request"
         );
         assert_eq!(st.clock, None);
+    }
+
+    #[test]
+    fn no_engine_is_started_for_an_absent_tracker() {
+        let mut st = state_with_client(1);
+
+        st.ensure_engine(false);
+        assert!(
+            st.device_for(1, false).is_none(),
+            "requests that need the tracker fail with CONNECTION_FAILED"
+        );
+
+        assert!(st.engines_started.is_empty());
+        assert!(
+            st.clients[0].holds_device,
+            "the watchdog starts it once it is plugged in"
+        );
+    }
+
+    #[test]
+    fn an_engine_is_started_once_the_tracker_is_on_the_bus() {
+        let mut st = state_with_client(1);
+        st.ensure_engine(false);
+        assert!(st.tracker_absence_logged);
+
+        let _ = st.device_for(1, true);
+
+        assert_eq!(st.engines_started.len(), 1);
+        assert!(st.clients[0].holds_device);
+        assert!(
+            !st.tracker_absence_logged,
+            "the next absence is logged again"
+        );
+    }
+
+    #[test]
+    fn the_bus_is_looked_at_only_when_no_engine_runs() {
+        let mut st = state_with_client(1);
+        st.fake_device = Some(Arc::new(crate::requests::tests::Answering(1)));
+        let state = Mutex::new(st);
+
+        assert!(look_for_tracker(&state), "nothing would be started");
+        assert_eq!(lock_state(&state).presence_probes, 0);
+
+        lock_state(&state).fake_device = None;
+        assert!(!look_for_tracker(&state));
+        assert_eq!(lock_state(&state).presence_probes, 1);
+    }
+
+    #[test]
+    fn a_subscription_starts_an_engine_only_for_a_tracker_on_the_bus() {
+        let state = Mutex::new(state_with_client(1));
+
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        {
+            let st = lock_state(&state);
+            assert_eq!(outbox(&st, 1), [encode_subscribed(true)]);
+            assert!(st.engines_started.is_empty());
+            assert!(
+                st.is_engine_wanted(),
+                "the watchdog starts it once the tracker is plugged in"
+            );
+        }
+
+        lock_state(&state).fake_present = true;
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+
+        let st = lock_state(&state);
+        assert_eq!(st.engines_started.len(), 1);
+        assert_eq!(st.presence_probes, 2, "one look for each subscription");
+    }
+
+    #[test]
+    fn the_watchdog_starts_an_engine_once_the_tracker_is_plugged_in() {
+        let state = Mutex::new(state_with_client(1));
+        lock_state(&state).fake_present = true;
+        watch_engine(&state);
+        assert_eq!(
+            lock_state(&state).presence_probes,
+            0,
+            "nobody wants one: the bus is not even scanned"
+        );
+        {
+            let mut st = lock_state(&state);
+            st.fake_present = false;
+            // A request found the tracker unplugged; its client stays.
+            assert!(st.device_for(1, false).is_none());
+        }
+        watch_engine(&state);
+        assert!(
+            lock_state(&state).engines_started.is_empty(),
+            "not while it is unplugged"
+        );
+
+        let probes = {
+            let mut st = lock_state(&state);
+            st.fake_present = true;
+            st.presence_probes
+        };
+        watch_engine(&state);
+
+        let st = lock_state(&state);
+        assert_eq!(st.engines_started.len(), 1);
+        assert_eq!(st.presence_probes, probes + 1, "one scan a pass");
+    }
+
+    #[test]
+    fn a_pre_warmed_engine_is_left_to_the_watchdog_to_start() {
+        let state = Mutex::new(State::new(true));
+        lock_state(&state).fake_present = true;
+
+        lock_state(&state).reconcile();
+        {
+            let st = lock_state(&state);
+            assert!(st.engines_started.is_empty());
+            assert_eq!(st.presence_probes, 0, "no scan under the state lock");
+        }
+        watch_engine(&state);
+
+        assert_eq!(lock_state(&state).engines_started.len(), 1);
     }
 
     #[test]

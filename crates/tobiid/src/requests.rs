@@ -22,7 +22,7 @@ use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_paylo
 use tobii_proto::protocol::cmd;
 use tracing::{info, warn};
 
-use crate::daemon::{State, lock_state};
+use crate::daemon::{State, is_tracker_present, lock_state, look_for_tracker};
 
 /// A reply: Stream Engine status code and kind-specific payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,14 @@ const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(25);
 const TIMESYNC_TIMEOUT: Duration = Duration::from_millis(300);
 /// How often a TIMESYNC looks for that frame (the tracker sends ~33 a second).
 const TIMESYNC_POLL: Duration = Duration::from_millis(5);
+/// How long a TIMESYNC lets no engine run before it looks for the tracker
+/// on the bus: the watchdog restarts an engine lost while the tracker is
+/// still there, and a re-plug or a re-enumeration takes the tracker off the
+/// bus for a moment.
+#[cfg(not(test))]
+const ENGINE_LOST_GRACE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const ENGINE_LOST_GRACE: Duration = Duration::from_millis(100);
 
 /// Answer one request from `client`.
 pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Reply {
@@ -143,7 +151,8 @@ pub(crate) fn facts(
     answer: impl Fn(&DeviceFacts) -> Option<Vec<u8>>,
 ) -> Reply {
     let started = Instant::now();
-    let _ = lock_state(state).device_for(client);
+    let on_bus = look_for_tracker(state);
+    let _ = lock_state(state).device_for(client, on_bus);
     loop {
         if let Some(facts) = lock_state(state).facts.clone() {
             return answer(&facts).map_or_else(|| Reply::err(status::NOT_SUPPORTED), Reply::ok);
@@ -159,21 +168,31 @@ pub(crate) fn facts(
 /// request, so that it is fresh and belongs to the running device session.
 /// Frames are counted rather than compared with the wall clock, which may
 /// step back meanwhile. Starts the engine if needed and, as the facts do,
-/// keeps it up while `client` stays connected. `TIMED_OUT` if no such frame
-/// arrives in time; `NOT_AVAILABLE` while the device is paused, since it
-/// sends none.
+/// keeps it up while `client` stays connected. `NOT_AVAILABLE` while the
+/// device is paused, since it sends none. `CONNECTION_FAILED` when no
+/// tracker can send one: at once when there is none on the bus to start an
+/// engine for, and, when the engine is lost during the wait, once none has
+/// run for [`ENGINE_LOST_GRACE`] and the tracker is off the bus. `TIMED_OUT`
+/// if no such frame arrives in time otherwise.
 fn timesync(state: &Mutex<State>, client: u64) -> Reply {
     let started = Instant::now();
+    let on_bus = look_for_tracker(state);
     let asked = {
         let mut st = lock_state(state);
-        let _ = st.device_for(client);
+        let _ = st.device_for(client, on_bus);
+        // Only a tracker on the bus gets an engine.
+        if !st.is_engine_running() {
+            return Reply::err(status::CONNECTION_FAILED);
+        }
         st.gaze_frames
     };
+    // Since when no engine has run during the wait.
+    let mut lost_since: Option<Instant> = None;
     loop {
         // Copied out, so that no guard is held across the sleep.
-        let (frames, clock, paused) = {
+        let (frames, clock, paused, running) = {
             let st = lock_state(state);
-            (st.gaze_frames, st.clock, st.paused)
+            (st.gaze_frames, st.clock, st.paused, st.is_engine_running())
         };
         if paused {
             return Reply::err(status::NOT_AVAILABLE);
@@ -187,6 +206,17 @@ fn timesync(state: &Mutex<State>, client: u64) -> Reply {
                 device_us,
                 host_end_us: host_us,
             }));
+        }
+        if running {
+            lost_since = None;
+        } else if lost_since.get_or_insert_with(Instant::now).elapsed() >= ENGINE_LOST_GRACE {
+            // The watchdog restarts an engine only for a tracker on the
+            // bus; the request does not start one itself. The bus is
+            // scanned without the state lock.
+            if !is_tracker_present(state) {
+                return Reply::err(status::CONNECTION_FAILED);
+            }
+            lost_since = None;
         }
         if started.elapsed() > TIMESYNC_TIMEOUT {
             return Reply::err(status::TIMED_OUT);
@@ -205,19 +235,22 @@ fn timesync(state: &Mutex<State>, client: u64) -> Reply {
 /// (`CALIBRATION_NOT_STARTED`): the end put back the area it replaced, which
 /// goes to the device again after this one.
 fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Reply {
+    let on_bus = look_for_tracker(state);
     let (device, display_id, in_session) = {
         let mut st = lock_state(state);
         if let Err(code) = st.calibration.display_access(client) {
             return Reply::err(code);
         }
-        let Some(device) = st.device_for(client) else {
-            return Reply::err(status::CONNECTION_FAILED);
-        };
-        // Fetching the device may have replaced a dead engine, which took
-        // the calibration session along: look again.
+        let device = st.device_for(client, on_bus);
+        // Fetching the device may have dropped a dead engine, which took
+        // the calibration session along, whether or not another started:
+        // look again.
         if let Err(code) = st.calibration.display_access(client) {
             return Reply::err(code);
         }
+        let Some(device) = device else {
+            return Reply::err(status::CONNECTION_FAILED);
+        };
         // A client's area supersedes TOBII_DISPLAY_MM for this run: do not
         // let the variable's write, queued at the next device init, undo it.
         st.display_request = None;
@@ -479,7 +512,7 @@ pub(crate) fn apply_display_request(st: &mut State) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
     use tobii_proto::time::now_us;
 
     #[test]
@@ -602,8 +635,9 @@ pub(crate) mod tests {
     }
 
     /// Ask for a clock pair from a state that has seen a gaze frame with
-    /// `clock`, with a stand-in device so that no engine starts; `feed` runs
-    /// beside the request as the pump would, until it is answered.
+    /// `clock`, with a stand-in device for the running engine; `feed` runs
+    /// beside the request as the pump would, from when the request has taken
+    /// its device until it is answered.
     fn timesync_from(
         clock: Option<(i64, i64)>,
         feed: impl Fn(&Mutex<State>) + Send + Sync,
@@ -624,7 +658,9 @@ pub(crate) mod tests {
             s.spawn(|| {
                 while !answered.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(10));
-                    feed(&state);
+                    if lock_state(&state).clients[0].holds_device {
+                        feed(&state);
+                    }
                 }
             });
             let reply = handle(&state, 1, &req);
@@ -677,6 +713,157 @@ pub(crate) mod tests {
         assert_eq!(reply, Reply::err(status::TIMED_OUT));
         let (reply, _) = timesync_from(None, stale);
         assert_eq!(reply, Reply::err(status::TIMED_OUT));
+    }
+
+    #[test]
+    fn timesync_fails_at_once_without_a_tracker() {
+        // No stand-in device, and no tracker on the bus.
+        let state = Mutex::new(crate::daemon::tests::state_with_client(1));
+        let req = Request {
+            id: 1,
+            kind: kind::TIMESYNC,
+            payload: &[],
+        };
+
+        let reply = handle(&state, 1, &req);
+
+        assert_eq!(reply, Reply::err(status::CONNECTION_FAILED));
+        let st = lock_state(&state);
+        assert_eq!(
+            st.presence_probes, 1,
+            "the start's look at the bus: the answer did not wait for another"
+        );
+        assert!(
+            st.engines_started.is_empty(),
+            "no engine for an absent tracker"
+        );
+        assert!(
+            st.clients[0].holds_device,
+            "the watchdog starts it once it is plugged in"
+        );
+    }
+
+    #[test]
+    fn timesync_fails_when_the_tracker_is_unplugged_during_the_wait() {
+        // Unplugged during the wait: the engine goes, and nothing is on the
+        // bus.
+        let (reply, state) = timesync_from(None, |state| lock_state(state).fake_device = None);
+
+        assert_eq!(reply, Reply::err(status::CONNECTION_FAILED));
+        assert_eq!(
+            lock_state(&state).presence_probes,
+            1,
+            "one look, once the grace was over"
+        );
+    }
+
+    /// The watchdog's restart, for a feed: the stand-in streams again a
+    /// tick after the request looked for the tracker, by when a request that
+    /// looked at every poll would have looked again.
+    fn restart_after_the_look(st: &mut State, ticks_since_the_look: &AtomicU32) {
+        if st.presence_probes > 0
+            && st.fake_device.is_none()
+            && ticks_since_the_look.fetch_add(1, Ordering::Relaxed) > 0
+        {
+            st.fake_device = Some(Arc::new(Answering(1)));
+            st.note_clock(5_000_000, 1);
+        }
+    }
+
+    #[test]
+    fn timesync_waits_for_a_restart_while_the_tracker_is_plugged_in() {
+        let since_the_look = AtomicU32::new(0);
+        let (reply, state) = timesync_from(None, |state| {
+            let mut st = lock_state(state);
+            if st.presence_probes == 0 {
+                // The engine is lost with the tracker still on the bus. The
+                // request took its device before the stand-in went.
+                st.fake_device = None;
+                st.fake_present = true;
+            } else {
+                // The request found the tracker and waited on.
+                restart_after_the_look(&mut st, &since_the_look);
+            }
+        });
+
+        assert_eq!(reply.status, status::OK);
+        let st = lock_state(&state);
+        assert_eq!(
+            st.presence_probes, 1,
+            "the request looked for the tracker once, after the grace"
+        );
+        assert!(
+            st.engines_started.is_empty(),
+            "nothing in the wait starts an engine"
+        );
+    }
+
+    #[test]
+    fn timesync_gives_a_re_plugged_tracker_the_grace() {
+        let ticks = AtomicU32::new(0);
+        let since_the_look = AtomicU32::new(0);
+        let (reply, state) = timesync_from(None, |state| {
+            let tick = ticks.fetch_add(1, Ordering::Relaxed);
+            let mut st = lock_state(state);
+            match tick {
+                // Unplugged: the engine goes, and the tracker is off the bus.
+                0 => st.fake_device = None,
+                // Back on the bus within the grace.
+                1 => st.fake_present = true,
+                _ => restart_after_the_look(&mut st, &since_the_look),
+            }
+        });
+
+        assert_eq!(
+            reply.status,
+            status::OK,
+            "the tracker was back by the time the request looked"
+        );
+        let st = lock_state(&state);
+        assert_eq!(st.presence_probes, 1, "one look, once the grace was over");
+        assert!(st.engines_started.is_empty());
+    }
+
+    #[test]
+    fn requests_that_need_the_tracker_fail_at_once_without_one() {
+        // No stand-in device, and no tracker on the bus.
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.calibration.location = tobii_calib::store::Location::Embedded;
+        let state = Mutex::new(st);
+        let area = encode_display_area(&DisplayArea {
+            top_left_mm: [-300.0, 300.0, 0.0],
+            top_right_mm: [300.0, 300.0, 0.0],
+            bottom_left_mm: [-300.0, 0.0, 0.0],
+        });
+
+        for (what, k, payload) in [
+            ("a pause", kind::DEVICE_PAUSE, &[1][..]),
+            ("a calibration", kind::CALIBRATION_START, &[2][..]),
+            ("a display area", kind::DISPLAY_AREA_SET, &area[..]),
+        ] {
+            let reply = handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind: k,
+                    payload,
+                },
+            );
+            assert_eq!(reply, Reply::err(status::CONNECTION_FAILED), "{what}");
+        }
+
+        let st = lock_state(&state);
+        assert!(
+            st.engines_started.is_empty(),
+            "no engine for an absent tracker"
+        );
+        assert!(
+            !st.paused && !st.pausing && st.pause_hint.is_none(),
+            "no pause is taken"
+        );
+        assert!(!st.calibration.is_active(), "nor a calibration session");
+        assert_eq!(st.display_override, None, "nor a display area");
     }
 
     /// Answers every command with `status`.
@@ -785,52 +972,59 @@ pub(crate) mod tests {
 
     #[test]
     fn an_in_session_area_set_that_replaces_a_dead_engine_is_refused() {
-        let dir = std::env::temp_dir().join(format!("tobiid-area-lost-{}", std::process::id()));
-        let path = dir.join("display-area");
-        let device = Arc::new(Logging::default());
-        let requested = DisplaySize::parse("600x340");
-        let mut st = crate::daemon::tests::state_with_client(1);
-        st.fake_device = Some(device.clone());
-        st.display_file = Some(path.clone());
-        st.display_request = requested;
-        st.calibration.location = tobii_calib::store::Location::Embedded;
-        let state = Mutex::new(st);
-        let ask = |kind, payload: &[u8]| {
-            handle(
-                &state,
-                1,
-                &Request {
-                    id: 1,
-                    kind,
-                    payload,
-                },
-            )
-        };
-        assert_eq!(ask(kind::CALIBRATION_START, &[2]), Reply::ok(Vec::new()));
-        device.0.lock().expect("log").clear();
-        lock_state(&state).lose_engine_on_fetch = true;
-        let area = DisplayArea {
-            top_left_mm: [-300.0, 300.0, 0.0],
-            top_right_mm: [300.0, 300.0, 0.0],
-            bottom_left_mm: [-300.0, 0.0, 0.0],
-        };
+        // A new engine starts for a tracker on the bus and none without one:
+        // either way the session went with the old engine.
+        for (tag, on_bus) in [("replaced", true), ("unplugged", false)] {
+            let dir =
+                std::env::temp_dir().join(format!("tobiid-area-lost-{tag}-{}", std::process::id()));
+            let path = dir.join("display-area");
+            let device = Arc::new(Logging::default());
+            let requested = DisplaySize::parse("600x340");
+            let mut st = crate::daemon::tests::state_with_client(1);
+            st.fake_device = Some(device.clone());
+            st.fake_present = on_bus;
+            st.display_file = Some(path.clone());
+            st.display_request = requested;
+            st.calibration.location = tobii_calib::store::Location::Embedded;
+            let state = Mutex::new(st);
+            let ask = |kind, payload: &[u8]| {
+                handle(
+                    &state,
+                    1,
+                    &Request {
+                        id: 1,
+                        kind,
+                        payload,
+                    },
+                )
+            };
+            assert_eq!(ask(kind::CALIBRATION_START, &[2]), Reply::ok(Vec::new()));
+            device.0.lock().expect("log").clear();
+            lock_state(&state).lose_engine_on_fetch = true;
+            let area = DisplayArea {
+                top_left_mm: [-300.0, 300.0, 0.0],
+                top_right_mm: [300.0, 300.0, 0.0],
+                bottom_left_mm: [-300.0, 0.0, 0.0],
+            };
 
-        let reply = ask(kind::DISPLAY_AREA_SET, &encode_display_area(&area));
+            let reply = ask(kind::DISPLAY_AREA_SET, &encode_display_area(&area));
 
-        assert_eq!(reply, Reply::err(status::CALIBRATION_NOT_STARTED));
-        assert!(
-            device.0.lock().expect("log").is_empty(),
-            "nothing reaches the device"
-        );
-        assert!(!path.exists(), "nor is saved");
-        let st = lock_state(&state);
-        assert_eq!(st.display_override, None, "nor configured");
-        assert_eq!(
-            st.display_request, requested,
-            "TOBII_DISPLAY_MM still applies"
-        );
-        drop(st);
-        let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(reply, Reply::err(status::CALIBRATION_NOT_STARTED), "{tag}");
+            assert!(
+                device.0.lock().expect("log").is_empty(),
+                "{tag}: nothing reaches the device"
+            );
+            assert!(!path.exists(), "{tag}: nor is saved");
+            let st = lock_state(&state);
+            assert_eq!(st.display_override, None, "{tag}: nor configured");
+            assert_eq!(
+                st.display_request, requested,
+                "{tag}: TOBII_DISPLAY_MM still applies"
+            );
+            assert_eq!(st.engines_started.len(), usize::from(on_bus), "{tag}");
+            drop(st);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

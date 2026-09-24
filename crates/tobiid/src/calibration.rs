@@ -56,7 +56,7 @@ use tobii_proto::calibration::{
 };
 use tracing::{info, warn};
 
-use crate::daemon::{State, lock_state};
+use crate::daemon::{State, lock_state, look_for_tracker};
 use crate::device::{DeviceCommands, run, run_in_session};
 use crate::requests::Reply;
 
@@ -256,17 +256,26 @@ fn check(st: &mut State, client: u64, access: &Access) -> Result<(), u8> {
 /// Check `access` for `client` and fetch the device; the session and its
 /// location for the caller to use once the lock is released.
 fn prepare(state: &Mutex<State>, client: u64, access: &Access) -> Result<Prepared, u8> {
-    prepare_locked(&mut lock_state(state), client, access)
+    let on_bus = look_for_tracker(state);
+    prepare_locked(&mut lock_state(state), client, access, on_bus)
 }
 
-/// [`prepare`] under the state lock the caller holds. Checked again once
-/// the device is fetched: a dead engine the fetch replaces takes the session
-/// along (see [`on_engine_lost`]). A request refused before the fetch starts
-/// no engine.
-fn prepare_locked(st: &mut State, client: u64, access: &Access) -> Result<Prepared, u8> {
+/// [`prepare`] under the state lock the caller holds, with what
+/// [`look_for_tracker`] found before it was taken. Checked again once the
+/// device is fetched, and before a missing one is `CONNECTION_FAILED`: a
+/// dead engine the fetch drops takes the session along (see
+/// [`on_engine_lost`]), whether or not another starts. A request refused
+/// before the fetch starts no engine.
+fn prepare_locked(
+    st: &mut State,
+    client: u64,
+    access: &Access,
+    tracker_on_bus: bool,
+) -> Result<Prepared, u8> {
     check(st, client, access)?;
-    let device = st.device_for(client).ok_or(status::CONNECTION_FAILED)?;
+    let device = st.device_for(client, tracker_on_bus);
     check(st, client, access)?;
+    let device = device.ok_or(status::CONNECTION_FAILED)?;
     let session = st.calibration.session.clone();
     let location = st.calibration.location.clone();
     Ok((device, session, location))
@@ -336,6 +345,7 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
         Ok(blob) => blob,
         Err(code) => return Reply::err(code),
     };
+    let on_bus = look_for_tracker(state);
     let (device, losses) = {
         let mut st = lock_state(state);
         match &st.calibration.session {
@@ -347,7 +357,7 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
         if st.paused || st.pausing {
             return Reply::err(status::NOT_AVAILABLE);
         }
-        let Some(device) = st.device_for(client) else {
+        let Some(device) = st.device_for(client, on_bus) else {
             return Reply::err(status::CONNECTION_FAILED);
         };
         // Claimed before the device work so a second client is turned away.
@@ -478,9 +488,10 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
         lock_state(state).calibration.orphaned = None;
         return Err(status::CALIBRATION_NOT_STARTED);
     }
+    let on_bus = look_for_tracker(state);
     let (device, session, location) = {
         let mut st = lock_state(state);
-        let prepared = prepare_locked(&mut st, client, &Access::Owner)?;
+        let prepared = prepare_locked(&mut st, client, &Access::Owner, on_bus)?;
         // Under the same lock: a device init from now on leaves the session
         // to this stop, whose commands still reach the device.
         if let Some(s) = st.calibration.session.as_mut() {
@@ -1818,37 +1829,50 @@ mod tests {
 
     #[test]
     fn a_request_that_replaces_a_dead_engine_finds_its_session_gone() {
-        let s = setup("lost-on-fetch");
-        let point = tobii_ipc::request::encode_point_2d(0.5, 0.5);
-        for (k, payload) in [
-            (kind::CALIBRATION_COLLECT_2D, &point[..]),
-            (kind::CALIBRATION_COMPUTE, &[][..]),
-            (kind::CALIBRATION_STOP, STOP_KEEP),
-        ] {
-            assert_eq!(
-                ask(&s, 1, kind::CALIBRATION_START, &[2]),
-                Reply::ok(Vec::new())
-            );
-            forget_sent(&s);
-            lock_state(&s.state).lose_engine_on_fetch = true;
+        // A new engine starts for a tracker on the bus and none without one:
+        // either way the session went with the old engine.
+        for (tag, on_bus) in [("lost-on-fetch", true), ("lost-unplugged", false)] {
+            let s = setup(tag);
+            lock_state(&s.state).fake_present = on_bus;
+            let point = tobii_ipc::request::encode_point_2d(0.5, 0.5);
+            for (k, payload) in [
+                (kind::CALIBRATION_COLLECT_2D, &point[..]),
+                (kind::CALIBRATION_COMPUTE, &[][..]),
+                (kind::CALIBRATION_STOP, STOP_KEEP),
+            ] {
+                // Without a tracker the stand-in went with the engine.
+                lock_state(&s.state).fake_device = Some(s.device.clone());
+                assert_eq!(
+                    ask(&s, 1, kind::CALIBRATION_START, &[2]),
+                    Reply::ok(Vec::new()),
+                    "{tag}, kind {k}"
+                );
+                forget_sent(&s);
+                lock_state(&s.state).lose_engine_on_fetch = true;
 
-            assert_eq!(
-                ask(&s, 1, k, payload).status,
-                status::CALIBRATION_NOT_STARTED,
-                "kind {k}"
-            );
+                assert_eq!(
+                    ask(&s, 1, k, payload).status,
+                    status::CALIBRATION_NOT_STARTED,
+                    "{tag}, kind {k}"
+                );
 
-            assert!(
-                s.device.log.lock().expect("log").is_empty(),
-                "kind {k}: nothing reaches the device"
-            );
-            let st = lock_state(&s.state);
-            assert!(!st.calibration.is_active(), "kind {k}");
-            assert_eq!(
-                st.calibration.display_access(1),
-                Ok(()),
-                "kind {k}: its owner has been told"
-            );
+                assert!(
+                    s.device.log.lock().expect("log").is_empty(),
+                    "{tag}, kind {k}: nothing reaches the device"
+                );
+                let st = lock_state(&s.state);
+                assert!(!st.calibration.is_active(), "{tag}, kind {k}");
+                assert_eq!(
+                    st.calibration.display_access(1),
+                    Ok(()),
+                    "{tag}, kind {k}: its owner has been told"
+                );
+                assert_eq!(
+                    st.fake_device.is_some(),
+                    on_bus,
+                    "{tag}, kind {k}: an engine runs only for a tracker"
+                );
+            }
         }
     }
 

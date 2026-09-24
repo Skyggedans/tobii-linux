@@ -108,7 +108,12 @@ Where the answers come from, and where they differ from Windows:
   unplugged (`TOBII_ERROR_TIMED_OUT` only if the daemon has not seen a tracker
   yet). The first call that needs the tracker starts it, and it then stays on
   (IR illuminator lit) for as long as that connection is open, as for an
-  open device in the Stream Engine.
+  open device in the Stream Engine. While it is unplugged, such a call (a
+  clock pair, a pause, a calibration, a display-area write) is
+  `TOBII_ERROR_CONNECTION_FAILED` at once from when the daemon has given the
+  tracker up, a few seconds after the unplug (until then the call waits on
+  the daemon's re-opens), and the daemon starts the tracker once it is
+  plugged back in, for a connection still open.
 - **Pause.** One state for the tracker, shared by every client, as in the
   Stream Engine: the last call wins and any client may resume.
   `TOBII_STATE_DEVICE_PAUSED` and a `DEVICE_PAUSED_STATE_CHANGED`
@@ -125,7 +130,10 @@ Where the answers come from, and where they differ from Windows:
   `tobii_get_device_name` gives the model.
 - **Clock pair.** `tobii_timesync` pairs the device timestamp of the next gaze
   frame with the host clock (`CLOCK_REALTIME`) in a fixed 30 ms bracket; the
-  Stream Engine times a round trip instead.
+  Stream Engine times a round trip instead. With no tracker plugged in it is
+  `TOBII_ERROR_CONNECTION_FAILED` rather than a wait, and a tracker unplugged
+  shortly before or during the call makes it so about a second after the
+  daemon gives the tracker up.
 - **Hardware configuration.** Its layout is the DLL's, but what the fields
   hold is inferred from one Windows capture, and on Linux the ET5 has
   answered its command (2120) with no data, so

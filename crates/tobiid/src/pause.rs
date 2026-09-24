@@ -38,7 +38,7 @@ use tobii_proto::facts::device_pause_payload;
 use tobii_proto::protocol::cmd;
 use tracing::{info, warn};
 
-use crate::daemon::{State, lock_state};
+use crate::daemon::{State, lock_state, look_for_tracker};
 use crate::device::run;
 use crate::requests::Reply;
 
@@ -89,6 +89,7 @@ fn pause(state: &Mutex<State>, client: u64) -> Reply {
     let Some(_held) = lock_until(&lock, deadline) else {
         return Reply::err(status::TIMED_OUT);
     };
+    let on_bus = look_for_tracker(state);
     let (device, losses) = {
         let mut st = lock_state(state);
         if st.calibration.is_active() {
@@ -96,7 +97,7 @@ fn pause(state: &Mutex<State>, client: u64) -> Reply {
         }
         // The engine takes commands only once its init is done, so the
         // pause always follows the init's resume.
-        let Some(device) = st.device_for(client) else {
+        let Some(device) = st.device_for(client, on_bus) else {
             return Reply::err(status::CONNECTION_FAILED);
         };
         st.pausing = true;

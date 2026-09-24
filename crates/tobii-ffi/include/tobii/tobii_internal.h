@@ -68,8 +68,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device
  * read it. The DLL times a round trip instead; its own offset estimator
  * skips pairs wider than 6 ms, though it still returns them with
  * TOBII_ERROR_NO_ERROR. Nothing is written unless the call succeeds;
- * TOBII_ERROR_NOT_AVAILABLE while the tracker is paused. Layout from the DLL
- * (24 bytes); the field names follow the older public headers. */
+ * TOBII_ERROR_NOT_AVAILABLE while the tracker is paused,
+ * TOBII_ERROR_CONNECTION_FAILED when no tracker is plugged in. Layout from
+ * the DLL (24 bytes); the field names follow the older public headers. */
 typedef struct tobii_timesync_data_t
 {
     int64_t system_start_us;
