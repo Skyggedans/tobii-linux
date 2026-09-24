@@ -15,7 +15,8 @@ Nice=-5
 # Keep the device warm so client connects are instant (the IR illuminator stays
 # on while the service runs). Uncomment for head tracking:
 #Environment=TOBII_PREWARM=head
-# Skipping the USB reset shaves a couple seconds off startup:
+# Skip the USB reset the engine tries once opens keep failing (it rarely helps
+# now that uvcvideo is kept off the device):
 #Environment=TOBII_NO_RESET=1
 
 [Install]

@@ -232,7 +232,7 @@ tracker runs in the daemon, not in the client):
 | `TOBII_POSE_DEBUG` | unset | log raw `t` vs pivoted `t'` and angles |
 | `TOBII_ROLL_EYELINE` | unset | `1` measures roll directly from the eye line (decoupled from yaw/pitch, symmetric by construction) instead of from the euler solve |
 | `TOBII_PREWARM` | unset | `1` (or the historical `head` / `gaze`): init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). |
-| `TOBII_NO_RESET` | unset | `1` skips the USB reset at init (a couple seconds faster; the reset rarely helps now that uvcvideo is kept off the device) |
+| `TOBII_NO_RESET` | unset | `1` skips the USB reset the engine tries once opens keep failing: two in a row that never arm the stream, or lose it within 30 s (the reset rarely helps now that uvcvideo is kept off the device) |
 | `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
 | `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s (an `info` event with `frames_per_s`/`poses_per_s`/`mean_ms` fields) |
 | `RUST_LOG` | `info` | log filter for all binaries (`debug`, `tobii=debug,ort=warn`, …); see §6 |
@@ -439,6 +439,13 @@ gaze has no rest pose.)
 - **Head pose arrives ~1 s after the first frame.** The tracker averages the
   first 30 frames as the rest pose (recenter to redo it); a cold device may
   additionally take one re-open (~10 s) before any stream arms.
+- **A stalled tracker is re-opened in place.** No gaze for 5 s (10 s after a
+  resume) outside a pause, or a USB error, makes the engine re-open and
+  re-init the tracker. Only opens that keep failing add up (they never arm,
+  or lose the stream within 30 s): after two in a row the tracker is
+  USB-reset before the third, and after five the engine stops; the daemon
+  starts a new one if a client still needs the tracker (or pre-warm is on)
+  and it is plugged in.
 - **Lazy claim.** An idle daemon holds no device; it opens the tracker on the
   first subscription or the first request that needs it (device info, a
   clock pair, a pause, …) and releases it when the last such client
