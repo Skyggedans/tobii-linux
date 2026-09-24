@@ -56,6 +56,20 @@ impl Writer {
         self
     }
 
+    /// A full-precision `f64`, for the fields the C ABI carries as `double`.
+    pub(crate) fn f64(&mut self, v: f64) -> &mut Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// Full-precision `f64`s (unlike [`Self::f64_as_f32`]).
+    pub(crate) fn f64_array(&mut self, vs: &[f64]) -> &mut Self {
+        for v in vs {
+            self.f64(*v);
+        }
+        self
+    }
+
     /// Narrowing to `f32` is the wire format: the C ABI this protocol feeds
     /// carries `float`, and millimetre geometry needs no more than 24 bits.
     #[allow(clippy::cast_possible_truncation)] // reason: f32 is the wire type
@@ -147,6 +161,20 @@ impl<'a> Reader<'a> {
         let mut out = [0.0; N];
         for v in &mut out {
             *v = f64::from(self.f32()?);
+        }
+        Some(out)
+    }
+
+    /// A full-precision `f64`.
+    pub(crate) fn f64(&mut self) -> Option<f64> {
+        self.take().map(f64::from_le_bytes)
+    }
+
+    /// Full-precision `f64`s (unlike [`Self::f64s`], which widens `f32`s).
+    pub(crate) fn f64_array<const N: usize>(&mut self) -> Option<[f64; N]> {
+        let mut out = [0.0; N];
+        for v in &mut out {
+            *v = self.f64()?;
         }
         Some(out)
     }

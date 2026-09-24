@@ -14,6 +14,7 @@
 //! | `0x14` | string: `u32` BE length + bytes |
 //! | `0x15` | bytes: `u32` BE length + bytes |
 //! | `0x17` | a list header (`u32` BE count, then the items) |
+//! | `0x19` | a list of 32.32 values (`u32` BE count, then the items; inferred, only empty ones seen) |
 //!
 //! Stream messages are **keyed**: each field is announced by
 //! `05 KEY_FIELD_ID` plus a `02` key, then either one scalar or a `05 <id>`
@@ -39,6 +40,10 @@ pub const TYPE_STRING: u8 = 0x14;
 pub const TYPE_BYTES: u8 = 0x15;
 /// List header.
 pub const TYPE_LIST: u8 = 0x17;
+/// A list of 32.32 values: `u32` BE count, then that many `i64` BE items.
+/// Inferred by analogy with [`TYPE_LIST`]: only empty ones were ever
+/// captured (in the 2120 hardware configuration).
+pub const TYPE_FIXED32_LIST: u8 = 0x19;
 /// `u32` BE trailer word.
 pub const TYPE_U32_TRAILER: u8 = 0x1a;
 
@@ -103,6 +108,30 @@ impl<'a> Tlv<'a> {
         (self.typ == TYPE_FIXED16).then(|| {
             Some(f64::from(i32::from_be_bytes(self.value.try_into().ok()?)) / FIXED16_ONE)
         })?
+    }
+
+    /// The raw items of a 32.32 list (type 0x19); `None` unless the value
+    /// is exactly the count and that many items.
+    #[must_use]
+    pub fn fixed32_list_raw(&self) -> Option<Vec<i64>> {
+        if self.typ != TYPE_FIXED32_LIST {
+            return None;
+        }
+        let (count, items) = self.value.split_first_chunk::<4>()?;
+        let count = usize::try_from(u32::from_be_bytes(*count)).ok()?;
+        if items.len() != count.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            items
+                .chunks_exact(8)
+                .map(|item| {
+                    let mut raw = [0; 8];
+                    raw.copy_from_slice(item);
+                    i64::from_be_bytes(raw)
+                })
+                .collect(),
+        )
     }
 
     fn length_prefixed(&self) -> Option<&'a [u8]> {
@@ -432,6 +461,34 @@ mod tests {
             .fixed32(),
             Some(-1.5)
         );
+    }
+
+    #[test]
+    fn a_fixed32_list_is_its_count_and_exactly_that_many_items() {
+        let list = |value: &[u8]| {
+            Tlv {
+                typ: TYPE_FIXED32_LIST,
+                value,
+            }
+            .fixed32_list_raw()
+        };
+        let mut two = 2u32.to_be_bytes().to_vec();
+        two.extend_from_slice(&(3i64 << 32).to_be_bytes());
+        two.extend_from_slice(&(-1i64).to_be_bytes());
+        assert_eq!(list(&two), Some(vec![3 << 32, -1]));
+        assert_eq!(list(&0u32.to_be_bytes()), Some(vec![]));
+
+        assert_eq!(list(&two[..two.len() - 1]), None, "an item short");
+        let mut long = two.clone();
+        long.push(0);
+        assert_eq!(list(&long), None, "a byte over");
+        assert_eq!(list(&u32::MAX.to_be_bytes()), None, "a huge count");
+        assert_eq!(list(&[0, 0, 0]), None, "no count");
+        let wrong_type = Tlv {
+            typ: TYPE_LIST,
+            value: &two,
+        };
+        assert_eq!(wrong_type.fixed32_list_raw(), None);
     }
 
     #[test]

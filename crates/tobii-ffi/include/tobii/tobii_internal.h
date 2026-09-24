@@ -3,9 +3,10 @@
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
  * argument types are best guesses. Only the field-of-use, image,
- * internal-stream, timesync, stream-type and pause functions are implemented;
- * every other entry point here returns TOBII_ERROR_NOT_SUPPORTED without
- * reading its arguments, so the guessed types cannot matter at runtime.
+ * internal-stream, timesync, stream-type, pause and hardware-configuration
+ * functions are implemented; every other entry point here returns
+ * TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the guessed
+ * types cannot matter at runtime.
  * Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
@@ -125,6 +126,45 @@ TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_stream_types( tobii_device_t*
 TOBII_API tobii_error_t TOBII_CALL tobii_pause_device( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_resume_device( tobii_device_t* device );
 
+/* PROVISIONAL. The tracker's hardware configuration (its command 2120). The
+ * layout is the DLL's (2472 bytes; offsets from its copy at 0x18014abe0 and
+ * its PRP deserialiser at 0x180045056, which load the 64-bit fields as
+ * double); the field names are ours, and what the fields mean is not known.
+ * The values come from the one answer ever captured (Windows): 16.16 values
+ * unscaled, 32.32 values scaled as lengths, in mm. On Linux the ET5 has so
+ * far answered 2120 with no data, so the call returns
+ * TOBII_ERROR_NOT_SUPPORTED there. When it succeeds the whole struct is
+ * written, zero past each count (the DLL leaves those slots untouched), and
+ * a mode outside 0..2 is 0, as in the DLL. Nothing is written on an error. */
+typedef struct tobii_hardware_configuration_entry_t
+{
+    int id;
+    float param_a;
+    float param_b;
+    double position_xyz[ 3 ];
+    double values[ 15 ];
+    int width;
+    int height;
+    int param_c;
+    int coefficient_count;
+    double coefficients[ 64 ];
+    double point_a_xyz[ 3 ];
+    double point_b_xyz[ 3 ];
+    double param_d;
+} tobii_hardware_configuration_entry_t;
+
+typedef struct tobii_hardware_configuration_t
+{
+    int entry_count;
+    tobii_hardware_configuration_entry_t entries[ 2 ];
+    int point_count;
+    double points_xyz[ 40 ][ 3 ];
+    int mode;
+} tobii_hardware_configuration_t;
+
+TOBII_API tobii_error_t TOBII_CALL tobii_hardware_configuration_get( tobii_device_t* device,
+    tobii_hardware_configuration_t* configuration );
+
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED. Its point type is
  * unknown. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_stimulus_points_get( tobii_device_t* device,
@@ -167,7 +207,6 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_face_id_parameters( tobii_device_t*
 TOBII_API tobii_error_t TOBII_CALL tobii_get_face_id_state( tobii_device_t* device, void* state );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_gaze_hid_enabled( tobii_device_t* device, void* enabled );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_illumination_mode( tobii_device_t* device, void* mode );
-TOBII_API tobii_error_t TOBII_CALL tobii_hardware_configuration_get( tobii_device_t* device, void* configuration );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_collection_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_collection_unsubscribe( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_internal_capability_supported( tobii_device_t* device, uint32_t capability, void* supported );

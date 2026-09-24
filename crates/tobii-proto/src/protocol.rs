@@ -490,6 +490,10 @@ pub mod cmd {
     pub const OUTPUT_RATE: u32 = 1650;
     /// Mounting geometry.
     pub const MOUNTING: u32 = 2110;
+    /// The hardware configuration (the Windows service's, for the DLL's
+    /// `tobii_hardware_configuration_get`). The init replay sends it inside
+    /// realm 0x2712; on Linux the ET5 answers with an empty payload.
+    pub const HARDWARE_CONFIGURATION: u32 = 2120;
     /// Pause (`u32 1`) or resume (`u32 0`) the device: the DLL's
     /// `tracker_pause_device` and `tracker_resume_device` (0x180199450,
     /// 0x18019e910). Every init replay resumes; a pause was never captured.

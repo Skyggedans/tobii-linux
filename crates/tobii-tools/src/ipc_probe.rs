@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tobii_ipc::geometry::display_area_basic;
 use tobii_ipc::request::{
-    self, decode_device_info, decode_display_area, decode_geometry_mounting, decode_stream_types,
-    decode_timesync, decode_track_box, encode_display_area, encode_request, kind, state,
+    self, decode_device_info, decode_display_area, decode_geometry_mounting,
+    decode_hardware_configuration, decode_stream_types, decode_timesync, decode_track_box,
+    encode_display_area, encode_request, kind, state,
 };
 use tobii_ipc::{ServerMsg, decode_server, encode_subscribe, read_frame, write_frame};
 
@@ -138,6 +139,17 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
                 .map(|t| format!("{:#x} {} ({})", t.id, t.name, t.value))
                 .collect::<Vec<_>>()
                 .join(", ")
+        })
+    });
+    let hardware = p.ask(kind::HARDWARE_CONFIGURATION, &[])?;
+    show("hardware config", &hardware, |b| {
+        decode_hardware_configuration(b).map_or("?".into(), |h| {
+            format!(
+                "{} entries, points {:?}, mode {}",
+                h.entries.len(),
+                h.points_mm,
+                h.mode
+            )
         })
     });
     let name = p.ask(kind::DEVICE_NAME_GET, &[])?;

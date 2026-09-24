@@ -7,10 +7,16 @@
 //! out here in millimetres.
 
 use tobii_ipc::geometry::{DisplayArea, GeometryMounting, TrackBox};
-use tobii_ipc::request::{DeviceInfo, StreamType};
+use tobii_ipc::request::{
+    DeviceInfo, HARDWARE_COEFFICIENTS_MAX, HARDWARE_ENTRIES_MAX, HARDWARE_POINTS_MAX,
+    HardwareConfiguration, HardwareEntry, StreamType,
+};
+use tracing::warn;
 
 use crate::protocol::{MARKER_NOTIFICATION, MARKER_RESPONSE, Message, cmd, notify};
-use crate::tlv::{FIELD_POINT_3D, TYPE_U32, Tlv, TlvWriter, UNITS_PER_MM};
+use crate::tlv::{
+    FIELD_POINT_3D, FIXED32_ONE, TYPE_U32, TYPE_U32_ALT, Tlv, TlvIter, TlvWriter, UNITS_PER_MM,
+};
 
 /// Field id of an indexed string (`05 ID, 02 index, 14 string`).
 const FIELD_INDEXED_STRING: u32 = 0x0002_2710;
@@ -19,6 +25,8 @@ const FIELD_STREAM_ENTRY: u32 = 0x0004_1389;
 /// Low half of a list header's field id; the high half's low 12 bits are
 /// the entry count plus one.
 const FIELD_LIST: u32 = 0x0100;
+/// Field id of a hardware configuration entry: 26 components.
+const FIELD_HARDWARE_ENTRY: u32 = 0x001a_332c;
 /// Field id announcing the display id after the three corners.
 const FIELD_DISPLAY_ID: u32 = 0x0001_0100;
 /// Field id announcing the output rate pair.
@@ -45,6 +53,9 @@ pub struct DeviceFacts {
     pub track_box: Option<TrackBox>,
     /// Mounting geometry (command 2110).
     pub mounting: Option<GeometryMounting>,
+    /// Hardware configuration (command 2120); provisional, and never sent
+    /// to Linux so far.
+    pub hardware: Option<HardwareConfiguration>,
     /// Status strings by index (the last command 1490).
     pub status: Vec<(u32, String)>,
     /// The active calibration id (status index 7).
@@ -83,6 +94,16 @@ impl DeviceFacts {
             cmd::MOUNTING if is_response => parse_mounting(msg)
                 .map(|m| self.mounting = Some(m))
                 .is_some(),
+            cmd::HARDWARE_CONFIGURATION if is_response => {
+                let parsed = parse_hardware_configuration(msg);
+                if parsed.is_none() && !msg.payload.is_empty() {
+                    warn!(
+                        len = msg.payload.len(),
+                        "hardware configuration (2120) in an unknown layout; ignored"
+                    );
+                }
+                parsed.map(|h| self.hardware = Some(h)).is_some()
+            }
             cmd::STATUS if is_response => {
                 self.status = parse_indexed_strings(msg);
                 self.calibration_id = self
@@ -150,11 +171,7 @@ pub fn parse_stream_catalogue(msg: &Message<'_>) -> Vec<StreamType> {
 
 fn stream_entries(msg: &Message<'_>) -> Option<Vec<StreamType>> {
     let mut entries = msg.tlvs();
-    let header = entries.next()?.field_id()?;
-    if header & 0xffff != FIELD_LIST {
-        return None;
-    }
-    let count = ((header >> 16) & 0xfff).checked_sub(1)?;
+    let count = list_header(&mut entries)?;
     entries.next()?.u32()?;
     (0..count)
         .map(|_| {
@@ -171,9 +188,41 @@ fn stream_entries(msg: &Message<'_>) -> Option<Vec<StreamType>> {
         .collect()
 }
 
+/// A list header's entry count: field `((n + 1) << 16) | 0x0100`. The
+/// entry type follows it.
+fn list_header(entries: &mut TlvIter<'_>) -> Option<u32> {
+    let header = entries.next()?.field_id()?;
+    if header & 0xffff != FIELD_LIST {
+        return None;
+    }
+    ((header >> 16) & 0xfff).checked_sub(1)
+}
+
 /// A `u32` of type 0x02 (`Tlv::u32` reads any 4 bytes).
 fn typed_u32(t: Tlv<'_>) -> Option<u32> {
     (t.typ == TYPE_U32).then(|| t.u32()).flatten()
+}
+
+/// A `u32` of type 0x01.
+fn alt_u32(t: Tlv<'_>) -> Option<u32> {
+    (t.typ == TYPE_U32_ALT).then(|| t.u32()).flatten()
+}
+
+/// A 32.32 value (type 0x04) in the device's length unit, as mm.
+fn fixed32_mm(t: Tlv<'_>) -> Option<f64> {
+    t.fixed32().map(|v| v / UNITS_PER_MM)
+}
+
+/// A 3-D point: `05 FIELD_POINT_3D` and three 32.32 components, mm.
+fn point_mm(entries: &mut TlvIter<'_>) -> Option<[f64; 3]> {
+    if entries.next()?.field_id()? != FIELD_POINT_3D {
+        return None;
+    }
+    Some([
+        fixed32_mm(entries.next()?)?,
+        fixed32_mm(entries.next()?)?,
+        fixed32_mm(entries.next()?)?,
+    ])
 }
 
 /// Every 3-D point in a payload, mm.
@@ -238,6 +287,95 @@ pub fn parse_mounting(msg: &Message<'_>) -> Option<GeometryMounting> {
         angle_deg,
         external_offset_mm: *points.first()?,
         internal_offset_mm: *points.get(1)?,
+    })
+}
+
+/// Command 2120: the hardware configuration, provisional.
+///
+/// The layout comes from the one response ever captured (Windows,
+/// `init.pcapng` frame 773): a list of entries (field `0x001a_332c`, 26
+/// components each: `u32` id, two 16.16 values, a point, fifteen 32.32
+/// values, three `u32`, a 0x19 list, two points, a 32.32 value), a list of
+/// points, then the `u32` mode. Every TLV's type is checked, and anything
+/// else (the empty payload the ET5 sends to Linux among it) is `None`.
+/// Beyond [`HARDWARE_ENTRIES_MAX`] entries and [`HARDWARE_POINTS_MAX`]
+/// points the rest is dropped, as the DLL clamps. Beyond
+/// [`HARDWARE_COEFFICIENTS_MAX`] list items too; the DLL does not check
+/// that count, but its struct holds only 64. 32.32 values are scaled as lengths (to mm), 16.16 values are
+/// not; both are inferred.
+#[must_use]
+pub fn parse_hardware_configuration(msg: &Message<'_>) -> Option<HardwareConfiguration> {
+    let mut tlvs = msg.tlvs();
+    let entry_count = list_header(&mut tlvs)?;
+    if typed_u32(tlvs.next()?)? != FIELD_HARDWARE_ENTRY & 0xffff {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for _ in 0..entry_count {
+        let entry = hardware_entry(&mut tlvs)?;
+        if entries.len() < HARDWARE_ENTRIES_MAX {
+            entries.push(entry);
+        }
+    }
+    let point_count = list_header(&mut tlvs)?;
+    if typed_u32(tlvs.next()?)? != FIELD_POINT_3D & 0xffff {
+        return None;
+    }
+    let mut points_mm = Vec::new();
+    for _ in 0..point_count {
+        let point = point_mm(&mut tlvs)?;
+        if points_mm.len() < HARDWARE_POINTS_MAX {
+            points_mm.push(point);
+        }
+    }
+    let mode = alt_u32(tlvs.next()?)?;
+    if tlvs.next().is_some() || tlvs.truncated() {
+        return None;
+    }
+    Some(HardwareConfiguration {
+        entries,
+        points_mm,
+        mode,
+    })
+}
+
+/// One entry of a 2120 list.
+#[allow(clippy::cast_precision_loss)] // reason: exact for the device's value range
+fn hardware_entry(tlvs: &mut TlvIter<'_>) -> Option<HardwareEntry> {
+    if tlvs.next()?.field_id()? != FIELD_HARDWARE_ENTRY {
+        return None;
+    }
+    let id = alt_u32(tlvs.next()?)?;
+    let param_a = tlvs.next()?.fixed16()?;
+    let param_b = tlvs.next()?.fixed16()?;
+    let position_mm = point_mm(tlvs)?;
+    let mut values = [0.0; 15];
+    for v in &mut values {
+        *v = fixed32_mm(tlvs.next()?)?;
+    }
+    let width = alt_u32(tlvs.next()?)?;
+    let height = alt_u32(tlvs.next()?)?;
+    let param_c = alt_u32(tlvs.next()?)?;
+    let coefficients = tlvs
+        .next()?
+        .fixed32_list_raw()?
+        .into_iter()
+        .take(HARDWARE_COEFFICIENTS_MAX)
+        .map(|raw| raw as f64 / FIXED32_ONE / UNITS_PER_MM)
+        .collect();
+    Some(HardwareEntry {
+        id,
+        param_a,
+        param_b,
+        position_mm,
+        values,
+        width,
+        height,
+        param_c,
+        coefficients,
+        point_a_mm: point_mm(tlvs)?,
+        point_b_mm: point_mm(tlvs)?,
+        param_d: fixed32_mm(tlvs.next()?)?,
     })
 }
 
@@ -408,6 +546,165 @@ mod tests {
         let mut fewer = good;
         fewer[32 + 2 + 5 + 1] -= 1;
         assert_eq!(catalogue(&fewer).len(), 8);
+    }
+
+    /// `init.pcapng` frame 773 with `edit` applied (offsets are into the
+    /// message, header included), parsed as a 2120.
+    fn hardware_edited(edit: impl FnOnce(&mut Vec<u8>)) -> Option<HardwareConfiguration> {
+        let mut bytes = crate::fixture!("init-rsp-2120");
+        edit(&mut bytes);
+        parse_hardware_configuration(&parse_message(&bytes).expect("msg"))
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: fixed-point values scale exactly
+    fn parses_the_captured_hardware_configuration() {
+        let facts = facts_from(&[crate::fixture!("init-rsp-2120")]);
+        let h = facts.hardware.expect("hardware configuration");
+
+        assert_eq!(h.entries.len(), 2);
+        let e = &h.entries[0];
+        assert_eq!((e.id, e.param_a, e.param_b), (0, 16.0, 100.0));
+        #[allow(clippy::cast_precision_loss)] // reason: exact for these values
+        let mm = |raw: i64| raw as f64 / FIXED32_ONE / UNITS_PER_MM;
+        assert_eq!(e.position_mm, [0.0, 0.0, mm(0x0000_108f_5c28_f5c2)]);
+        assert!(close(e.position_mm, [0.0, 0.0, 4.14], 1e-9));
+        let mut values = [0.0; 15];
+        values[3] = mm(0x0000_14e1_47ae_147a);
+        values[13] = mm(0x0000_0001_cac0_8312);
+        values[14] = values[13];
+        assert_eq!(e.values, values);
+        assert!((values[3] - 5.22).abs() < 1e-9 && (values[13] - 0.001_75).abs() < 1e-9);
+        assert_eq!((e.width, e.height, e.param_c), (2240, 2240, 0));
+        assert!(e.coefficients.is_empty());
+        assert_eq!(
+            (e.point_a_mm, e.point_b_mm, e.param_d),
+            ([0.0; 3], [0.0; 3], 0.0)
+        );
+        assert_eq!(
+            h.entries[1],
+            HardwareEntry {
+                param_a: 62.0,
+                param_b: 100.0,
+                ..HardwareEntry::default()
+            }
+        );
+
+        assert_eq!(h.points_mm.len(), 3);
+        assert_eq!(h.points_mm[0], [0.0; 3]);
+        assert!(close(h.points_mm[1], [130.0, 0.76, 1.62], 1e-9));
+        assert!(close(h.points_mm[2], [-130.0, 0.76, 1.62], 1e-9));
+        assert_eq!(h.mode, 1);
+    }
+
+    /// What the ET5 sends to Linux: the header alone.
+    #[test]
+    fn an_empty_hardware_configuration_is_not_a_fact() {
+        let bytes = crate::fixture!("init-rsp-2120");
+        let msg = parse_message(&bytes[..32]).expect("msg");
+        assert_eq!(msg.id, cmd::HARDWARE_CONFIGURATION);
+
+        assert_eq!(parse_hardware_configuration(&msg), None);
+        let mut facts = DeviceFacts::default();
+        assert!(!facts.apply(&msg));
+        assert_eq!(facts.hardware, None);
+    }
+
+    #[test]
+    fn a_cut_hardware_configuration_is_none() {
+        let bytes = crate::fixture!("init-rsp-2120");
+        for len in 32..bytes.len() {
+            let msg = parse_message(&bytes[..len]).expect("msg");
+            assert_eq!(parse_hardware_configuration(&msg), None, "cut at {len}");
+        }
+        assert_eq!(
+            hardware_edited(|b| b.extend_from_slice(&[1, 0, 0, 0, 4, 0, 0, 0, 0])),
+            None,
+            "a TLV after the mode"
+        );
+    }
+
+    #[test]
+    fn every_hardware_configuration_type_is_checked() {
+        // The first entry's id (0x01), its param_a (0x03), a value (0x04),
+        // its width (0x01), its list (0x19), the mode (0x01) and the entry
+        // list's element type (0x02).
+        for (at, other) in [
+            (0x3d, TYPE_U32),
+            (0x46, crate::tlv::TYPE_FIXED32),
+            (0x88, crate::tlv::TYPE_FIXED16),
+            (0x14b, TYPE_U32),
+            (0x166, crate::tlv::TYPE_LIST),
+            (0x426, TYPE_U32),
+            (0x2b, TYPE_U32_ALT),
+        ] {
+            assert_eq!(hardware_edited(|b| b[at] = other), None, "type at {at:#x}");
+        }
+        // Each entry's field id, with 27 components in place of 26.
+        for at in [0x3a, 0x1e2] {
+            assert_eq!(
+                hardware_edited(|b| b[at] = 0x1b),
+                None,
+                "an entry of 27 components at {at:#x}"
+            );
+        }
+    }
+
+    /// Replace the first entry's empty 0x19 list (at 0x166) with `value`.
+    fn with_list(value: &[u8]) -> Option<HardwareConfiguration> {
+        hardware_edited(|b| {
+            let mut tlv = vec![crate::tlv::TYPE_FIXED32_LIST];
+            tlv.extend_from_slice(&u32::try_from(value.len()).expect("len").to_be_bytes());
+            tlv.extend_from_slice(value);
+            b.splice(0x166..0x166 + 9, tlv);
+        })
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: fixed-point values scale exactly
+    fn a_fixed32_list_becomes_the_coefficients() {
+        let mut two = 2u32.to_be_bytes().to_vec();
+        two.extend_from_slice(&(1024i64 << 32).to_be_bytes());
+        two.extend_from_slice(&(-512i64 << 32).to_be_bytes());
+        let h = with_list(&two).expect("parses");
+        assert_eq!(h.entries[0].coefficients, [1.0, -0.5]);
+        assert_eq!(h.entries[0].width, 2240, "the rest still lines up");
+
+        let mut three = two;
+        three[3] = 3;
+        assert_eq!(with_list(&three), None, "a count the length does not hold");
+
+        let mut many = 65u32.to_be_bytes().to_vec();
+        many.extend((0..65i64).flat_map(|i| (i << 42).to_be_bytes()));
+        let h = with_list(&many).expect("parses");
+        assert_eq!(h.entries[0].coefficients.len(), HARDWARE_COEFFICIENTS_MAX);
+        assert_eq!(h.entries[0].coefficients[63], 63.0);
+    }
+
+    #[test]
+    fn extra_hardware_entries_and_points_are_dropped() {
+        let h = hardware_edited(|b| {
+            // A third entry: the second one again.
+            let second = b[0x1dc..0x384].to_vec();
+            b.splice(0x384..0x384, second);
+            b[0x22 + 5 + 1] = 4;
+        })
+        .expect("parses");
+        assert_eq!(h.entries.len(), HARDWARE_ENTRIES_MAX);
+        assert_eq!((h.points_mm.len(), h.mode), (3, 1));
+
+        let h = hardware_edited(|b| {
+            // 41 points: the second one 38 more times.
+            let point = b[0x3c6..0x3f6].to_vec();
+            for _ in 0..38 {
+                b.splice(0x426..0x426, point.iter().copied());
+            }
+            b[0x384 + 5 + 1] = 42;
+        })
+        .expect("parses");
+        assert_eq!(h.points_mm.len(), HARDWARE_POINTS_MAX);
+        assert!(close(h.points_mm[39], [130.0, 0.76, 1.62], 1e-9));
+        assert_eq!(h.mode, 1);
     }
 
     #[test]

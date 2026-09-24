@@ -1302,12 +1302,14 @@ mod tests {
             fixture("init-rsp-1430"),
             fixture("init-rsp-2110"),
             fixture("init-rsp-1490"),
+            fixture("init-rsp-2120"),
         ];
         let facts = DeviceFacts::from_messages(responses.iter().filter_map(|r| parse_message(r)));
         assert_eq!(facts.info.generation, "IS5");
         assert!(
             facts.track_box.is_some() && facts.display_area.is_some() && facts.mounting.is_some()
         );
+        assert!(facts.hardware.is_some());
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
     }
 

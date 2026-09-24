@@ -377,6 +377,59 @@ pub struct StreamType {
     pub text: [c_char; 64],
 }
 
+/// One entry of [`HardwareConfiguration`] (provisional: offsets from the
+/// DLL's copy at 0x18014abe0 and its PRP (de)serialisers, which load the
+/// 64-bit fields as `double`; the names are ours, and what the fields mean
+/// is not known).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HardwareConfigurationEntry {
+    /// An id.
+    pub id: i32,
+    /// A 16.16 value from the tracker, unscaled.
+    pub param_a: f32,
+    /// A 16.16 value from the tracker, unscaled.
+    pub param_b: f32,
+    /// A 3-D point, mm.
+    pub position_xyz: [f64; 3],
+    /// Fifteen values, scaled as lengths (mm).
+    pub values: [f64; 15],
+    /// A count (2240 on the ET5).
+    pub width: i32,
+    /// A count (2240 on the ET5).
+    pub height: i32,
+    /// A number.
+    pub param_c: i32,
+    /// How many of `coefficients` are set.
+    pub coefficient_count: i32,
+    /// Values scaled as lengths (mm); the first `coefficient_count` are set.
+    pub coefficients: [f64; 64],
+    /// A 3-D point, mm.
+    pub point_a_xyz: [f64; 3],
+    /// A 3-D point, mm.
+    pub point_b_xyz: [f64; 3],
+    /// A value scaled as a length (mm).
+    pub param_d: f64,
+}
+
+/// `tobii_hardware_configuration_t` (undocumented, provisional: 2472 bytes,
+/// offsets from the DLL's copy at 0x18014abe0 and its PRP deserialiser at
+/// 0x180045056; the names and units are ours).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HardwareConfiguration {
+    /// How many of `entries` are set.
+    pub entry_count: i32,
+    /// The tracker's entries; the first `entry_count` are set.
+    pub entries: [HardwareConfigurationEntry; 2],
+    /// How many of `points_xyz` are set.
+    pub point_count: i32,
+    /// 3-D points, mm; the first `point_count` are set.
+    pub points_xyz: [[f64; 3]; 40],
+    /// A mode, 0..=2.
+    pub mode: i32,
+}
+
 /// `tobii_calibration_point_data_t`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -503,6 +556,29 @@ mod tests {
         assert_eq!(offset_of!(StreamType, value), 4);
         assert_eq!(offset_of!(StreamType, name), 8);
         assert_eq!(offset_of!(StreamType, text), 72);
+
+        assert_eq!(size_of::<HardwareConfigurationEntry>(), 0x2e8);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, param_a), 4);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, param_b), 8);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, position_xyz), 0x10);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, values), 0x28);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, width), 0xa0);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, height), 0xa4);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, param_c), 0xa8);
+        assert_eq!(
+            offset_of!(HardwareConfigurationEntry, coefficient_count),
+            0xac
+        );
+        assert_eq!(offset_of!(HardwareConfigurationEntry, coefficients), 0xb0);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, point_a_xyz), 0x2b0);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, point_b_xyz), 0x2c8);
+        assert_eq!(offset_of!(HardwareConfigurationEntry, param_d), 0x2e0);
+        assert_eq!(size_of::<HardwareConfiguration>(), 0x9a8);
+        assert_eq!(align_of::<HardwareConfiguration>(), 8);
+        assert_eq!(offset_of!(HardwareConfiguration, entries), 8);
+        assert_eq!(offset_of!(HardwareConfiguration, point_count), 0x5d8);
+        assert_eq!(offset_of!(HardwareConfiguration, points_xyz), 0x5e0);
+        assert_eq!(offset_of!(HardwareConfiguration, mode), 0x9a0);
 
         assert_eq!(size_of::<CalibrationPointData>(), 32);
         assert_eq!(offset_of!(CalibrationPointData, right_status), 20);

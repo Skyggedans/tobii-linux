@@ -2,13 +2,15 @@
 //! does not cover (all but `tobii_calibration_stimulus_points_get`, which
 //! lives with calibration). Their argument counts come from the DLL (see
 //! `tools/abi`); their types are best-effort, which is safe because only the
-//! field-of-use, image, internal-stream, timesync, stream-type and pause
-//! functions below read their arguments.
+//! field-of-use, image, internal-stream, timesync, stream-type, pause and
+//! hardware-configuration functions below read their arguments.
 
 use std::ffi::c_void;
 use std::time::Duration;
 
-use tobii_ipc::request::{self, decode_stream_types, decode_timesync, kind};
+use tobii_ipc::request::{
+    self, decode_hardware_configuration, decode_stream_types, decode_timesync, kind,
+};
 
 use crate::api::{FACTS_TIMEOUT, write_supported};
 use crate::calibration::request;
@@ -19,7 +21,8 @@ use crate::status::{
 use crate::streams::{subscribe, unsubscribe};
 use crate::stub::not_supported;
 use crate::types::{
-    FieldOfUse, FieldOfUseFn, ImageFn, StreamType, StreamTypeReceiver, TimesyncData, copy_c_string,
+    FieldOfUse, FieldOfUseFn, HardwareConfiguration, HardwareConfigurationEntry, ImageFn,
+    StreamType, StreamTypeReceiver, TimesyncData, copy_c_string,
 };
 
 /// The field of use the device was created with.
@@ -300,6 +303,107 @@ pub unsafe extern "C" fn tobii_resume_device(device: *mut Device) -> Status {
     unsafe { request(device, kind::DEVICE_PAUSE, &[0], PAUSE_TIMEOUT) }
 }
 
+/// A hardware configuration entry with nothing set.
+const NO_HARDWARE_ENTRY: HardwareConfigurationEntry = HardwareConfigurationEntry {
+    id: 0,
+    param_a: 0.0,
+    param_b: 0.0,
+    position_xyz: [0.0; 3],
+    values: [0.0; 15],
+    width: 0,
+    height: 0,
+    param_c: 0,
+    coefficient_count: 0,
+    coefficients: [0.0; 64],
+    point_a_xyz: [0.0; 3],
+    point_b_xyz: [0.0; 3],
+    param_d: 0.0,
+};
+
+/// A count of slots, which is at most an array's length.
+fn c_count(n: usize) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// The daemon's hardware configuration in the DLL's layout: every slot past
+/// a count is zero, and the tracker's 32-bit words keep their bits, as the
+/// DLL copies them. A mode outside 0..=2 is 0, as the DLL's service maps it.
+#[allow(clippy::cast_possible_truncation)] // reason: the C fields are float (inferred); 16.16 values fit
+fn hardware_configuration_c(h: &request::HardwareConfiguration) -> HardwareConfiguration {
+    let mut c = HardwareConfiguration {
+        entry_count: c_count(h.entries.len().min(2)),
+        entries: [NO_HARDWARE_ENTRY; 2],
+        point_count: c_count(h.points_mm.len().min(40)),
+        points_xyz: [[0.0; 3]; 40],
+        mode: match h.mode {
+            mode @ 0..=2 => mode.cast_signed(),
+            _ => 0,
+        },
+    };
+    for (dst, e) in c.entries.iter_mut().zip(&h.entries) {
+        let n = e.coefficients.len().min(dst.coefficients.len());
+        dst.coefficients[..n].copy_from_slice(&e.coefficients[..n]);
+        dst.coefficient_count = c_count(n);
+        dst.id = e.id.cast_signed();
+        dst.param_a = e.param_a as f32;
+        dst.param_b = e.param_b as f32;
+        dst.position_xyz = e.position_mm;
+        dst.values = e.values;
+        dst.width = e.width.cast_signed();
+        dst.height = e.height.cast_signed();
+        dst.param_c = e.param_c.cast_signed();
+        dst.point_a_xyz = e.point_a_mm;
+        dst.point_b_xyz = e.point_b_mm;
+        dst.param_d = e.param_d;
+    }
+    for (dst, p) in c.points_xyz.iter_mut().zip(&h.points_mm) {
+        *dst = *p;
+    }
+    c
+}
+
+/// The tracker's hardware configuration: provisional.
+///
+/// The DLL reads it from its service (PRP property 12), which has it from
+/// the tracker's command 2120. That answer's layout is inferred from one
+/// Windows capture, and on Linux the ET5 has so far answered 2120 with no
+/// data, so this is `TOBII_ERROR_NOT_SUPPORTED` there, as the DLL answers
+/// when a device does not list the property. When the daemon has one, the
+/// whole struct is written, with every slot past a count zero (the DLL
+/// leaves those as the caller had them); nothing is written unless the call
+/// succeeds. The field names and units are ours: 16.16 values unscaled,
+/// 32.32 values as lengths in mm.
+///
+/// # Safety
+/// `device` as `tobii_device_process_callbacks`; `configuration` must be
+/// null or valid for writing one `tobii_hardware_configuration_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_hardware_configuration_get(
+    device: *mut Device,
+    configuration: *mut HardwareConfiguration,
+) -> Status {
+    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
+    let d = match unsafe { device_mut(device) } {
+        Ok(d) => d,
+        Err(status) => return status,
+    };
+    if configuration.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    match d
+        .request(kind::HARDWARE_CONFIGURATION, &[], FACTS_TIMEOUT)
+        .map(|p| decode_hardware_configuration(&p))
+    {
+        Ok(Some(h)) => {
+            // SAFETY: non-null, and the caller guarantees it is writable.
+            unsafe { configuration.write(hardware_configuration_c(&h)) };
+            TOBII_ERROR_NO_ERROR
+        }
+        Ok(None) => TOBII_ERROR_INTERNAL,
+        Err(status) => status,
+    }
+}
+
 type P = *mut c_void;
 type C = *const c_void;
 
@@ -339,7 +443,6 @@ not_supported! {
     fn tobii_get_face_id_state(device: P, state: P);
     fn tobii_get_gaze_hid_enabled(device: P, enabled: P);
     fn tobii_get_illumination_mode(device: P, mode: P);
-    fn tobii_hardware_configuration_get(device: P, configuration: P);
     fn tobii_image_collection_subscribe(device: P, callback: C, user_data: P);
     fn tobii_image_collection_unsubscribe(device: P);
     fn tobii_internal_capability_supported(device: P, capability: u32, supported: P);
@@ -664,6 +767,123 @@ mod tests {
             );
             assert_eq!(tobii_device_destroy(d), 0);
         }
+    }
+
+    /// A configuration with every field set, to see what a call writes.
+    fn sentinel_configuration() -> HardwareConfiguration {
+        let entry = HardwareConfigurationEntry {
+            id: -7,
+            coefficient_count: -7,
+            coefficients: [-7.0; 64],
+            param_d: -7.0,
+            ..NO_HARDWARE_ENTRY
+        };
+        HardwareConfiguration {
+            entry_count: -7,
+            entries: [entry; 2],
+            point_count: -7,
+            points_xyz: [[-7.0; 3]; 40],
+            mode: -7,
+        }
+    }
+
+    /// Ask a daemon answering `status`/`payload` for the hardware
+    /// configuration, into a sentinel.
+    fn hardware_with(status: u8, payload: Vec<u8>) -> (Status, HardwareConfiguration) {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(status, payload)));
+        let mut out = sentinel_configuration();
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below; `out` is a live local.
+        unsafe {
+            let got = tobii_hardware_configuration_get(d, &raw mut out);
+            assert_eq!(tobii_device_destroy(d), 0);
+            (got, out)
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: values copied, not computed
+    fn the_hardware_configuration_fills_the_dll_layout() {
+        let h = request::HardwareConfiguration {
+            entries: vec![request::HardwareEntry {
+                id: u32::MAX,
+                param_a: 16.0,
+                param_b: 100.0,
+                position_mm: [0.0, 0.0, 4.14],
+                values: [0.5; 15],
+                width: 2240,
+                height: 2241,
+                param_c: 3,
+                coefficients: vec![1.0, -0.5],
+                point_a_mm: [1.0, 2.0, 3.0],
+                point_b_mm: [4.0, 5.0, 6.0],
+                param_d: 0.25,
+            }],
+            points_mm: vec![[130.0, 0.76, 1.62], [-130.0, 0.76, 1.62]],
+            mode: 2,
+        };
+
+        let (got, c) = hardware_with(0, request::encode_hardware_configuration(&h));
+
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        assert_eq!((c.entry_count, c.point_count, c.mode), (1, 2, 2));
+        let e = &c.entries[0];
+        assert_eq!((e.id, e.param_a, e.param_b), (-1, 16.0, 100.0));
+        assert_eq!((e.position_xyz, e.values), ([0.0, 0.0, 4.14], [0.5; 15]));
+        assert_eq!((e.width, e.height, e.param_c), (2240, 2241, 3));
+        assert_eq!(e.coefficient_count, 2);
+        assert_eq!(e.coefficients[..3], [1.0, -0.5, 0.0], "zero past the count");
+        assert_eq!(
+            (e.point_a_xyz, e.point_b_xyz),
+            ([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
+        );
+        assert_eq!(e.param_d, 0.25);
+        assert_eq!(c.entries[1], NO_HARDWARE_ENTRY, "zero past the count");
+        assert_eq!(c.points_xyz[1], [-130.0, 0.76, 1.62]);
+        assert_eq!(c.points_xyz[2], [0.0; 3], "zero past the count");
+    }
+
+    #[test]
+    fn a_hardware_mode_outside_the_dlls_range_is_zero() {
+        for (mode, want) in [(0, 0), (1, 1), (2, 2), (3, 0), (u32::MAX, 0)] {
+            let h = request::HardwareConfiguration {
+                mode,
+                ..request::HardwareConfiguration::default()
+            };
+            let (got, c) = hardware_with(0, request::encode_hardware_configuration(&h));
+            assert_eq!((got, c.mode), (TOBII_ERROR_NO_ERROR, want), "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_hardware_configuration_failure_writes_nothing() {
+        let (got, c) = hardware_with(status::NOT_SUPPORTED, vec![]);
+        assert_eq!(
+            got,
+            crate::status::TOBII_ERROR_NOT_SUPPORTED,
+            "what the ET5 answers on Linux, passed through"
+        );
+        assert_eq!(c, sentinel_configuration());
+        let (got, c) = hardware_with(0, vec![3]);
+        assert_eq!(got, TOBII_ERROR_INTERNAL, "a malformed reply");
+        assert_eq!(c, sentinel_configuration());
+
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        let mut out = sentinel_configuration();
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below; `out` is a live local.
+        unsafe {
+            assert_eq!(
+                tobii_hardware_configuration_get(d, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_hardware_configuration_get(ptr::null_mut(), &raw mut out),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+        assert_eq!(out, sentinel_configuration());
     }
 
     #[test]

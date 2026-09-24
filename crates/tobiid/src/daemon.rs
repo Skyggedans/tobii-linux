@@ -320,14 +320,18 @@ impl State {
 }
 
 /// Fill in, from the previous init's facts, what a new init did not report
-/// because a response was lost: the stream catalogue is the firmware's, so
-/// the old one still holds, and a lost 1200 must not blank it.
+/// because a response was lost: the stream catalogue and the hardware
+/// configuration are the firmware's, so the old ones still hold, and a lost
+/// 1200 or 2120 must not blank them.
 fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
     let Some(previous) = previous else {
         return;
     };
     if facts.streams.is_empty() {
         facts.streams.clone_from(&previous.streams);
+    }
+    if facts.hardware.is_none() {
+        facts.hardware.clone_from(&previous.hardware);
     }
 }
 
@@ -709,6 +713,29 @@ pub(crate) mod tests {
             st.facts.as_ref().map(|f| f.streams.clone()),
             Some(vec![image]),
             "a reported catalogue replaces the old one"
+        );
+    }
+
+    #[test]
+    fn an_init_without_a_hardware_configuration_keeps_the_previous_one() {
+        let mut st = state_with_client(1);
+        let ready = |hardware| {
+            Sample::DeviceReady(Arc::new(DeviceFacts {
+                hardware,
+                ..DeviceFacts::default()
+            }))
+        };
+        let hardware = tobii_ipc::request::HardwareConfiguration {
+            mode: 1,
+            ..Default::default()
+        };
+        st.observe(&ready(Some(hardware.clone())));
+
+        st.observe(&ready(None));
+
+        assert_eq!(
+            st.facts.as_ref().and_then(|f| f.hardware.clone()),
+            Some(hardware)
         );
     }
 

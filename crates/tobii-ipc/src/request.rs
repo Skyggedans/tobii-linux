@@ -28,6 +28,10 @@ pub mod kind {
     /// The tracker's stream catalogue: reply is a list of
     /// [`super::StreamType`] (see [`super::encode_stream_types`]).
     pub const STREAM_TYPES: u8 = 8;
+    /// The tracker's hardware configuration (command 2120): reply is a
+    /// [`super::HardwareConfiguration`]. Provisional: the layout is inferred
+    /// from one Windows capture, and the ET5 has never sent one to Linux.
+    pub const HARDWARE_CONFIGURATION: u8 = 9;
     /// Pause (payload `u8 1`) or resume (`u8 0`) the device; reply is empty.
     /// One state for every client: the last request wins, any client may
     /// resume, and the device resumes when the client that paused it goes
@@ -334,6 +338,149 @@ pub fn decode_stream_types(payload: &[u8]) -> Option<Vec<StreamType>> {
         });
     }
     Some(types)
+}
+
+/// Most entries a [`HardwareConfiguration`] carries: the slots of
+/// `tobii_hardware_configuration_t`.
+pub const HARDWARE_ENTRIES_MAX: usize = 2;
+/// Most points a [`HardwareConfiguration`] carries.
+pub const HARDWARE_POINTS_MAX: usize = 40;
+/// Most coefficients a [`HardwareEntry`] carries.
+pub const HARDWARE_COEFFICIENTS_MAX: usize = 64;
+
+/// One entry of the tracker's hardware configuration (command 2120). What
+/// each field means is not known; the names are neutral. The 32.32 values
+/// are scaled as the tracker's lengths are (1/1024 mm to mm).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HardwareEntry {
+    /// An id (0 in both entries the ET5 sent to Windows).
+    pub id: u32,
+    /// A 16.16 value, unscaled (16 and 62 on the ET5).
+    pub param_a: f64,
+    /// A 16.16 value, unscaled (100 on the ET5).
+    pub param_b: f64,
+    /// A 3-D point, mm.
+    pub position_mm: [f64; 3],
+    /// Fifteen 32.32 values, scaled to mm.
+    pub values: [f64; 15],
+    /// A count (2240 on the ET5).
+    pub width: u32,
+    /// A count (2240 on the ET5).
+    pub height: u32,
+    /// A number (0 on the ET5).
+    pub param_c: u32,
+    /// A list of 32.32 values, scaled to mm; at most
+    /// [`HARDWARE_COEFFICIENTS_MAX`] (empty on the ET5).
+    pub coefficients: Vec<f64>,
+    /// A 3-D point, mm.
+    pub point_a_mm: [f64; 3],
+    /// A 3-D point, mm.
+    pub point_b_mm: [f64; 3],
+    /// A 32.32 value, scaled to mm.
+    pub param_d: f64,
+}
+
+/// The tracker's hardware configuration (command 2120), the data behind
+/// `tobii_hardware_configuration_get`. Provisional: see
+/// [`kind::HARDWARE_CONFIGURATION`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HardwareConfiguration {
+    /// At most [`HARDWARE_ENTRIES_MAX`] entries.
+    pub entries: Vec<HardwareEntry>,
+    /// At most [`HARDWARE_POINTS_MAX`] 3-D points, mm.
+    pub points_mm: Vec<[f64; 3]>,
+    /// The tracker's mode word (1 on the ET5).
+    pub mode: u32,
+}
+
+/// Reply payload of [`kind::HARDWARE_CONFIGURATION`]: `u8` entry count, then
+/// per entry `u32 id`, `f64 param_a, param_b`, 3 `f64` position, 15 `f64`
+/// values, `u32 width, height, param_c`, `u8` coefficient count and the
+/// `f64` coefficients, 3 + 3 `f64` points, `f64 param_d`; then `u8` point
+/// count and 3 `f64` per point; then `u32 mode`. Lists past their limit are
+/// cut to it.
+#[must_use]
+pub fn encode_hardware_configuration(h: &HardwareConfiguration) -> Vec<u8> {
+    // Each list is cut to its limit, which fits a `u8`.
+    let count = |n: usize, max: usize| u8::try_from(n.min(max)).unwrap_or(u8::MAX);
+    let mut w = Writer::default();
+    w.u8(count(h.entries.len(), HARDWARE_ENTRIES_MAX));
+    for e in h.entries.iter().take(HARDWARE_ENTRIES_MAX) {
+        let coefficients = &e.coefficients[..e.coefficients.len().min(HARDWARE_COEFFICIENTS_MAX)];
+        w.u32(e.id)
+            .f64(e.param_a)
+            .f64(e.param_b)
+            .f64_array(&e.position_mm)
+            .f64_array(&e.values)
+            .u32(e.width)
+            .u32(e.height)
+            .u32(e.param_c)
+            .u8(count(coefficients.len(), HARDWARE_COEFFICIENTS_MAX))
+            .f64_array(coefficients)
+            .f64_array(&e.point_a_mm)
+            .f64_array(&e.point_b_mm)
+            .f64(e.param_d);
+    }
+    w.u8(count(h.points_mm.len(), HARDWARE_POINTS_MAX));
+    for p in h.points_mm.iter().take(HARDWARE_POINTS_MAX) {
+        w.f64_array(p);
+    }
+    w.u32(h.mode).finish()
+}
+
+/// Decode a [`kind::HARDWARE_CONFIGURATION`] reply payload; a count past its
+/// limit is `None`.
+#[must_use]
+pub fn decode_hardware_configuration(payload: &[u8]) -> Option<HardwareConfiguration> {
+    let mut r = Reader::new(payload);
+    let entry_count = usize::from(r.u8()?);
+    if entry_count > HARDWARE_ENTRIES_MAX {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let id = r.u32()?;
+        let param_a = r.f64()?;
+        let param_b = r.f64()?;
+        let position_mm = r.f64_array()?;
+        let values = r.f64_array()?;
+        let width = r.u32()?;
+        let height = r.u32()?;
+        let param_c = r.u32()?;
+        let coefficient_count = usize::from(r.u8()?);
+        if coefficient_count > HARDWARE_COEFFICIENTS_MAX {
+            return None;
+        }
+        let coefficients = (0..coefficient_count)
+            .map(|_| r.f64())
+            .collect::<Option<Vec<_>>>()?;
+        entries.push(HardwareEntry {
+            id,
+            param_a,
+            param_b,
+            position_mm,
+            values,
+            width,
+            height,
+            param_c,
+            coefficients,
+            point_a_mm: r.f64_array()?,
+            point_b_mm: r.f64_array()?,
+            param_d: r.f64()?,
+        });
+    }
+    let point_count = usize::from(r.u8()?);
+    if point_count > HARDWARE_POINTS_MAX {
+        return None;
+    }
+    let points_mm = (0..point_count)
+        .map(|_| r.f64_array())
+        .collect::<Option<Vec<_>>>()?;
+    Some(HardwareConfiguration {
+        entries,
+        points_mm,
+        mode: r.u32()?,
+    })
 }
 
 /// A single `u32` payload (state id, state value, calibration id).

@@ -1,5 +1,6 @@
 //! Client requests: what the device reported about itself (identity,
-//! geometry, stream catalogue), its display area, states and clock.
+//! geometry, stream catalogue, hardware configuration), its display area,
+//! states and clock.
 //! Calibration requests are handed to [`crate::calibration`], the device
 //! name to [`crate::name`], pause and resume to [`crate::pause`].
 //!
@@ -14,8 +15,8 @@ use std::time::{Duration, Instant};
 use tobii_ipc::geometry::{DisplayArea, display_area_basic};
 use tobii_ipc::request::{
     self, DeviceInfo, Request, Timesync, decode_display_area, encode_device_info,
-    encode_display_area, encode_geometry_mounting, encode_stream_types, encode_timesync,
-    encode_track_box, encode_u32, kind, state, status,
+    encode_display_area, encode_geometry_mounting, encode_hardware_configuration,
+    encode_stream_types, encode_timesync, encode_track_box, encode_u32, kind, state, status,
 };
 use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_payload};
 use tobii_proto::protocol::cmd;
@@ -85,6 +86,11 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
         // catalogue is the firmware's.
         kind::STREAM_TYPES => facts(state, client, |f| {
             (!f.streams.is_empty()).then(|| encode_stream_types(&f.streams))
+        }),
+        // Provisional, and NOT_SUPPORTED so far: the ET5 answers the init's
+        // 2120 with an empty payload on Linux.
+        kind::HARDWARE_CONFIGURATION => facts(state, client, |f| {
+            f.hardware.as_ref().map(encode_hardware_configuration)
         }),
         kind::DISPLAY_AREA_SET => match decode_display_area(req.payload) {
             Some(area) if is_finite(&area) => set_display_area(state, client, area),
@@ -501,6 +507,44 @@ pub(crate) mod tests {
         // An init that reported no catalogue.
         lock_state(&state).facts = Some(Arc::new(DeviceFacts::default()));
         assert_eq!(handle(&state, 1, &req), Reply::err(status::NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn the_hardware_configuration_answers_from_the_facts() {
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        st.facts = Some(Arc::new(DeviceFacts::default()));
+        let state = Mutex::new(st);
+        let req = Request {
+            id: 1,
+            kind: kind::HARDWARE_CONFIGURATION,
+            payload: &[],
+        };
+
+        // What the ET5 reports on Linux: an empty 2120.
+        assert_eq!(handle(&state, 1, &req), Reply::err(status::NOT_SUPPORTED));
+        assert!(lock_state(&state).clients[0].holds_device);
+
+        let hardware = request::HardwareConfiguration {
+            entries: vec![request::HardwareEntry {
+                param_a: 16.0,
+                width: 2240,
+                ..request::HardwareEntry::default()
+            }],
+            points_mm: vec![[130.0, 0.76, 1.62]],
+            mode: 1,
+        };
+        lock_state(&state).facts = Some(Arc::new(DeviceFacts {
+            hardware: Some(hardware.clone()),
+            ..DeviceFacts::default()
+        }));
+        let reply = handle(&state, 1, &req);
+
+        assert_eq!(reply.status, status::OK);
+        assert_eq!(
+            request::decode_hardware_configuration(&reply.payload),
+            Some(hardware)
+        );
     }
 
     /// Ask for a clock pair from a state that has seen a gaze frame with

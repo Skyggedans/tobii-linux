@@ -528,4 +528,90 @@ mod tests {
             Some(vec![StreamType::default(), StreamType::default()])
         );
     }
+
+    fn hardware() -> request::HardwareConfiguration {
+        use request::*;
+        let mut values = [0.0; 15];
+        values[3] = 5.22;
+        values[13] = 0.001_75;
+        HardwareConfiguration {
+            entries: vec![
+                HardwareEntry {
+                    param_a: 16.0,
+                    param_b: 100.0,
+                    position_mm: [0.0, 0.0, 4.14],
+                    values,
+                    width: 2240,
+                    height: 2240,
+                    coefficients: vec![0.1, -0.2],
+                    param_d: 1.0 / 3.0,
+                    ..HardwareEntry::default()
+                },
+                HardwareEntry {
+                    id: u32::MAX,
+                    param_a: 62.0,
+                    point_b_mm: [1.0, 2.0, 3.0],
+                    ..HardwareEntry::default()
+                },
+            ],
+            points_mm: vec![[0.0; 3], [130.0, 0.76, 1.62], [-130.0, 0.76, 1.62]],
+            mode: 1,
+        }
+    }
+
+    #[test]
+    fn a_hardware_configuration_round_trips_at_full_precision() {
+        use request::*;
+        let h = hardware();
+        let body = encode_hardware_configuration(&h);
+        assert_eq!(decode_hardware_configuration(&body), Some(h));
+        assert_eq!(
+            decode_hardware_configuration(&encode_hardware_configuration(
+                &HardwareConfiguration::default()
+            )),
+            Some(HardwareConfiguration::default())
+        );
+        for len in 0..body.len() {
+            assert_eq!(
+                decode_hardware_configuration(&body[..len]),
+                None,
+                "cut at {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn hardware_configuration_lists_are_bounded() {
+        use request::*;
+        let mut big = hardware();
+        big.entries.push(HardwareEntry::default());
+        big.entries[0].coefficients = vec![0.5; HARDWARE_COEFFICIENTS_MAX + 1];
+        big.points_mm = vec![[1.0; 3]; HARDWARE_POINTS_MAX + 1];
+
+        let got = decode_hardware_configuration(&encode_hardware_configuration(&big))
+            .expect("the encoder cuts every list to its limit");
+        assert_eq!(got.entries.len(), HARDWARE_ENTRIES_MAX);
+        assert_eq!(got.entries[0].coefficients.len(), HARDWARE_COEFFICIENTS_MAX);
+        assert_eq!(got.points_mm.len(), HARDWARE_POINTS_MAX);
+
+        // Counts past the limits, however much follows them.
+        let mut entries = vec![3];
+        entries.extend_from_slice(&[0; 4096]);
+        assert_eq!(decode_hardware_configuration(&entries), None);
+        let mut points = vec![0, 41];
+        points.extend_from_slice(&[0; 41 * 24 + 4]);
+        assert_eq!(decode_hardware_configuration(&points), None);
+        let one = HardwareConfiguration {
+            entries: vec![HardwareEntry::default()],
+            ..HardwareConfiguration::default()
+        };
+        let mut coefficients = encode_hardware_configuration(&one);
+        // The coefficient count: after the entry count, id, two values, the
+        // position, the values and three words.
+        let at = 1 + 4 + 2 * 8 + 3 * 8 + 15 * 8 + 3 * 4;
+        assert_eq!(coefficients[at], 0);
+        coefficients[at] = 65;
+        coefficients.splice(at + 1..at + 1, [0; 65 * 8]);
+        assert_eq!(decode_hardware_configuration(&coefficients), None);
+    }
 }

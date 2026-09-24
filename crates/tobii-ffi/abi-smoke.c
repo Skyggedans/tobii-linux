@@ -121,6 +121,9 @@ int main( void )
     assert( timesync.system_start_us == 1 && timesync.tracker_us == 3 );
     assert( tobii_enumerate_stream_types( NULL, NULL, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_pause_device( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    tobii_hardware_configuration_t hardware = { .entry_count = 7, .mode = 7 };
+    assert( tobii_hardware_configuration_get( NULL, &hardware ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( hardware.entry_count == 7 && hardware.mode == 7 );
     assert( tobii_resume_device( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     tobii_device_name_t name = "unchanged";
     assert( tobii_set_device_name( NULL, name ) == TOBII_ERROR_INVALID_PARAMETER );
@@ -166,6 +169,16 @@ int main( void )
     assert( offsetof( tobii_stream_type_t, value ) == 4 );
     assert( offsetof( tobii_stream_type_t, name ) == 8 );
     assert( offsetof( tobii_stream_type_t, text ) == 72 );
+    assert( sizeof( tobii_hardware_configuration_entry_t ) == 0x2e8 );
+    assert( offsetof( tobii_hardware_configuration_entry_t, position_xyz ) == 0x10 );
+    assert( offsetof( tobii_hardware_configuration_entry_t, width ) == 0xa0 );
+    assert( offsetof( tobii_hardware_configuration_entry_t, coefficients ) == 0xb0 );
+    assert( offsetof( tobii_hardware_configuration_entry_t, param_d ) == 0x2e0 );
+    assert( sizeof( tobii_hardware_configuration_t ) == 2472 );
+    assert( offsetof( tobii_hardware_configuration_t, entries ) == 8 );
+    assert( offsetof( tobii_hardware_configuration_t, point_count ) == 0x5d8 );
+    assert( offsetof( tobii_hardware_configuration_t, points_xyz ) == 0x5e0 );
+    assert( offsetof( tobii_hardware_configuration_t, mode ) == 0x9a0 );
     assert( sizeof( tobii_calibration_point_data_t ) == 32 );
     assert( sizeof( tobii_license_key_t ) == 16 );
     assert( sizeof( tobii_device_name_t ) == 64 );

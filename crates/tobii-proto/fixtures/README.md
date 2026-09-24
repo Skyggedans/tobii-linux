@@ -10,6 +10,7 @@ length); nothing else is modified.
 | file | capture | what it is |
 |---|---|---|
 | `init-rsp-<cmd>.hex` | init.pcapng | the device's response to init command `<cmd>`: 1000 protocol version, 1200 stream catalogue, 1330 properties, 1400 track box, 1420 identity strings, 1430 display area, 1490 status strings, 1650/1670 output rate, 2110 mounting, 3170 state |
+| `init-rsp-2120.hex` | init.pcapng frame 773 | the hardware configuration (post-calib-init.pcapng frame 223 is byte-identical); on Linux the ET5 answers 2120 with the header alone |
 | `init-notify-3180.hex` | init.pcapng | the one notification during init |
 | `init-presence.hex` | init.pcapng | the first 0x504 presence message (present) |
 | `change-display-cmd-1440.hex` | change-display.pcapng | the host setting a 597x336 mm display at runtime |
