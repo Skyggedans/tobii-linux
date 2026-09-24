@@ -84,8 +84,9 @@ pub(crate) struct State {
     /// (the device reports presence only when it changes).
     last_presence: Option<PresenceSample>,
     /// The newest `(device_us, host_us)` pair seen on the gaze stream.
-    /// Cleared whenever the engine stops or starts: the device clock
-    /// restarts with the device, so a pair is good for its session only.
+    /// Cleared whenever the engine is dropped or replaced and at every
+    /// device init: the device clock restarts with the device, so a pair
+    /// holds for one init only.
     pub(crate) clock: Option<(i64, i64)>,
     /// Gaze frames seen so far. A TIMESYNC waits for this to move, which,
     /// unlike the wall clock, never steps back.
@@ -122,6 +123,8 @@ pub(crate) struct State {
     pub(crate) pause_lock: Arc<Mutex<()>>,
     /// How many times the engine was lost. A pause the device accepted
     /// counts only if no loss came in between: the next init resumes it.
+    /// Likewise a calibration start: one the device took counts only if no
+    /// loss came in between (see [`crate::calibration`]).
     pub(crate) engine_losses: u64,
     /// Stand-in for the engine's command queue in tests.
     #[cfg(test)]
@@ -129,6 +132,11 @@ pub(crate) struct State {
     /// The pause hint last given to the engine, in tests.
     #[cfg(test)]
     pub(crate) pause_hint: Option<bool>,
+    /// The next device fetch in tests finds the engine dead: it goes
+    /// through [`Self::ensure_engine`], which drops it and, with a stand-in
+    /// device, starts no other.
+    #[cfg(test)]
+    pub(crate) lose_engine_on_fetch: bool,
 }
 
 impl State {
@@ -157,6 +165,8 @@ impl State {
             fake_device: None,
             #[cfg(test)]
             pause_hint: None,
+            #[cfg(test)]
+            lose_engine_on_fetch: false,
         }
     }
 
@@ -179,32 +189,53 @@ impl State {
     /// in which case keep (or restart) it. Also drops a dead engine so it can
     /// be restarted.
     fn reconcile(&mut self) {
-        if self.engine.as_ref().is_some_and(|e| !e.is_alive()) {
-            self.engine = None;
-            self.clock = None;
-            crate::calibration::on_engine_lost(self);
-            crate::pause::on_engine_lost(self);
+        if self.engine.is_some() {
+            self.drop_engine_unless_alive();
         }
         if self.prewarm {
             self.ensure_engine();
         } else if !self.is_engine_wanted() {
-            self.engine = None;
-            self.clock = None;
-            crate::calibration::on_engine_lost(self);
-            crate::pause::on_engine_lost(self);
+            self.drop_engine();
         }
         self.sync_wanted();
     }
 
     /// Start the engine if it is not running. A dead engine it replaces
-    /// took the pause with it.
+    /// took the calibration session and the pause with it, ended before the
+    /// new engine starts, so that its first init writes the display area
+    /// the session started from.
     pub(crate) fn ensure_engine(&mut self) {
-        if self.engine.as_ref().is_none_or(|e| !e.is_alive()) {
-            self.clock = None;
-            crate::pause::on_engine_lost(self);
+        if self.drop_engine_unless_alive() {
+            // The stand-in device stands for the new engine in tests.
+            #[cfg(test)]
+            if self.fake_device.is_some() {
+                return;
+            }
             self.engine = Some(Engine::start_with(self.display_override));
             self.sync_wanted();
         }
+    }
+
+    /// Drop the engine unless it is running (see [`Self::drop_engine`]).
+    /// Whether none runs now: the step [`Self::ensure_engine`] takes before
+    /// it starts one, and the one [`Self::reconcile`] and the watchdog take
+    /// for a dead engine.
+    fn drop_engine_unless_alive(&mut self) -> bool {
+        if self.engine.as_ref().is_some_and(Engine::is_alive) {
+            return false;
+        }
+        self.drop_engine();
+        true
+    }
+
+    /// Drop the engine, with what lasts only as long as it runs: a started
+    /// calibration session (see [`crate::calibration::on_engine_lost`]), the
+    /// pause (see [`crate::pause::on_engine_lost`]) and the clock pair.
+    pub(crate) fn drop_engine(&mut self) {
+        self.engine = None;
+        self.clock = None;
+        crate::calibration::on_engine_lost(self);
+        crate::pause::on_engine_lost(self);
     }
 
     /// Tell the engine which optional work anyone consumes: head-pose
@@ -224,8 +255,11 @@ impl State {
             c.holds_device = true;
         }
         #[cfg(test)]
-        if let Some(fake) = &self.fake_device {
-            return Some(Arc::clone(fake));
+        if let Some(fake) = self.fake_device.clone() {
+            if std::mem::take(&mut self.lose_engine_on_fetch) {
+                self.ensure_engine();
+            }
+            return Some(fake);
         }
         self.ensure_engine();
         self.engine
@@ -293,6 +327,9 @@ impl State {
                     self.calibration.id = Some(id);
                 }
                 self.facts = Some(Arc::new(facts));
+                // A pair from before the init may not hold after it.
+                self.clock = None;
+                crate::calibration::on_device_ready(self);
                 crate::requests::apply_display_request(self);
                 crate::pause::on_device_ready(self);
             }
@@ -421,11 +458,8 @@ pub fn run() -> Result<()> {
                 thread::sleep(Duration::from_secs(3));
                 let mut st = lock_state(&state);
                 // Dropped even while unplugged, so that clients hear of it.
-                if st.engine.as_ref().is_some_and(|e| !e.is_alive()) {
-                    crate::calibration::on_engine_lost(&mut st);
-                    crate::pause::on_engine_lost(&mut st);
-                    st.engine = None;
-                    st.clock = None;
+                if st.engine.is_some() {
+                    st.drop_engine_unless_alive();
                 }
                 // Don't spin (reloading the model) on an unplugged device.
                 if st.engine.is_none()
@@ -678,6 +712,74 @@ pub(crate) mod tests {
         st.clock = Some((5_000_000, 1_700_000_000_000_000));
         // Nobody wants the engine (and prewarm is off): no engine starts.
         st.reconcile();
+        assert_eq!(st.clock, None);
+    }
+
+    /// A display area as a client sends it: whole millimetres, so that it
+    /// comes back equal from the wire (f32).
+    fn area(width_mm: f64) -> DisplayArea {
+        let half = width_mm / 2.0;
+        DisplayArea {
+            top_left_mm: [-half, 300.0, 0.0],
+            top_right_mm: [half, 300.0, 0.0],
+            bottom_left_mm: [-half, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn replacing_the_engine_ends_the_session_before_the_new_one_starts() {
+        let old = area(600.0);
+        let mut st = state_with_client(1);
+        st.fake_device = Some(Arc::new(crate::requests::tests::Answering(1)));
+        st.calibration.location = tobii_calib::store::Location::Embedded;
+        st.display_override = Some(old);
+        let state = Mutex::new(st);
+        let ask = |kind, payload: &[u8]| {
+            crate::requests::handle(
+                &state,
+                1,
+                &tobii_ipc::request::Request {
+                    id: 1,
+                    kind,
+                    payload,
+                },
+            )
+        };
+        let start = ask(tobii_ipc::request::kind::CALIBRATION_START, &[2]);
+        assert_eq!(start.status, tobii_ipc::request::status::OK);
+        let set = ask(
+            tobii_ipc::request::kind::DISPLAY_AREA_SET,
+            &tobii_ipc::request::encode_display_area(&area(520.0)),
+        );
+        assert_eq!(set.status, tobii_ipc::request::status::OK);
+        let mut st = lock_state(&state);
+        st.note_clock(5_000_000, 1);
+
+        // No engine runs: one would start, with the display area configured
+        // by then.
+        st.ensure_engine();
+
+        assert_eq!(
+            st.display_override,
+            Some(old),
+            "what the new engine's first init writes"
+        );
+        assert!(!st.calibration.is_active());
+        assert_eq!(
+            st.calibration.display_access(1),
+            Err(tobii_ipc::request::status::CALIBRATION_NOT_STARTED),
+            "its owner is told on its next request"
+        );
+        assert_eq!(st.clock, None);
+    }
+
+    #[test]
+    fn a_device_init_takes_the_clock_pair_along() {
+        let mut st = state_with_client(1);
+        st.note_clock(5_000_000, 1_700_000_000_000_000);
+
+        st.observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+
         assert_eq!(st.clock, None);
     }
 

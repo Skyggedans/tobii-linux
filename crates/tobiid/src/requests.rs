@@ -200,10 +200,21 @@ fn timesync(state: &Mutex<State>, client: u64) -> Reply {
 /// (its calibration is being made on the current area). During the caller's
 /// own session it is saved only with the calibration computed on it, and
 /// what it replaces is remembered, so that a session ending without a
-/// calibration can put it back (see [`crate::calibration`]).
+/// calibration can put it back (see [`crate::calibration`]). One set inside
+/// a session that ends before the device answers is neither kept nor saved
+/// (`CALIBRATION_NOT_STARTED`): the end put back the area it replaced, which
+/// goes to the device again after this one.
 fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Reply {
-    let (device, display_id) = {
+    let (device, display_id, in_session) = {
         let mut st = lock_state(state);
+        if let Err(code) = st.calibration.display_access(client) {
+            return Reply::err(code);
+        }
+        let Some(device) = st.device_for(client) else {
+            return Reply::err(status::CONNECTION_FAILED);
+        };
+        // Fetching the device may have replaced a dead engine, which took
+        // the calibration session along: look again.
         if let Err(code) = st.calibration.display_access(client) {
             return Reply::err(code);
         }
@@ -220,10 +231,8 @@ fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Rep
             .as_ref()
             .and_then(|f| f.display_id)
             .unwrap_or(DEFAULT_DISPLAY_ID);
-        (st.device_for(client), display_id)
-    };
-    let Some(device) = device else {
-        return Reply::err(status::CONNECTION_FAILED);
+        let in_session = st.calibration.owner() == Some(client);
+        (device, display_id, in_session)
     };
     let result = crate::device::run(
         device.as_ref(),
@@ -234,6 +243,23 @@ fn set_display_area(state: &Mutex<State>, client: u64, area: DisplayArea) -> Rep
     if result.is_ok() {
         let file = {
             let mut st = lock_state(state);
+            // The session ended while the device took the area (the device
+            // re-initialised, or the engine was lost), and its end put back
+            // the area this one replaced: nothing would put this one back.
+            if in_session && st.calibration.owner() != Some(client) {
+                let back = st.facts.as_ref().and_then(|f| f.display_area);
+                drop(st);
+                warn!(
+                    client,
+                    "the calibration session ended as the display area was set; not kept"
+                );
+                // The end's own write may have reached the device ahead of
+                // this one's: the area it put back goes once more.
+                if let Some(back) = back {
+                    put_area_back_on(device.as_ref(), &back, display_id);
+                }
+                return Reply::err(status::CALIBRATION_NOT_STARTED);
+            }
             let save_now = st.calibration.note_display_set(client, area);
             st.display_override = Some(area);
             if let Some(engine) = st.engine.as_ref() {
@@ -285,19 +311,46 @@ pub(crate) fn put_display_back(
             .as_ref()
             .and_then(|f| f.display_id)
             .unwrap_or(DEFAULT_DISPLAY_ID);
-        if let Err(code) = crate::device::run(
-            device,
-            cmd::DISPLAY_AREA_SET,
-            display_area_set_payload(&area, display_id),
-            DISPLAY_AREA_TIMEOUT,
-        ) {
-            warn!(
-                status = code,
-                "could not put the display area back on the device"
-            );
-        }
+        put_area_back_on(device, &area, display_id);
     }
     put_display_configuration_back(&mut lock_state(state), before);
+}
+
+/// Write `area`, one that was put back, to `device`.
+fn put_area_back_on(
+    device: &dyn crate::device::DeviceCommands,
+    area: &DisplayArea,
+    display_id: u32,
+) {
+    if let Err(code) = crate::device::run(
+        device,
+        cmd::DISPLAY_AREA_SET,
+        display_area_set_payload(area, display_id),
+        DISPLAY_AREA_TIMEOUT,
+    ) {
+        warn!(
+            status = code,
+            "could not put the display area back on the device"
+        );
+    }
+}
+
+/// [`put_display_back`] for the fan-out pump, which must not wait on the
+/// device: the write runs on its own thread, as [`apply_display_request`]'s
+/// does.
+pub(crate) fn put_display_back_detached(
+    st: &mut State,
+    before: &crate::calibration::DisplayBefore,
+) {
+    if let (Some(device), Some(area)) = (st.commands(), before.device) {
+        let display_id = st
+            .facts
+            .as_ref()
+            .and_then(|f| f.display_id)
+            .unwrap_or(DEFAULT_DISPLAY_ID);
+        thread::spawn(move || put_area_back_on(device.as_ref(), &area, display_id));
+    }
+    put_display_configuration_back(st, before);
 }
 
 /// The configuration half of [`put_display_back`]: what later inits write.
@@ -711,6 +764,72 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&prev);
         assert_eq!(set_area(1, &path, &area).0, Reply::ok(Vec::new()));
         assert!(!prev.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers every command and remembers which it got.
+    #[derive(Default)]
+    struct Logging(Mutex<Vec<u32>>);
+
+    impl crate::device::DeviceCommands for Logging {
+        fn run(
+            &self,
+            cmd: u32,
+            _payload: Vec<u8>,
+            _timeout: Duration,
+        ) -> Result<tobii_usb::engine::CommandResponse, tobii_usb::engine::CommandError> {
+            self.0.lock().expect("log").push(cmd);
+            Ok(tobii_usb::engine::CommandResponse::ok(Vec::new()))
+        }
+    }
+
+    #[test]
+    fn an_in_session_area_set_that_replaces_a_dead_engine_is_refused() {
+        let dir = std::env::temp_dir().join(format!("tobiid-area-lost-{}", std::process::id()));
+        let path = dir.join("display-area");
+        let device = Arc::new(Logging::default());
+        let requested = DisplaySize::parse("600x340");
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(device.clone());
+        st.display_file = Some(path.clone());
+        st.display_request = requested;
+        st.calibration.location = tobii_calib::store::Location::Embedded;
+        let state = Mutex::new(st);
+        let ask = |kind, payload: &[u8]| {
+            handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind,
+                    payload,
+                },
+            )
+        };
+        assert_eq!(ask(kind::CALIBRATION_START, &[2]), Reply::ok(Vec::new()));
+        device.0.lock().expect("log").clear();
+        lock_state(&state).lose_engine_on_fetch = true;
+        let area = DisplayArea {
+            top_left_mm: [-300.0, 300.0, 0.0],
+            top_right_mm: [300.0, 300.0, 0.0],
+            bottom_left_mm: [-300.0, 0.0, 0.0],
+        };
+
+        let reply = ask(kind::DISPLAY_AREA_SET, &encode_display_area(&area));
+
+        assert_eq!(reply, Reply::err(status::CALIBRATION_NOT_STARTED));
+        assert!(
+            device.0.lock().expect("log").is_empty(),
+            "nothing reaches the device"
+        );
+        assert!(!path.exists(), "nor is saved");
+        let st = lock_state(&state);
+        assert_eq!(st.display_override, None, "nor configured");
+        assert_eq!(
+            st.display_request, requested,
+            "TOBII_DISPLAY_MM still applies"
+        );
+        drop(st);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

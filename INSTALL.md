@@ -375,8 +375,9 @@ only holds for the display area it is made on, so the setup runs inside the
 calibration session, before the points: the daemon writes the display area
 to the tracker at once, and saves it (in `~/.config/tobii/display-area`, for
 every later start) together with the first calibration computed on it. If
-the session ends without a calibration (Esc, a failure, the client dying),
-the tracker gets the previous display area back along with the previous
+the session ends without a calibration (Esc, a failure, the client dying,
+the daemon or tracker going away, or the tracker re-initialising), the
+tracker gets the previous display area back along with the previous
 calibration. Outside a calibration session, a display area set through
 `tobii_set_display_area` is saved at once. `--no-display-setup`
 skips the setup, and so does `--windowed` (it needs the whole monitor).
@@ -387,9 +388,10 @@ compute the calibration after each batch, and when the session ends normally
 saves the last one to `~/.config/tobii/calibration.bin` (the previous one is
 kept as `calibration.bin.prev`), with the display area it was made on, and
 uploads it at every later start. A session that does not run to its end
-(Esc, a failure, the client dying, the daemon or tracker going away) leaves
-nothing behind: the calibration and display area it started from stay. The
-result screen shows the targets and your live gaze to check it.
+(Esc, a failure, the client dying, the daemon or tracker going away, or the
+tracker re-initialising) leaves nothing behind: the calibration and display
+area it started from stay. The result screen shows the targets and your live
+gaze to check it.
 
 - `--rounds 1` for a quick 7-point pass (half the tracker's 14 stored points
   stay from the previous calibration); `--dwell-ms` to linger longer per point.

@@ -18,8 +18,10 @@
 //! ([`STOP_KEEP`], what `tobii_calibration_stop` sends): the last computed
 //! calibration then stays on the device and is saved as the user's, uploaded
 //! at every later init. Stopped with [`STOP_DISCARD`], by its owner going
-//! away, or by the engine dying, a session leaves nothing behind: the
-//! calibration it started from goes back on the device and nothing is saved.
+//! away, by the engine dying or by the device re-initialising (the engine
+//! re-opening it after a stall or a USB error), a session leaves nothing
+//! behind: the calibration it started from goes back on the device and
+//! nothing is saved.
 //! A session stopped part way through would otherwise keep a calibration
 //! that mixes its points with the previous session's (the device keeps the
 //! last 14).
@@ -62,8 +64,9 @@ const ENABLED_EYE_BOTH: u8 = 2;
 #[derive(Debug)]
 pub(crate) struct Calibration {
     session: Option<Session>,
-    /// The owner of a session the engine took down: it may not set the
-    /// display area until it stops or goes away (nothing would put it back).
+    /// The owner of a session that ended without it (the engine lost, or
+    /// the device re-initialised): it may not set the display area until it
+    /// stops or goes away (nothing would put it back).
     orphaned: Option<u64>,
     /// The calibration id the device reports.
     pub(crate) id: Option<u32>,
@@ -93,7 +96,8 @@ impl Calibration {
     }
 
     /// Whether `client` may set the display area now: not while another
-    /// client calibrates, nor after its own session died with the engine.
+    /// client calibrates, nor after its own session ended with the engine
+    /// or a device init.
     pub(crate) fn display_access(&self, client: u64) -> Result<(), u8> {
         match &self.session {
             Some(s) if s.owner != client => Err(status::CALIBRATION_BUSY),
@@ -147,6 +151,13 @@ struct Session {
     display_before: Option<DisplayBefore>,
     /// The display area the owner set, saved when the session commits.
     unsaved_display: Option<DisplayArea>,
+    /// The device took the start (1010, 1060, 1110) and clients were told.
+    /// Until then a device init or a lost engine leaves the session to the
+    /// start in flight (see [`on_device_ready`] and [`on_engine_lost`]).
+    started: bool,
+    /// Its owner's stop is running: a device init leaves the session to it
+    /// (see [`on_device_ready`]).
+    stopping: bool,
 }
 
 fn broadcast_state(st: &mut State, active: bool) {
@@ -218,25 +229,38 @@ type Prepared = (
     Location,
 );
 
-/// Check `access` for `client` and fetch the device; the session and its
-/// location for the caller to use once the lock is released.
-fn prepare(state: &Mutex<State>, client: u64, access: &Access) -> Result<Prepared, u8> {
-    let mut st = lock_state(state);
-    let session = st.calibration.session.clone();
-    match (access, &session) {
-        (Access::Owner, Some(s)) if s.owner == client => {}
+/// Check `access` for `client`.
+fn check(st: &mut State, client: u64, access: &Access) -> Result<(), u8> {
+    match (access, st.calibration.owner()) {
+        (Access::Owner, Some(owner)) if owner == client => Ok(()),
         (Access::Owner, _) => {
-            // A client whose session died with the engine now knows it.
+            // A client whose session ended without it now knows it.
             if st.calibration.orphaned == Some(client) {
                 st.calibration.orphaned = None;
             }
-            return Err(status::CALIBRATION_NOT_STARTED);
+            Err(status::CALIBRATION_NOT_STARTED)
         }
-        (Access::NotBusy, Some(s)) if s.owner != client => return Err(status::CALIBRATION_BUSY),
-        _ => {}
+        (Access::NotBusy, Some(owner)) if owner != client => Err(status::CALIBRATION_BUSY),
+        _ => Ok(()),
     }
-    let location = st.calibration.location.clone();
+}
+
+/// Check `access` for `client` and fetch the device; the session and its
+/// location for the caller to use once the lock is released.
+fn prepare(state: &Mutex<State>, client: u64, access: &Access) -> Result<Prepared, u8> {
+    prepare_locked(&mut lock_state(state), client, access)
+}
+
+/// [`prepare`] under the state lock the caller holds. Checked again once
+/// the device is fetched: a dead engine the fetch replaces takes the session
+/// along (see [`on_engine_lost`]). A request refused before the fetch starts
+/// no engine.
+fn prepare_locked(st: &mut State, client: u64, access: &Access) -> Result<Prepared, u8> {
+    check(st, client, access)?;
     let device = st.device_for(client).ok_or(status::CONNECTION_FAILED)?;
+    check(st, client, access)?;
+    let session = st.calibration.session.clone();
+    let location = st.calibration.location.clone();
     Ok((device, session, location))
 }
 
@@ -300,7 +324,7 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
         Ok(blob) => blob,
         Err(code) => return Reply::err(code),
     };
-    let device = {
+    let (device, losses) = {
         let mut st = lock_state(state);
         match &st.calibration.session {
             Some(s) if s.owner == client => return Reply::err(status::CALIBRATION_ALREADY_STARTED),
@@ -321,24 +345,43 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
             computed: None,
             display_before: None,
             unsaved_display: None,
+            started: false,
+            stopping: false,
         });
         if st.calibration.orphaned == Some(client) {
             st.calibration.orphaned = None;
         }
-        device
+        (device, st.engine_losses)
     };
     let seeded = run(device.as_ref(), cmd::START, Vec::new(), QUICK)
         .and_then(|_| run(device.as_ref(), cmd::CLEAR, Vec::new(), QUICK))
         .and_then(|_| run(device.as_ref(), cmd::WRITE, write_payload(&previous), SLOW));
     let mut st = lock_state(state);
+    let seeded = match seeded {
+        // The engine that took the start was lost before it could be
+        // announced: its successor's device has no session.
+        Ok(_) if st.engine_losses != losses => {
+            warn!(client, "the engine was lost as the calibration started");
+            Err(status::CONNECTION_FAILED)
+        }
+        seeded => seeded,
+    };
     match seeded {
         Ok(_) => {
+            if let Some(s) = st.calibration.session.as_mut()
+                && s.owner == client
+            {
+                s.started = true;
+            }
             info!(client, "calibration started");
             broadcast_state(&mut st, true);
             Reply::ok(Vec::new())
         }
         Err(code) => {
-            st.calibration.session = None;
+            // Its own session only: nothing else may be cleared here.
+            if st.calibration.owner() == Some(client) {
+                st.calibration.session = None;
+            }
             drop(st);
             // A start or clear may have gone through: never leave the device
             // without its calibration.
@@ -355,6 +398,16 @@ fn compute(state: &Mutex<State>, client: u64) -> Result<Vec<u8>, u8> {
     let blob = read_blob(device.as_ref())?;
     let id = tobii_calib::blob::calibration_id(&blob);
     let mut st = lock_state(state);
+    // The session may have ended while the device computed (the device
+    // re-initialised, or the engine was lost): what it computed belongs to
+    // no session then, and the calibration the session started from stays
+    // the active one.
+    check(&mut st, client, &Access::Owner).inspect_err(|_| {
+        warn!(
+            client,
+            "the calibration session ended as it computed; not kept"
+        );
+    })?;
     if let Some(s) = st.calibration.session.as_mut() {
         // Kept for the stop: only a valid calibration may be committed.
         match tobii_calib::blob::validate(&blob) {
@@ -407,11 +460,21 @@ fn apply(state: &Mutex<State>, client: u64, payload: &[u8]) -> Result<Vec<u8>, u
 /// computed something), else put back what it started from.
 fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
     if lock_state(state).calibration.orphaned == Some(client) {
-        // Its session died with the engine; the stop only closes that out.
+        // Its session ended without it (the engine lost, or the device
+        // re-initialised); the stop only closes that out.
         lock_state(state).calibration.orphaned = None;
         return Err(status::CALIBRATION_NOT_STARTED);
     }
-    let (device, session, location) = prepare(state, client, &Access::Owner)?;
+    let (device, session, location) = {
+        let mut st = lock_state(state);
+        let prepared = prepare_locked(&mut st, client, &Access::Owner)?;
+        // Under the same lock: a device init from now on leaves the session
+        // to this stop, whose commands still reach the device.
+        if let Some(s) = st.calibration.session.as_mut() {
+            s.stopping = true;
+        }
+        prepared
+    };
     let Some(session) = session else {
         return Err(status::CALIBRATION_NOT_STARTED);
     };
@@ -459,8 +522,18 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
     } else {
         None
     };
-    st.calibration.session = None;
-    broadcast_state(&mut st, false);
+    // A lost engine may have ended the session under this stop, and told
+    // every client: its owner hears of it from this answer.
+    if st
+        .calibration
+        .session
+        .take_if(|s| s.owner == client)
+        .is_some()
+    {
+        broadcast_state(&mut st, false);
+    } else if st.calibration.orphaned == Some(client) {
+        st.calibration.orphaned = None;
+    }
     info!(client, kept = commit.is_some(), "calibration stopped");
     outcome
 }
@@ -487,28 +560,89 @@ pub(crate) fn on_client_gone(state: &Mutex<State>, client: u64) {
     }
 }
 
-/// The engine went away: any session died with it, uncommitted. The next
-/// init uploads the saved calibration, which is the one the session started
-/// from, and the display area it was made on is configured again.
+/// The engine went away: a started session died with it, uncommitted. The
+/// next init uploads the saved calibration, which is the one the session
+/// started from, and the display area it was made on is configured again.
+/// A start in flight is left to its own error path: its commands went to
+/// the lost engine.
 pub(crate) fn on_engine_lost(st: &mut State) {
-    if let Some(session) = st.calibration.session.take() {
-        if let Some(before) = &session.display_before {
-            crate::requests::put_display_configuration_back(st, before);
-        }
-        if let Some(id) = tobii_calib::blob::calibration_id(&session.previous) {
-            st.calibration.id = Some(id);
-        }
-        st.calibration.orphaned = Some(session.owner);
-        broadcast_state(st, false);
+    let Some(session) = st.calibration.session.take_if(|s| s.started) else {
+        return;
+    };
+    warn!(
+        client = session.owner,
+        "the engine stopped; discarding the calibration session"
+    );
+    if let Some(before) = &session.display_before {
+        crate::requests::put_display_configuration_back(st, before);
     }
+    orphan(st, &session);
+}
+
+/// The device finished an init, which leaves it outside any session: a
+/// started session ends as with a lost engine. The init uploaded the saved
+/// calibration, the one the session started from, so none is written; but
+/// it wrote the display area configured then, the session's own once its
+/// owner set one, so the area the session replaced goes back on the device
+/// too. A start still in flight is left to finish: a cold engine inits
+/// twice before it runs a queued command, and the command in flight when
+/// the engine re-opens the device fails. A stop that is running is left to
+/// finish too: the engine keeps its command queue across the re-open, so
+/// the stop's own commands still reach the device.
+///
+/// Unverified on hardware: that a re-open takes the device out of its
+/// calibration session. The init replay sends no 1020, so a device that
+/// stayed in it would be left in a session nobody owns.
+pub(crate) fn on_device_ready(st: &mut State) {
+    let Some(session) = st.calibration.session.take_if(|s| s.started && !s.stopping) else {
+        return;
+    };
+    warn!(
+        client = session.owner,
+        "the device re-initialised; discarding the calibration session"
+    );
+    if let Some(before) = &session.display_before {
+        crate::requests::put_display_back_detached(st, before);
+    }
+    orphan(st, &session);
+}
+
+/// End a session its owner did not stop: the calibration it started from
+/// is the active one again, its owner is told on its next request, and
+/// every client hears the session ended.
+fn orphan(st: &mut State, session: &Session) {
+    if let Some(id) = tobii_calib::blob::calibration_id(&session.previous) {
+        st.calibration.id = Some(id);
+    }
+    st.calibration.orphaned = Some(session.owner);
+    broadcast_state(st, false);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
+    use std::thread;
+    use std::time::Instant;
     use tobii_ipc::request::decode_u32;
-    use tobii_usb::engine::{CommandError, CommandResponse};
+    use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_payload};
+    use tobii_proto::protocol::cmd::DISPLAY_AREA_SET;
+    use tobii_usb::engine::{CommandError, CommandResponse, Sample};
+
+    /// What befalls the device while a command is on its way.
+    #[derive(Debug, Clone, Copy)]
+    enum Mishap {
+        /// The device re-initialises first: the pump takes in a
+        /// `DeviceReady` before the command reaches it.
+        Reinit,
+        /// The device re-initialises, and then the client starts a session
+        /// of its own, before the command reaches the device.
+        ReinitThenStart(u64),
+        /// The engine is lost, and the command with it.
+        EngineLost,
+        /// The engine is lost once the device has answered.
+        EngineLostAfter,
+    }
 
     /// Answers every command, remembers them, and hands back `blob` for a read.
     struct FakeDevice {
@@ -518,6 +652,26 @@ mod tests {
         payloads: Mutex<Vec<(u32, Vec<u8>)>>,
         /// A command the device refuses.
         refuse: Mutex<Option<u32>>,
+        /// What befalls the device the next time it gets that command.
+        mishap: Mutex<Option<(u32, Mishap)>>,
+        /// The daemon's state, for a mishap to reach.
+        state: Weak<Mutex<State>>,
+    }
+
+    impl FakeDevice {
+        /// Lose the engine, as the daemon drops one.
+        fn lose_engine(&self) {
+            if let Some(state) = self.state.upgrade() {
+                lock_state(&state).drop_engine();
+            }
+        }
+
+        /// Have the pump take in a `DeviceReady`.
+        fn reinit(&self) {
+            if let Some(state) = self.state.upgrade() {
+                lock_state(&state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+            }
+        }
     }
 
     impl DeviceCommands for FakeDevice {
@@ -527,6 +681,26 @@ mod tests {
             payload: Vec<u8>,
             _timeout: Duration,
         ) -> Result<CommandResponse, CommandError> {
+            let mishap = self
+                .mishap
+                .lock()
+                .expect("mishap")
+                .take_if(|(on, _)| *on == cmd)
+                .map(|(_, mishap)| mishap);
+            match mishap {
+                Some(Mishap::Reinit) => self.reinit(),
+                Some(Mishap::ReinitThenStart(client)) => {
+                    self.reinit();
+                    if let Some(state) = self.state.upgrade() {
+                        let _ = start(&state, client, &[ENABLED_EYE_BOTH]);
+                    }
+                }
+                Some(Mishap::EngineLost) => {
+                    self.lose_engine();
+                    return Err(CommandError::EngineGone);
+                }
+                Some(Mishap::EngineLostAfter) | None => {}
+            }
             self.log.lock().expect("log").push(cmd);
             self.payloads.lock().expect("payloads").push((cmd, payload));
             if *self.refuse.lock().expect("refuse") == Some(cmd) {
@@ -540,12 +714,15 @@ mod tests {
             } else {
                 Vec::new()
             };
+            if let Some(Mishap::EngineLostAfter) = mishap {
+                self.lose_engine();
+            }
             Ok(CommandResponse::ok(payload))
         }
     }
 
     struct Setup {
-        state: Mutex<State>,
+        state: Arc<Mutex<State>>,
         device: Arc<FakeDevice>,
         dir: std::path::PathBuf,
     }
@@ -561,22 +738,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut blob = tobii_usb::calibration::embedded_blob().expect("blob");
         blob[20..24].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        let device = Arc::new(FakeDevice {
-            blob,
-            log: Mutex::new(Vec::new()),
-            payloads: Mutex::new(Vec::new()),
-            refuse: Mutex::new(None),
-        });
         let mut st = crate::daemon::tests::state_with_client(1);
         st.clients
             .append(&mut crate::daemon::tests::state_with_client(2).clients);
-        st.fake_device = Some(device.clone());
         st.calibration.location = Location::File(dir.join("calibration.bin"));
+        let mut device = None;
+        let state = Arc::new_cyclic(|weak| {
+            let fake = Arc::new(FakeDevice {
+                blob,
+                log: Mutex::new(Vec::new()),
+                payloads: Mutex::new(Vec::new()),
+                refuse: Mutex::new(None),
+                mishap: Mutex::new(None),
+                state: weak.clone(),
+            });
+            st.fake_device = Some(fake.clone());
+            device = Some(fake);
+            Mutex::new(st)
+        });
         Setup {
-            state: Mutex::new(st),
-            device,
+            state,
+            device: device.expect("device"),
             dir,
         }
+    }
+
+    /// Have `mishap` befall the device the next time it gets `command`.
+    fn befall(s: &Setup, command: u32, mishap: Mishap) {
+        *s.device.mishap.lock().expect("mishap") = Some((command, mishap));
+    }
+
+    /// The device re-initialised.
+    fn device_ready(s: &Setup) {
+        lock_state(&s.state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+    }
+
+    /// Forget the commands the device got so far.
+    fn forget_sent(s: &Setup) {
+        s.device.log.lock().expect("log").clear();
+        s.device.payloads.lock().expect("payloads").clear();
+    }
+
+    /// Whether the device gets `command` with `payload` within two seconds
+    /// (from a thread of its own).
+    fn gets_soon(s: &Setup, command: u32, payload: &[u8]) -> bool {
+        gets_soon_times(s, command, payload, 1)
+    }
+
+    /// Whether the device has got `command` with `payload` `times` times
+    /// within two seconds.
+    fn gets_soon_times(s: &Setup, command: u32, payload: &[u8], times: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if s.device
+                .payloads
+                .lock()
+                .expect("payloads")
+                .iter()
+                .filter(|(c, p)| *c == command && p == payload)
+                .count()
+                >= times
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Whether the device gets no further command for 100 ms, time enough
+    /// for one sent from a thread of its own to arrive.
+    fn stays_quiet(s: &Setup) -> bool {
+        let sent = s.device.log.lock().expect("log").len();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            if s.device.log.lock().expect("log").len() != sent {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// The payload of the last display area the device got.
+    fn last_display_write(s: &Setup) -> Option<Vec<u8>> {
+        s.device
+            .payloads
+            .lock()
+            .expect("payloads")
+            .iter()
+            .rev()
+            .find(|(c, _)| *c == DISPLAY_AREA_SET)
+            .map(|(_, p)| p.clone())
+    }
+
+    /// The session states announced to `client` so far.
+    fn announced(s: &Setup, client: u64) -> Vec<bool> {
+        crate::daemon::tests::outbox(&lock_state(&s.state), client)
+            .iter()
+            .filter_map(|body| match tobii_ipc::decode_server(body) {
+                Some(tobii_ipc::ServerMsg::Notification(Notification {
+                    kind: notification::CALIBRATION_STATE_CHANGED,
+                    value: NotificationValue::State(active),
+                })) => Some(active),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The id of the calibration built into the init replay.
+    fn built_in_id() -> Option<u32> {
+        tobii_calib::blob::calibration_id(&tobii_usb::calibration::embedded_blob().expect("blob"))
     }
 
     fn ask(s: &Setup, client: u64, k: u8, payload: &[u8]) -> Reply {
@@ -1120,5 +1394,314 @@ mod tests {
             status::CALIBRATION_NOT_STARTED
         );
         assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_device_init_ends_a_started_session_and_puts_its_display_area_back() {
+        let (s, file, old) = display_setup("reinit");
+        lock_state(&s.state).clients[1].streams = STREAM_NOTIFICATIONS;
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+        forget_sent(&s);
+
+        lock_state(&s.state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts {
+            calibration_id: Some(7),
+            ..DeviceFacts::default()
+        })));
+
+        {
+            let st = lock_state(&s.state);
+            assert!(!st.calibration.is_active());
+            assert_eq!(
+                st.calibration.id,
+                built_in_id(),
+                "the one the init uploaded, which the session started from"
+            );
+            assert_eq!(st.display_override, Some(old));
+            assert_eq!(st.facts.as_ref().and_then(|f| f.display_area), Some(old));
+        }
+        assert!(
+            gets_soon(
+                &s,
+                DISPLAY_AREA_SET,
+                &display_area_set_payload(&old, DEFAULT_DISPLAY_ID)
+            ),
+            "the init wrote the session's area: the old one goes back"
+        );
+        assert!(stays_quiet(&s), "nothing more");
+        assert!(
+            !s.device
+                .log
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|c| (cmd::START..=cmd::WRITE).contains(c)),
+            "the init restored the calibration"
+        );
+        assert!(!file.exists());
+        assert_eq!(announced(&s, 2), [false]);
+        // Its owner is told as after a lost engine.
+        assert_eq!(
+            set_area(&s, 1, &area(597.0)).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+        let point = tobii_ipc::request::encode_point_2d(0.5, 0.5);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &point).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+        // The device's own word on the id then stands.
+        lock_state(&s.state).observe(&Sample::Notification(
+            tobii_proto::facts::DeviceNotification::CalibrationIdChanged(7),
+        ));
+        assert_eq!(lock_state(&s.state).calibration.id, Some(7));
+    }
+
+    #[test]
+    fn a_device_init_with_no_display_change_to_undo_sends_nothing() {
+        let s = setup("reinit-quiet");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        forget_sent(&s);
+
+        device_ready(&s);
+
+        assert!(!lock_state(&s.state).calibration.is_active());
+        assert!(stays_quiet(&s));
+        assert!(s.device.log.lock().expect("log").is_empty());
+    }
+
+    #[test]
+    fn a_device_init_before_the_start_reaches_the_device_leaves_the_session() {
+        let s = setup("reinit-start");
+        lock_state(&s.state).clients[0].streams = STREAM_NOTIFICATIONS;
+        // A cold tracker inits a second time while the 1010 waits its turn.
+        befall(&s, cmd::START, Mishap::Reinit);
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+
+        let point = tobii_ipc::request::encode_point_2d(0.5, 0.5);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &point),
+            Reply::ok(Vec::new()),
+            "the session goes on"
+        );
+        assert_eq!(announced(&s, 1), [true]);
+    }
+
+    #[test]
+    fn a_device_init_during_a_kept_stop_leaves_the_session_to_it() {
+        let (s, file, _) = display_setup("reinit-keep");
+        lock_state(&s.state).clients[1].streams = STREAM_NOTIFICATIONS;
+        let new = area(597.0);
+        assert_eq!(set_area(&s, 1, &new), Reply::ok(Vec::new()));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+        befall(&s, cmd::STOP, Mishap::Reinit);
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::ok(Vec::new())
+        );
+
+        {
+            let st = lock_state(&s.state);
+            assert_eq!(st.display_override, Some(new), "the kept area stays");
+            assert_eq!(st.facts.as_ref().and_then(|f| f.display_area), Some(new));
+            assert_eq!(st.calibration.id, Some(0x1234_5678));
+            assert_eq!(st.calibration.display_access(1), Ok(()), "no orphan mark");
+        }
+        assert_eq!(crate::display::load(&file).expect("load"), Some(new));
+        assert!(stays_quiet(&s));
+        assert_eq!(display_writes(&s), 1, "the old area does not go back");
+        assert_eq!(announced(&s, 2), [false]);
+    }
+
+    #[test]
+    fn a_device_init_during_a_discarding_stop_leaves_the_session_to_it() {
+        let (s, file, old) = display_setup("reinit-discard");
+        lock_state(&s.state).clients[1].streams = STREAM_NOTIFICATIONS;
+        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
+        befall(&s, cmd::STOP, Mishap::Reinit);
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_DISCARD),
+            Reply::ok(Vec::new())
+        );
+
+        {
+            let st = lock_state(&s.state);
+            assert_eq!(st.display_override, Some(old));
+            assert_eq!(st.facts.as_ref().and_then(|f| f.display_area), Some(old));
+            assert_eq!(st.calibration.display_access(1), Ok(()), "no orphan mark");
+        }
+        assert!(!file.exists());
+        assert!(stays_quiet(&s));
+        assert_eq!(display_writes(&s), 2, "set, then put back by the stop");
+        assert_eq!(announced(&s, 2), [false]);
+    }
+
+    #[test]
+    fn an_area_set_whose_session_ends_on_the_way_is_neither_kept_nor_saved() {
+        let (s, file, old) = display_setup("reinit-area");
+        befall(&s, DISPLAY_AREA_SET, Mishap::Reinit);
+
+        assert_eq!(
+            set_area(&s, 1, &area(597.0)).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+
+        {
+            let st = lock_state(&s.state);
+            assert_eq!(st.display_override, Some(old));
+            assert_eq!(st.facts.as_ref().and_then(|f| f.display_area), Some(old));
+        }
+        assert!(!file.exists());
+        let back = display_area_set_payload(&old, DEFAULT_DISPLAY_ID);
+        // Put back by the init's thread and again after the refused area,
+        // so the tracker ends on the old one whichever went first.
+        assert!(gets_soon_times(&s, DISPLAY_AREA_SET, &back, 2));
+        assert!(stays_quiet(&s));
+        assert_eq!(display_writes(&s), 3, "the refused area, the old one twice");
+        assert_eq!(last_display_write(&s), Some(back));
+    }
+
+    #[test]
+    fn a_compute_whose_session_ends_on_the_way_is_not_kept() {
+        let s = setup("reinit-compute");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        // Client 2 claims the device as soon as client 1's session ends.
+        befall(&s, cmd::READ, Mishap::ReinitThenStart(2));
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+
+        {
+            let st = lock_state(&s.state);
+            assert_eq!(
+                st.calibration.id,
+                built_in_id(),
+                "the one client 1's session started from"
+            );
+            assert_eq!(st.calibration.orphaned, None, "client 1 has been told");
+            assert_eq!(st.calibration.owner(), Some(2));
+            assert!(
+                st.calibration
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.computed.is_none()),
+                "client 2's session does not get what client 1 computed"
+            );
+        }
+        assert_eq!(
+            ask(&s, 2, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::ok(Vec::new())
+        );
+        assert!(!s.dir.join("calibration.bin").exists(), "nothing to commit");
+    }
+
+    #[test]
+    fn an_engine_lost_during_the_stop_ends_the_session_once() {
+        let s = setup("lost-stop");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]),
+            Reply::ok(Vec::new())
+        );
+        lock_state(&s.state).clients[1].streams = STREAM_NOTIFICATIONS;
+        befall(&s, cmd::STOP, Mishap::EngineLostAfter);
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_DISCARD),
+            Reply::ok(Vec::new())
+        );
+
+        assert_eq!(announced(&s, 2), [false]);
+        assert_eq!(
+            lock_state(&s.state).calibration.display_access(1),
+            Ok(()),
+            "its stop answered: no orphan mark"
+        );
+    }
+
+    #[test]
+    fn a_request_that_replaces_a_dead_engine_finds_its_session_gone() {
+        let s = setup("lost-on-fetch");
+        let point = tobii_ipc::request::encode_point_2d(0.5, 0.5);
+        for (k, payload) in [
+            (kind::CALIBRATION_COLLECT_2D, &point[..]),
+            (kind::CALIBRATION_COMPUTE, &[][..]),
+            (kind::CALIBRATION_STOP, STOP_KEEP),
+        ] {
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[2]),
+                Reply::ok(Vec::new())
+            );
+            forget_sent(&s);
+            lock_state(&s.state).lose_engine_on_fetch = true;
+
+            assert_eq!(
+                ask(&s, 1, k, payload).status,
+                status::CALIBRATION_NOT_STARTED,
+                "kind {k}"
+            );
+
+            assert!(
+                s.device.log.lock().expect("log").is_empty(),
+                "kind {k}: nothing reaches the device"
+            );
+            let st = lock_state(&s.state);
+            assert!(!st.calibration.is_active(), "kind {k}");
+            assert_eq!(
+                st.calibration.display_access(1),
+                Ok(()),
+                "kind {k}: its owner has been told"
+            );
+        }
+    }
+
+    #[test]
+    fn losing_the_engine_as_a_start_is_on_its_way_leaves_it_to_the_start() {
+        for (tag, command, mishap) in [
+            ("lost-start", cmd::START, Mishap::EngineLost),
+            ("lost-seeded", cmd::WRITE, Mishap::EngineLostAfter),
+        ] {
+            let s = setup(tag);
+            lock_state(&s.state).clients[0].streams = STREAM_NOTIFICATIONS;
+            befall(&s, command, mishap);
+
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[2]).status,
+                status::CONNECTION_FAILED,
+                "{tag}"
+            );
+
+            {
+                let st = lock_state(&s.state);
+                assert!(!st.calibration.is_active(), "{tag}");
+                assert_eq!(
+                    st.calibration.display_access(1),
+                    Ok(()),
+                    "{tag}: no orphan mark"
+                );
+            }
+            assert!(announced(&s, 1).is_empty(), "{tag}: nothing to announce");
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[2]),
+                Reply::ok(Vec::new()),
+                "{tag}"
+            );
+        }
     }
 }
