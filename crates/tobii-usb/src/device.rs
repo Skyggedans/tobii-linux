@@ -602,13 +602,21 @@ impl InitReader {
     }
 }
 
-/// Trace one message read during the init replay.
+/// Trace one message read during the init replay, with a response's status
+/// and error words (an empty 2120 answer shows up here).
 fn log_init_message(msg: &[u8]) {
+    let Some(m) = parse_message(msg) else {
+        debug!(len = msg.len(), marker = ?marker(msg), seq = ?seq(msg), "IN");
+        return;
+    };
     debug!(
         len = msg.len(),
-        marker = ?marker(msg),
-        seq = ?seq(msg),
-        id = ?parse_message(msg).map(|m| m.id),
+        marker = m.marker,
+        seq = m.seq,
+        id = m.id,
+        status = m.status,
+        error = format_args!("{:#x}", m.error),
+        payload_len = m.payload_len,
         "IN"
     );
 }
@@ -866,6 +874,7 @@ pub(crate) enum Incoming {
     Response {
         seq: u32,
         status: u32,
+        error: u32,
         payload: Vec<u8>,
     },
     /// A notification.
@@ -892,6 +901,7 @@ pub(crate) fn classify(msg: &[u8]) -> Incoming {
         (MARKER_RESPONSE, _) => Incoming::Response {
             seq: m.seq,
             status: m.status,
+            error: m.error,
             payload: m.payload.to_vec(),
         },
         (MARKER_NOTIFICATION, _) => {
@@ -904,6 +914,7 @@ pub(crate) fn classify(msg: &[u8]) -> Incoming {
 /// A command written to the device and not yet answered.
 #[derive(Debug)]
 struct Outstanding {
+    cmd: u32,
     seq: u32,
     deadline: Instant,
     reply: Sender<Result<CommandResponse, CommandError>>,
@@ -963,10 +974,23 @@ impl Pump<'_> {
             Incoming::Response {
                 seq,
                 status,
+                error,
                 payload,
             } => {
                 if let Some(o) = self.outstanding.take_if(|o| o.seq == seq) {
-                    let _ = o.reply.send(Ok(CommandResponse { status, payload }));
+                    debug!(
+                        cmd = o.cmd,
+                        seq,
+                        status,
+                        error = format_args!("{error:#x}"),
+                        len = payload.len(),
+                        "response"
+                    );
+                    let _ = o.reply.send(Ok(CommandResponse {
+                        status,
+                        error,
+                        payload,
+                    }));
                 } else {
                     debug!(seq, "unsolicited response");
                 }
@@ -1011,6 +1035,7 @@ impl Pump<'_> {
             }
         }
         self.outstanding = Some(Outstanding {
+            cmd: command.cmd,
             seq,
             deadline: Instant::now() + command.timeout,
             reply,
@@ -1020,7 +1045,7 @@ impl Pump<'_> {
     /// Fail the outstanding command once its deadline has passed.
     fn expire(&mut self, asm: &mut BulkReassembler) {
         if let Some(o) = self.outstanding.take_if(|o| Instant::now() >= o.deadline) {
-            warn!(seq = o.seq, "device command timed out");
+            warn!(cmd = o.cmd, seq = o.seq, "device command timed out");
             asm.abort_continuation();
             let _ = o.reply.send(Err(CommandError::Timeout));
         }
@@ -1196,6 +1221,7 @@ mod tests {
             Incoming::Response {
                 seq: 0x2a,
                 status: 1,
+                error: 0,
                 ..
             }
         ));

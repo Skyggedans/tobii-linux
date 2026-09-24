@@ -136,13 +136,30 @@ fn be_word(buf: &[u8], offset: usize) -> Option<u32> {
 /// here.
 pub const HEADER_LEN: usize = 32;
 
+/// The status word of every response ever captured.
+pub const RESPONSE_STATUS_OK: u32 = 1;
+
+/// TTP error codes a response carries in its error word, as the Windows
+/// engine reads them (its parser at 0x18017b4c0). Every captured response
+/// carries [`NONE`](ttp_error::NONE).
+pub mod ttp_error {
+    /// No error.
+    pub const NONE: u32 = 0;
+    /// The device is not in a state to run the command (for a calibration
+    /// command: no session).
+    pub const BAD_STATE: u32 = 0x2000_0508;
+    /// The device rejected a parameter.
+    pub const INVALID_PARAMETER: u32 = 0x2000_0509;
+}
+
 /// A device->host (or host->device) message split into its header words and
 /// payload.
 ///
 /// Layout after the 8-byte prefix, as BE u32 words: marker, seq, status,
-/// id, 0, payload length. `id` is the command for a 0x51/0x52, the stream id
-/// for a 0x53 and the notification id for a 0x4e; `status` is 1 on every
-/// response ever captured and 0 elsewhere. The payload is `00 00` + TLVs.
+/// id, error, payload length. `id` is the command for a 0x51/0x52, the stream
+/// id for a 0x53 and the notification id for a 0x4e; `status` is 1 on every
+/// response ever captured and 0 elsewhere, and `error` is 0 on every message
+/// ever captured. The payload is `00 00` + TLVs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message<'a> {
     /// One of the `MARKER_*` values.
@@ -153,6 +170,9 @@ pub struct Message<'a> {
     pub status: u32,
     /// Command, stream or notification id.
     pub id: u32,
+    /// The response's TTP error code, one of the [`ttp_error`] values; the
+    /// Windows engine takes anything but 0 as a refusal.
+    pub error: u32,
     /// Declared payload length; larger than `payload.len()` for the head of
     /// a chunked response.
     pub payload_len: u32,
@@ -176,6 +196,7 @@ pub fn parse_message(buf: &[u8]) -> Option<Message<'_>> {
         seq: be_word(buf, 12)?,
         status: be_word(buf, 16)?,
         id: be_word(buf, 20)?,
+        error: be_word(buf, 24)?,
         payload_len: be_word(buf, 28)?,
         payload: buf.get(HEADER_LEN..)?,
     })
@@ -707,8 +728,8 @@ mod tests {
         let rsp = crate::fixture!("init-rsp-1420");
         let m = parse_message(&rsp).expect("response");
         assert_eq!(
-            (m.marker, m.seq, m.status, m.id),
-            (MARKER_RESPONSE, 3, 1, 1420)
+            (m.marker, m.seq, m.status, m.id, m.error),
+            (MARKER_RESPONSE, 3, 1, 1420, ttp_error::NONE)
         );
         assert_eq!(
             m.payload.len(),
@@ -720,6 +741,22 @@ mod tests {
         let m = parse_message(&n).expect("notification");
         assert_eq!((m.marker, m.id), (MARKER_NOTIFICATION, notify::STATE_3180));
         assert_eq!(m.tlvs().next().and_then(|t| t.u32()), Some(3));
+    }
+
+    /// Word 5 is the TTP error code: 0 in every capture, and whatever a
+    /// refusing device puts there otherwise.
+    #[test]
+    fn parse_message_reads_the_error_word() {
+        let mut rsp = crate::fixture!("change-display-rsp-1440");
+        let m = parse_message(&rsp).expect("response");
+        assert_eq!((m.id, m.status, m.error), (1440, 1, ttp_error::NONE));
+
+        rsp[24..28].copy_from_slice(&ttp_error::BAD_STATE.to_be_bytes());
+        let m = parse_message(&rsp).expect("response");
+        assert_eq!(
+            (m.marker, m.seq, m.status, m.id, m.error, m.payload_len),
+            (MARKER_RESPONSE, 0x2a, 1, 1440, ttp_error::BAD_STATE, 0)
+        );
     }
 
     /// The device splits a calibration read: a 0x52 head declaring 659067

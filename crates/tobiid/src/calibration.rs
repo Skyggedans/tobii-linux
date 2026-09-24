@@ -507,7 +507,7 @@ mod tests {
             if *self.refuse.lock().expect("refuse") == Some(cmd) {
                 return Ok(CommandResponse {
                     status: 2,
-                    payload: Vec::new(),
+                    ..CommandResponse::ok(Vec::new())
                 });
             }
             let payload = if cmd == cmd::READ {
@@ -515,7 +515,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Ok(CommandResponse { status: 1, payload })
+            Ok(CommandResponse::ok(payload))
         }
     }
 

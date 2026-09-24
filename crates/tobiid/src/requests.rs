@@ -436,7 +436,7 @@ mod tests {
         ) -> Result<tobii_usb::engine::CommandResponse, tobii_usb::engine::CommandError> {
             Ok(tobii_usb::engine::CommandResponse {
                 status: self.0,
-                payload: Vec::new(),
+                ..tobii_usb::engine::CommandResponse::ok(Vec::new())
             })
         }
     }

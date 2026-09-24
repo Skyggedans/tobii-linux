@@ -32,6 +32,7 @@ use tobii_ipc::geometry::DisplayArea;
 use tobii_proto::facts::{DeviceFacts, DeviceNotification};
 use tobii_proto::gaze83::GazeFrame;
 use tobii_proto::image83::ImageFrame;
+use tobii_proto::protocol::{RESPONSE_STATUS_OK, ttp_error};
 use tracing::error;
 
 /// One 6DOF head-pose estimate from the IR image stream.
@@ -121,8 +122,23 @@ pub struct DeviceCommand {
 pub struct CommandResponse {
     /// The response's status word (1 on every answer ever captured).
     pub status: u32,
+    /// The response's TTP error code (0 on every answer ever captured; see
+    /// [`tobii_proto::protocol::ttp_error`]).
+    pub error: u32,
     /// The whole payload, chunked responses joined.
     pub payload: Vec<u8>,
+}
+
+impl CommandResponse {
+    /// A successful answer carrying `payload`.
+    #[must_use]
+    pub fn ok(payload: Vec<u8>) -> Self {
+        Self {
+            status: RESPONSE_STATUS_OK,
+            error: ttp_error::NONE,
+            payload,
+        }
+    }
 }
 
 /// Why a command got no answer.
