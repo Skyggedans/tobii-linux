@@ -60,10 +60,11 @@ const DISPLAY_AREA_TIMEOUT: Duration = Duration::from_secs(5);
 /// Host-side latency bound between the device stamping a gaze frame and the
 /// daemon reading it: the lower edge of the TIMESYNC window.
 const FRAME_LATENCY_US: i64 = 30_000;
-/// How long a TIMESYNC waits for a gaze frame newer than the request: a
-/// cold engine takes as long as its facts.
+/// How long a TIMESYNC waits for a gaze frame newer than the request. A cold
+/// engine reports its facts within seconds but streams gaze only after its
+/// second init (about 12 s on the ET5); this also covers a third.
 #[cfg(not(test))]
-const TIMESYNC_TIMEOUT: Duration = FACTS_TIMEOUT;
+const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(test)]
 const TIMESYNC_TIMEOUT: Duration = Duration::from_millis(300);
 /// How often a TIMESYNC looks for that frame (the tracker sends ~33 a second).

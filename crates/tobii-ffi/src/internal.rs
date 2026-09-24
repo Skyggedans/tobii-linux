@@ -133,6 +133,10 @@ pub unsafe extern "C" fn tobii_internal_stream_supported(
     unsafe { write_supported(device, stream, supported, internal_stream_supported) }
 }
 
+/// The daemon waits up to 25 s for a gaze frame: a cold tracker streams
+/// gaze only after its second init.
+const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(27);
+
 /// A fresh tracker/host clock pair: the tracker clock read `tracker_us` at
 /// some host time between `system_start_us` and `system_end_us`.
 ///
@@ -162,7 +166,7 @@ pub unsafe extern "C" fn tobii_timesync(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     match d
-        .request(kind::TIMESYNC, &[], FACTS_TIMEOUT)
+        .request(kind::TIMESYNC, &[], TIMESYNC_TIMEOUT)
         .map(|p| decode_timesync(&p))
     {
         Ok(Some(t)) => {
