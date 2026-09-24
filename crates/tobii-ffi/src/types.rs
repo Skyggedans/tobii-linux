@@ -343,6 +343,22 @@ pub struct Image {
     pub data: *const c_void,
 }
 
+/// `tobii_timesync_data_t` (undocumented; layout from the DLL's
+/// `device_timesync`, field names from the older public headers): the
+/// tracker clock read `tracker_us` at some host time between
+/// `system_start_us` and `system_end_us`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimesyncData {
+    /// Host time before the tracker time was taken, microseconds (the
+    /// `tobii_system_clock` clock).
+    pub system_start_us: i64,
+    /// Host time after the tracker time was taken, microseconds.
+    pub system_end_us: i64,
+    /// Tracker time, microseconds (the clock of the samples' timestamps).
+    pub tracker_us: i64,
+}
+
 /// `tobii_calibration_point_data_t`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -450,6 +466,11 @@ mod tests {
         assert_eq!(size_of::<Image>(), 32);
         assert_eq!(offset_of!(Image, padding_per_row), 12);
         assert_eq!(offset_of!(Image, data), 24);
+
+        assert_eq!(size_of::<TimesyncData>(), 24);
+        assert_eq!(align_of::<TimesyncData>(), 8);
+        assert_eq!(offset_of!(TimesyncData, system_end_us), 8);
+        assert_eq!(offset_of!(TimesyncData, tracker_us), 16);
 
         assert_eq!(size_of::<CalibrationPointData>(), 32);
         assert_eq!(offset_of!(CalibrationPointData, right_status), 20);

@@ -2,10 +2,10 @@
  * that the Stream Engine never documented, as provided by libtobii.so.
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
- * argument types are best guesses. Only the field-of-use, image and
- * internal-stream functions are implemented; every other entry point here
- * returns TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the
- * guessed types cannot matter at runtime. Companion to tobii/tobii.h.
+ * argument types are best guesses. Only the field-of-use, image,
+ * internal-stream and timesync functions are implemented; every other entry
+ * point here returns TOBII_ERROR_NOT_SUPPORTED without reading its arguments,
+ * so the guessed types cannot matter at runtime. Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -56,6 +56,26 @@ TOBII_API tobii_error_t TOBII_CALL tobii_image_unsubscribe( tobii_device_t* devi
  * TOBII_ERROR_INVALID_PARAMETER. */
 TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device_t* device,
     uint32_t stream, tobii_supported_t* supported );
+
+/* One tracker/host clock pair: the tracker clock (the clock of the samples'
+ * timestamps) read tracker_us at some host time between system_start_us and
+ * system_end_us, all in microseconds. The host clock is tobii_system_clock's:
+ * CLOCK_REALTIME, not the DLL's QueryPerformanceCounter. The pair comes from
+ * the first gaze frame the daemon receives after the call (the tracker is
+ * started if needed), and the bracket is a fixed 30 ms before the daemon
+ * read it. The DLL times a round trip instead; its own offset estimator
+ * skips pairs wider than 6 ms, though it still returns them with
+ * TOBII_ERROR_NO_ERROR. Nothing is written unless the call succeeds. Layout
+ * from the DLL (24 bytes); the field names follow the older public headers. */
+typedef struct tobii_timesync_data_t
+{
+    int64_t system_start_us;
+    int64_t system_end_us;
+    int64_t tracker_us;
+} tobii_timesync_data_t;
+
+TOBII_API tobii_error_t TOBII_CALL tobii_timesync( tobii_device_t* device,
+    tobii_timesync_data_t* timesync );
 
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED. Its point type is
  * unknown. */
@@ -127,7 +147,6 @@ TOBII_API tobii_error_t TOBII_CALL tobii_set_display_info( tobii_device_t* devic
 TOBII_API tobii_error_t TOBII_CALL tobii_set_face_id_parameters( tobii_device_t* device, void const* parameters );
 TOBII_API tobii_error_t TOBII_CALL tobii_set_fw_upgrade_allowed( tobii_device_t* device, uint32_t allowed );
 TOBII_API tobii_error_t TOBII_CALL tobii_set_illumination_mode( tobii_device_t* device, void const* mode );
-TOBII_API tobii_error_t TOBII_CALL tobii_timesync( tobii_device_t* device, void* timesync );
 TOBII_API tobii_error_t TOBII_CALL tobii_wearable_limited_image_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_wearable_limited_image_unsubscribe( tobii_device_t* device );
 

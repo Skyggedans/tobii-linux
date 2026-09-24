@@ -2,17 +2,21 @@
 //! does not cover (all but `tobii_calibration_stimulus_points_get`, which
 //! lives with calibration). Their argument counts come from the DLL (see
 //! `tools/abi`); their types are best-effort, which is safe because only the
-//! field-of-use, image and internal-stream functions below read their
-//! arguments.
+//! field-of-use, image, internal-stream and timesync functions below read
+//! their arguments.
 
 use std::ffi::c_void;
 
-use crate::api::write_supported;
+use tobii_ipc::request::{decode_timesync, kind};
+
+use crate::api::{FACTS_TIMEOUT, write_supported};
 use crate::device::{Device, device_mut};
-use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
+use crate::status::{
+    Status, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
+};
 use crate::streams::{subscribe, unsubscribe};
 use crate::stub::not_supported;
-use crate::types::{FieldOfUse, FieldOfUseFn, ImageFn};
+use crate::types::{FieldOfUse, FieldOfUseFn, ImageFn, TimesyncData};
 
 /// The field of use the device was created with.
 ///
@@ -122,6 +126,54 @@ pub unsafe extern "C" fn tobii_internal_stream_supported(
     unsafe { write_supported(device, stream, supported, internal_stream_supported) }
 }
 
+/// A fresh tracker/host clock pair: the tracker clock read `tracker_us` at
+/// some host time between `system_start_us` and `system_end_us`.
+///
+/// The daemon answers from the first gaze frame it receives after the
+/// request (starting the tracker if needed): `tracker_us` is the frame's
+/// device timestamp and the bracket is the 30 ms before the daemon read it.
+/// The DLL instead times a round trip to its service, and its own offset
+/// estimator skips pairs wider than 6 ms, though it still returns them. The
+/// host clock is `tobii_system_clock`'s, `CLOCK_REALTIME` rather than the
+/// DLL's monotonic QPC. Nothing is written unless the call succeeds.
+///
+/// # Safety
+/// `device` as `tobii_device_process_callbacks`; `timesync` must be null or
+/// valid for writing one `tobii_timesync_data_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_timesync(
+    device: *mut Device,
+    timesync: *mut TimesyncData,
+) -> Status {
+    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
+    let d = match unsafe { device_mut(device) } {
+        Ok(d) => d,
+        Err(status) => return status,
+    };
+    if timesync.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    match d
+        .request(kind::TIMESYNC, &[], FACTS_TIMEOUT)
+        .map(|p| decode_timesync(&p))
+    {
+        Ok(Some(t)) => {
+            // The reply's order is start, device, end; the struct's is
+            // start, end, tracker.
+            let out = TimesyncData {
+                system_start_us: t.host_start_us,
+                system_end_us: t.host_end_us,
+                tracker_us: t.device_us,
+            };
+            // SAFETY: non-null, and the caller guarantees it is writable.
+            unsafe { timesync.write(out) };
+            TOBII_ERROR_NO_ERROR
+        }
+        Ok(None) => TOBII_ERROR_INTERNAL,
+        Err(status) => status,
+    }
+}
+
 type P = *mut c_void;
 type C = *const c_void;
 
@@ -189,7 +241,6 @@ not_supported! {
     fn tobii_set_face_id_parameters(device: P, parameters: C);
     fn tobii_set_fw_upgrade_allowed(device: P, allowed: u32);
     fn tobii_set_illumination_mode(device: P, mode: C);
-    fn tobii_timesync(device: P, timesync: P);
     fn tobii_wearable_limited_image_subscribe(device: P, callback: C, user_data: P);
     fn tobii_wearable_limited_image_unsubscribe(device: P);
 }
@@ -198,8 +249,10 @@ not_supported! {
 mod tests {
     use super::*;
     use crate::api::tobii_device_destroy;
+    use crate::status::TOBII_ERROR_NOT_AVAILABLE;
     use crate::types::{TOBII_NOT_SUPPORTED, TOBII_SUPPORTED};
     use std::ptr;
+    use tobii_ipc::request::{Timesync, encode_timesync, status};
 
     #[test]
     fn only_the_ir_image_is_a_supported_internal_stream() {
@@ -236,5 +289,79 @@ mod tests {
             assert_eq!(s, 9, "nothing written");
             assert_eq!(tobii_device_destroy(d), 0);
         }
+    }
+
+    /// Ask a daemon answering `status`/`payload` for a clock pair, into a
+    /// sentinel.
+    fn timesync_with(status: u8, payload: Vec<u8>) -> (Status, TimesyncData) {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(status, payload)));
+        let mut out = TimesyncData {
+            system_start_us: -1,
+            system_end_us: -2,
+            tracker_us: -3,
+        };
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below; `out` is a live local.
+        unsafe {
+            let got = tobii_timesync(d, &raw mut out);
+            assert_eq!(tobii_device_destroy(d), 0);
+            (got, out)
+        }
+    }
+
+    #[test]
+    fn timesync_puts_the_daemon_pair_in_stream_engine_order() {
+        let payload = encode_timesync(&Timesync {
+            host_start_us: 1_700_000_000_000_000,
+            device_us: 5_000_000,
+            host_end_us: 1_700_000_000_030_000,
+        });
+        assert_eq!(
+            timesync_with(0, payload),
+            (
+                TOBII_ERROR_NO_ERROR,
+                TimesyncData {
+                    system_start_us: 1_700_000_000_000_000,
+                    system_end_us: 1_700_000_000_030_000,
+                    tracker_us: 5_000_000,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn timesync_writes_nothing_on_an_error() {
+        let untouched = TimesyncData {
+            system_start_us: -1,
+            system_end_us: -2,
+            tracker_us: -3,
+        };
+        assert_eq!(
+            timesync_with(status::NOT_AVAILABLE, vec![]),
+            (TOBII_ERROR_NOT_AVAILABLE, untouched),
+            "the daemon's status passes through"
+        );
+        assert_eq!(
+            timesync_with(0, vec![1, 2, 3]),
+            (TOBII_ERROR_INTERNAL, untouched),
+            "a malformed reply"
+        );
+
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        let mut out = untouched;
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below; `out` is a live local.
+        unsafe {
+            assert_eq!(
+                tobii_timesync(d, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_timesync(ptr::null_mut(), &raw mut out),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+        assert_eq!(out, untouched);
     }
 }

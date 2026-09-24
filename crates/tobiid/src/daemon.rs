@@ -83,7 +83,12 @@ pub(crate) struct State {
     /// (the device reports presence only when it changes).
     last_presence: Option<PresenceSample>,
     /// The newest `(device_us, host_us)` pair seen on the gaze stream.
+    /// Cleared whenever the engine stops or starts: the device clock
+    /// restarts with the device, so a pair is good for its session only.
     pub(crate) clock: Option<(i64, i64)>,
+    /// Gaze frames seen so far. A TIMESYNC waits for this to move, which,
+    /// unlike the wall clock, never steps back.
+    pub(crate) gaze_frames: u64,
     /// The display area a client set (or the saved one), re-applied at every
     /// device init.
     pub(crate) display_override: Option<DisplayArea>,
@@ -108,6 +113,7 @@ impl State {
             facts: None,
             last_presence: None,
             clock: None,
+            gaze_frames: 0,
             display_override: None,
             display_request: crate::requests::DisplaySize::from_env(),
             display_file: None,
@@ -138,12 +144,14 @@ impl State {
     fn reconcile(&mut self) {
         if self.engine.as_ref().is_some_and(|e| !e.is_alive()) {
             self.engine = None;
+            self.clock = None;
             crate::calibration::on_engine_lost(self);
         }
         if self.prewarm {
             self.ensure_engine();
         } else if !self.is_engine_wanted() {
             self.engine = None;
+            self.clock = None;
             crate::calibration::on_engine_lost(self);
         }
         self.sync_wanted();
@@ -152,6 +160,7 @@ impl State {
     /// Start the engine if it is not running.
     pub(crate) fn ensure_engine(&mut self) {
         if self.engine.as_ref().is_none_or(|e| !e.is_alive()) {
+            self.clock = None;
             self.engine = Some(Engine::start_with(self.display_override));
             self.sync_wanted();
         }
@@ -197,6 +206,12 @@ impl State {
         }
     }
 
+    /// Note the `(device_us, host_us)` pair of a gaze frame.
+    pub(crate) fn note_clock(&mut self, device_us: i64, host_us: i64) {
+        self.clock = Some((device_us, host_us));
+        self.gaze_frames = self.gaze_frames.wrapping_add(1);
+    }
+
     /// Fold a sample into the daemon's own state.
     fn observe(&mut self, sample: &Sample) {
         match sample {
@@ -214,7 +229,7 @@ impl State {
             Sample::Presence(p) => self.last_presence = Some(*p),
             Sample::Gaze(g) => {
                 let device = i64::try_from(g.frame.device_ts_us).unwrap_or(i64::MAX);
-                self.clock = Some((device, g.host_rx_us));
+                self.note_clock(device, g.host_rx_us);
             }
             Sample::Notification(DeviceNotification::DisplayAreaChanged(area)) => {
                 if let Some(facts) = &self.facts {
@@ -320,6 +335,7 @@ pub fn run() -> Result<()> {
                     warn!("engine not running but wanted; restarting");
                     crate::calibration::on_engine_lost(&mut st);
                     st.engine = None;
+                    st.clock = None;
                     st.ensure_engine();
                 }
             }
@@ -542,6 +558,15 @@ pub(crate) mod tests {
             .find(|c| c.id == id)
             .map(|c| c.outbox.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_stopped_engine_takes_its_clock_pair_along() {
+        let mut st = state_with_client(1);
+        st.clock = Some((5_000_000, 1_700_000_000_000_000));
+        // Nobody wants the engine (and prewarm is off): no engine starts.
+        st.reconcile();
+        assert_eq!(st.clock, None);
     }
 
     #[test]

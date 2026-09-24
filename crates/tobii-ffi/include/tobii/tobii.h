@@ -239,8 +239,8 @@ TOBII_API tobii_error_t TOBII_CALL tobii_wait_for_callbacks( int device_count,
 TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
-/* A no-op: samples carry the device clock and the daemon keeps the clocks in
- * step. */
+/* A no-op: samples carry the device clock, and there is no offset estimate to
+ * refresh (tobii_timesync takes a fresh clock pair on every call). */
 TOBII_API tobii_error_t TOBII_CALL tobii_update_timesync( tobii_device_t* device );
 /* Microseconds since the Unix epoch: the clock of gaze data's
  * timestamp_system_us. */

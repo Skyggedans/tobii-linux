@@ -323,8 +323,9 @@ pub unsafe extern "C" fn tobii_device_reconnect(device: *mut Device) -> Status {
     }
 }
 
-/// Accepted and a no-op: samples already carry the device clock, and the
-/// daemon keeps the device/host clock pair current by itself.
+/// Accepted and a no-op: samples carry the device clock, and there is no
+/// offset estimate to refresh (`tobii_timesync` takes a fresh clock pair
+/// from the daemon on every call).
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.

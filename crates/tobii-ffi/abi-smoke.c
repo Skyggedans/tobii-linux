@@ -115,6 +115,9 @@ int main( void )
     tobii_lens_configuration_writable_t writable = TOBII_LENS_CONFIGURATION_WRITABLE;
     assert( tobii_lens_configuration_writable( NULL, &writable ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( supported == TOBII_SUPPORTED && writable == TOBII_LENS_CONFIGURATION_WRITABLE );
+    tobii_timesync_data_t timesync = { 1, 2, 3 };
+    assert( tobii_timesync( NULL, &timesync ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( timesync.system_start_us == 1 && timesync.tracker_us == 3 );
 
     assert( tobii_error_message( TOBII_ERROR_NO_ERROR ) != NULL );
     assert( tobii_error_message( (tobii_error_t)9999 ) != NULL );
@@ -148,6 +151,9 @@ int main( void )
     assert( offsetof( tobii_notification_t, value ) == 8 );
     assert( sizeof( tobii_image_t ) == 32 );
     assert( offsetof( tobii_image_t, data ) == 24 );
+    assert( sizeof( tobii_timesync_data_t ) == 24 );
+    assert( offsetof( tobii_timesync_data_t, system_end_us ) == 8 );
+    assert( offsetof( tobii_timesync_data_t, tracker_us ) == 16 );
     assert( sizeof( tobii_calibration_point_data_t ) == 32 );
     assert( sizeof( tobii_license_key_t ) == 16 );
     assert( sizeof( tobii_device_name_t ) == 64 );

@@ -57,6 +57,14 @@ const DISPLAY_AREA_TIMEOUT: Duration = Duration::from_secs(5);
 /// Host-side latency bound between the device stamping a gaze frame and the
 /// daemon reading it: the lower edge of the TIMESYNC window.
 const FRAME_LATENCY_US: i64 = 30_000;
+/// How long a TIMESYNC waits for a gaze frame newer than the request: a
+/// cold engine takes as long as its facts.
+#[cfg(not(test))]
+const TIMESYNC_TIMEOUT: Duration = FACTS_TIMEOUT;
+#[cfg(test)]
+const TIMESYNC_TIMEOUT: Duration = Duration::from_millis(300);
+/// How often a TIMESYNC looks for that frame (the tracker sends ~33 a second).
+const TIMESYNC_POLL: Duration = Duration::from_millis(5);
 
 /// Answer one request from `client`.
 pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Reply {
@@ -90,14 +98,7 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
             Some(_) => Reply::err(status::NOT_SUPPORTED),
             None => Reply::err(status::INVALID_PARAMETER),
         },
-        kind::TIMESYNC => match lock_state(state).clock {
-            Some((device_us, host_us)) => Reply::ok(encode_timesync(&Timesync {
-                host_start_us: host_us - FRAME_LATENCY_US,
-                device_us,
-                host_end_us: host_us,
-            })),
-            None => Reply::err(status::NOT_AVAILABLE),
-        },
+        kind::TIMESYNC => timesync(state, client),
         k if (kind::CALIBRATION_START..=kind::CALIBRATION_CLEAR).contains(&k) => {
             crate::calibration::handle(state, client, k, req.payload)
         }
@@ -133,6 +134,42 @@ fn facts(
             return Reply::err(status::TIMED_OUT);
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A device/host clock pair from the first gaze frame seen after the
+/// request, so that it is fresh and belongs to the running device session.
+/// Frames are counted rather than compared with the wall clock, which may
+/// step back meanwhile. Starts the engine if needed and, as the facts do,
+/// keeps it up while `client` stays connected. `TIMED_OUT` if no such frame
+/// arrives in time.
+fn timesync(state: &Mutex<State>, client: u64) -> Reply {
+    let started = Instant::now();
+    let asked = {
+        let mut st = lock_state(state);
+        let _ = st.device_for(client);
+        st.gaze_frames
+    };
+    loop {
+        // Copied out, so that no guard is held across the sleep.
+        let (frames, clock) = {
+            let st = lock_state(state);
+            (st.gaze_frames, st.clock)
+        };
+        // A stop clears `clock` after the count moved: wait for the next one.
+        if frames != asked
+            && let Some((device_us, host_us)) = clock
+        {
+            return Reply::ok(encode_timesync(&Timesync {
+                host_start_us: host_us - FRAME_LATENCY_US,
+                device_us,
+                host_end_us: host_us,
+            }));
+        }
+        if started.elapsed() > TIMESYNC_TIMEOUT {
+            return Reply::err(status::TIMED_OUT);
+        }
+        thread::sleep(TIMESYNC_POLL);
     }
 }
 
@@ -367,6 +404,8 @@ pub(crate) fn apply_display_request(st: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use tobii_proto::time::now_us;
 
     #[test]
     #[allow(clippy::float_cmp)] // reason: parsed literals
@@ -408,20 +447,82 @@ mod tests {
         assert_eq!(ask(3), Reply::err(status::NOT_SUPPORTED));
     }
 
-    #[test]
-    fn timesync_needs_a_gaze_frame() {
-        let state = Mutex::new(crate::daemon::tests::state_with_client(1));
+    /// Ask for a clock pair from a state that has seen a gaze frame with
+    /// `clock`, with a stand-in device so that no engine starts; `feed` runs
+    /// beside the request as the pump would, until it is answered.
+    fn timesync_from(
+        clock: Option<(i64, i64)>,
+        feed: impl Fn(&Mutex<State>) + Send + Sync,
+    ) -> (Reply, Mutex<State>) {
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        if let Some((device_us, host_us)) = clock {
+            st.note_clock(device_us, host_us);
+        }
+        let state = Mutex::new(st);
         let req = Request {
             id: 1,
             kind: kind::TIMESYNC,
             payload: &[],
         };
-        assert_eq!(handle(&state, 1, &req), Reply::err(status::NOT_AVAILABLE));
-        lock_state(&state).clock = Some((5_000_000, 1_700_000_000_000_000));
-        let reply = handle(&state, 1, &req);
+        let answered = AtomicBool::new(false);
+        let reply = thread::scope(|s| {
+            s.spawn(|| {
+                while !answered.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                    feed(&state);
+                }
+            });
+            let reply = handle(&state, 1, &req);
+            answered.store(true, Ordering::Relaxed);
+            reply
+        });
+        (reply, state)
+    }
+
+    #[test]
+    fn timesync_serves_the_first_gaze_frame_after_the_request() {
+        let asked = i64::try_from(now_us()).expect("now");
+        let device_us = AtomicI64::new(5_000_000);
+        // The gaze stream: a newer frame every 10 ms.
+        let (reply, state) = timesync_from(Some((4_000_000, 1)), |state| {
+            let device = device_us.fetch_add(10_000, Ordering::Relaxed);
+            let host = i64::try_from(now_us()).expect("now");
+            lock_state(state).note_clock(device, host);
+        });
+
+        assert_eq!(reply.status, status::OK);
         let sync = request::decode_timesync(&reply.payload).expect("timesync");
-        assert_eq!(sync.device_us, 5_000_000);
-        assert!(sync.host_start_us < sync.host_end_us);
+        assert!(sync.device_us >= 5_000_000, "not the stale pair");
+        assert!(sync.host_end_us >= asked);
+        assert_eq!(sync.host_end_us - sync.host_start_us, FRAME_LATENCY_US);
+        assert!(
+            lock_state(&state).clients[0].holds_device,
+            "the device stays up for the client"
+        );
+    }
+
+    #[test]
+    fn timesync_serves_a_new_frame_across_a_wall_clock_step_back() {
+        // The host clock went back an hour: new frames look older than the
+        // request, but they are still new.
+        let host_us = i64::try_from(now_us()).expect("now") - 3_600_000_000;
+        let (reply, _) = timesync_from(Some((4_000_000, 1)), |state| {
+            lock_state(state).note_clock(5_000_000, host_us);
+        });
+
+        assert_eq!(reply.status, status::OK);
+        let sync = request::decode_timesync(&reply.payload).expect("timesync");
+        assert_eq!((sync.device_us, sync.host_end_us), (5_000_000, host_us));
+    }
+
+    #[test]
+    fn timesync_times_out_on_a_stale_pair() {
+        let stale = |_: &Mutex<State>| {};
+        let (reply, _) = timesync_from(Some((5_000_000, 1)), stale);
+        assert_eq!(reply, Reply::err(status::TIMED_OUT));
+        let (reply, _) = timesync_from(None, stale);
+        assert_eq!(reply, Reply::err(status::TIMED_OUT));
     }
 
     /// Answers every command with `status`.

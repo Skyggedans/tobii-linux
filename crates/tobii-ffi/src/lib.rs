@@ -96,7 +96,6 @@ mod tests {
             ),
             ("open_realm", crate::internal::tobii_open_realm(n, 0, c, 0)),
             ("pause_device", crate::internal::tobii_pause_device(n)),
-            ("timesync", crate::internal::tobii_timesync(n, n)),
             (
                 "send_custom_command",
                 crate::internal::tobii_send_custom_command(n, 0, c, 0, c, n),
