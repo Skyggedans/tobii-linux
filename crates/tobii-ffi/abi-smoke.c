@@ -129,6 +129,8 @@ int main( void )
     assert( tobii_set_device_name( NULL, name ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_get_device_name( NULL, &name ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( strcmp( name, "unchanged" ) == 0 );
+    assert( tobii_device_destroy( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_api_destroy( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
 
     assert( tobii_error_message( TOBII_ERROR_NO_ERROR ) != NULL );
     assert( tobii_error_message( (tobii_error_t)9999 ) != NULL );

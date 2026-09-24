@@ -4,9 +4,10 @@
 //! or a live handle from `tobii_device_create` that no other thread uses
 //! during the call; `callback` must be null (rejected) or sound to invoke with
 //! a valid pointer to its sample type and `user_data`, must not re-enter this
-//! library (such calls are refused with `TOBII_ERROR_CALLBACK_IN_PROGRESS`),
-//! and `user_data` must stay valid until the stream is unsubscribed or the
-//! device destroyed. Callbacks run on the thread that calls
+//! library (an implemented call that takes a device, or `tobii_api_destroy`,
+//! is refused with `TOBII_ERROR_CALLBACK_IN_PROGRESS`; see the crate
+//! documentation), and `user_data` must stay valid until the stream is
+//! unsubscribed or the device destroyed. Callbacks run on the thread that calls
 //! `tobii_device_process_callbacks`.
 
 use std::ffi::c_void;

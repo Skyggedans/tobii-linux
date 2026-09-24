@@ -31,14 +31,24 @@
 //! catalogue, pause) works here under the consumer group this library
 //! reports (see `licensing`).
 //!
-//! An entry point that takes a device checks its arguments in one order: a
-//! call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, then a
-//! null device is `TOBII_ERROR_INVALID_PARAMETER`, then its other arguments
-//! are checked (`TOBII_ERROR_INVALID_PARAMETER` again). Two check an
-//! argument first: `tobii_calibration_start` its eye and
-//! `tobii_calibration_apply` its blob. The DLL checks null pointers before
-//! the callback in some entry points, so the two differ only for an invalid
-//! argument passed from inside a callback.
+//! A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, as in
+//! the Stream Engine, from every implemented entry point that takes a device
+//! handle, `tobii_device_destroy` included. Four more refuse it once their
+//! arguments check out, as in the DLL: `tobii_api_destroy` (the DLL keeps its
+//! callback flag in the API instance), `tobii_device_create` and
+//! `tobii_device_create_ex` (a callback could not destroy what they make) and
+//! `tobii_calibration_parse`.
+//!
+//! An entry point that takes a device handle checks the callback first, then
+//! a null device, then its other arguments (`TOBII_ERROR_INVALID_PARAMETER`
+//! both). Three check arguments first: `tobii_calibration_start` its eye,
+//! `tobii_calibration_apply` its blob and `tobii_wait_for_callbacks` its
+//! count and null handles. The DLL checks the handle, and sometimes more,
+//! first, so the two differ only for an invalid argument passed from inside a
+//! callback. The DLL also refuses only calls into the API instance whose
+//! callbacks run, where here any is refused, and it counts the receivers of
+//! `tobii_calibration_retrieve` and `tobii_enumerate_local_device_urls(_ex)`
+//! as callbacks, where here their `# Safety` sections forbid re-entry.
 //!
 //! `tobii_device_create` connects to the daemon (auto-spawning it if needed),
 //! so several processes can use the device at once. Pump with

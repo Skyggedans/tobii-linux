@@ -6,11 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tobii_ipc::request::{self, decode_device_info, decode_track_box, kind};
 
-use crate::device::{Api, Device, device_mut};
+use crate::device::{Api, Device, device_mut, in_callback};
 use crate::status::{
-    Status, TOBII_ERROR_CONFLICTING_API_INSTANCES, TOBII_ERROR_CONNECTION_FAILED,
-    TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
-    TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_TIMED_OUT,
+    Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_CONFLICTING_API_INSTANCES,
+    TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER,
+    TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_TIMED_OUT,
 };
 use crate::types::{
     DeviceInfo, DeviceUrlReceiver, FieldOfUse, StateString, TOBII_CAPABILITY_CALIBRATION_2D,
@@ -79,18 +79,27 @@ pub unsafe extern "C" fn tobii_api_create(
     TOBII_ERROR_NO_ERROR
 }
 
-/// Release an API handle. Null is accepted and ignored.
+/// Release an API handle. A null handle is `TOBII_ERROR_INVALID_PARAMETER`,
+/// then a call from inside a callback `TOBII_ERROR_CALLBACK_IN_PROGRESS`, in
+/// the DLL's order; neither releases anything. As in the DLL, devices created
+/// from the handle are not checked for; here they keep working, since the
+/// handle carries no state.
 ///
 /// # Safety
 /// `api` must be null or a handle from `tobii_api_create` that has not been
-/// destroyed yet; it must not be used afterwards.
+/// destroyed yet; once this returns `TOBII_ERROR_NO_ERROR` it must not be
+/// used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_api_destroy(api: *mut Api) -> Status {
-    if !api.is_null() {
-        // SAFETY: non-null, and the caller guarantees it came from
-        // `Box::into_raw` in `tobii_api_create` and is destroyed only once.
-        drop(unsafe { Box::from_raw(api) });
+    if api.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
     }
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
+    }
+    // SAFETY: non-null (checked above), and the caller guarantees it came
+    // from `Box::into_raw` in `tobii_api_create` and is destroyed only once.
+    drop(unsafe { Box::from_raw(api) });
     TOBII_ERROR_NO_ERROR
 }
 
@@ -146,7 +155,8 @@ pub unsafe extern "C" fn tobii_enumerate_local_device_urls_ex(
     unsafe { tobii_enumerate_local_device_urls(api, receiver, user_data) }
 }
 
-/// Validate the arguments of the device constructors and connect.
+/// Validate the arguments of the device constructors, refuse a call from
+/// inside a callback (after the arguments, as in the DLL) and connect.
 ///
 /// # Safety
 /// `device` must be null or valid for writing one `*mut Device`.
@@ -169,6 +179,10 @@ pub(crate) unsafe fn create_device(
         );
         return TOBII_ERROR_INVALID_PARAMETER;
     }
+    // A callback could not destroy the device it made.
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
+    }
     let Ok(d) = Device::connect_daemon(api as usize, field_of_use)
         .inspect_err(|e| tracing::warn!(error = %e, "could not connect to tobiid"))
     else {
@@ -189,6 +203,8 @@ pub(crate) unsafe fn create_device(
 /// that check is load-bearing: a caller compiled against the three-argument
 /// Stream Engine 3.x header lands here with a stack address in `field_of_use`
 /// and an uninitialised `device`, and is rejected instead of corrupting memory.
+/// A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS` once
+/// the arguments have been checked, as in the DLL.
 ///
 /// # Safety
 /// `api` must be null or a live handle from `tobii_api_create`. `device` must
@@ -206,19 +222,26 @@ pub unsafe extern "C" fn tobii_device_create(
 }
 
 /// Release a device handle: unsubscribes everything, closes the daemon
-/// connection and joins the reader thread. Null is accepted and ignored.
+/// connection and joins the reader thread. A null handle is
+/// `TOBII_ERROR_INVALID_PARAMETER`, and a call from inside a callback
+/// `TOBII_ERROR_CALLBACK_IN_PROGRESS` for any device, since the one a callback
+/// runs on is still being dispatched; as in the DLL, neither releases
+/// anything.
 ///
 /// # Safety
 /// `device` must be null or a handle from `tobii_device_create` that has not
-/// been destroyed yet and is not in use by another thread; it must not be used
-/// afterwards.
+/// been destroyed yet and is not in use by another thread; once this returns
+/// `TOBII_ERROR_NO_ERROR` it must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_device_destroy(device: *mut Device) -> Status {
-    if !device.is_null() {
-        // SAFETY: non-null, and the caller guarantees it came from
-        // `Box::into_raw` in `tobii_device_create` and is destroyed only once.
-        drop(unsafe { Box::from_raw(device) });
+    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
+    if let Err(status) = unsafe { device_mut(device) } {
+        return status;
     }
+    // SAFETY: non-null (checked above), and the caller guarantees it came
+    // from `Box::into_raw` in `tobii_device_create` and is destroyed only
+    // once; no callback runs on this thread, so no dispatch loop borrows it.
+    drop(unsafe { Box::from_raw(device) });
     TOBII_ERROR_NO_ERROR
 }
 
@@ -227,7 +250,10 @@ const WAIT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Block until at least one of `devices` has a sample queued, waiting up to
 /// ~100 ms per idle device. Returns `TOBII_ERROR_TIMED_OUT` when none has.
-/// Devices from different API handles are refused, as in the DLL.
+/// Devices from different API handles are refused, as in the DLL. A call
+/// from inside a callback is refused after the count and null checks and
+/// before any device is read, so before that API check, which the DLL makes
+/// first.
 ///
 /// # Safety
 /// `devices` must be null or point to `device_count` initialised
@@ -250,6 +276,11 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
     let handles = unsafe { std::slice::from_raw_parts(devices, n) };
     if handles.iter().any(|h| h.is_null()) {
         return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    // Before any device is read: the one a callback runs on is still
+    // borrowed by the dispatch loop.
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
     }
     let mut api = None;
     for &handle in handles {
@@ -652,7 +683,9 @@ pub unsafe extern "C" fn tobii_stream_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TOBII_STATE_EXCLUSIVE_MODE;
+    use crate::types::{
+        CalibrationPointData, EyePair, EyePairFn, LicenseKey, TOBII_STATE_EXCLUSIVE_MODE,
+    };
     use std::ptr;
 
     fn api() -> *mut Api {
@@ -736,6 +769,253 @@ mod tests {
             );
             assert_eq!(tobii_api_destroy(api), 0);
         }
+    }
+
+    /// As in the DLL and the 4.1 documentation.
+    #[test]
+    fn destroying_a_null_handle_is_an_invalid_parameter() {
+        // SAFETY: null handles are rejected before anything is freed.
+        unsafe {
+            assert_eq!(
+                tobii_device_destroy(ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_api_destroy(ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+        }
+    }
+
+    /// A device over a fake daemon that sends two gaze-origin samples ahead of
+    /// every subscription ack, so each subscription change leaves both queued
+    /// for `tobii_device_process_callbacks`.
+    fn device_with_two_samples_per_ack() -> *mut Device {
+        let connect = crate::device::tests::fake_daemon(|body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                let sample = tobii_ipc::encode_gaze_origin(&tobii_ipc::EyePair::default());
+                vec![sample.clone(), sample, tobii_ipc::encode_subscribed(true)]
+            }
+            _ => vec![],
+        });
+        Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")))
+    }
+
+    unsafe extern "C" fn ignore_pair(_p: *const EyePair, _ud: *mut c_void) {}
+
+    #[test]
+    fn wait_for_callbacks_rejects_bad_arguments_then_waits() {
+        let idle = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        let connect = crate::device::tests::fake_daemon(|_| vec![]);
+        let elsewhere = Box::into_raw(Box::new(Device::new(connect, 2, 1).expect("device")));
+        let busy = device_with_two_samples_per_ack();
+        let (one, none) = ([idle], [ptr::null_mut()]);
+        let (mixed, either) = ([idle, elsewhere], [idle, busy]);
+        // SAFETY: the devices are live and each destroyed once below; the
+        // arrays are live locals of the length passed.
+        unsafe {
+            assert_eq!(
+                tobii_wait_for_callbacks(0, ptr::null()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_wait_for_callbacks(-1, one.as_ptr()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_wait_for_callbacks(1, none.as_ptr()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_wait_for_callbacks(2, mixed.as_ptr()),
+                TOBII_ERROR_CONFLICTING_API_INSTANCES
+            );
+            assert_eq!(
+                tobii_wait_for_callbacks(1, one.as_ptr()),
+                TOBII_ERROR_TIMED_OUT
+            );
+            assert_eq!(
+                crate::streams::tobii_gaze_origin_subscribe(
+                    busy,
+                    Some(ignore_pair as EyePairFn),
+                    ptr::null_mut()
+                ),
+                0
+            );
+            assert_eq!(tobii_wait_for_callbacks(2, either.as_ptr()), 0);
+            for d in [idle, elsewhere, busy] {
+                assert_eq!(tobii_device_destroy(d), 0);
+            }
+        }
+    }
+
+    /// The handles a callback tries to release, and what it got back: one
+    /// row per sample. `other` belongs to another API instance.
+    struct Teardown {
+        own: *mut Device,
+        other: *mut Device,
+        api: *mut Api,
+        got: Vec<[Status; 8]>,
+    }
+
+    unsafe extern "C" fn tear_down(_p: *const EyePair, ud: *mut c_void) {
+        // SAFETY: the test passes `&raw mut Teardown` as `ud`.
+        let t = unsafe { &mut *ud.cast::<Teardown>() };
+        let (own, pair) = ([t.own], [t.own, t.other]);
+        // SAFETY: each call is refused, or rejected, before it reads a device
+        // or frees a handle; `own` and `pair` are live locals.
+        t.got.push(unsafe {
+            [
+                tobii_device_destroy(t.own),
+                tobii_device_destroy(t.other),
+                tobii_device_destroy(ptr::null_mut()),
+                tobii_api_destroy(t.api),
+                tobii_api_destroy(ptr::null_mut()),
+                tobii_wait_for_callbacks(1, own.as_ptr()),
+                tobii_wait_for_callbacks(0, ptr::null()),
+                tobii_wait_for_callbacks(2, pair.as_ptr()),
+            ]
+        });
+    }
+
+    /// A callback that destroyed its own device used to free it under the
+    /// dispatch loop. No release goes through now and the device keeps
+    /// working: the second sample is still delivered, and the daemon link
+    /// still round-trips.
+    #[test]
+    fn a_callback_cannot_destroy_a_device_or_the_api() {
+        let api = api();
+        let own = device_with_two_samples_per_ack();
+        let connect = crate::device::tests::fake_daemon(|_| vec![]);
+        let other = Box::into_raw(Box::new(Device::new(connect, 2, 1).expect("device")));
+        let mut t = Teardown {
+            own,
+            other,
+            api,
+            got: Vec::new(),
+        };
+        // SAFETY: `own`, `other` and `api` are live and each destroyed once,
+        // after the callbacks; `t` outlives the subscription.
+        unsafe {
+            assert_eq!(
+                crate::streams::tobii_gaze_origin_subscribe(
+                    own,
+                    Some(tear_down as EyePairFn),
+                    (&raw mut t).cast()
+                ),
+                0
+            );
+            assert_eq!(tobii_device_process_callbacks(own), 0);
+            assert_eq!(crate::streams::tobii_gaze_origin_unsubscribe(own), 0);
+            assert_eq!(tobii_device_destroy(own), 0);
+            assert_eq!(tobii_device_destroy(other), 0);
+            assert_eq!(tobii_api_destroy(api), 0);
+        }
+        let (refused, invalid) = (
+            TOBII_ERROR_CALLBACK_IN_PROGRESS,
+            TOBII_ERROR_INVALID_PARAMETER,
+        );
+        // A null API handle and a zero count are checked before the callback,
+        // as in the DLL; a null device after it, as wherever a device handle
+        // is taken. The mixed-API wait is refused before either device is
+        // read, where the DLL answers `TOBII_ERROR_CONFLICTING_API_INSTANCES`.
+        let row = [
+            refused, refused, refused, refused, invalid, refused, invalid, refused,
+        ];
+        assert_eq!(t.got, [row; 2], "both samples are delivered");
+        assert!(!in_callback());
+    }
+
+    /// The device and calibration a callback tries to make, and what it got
+    /// back: one row per sample.
+    struct Creation {
+        api: *mut Api,
+        device: *mut Device,
+        license_results: [u32; 1],
+        got: Vec<[Status; 5]>,
+    }
+
+    unsafe extern "C" fn ignore_point(_p: *const CalibrationPointData, _ud: *mut c_void) {}
+
+    unsafe extern "C" fn create(_p: *const EyePair, ud: *mut c_void) {
+        // SAFETY: the test passes `&raw mut Creation` as `ud`.
+        let c = unsafe { &mut *ud.cast::<Creation>() };
+        let blob = [0u8; 8];
+        let data = blob.as_ptr().cast();
+        let key = LicenseKey {
+            license_key: ptr::null(),
+            size_in: 0,
+        };
+        // SAFETY: `c.api` is live and `c.device` and `c.license_results` live
+        // fields; `key` is a live local, `data` points to `blob.len()`
+        // readable bytes and `ignore_point` is sound to call. Each call is
+        // refused, or rejected, before it connects or parses.
+        c.got.push(unsafe {
+            [
+                tobii_device_create(c.api, ptr::null(), 1, &raw mut c.device),
+                tobii_device_create(c.api, ptr::null(), 0, &raw mut c.device),
+                crate::licensing::tobii_device_create_ex(
+                    c.api,
+                    ptr::null(),
+                    1,
+                    &raw const key,
+                    1,
+                    c.license_results.as_mut_ptr(),
+                    &raw mut c.device,
+                ),
+                crate::calibration::tobii_calibration_parse(
+                    c.api,
+                    data,
+                    blob.len(),
+                    Some(ignore_point),
+                    ptr::null_mut(),
+                ),
+                crate::calibration::tobii_calibration_parse(
+                    c.api,
+                    data,
+                    blob.len(),
+                    None,
+                    ptr::null_mut(),
+                ),
+            ]
+        });
+    }
+
+    /// The DLL refuses these once their arguments check out; a callback
+    /// could not destroy a device it made.
+    #[test]
+    fn a_callback_cannot_create_a_device_or_parse_a_calibration() {
+        let api = api();
+        let d = device_with_two_samples_per_ack();
+        let mut c = Creation {
+            api,
+            device: ptr::null_mut(),
+            license_results: [99],
+            got: Vec::new(),
+        };
+        // SAFETY: `d` and `api` are live and each destroyed once, after the
+        // callbacks; `c` outlives the subscription.
+        unsafe {
+            assert_eq!(
+                crate::streams::tobii_gaze_origin_subscribe(
+                    d,
+                    Some(create as EyePairFn),
+                    (&raw mut c).cast()
+                ),
+                0
+            );
+            assert_eq!(tobii_device_process_callbacks(d), 0);
+            assert_eq!(tobii_device_destroy(d), 0);
+            assert_eq!(tobii_api_destroy(api), 0);
+        }
+        let (refused, invalid) = (
+            TOBII_ERROR_CALLBACK_IN_PROGRESS,
+            TOBII_ERROR_INVALID_PARAMETER,
+        );
+        assert_eq!(c.got, [[refused, invalid, refused, refused, invalid]; 2]);
+        assert!(c.device.is_null(), "no device was written");
+        assert_eq!(c.license_results, [99], "no licence result was written");
+        assert!(!in_callback());
     }
 
     #[test]

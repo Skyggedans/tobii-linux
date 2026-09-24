@@ -42,9 +42,10 @@ use crate::types::{
 const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 thread_local! {
-    /// Set while this thread runs a user callback: the Stream Engine refuses
-    /// every call made from inside one, and so do we — re-entering with the
-    /// device being dispatched would alias its `&mut`.
+    /// Set while this thread runs a user callback. The entry points the crate
+    /// documentation lists refuse a call made from inside one, as the Stream
+    /// Engine does: re-entering with the device being dispatched would alias
+    /// its `&mut`, and destroying it would free it under the dispatch loop.
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -207,8 +208,17 @@ impl Device {
     }
 
     /// Connect to the daemon, spawning it if needed.
+    #[cfg(not(test))]
     pub(crate) fn connect_daemon(api: usize, field_of_use: FieldOfUse) -> io::Result<Self> {
         Self::new(Box::new(tobii_ipc::connect_or_spawn), api, field_of_use)
+    }
+
+    /// Unit tests never reach the real daemon, which would open the tracker:
+    /// their devices talk to `tests::fake_daemon`, and a constructor that
+    /// gets this far fails as if no daemon could be reached.
+    #[cfg(test)]
+    pub(crate) fn connect_daemon(_api: usize, _field_of_use: FieldOfUse) -> io::Result<Self> {
+        Err(io::ErrorKind::NotConnected.into())
     }
 
     /// The daemon connection, for fire-and-forget frames.

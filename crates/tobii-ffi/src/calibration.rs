@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
 
-use crate::device::{Api, Device, device_mut};
-use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
+use crate::device::{Api, Device, device_mut, in_callback};
+use crate::status::{
+    Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
+};
 use crate::stub::not_supported;
 use crate::types::{
     CalibrationPointData, CalibrationPointReceiver, DataReceiver,
@@ -206,7 +208,9 @@ fn point_status(word: u64) -> u32 {
 }
 
 /// Hand each calibration point stored in `data` to `receiver`. The first
-/// measurement of each record is reported as the left eye.
+/// measurement of each record is reported as the left eye. A call from inside
+/// a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS` once the arguments have
+/// been checked, before `data` is parsed, as in the DLL.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `data` must be null or point to
@@ -225,6 +229,9 @@ pub unsafe extern "C" fn tobii_calibration_parse(
     };
     if api.is_null() || data.is_null() || data_size < 8 {
         return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
     }
     // SAFETY: non-null, and the caller guarantees `data_size` readable bytes.
     let blob = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), data_size) };
