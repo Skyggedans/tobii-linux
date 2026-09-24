@@ -51,10 +51,13 @@ pub(crate) const EP_OUT: u8 = 0x05;
 /// buffer this size normally returns exactly one whole message per read.
 pub const READ_BUF: usize = 128 * 1024;
 
-/// Full open+init attempts that may fail in a row before giving up on a
-/// device that does not stream. The engine also counts an open whose stream
-/// armed and then died within 30 s as failed; a stream that ran longer
-/// starts the count again.
+/// Failed open+init attempts in a row after which the engine gives up on a
+/// device that does not stream. It counts failures, not opens: the prime,
+/// the first open since the engine started or a stream last armed that
+/// accepts the init but does not stream (a cold-start quirk), is not one. An
+/// open whose stream armed and then died within 30 s is one; a stream that
+/// ran longer starts the count again. (That is the engine's count: `replay
+/// --reconnect` spends it as plain opens, prime included.)
 pub const MAX_REPLAY_ATTEMPTS: usize = 5;
 
 /// Bulk-flag parsing shared by the `TOBII_*` opt-out variables: set and
@@ -91,7 +94,7 @@ impl error::Error for GazeStalled {}
 
 /// Context on a failure after the gaze stream armed (its first gaze frame
 /// came): the stream ran for `ran`, then died, which is not the device
-/// failing to start. [`after_arming`] adds it; [`stream_ran`] reads it.
+/// failing to start. [`after_arming`] adds it; [`OpenFailure::of`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StreamLost {
     /// Time from arming to the failure.
@@ -277,7 +280,7 @@ pub fn wait_for_response_seq(
 /// sleep) so the following init doesn't race a missing device.
 ///
 /// Set `TOBII_NO_RESET=1` to skip it: the engine resets only as an escalation
-/// once opens keep failing (see [`RESET_ESCALATION_ATTEMPT`]), and now that
+/// once opens keep failing (see [`RESET_AFTER_FAILURES`]), and now that
 /// uvcvideo is kept off the device the reset may no longer be needed.
 fn reset_device_baseline(ctx: &UsbContext) {
     if is_env_flag_set("TOBII_NO_RESET") {
@@ -322,17 +325,19 @@ fn is_tobii_present(ctx: &UsbContext) -> bool {
 }
 
 /// A cold gaze start normally arms on the *second* fresh open (the first accepts
-/// the init but doesn't stream — a firmware quirk, not stale state). A USB reset
-/// up front doesn't change that (verified: start behaves identically with and
-/// without it), so we no longer pay its re-enumeration cost on every start. It's
-/// kept only as a recovery escalation once opens keep failing — two in a row
-/// that never arm, or lose the stream within [`HEALTHY_STREAM`] — which is the
-/// signature of a device left hot by an unclean exit (`kill -9`, crash) that
-/// skipped the teardown. A stream that ran for [`HEALTHY_STREAM`] ends such a
-/// run (see [`FailedOpens`]), so the reset comes at most once per run of
-/// failures, not once per engine. `reset_device_baseline` still honors
-/// `TOBII_NO_RESET=1` (skip even the escalation).
-const RESET_ESCALATION_ATTEMPT: usize = 3;
+/// the init but doesn't stream — a firmware quirk, not stale state), and so does
+/// a re-open after the stream died; that first open is the prime, which is not
+/// a failure (see [`FailedOpens`]). A USB reset up front doesn't change that
+/// (verified: start behaves identically with and without it), so we no longer
+/// pay its re-enumeration cost on every start. It's kept only as a recovery
+/// escalation once opens keep failing — this many failures in a row: opens
+/// whose init fails, that do not arm past the prime, or that lose the stream
+/// within [`HEALTHY_STREAM`] — which is the signature of a device left hot by
+/// an unclean exit (`kill -9`, crash) that skipped the teardown. A stream that
+/// ran for [`HEALTHY_STREAM`] ends such a run, so the reset comes at most once
+/// per run of failures, not once per engine. `reset_device_baseline` still
+/// honors `TOBII_NO_RESET=1` (skip even the escalation).
+const RESET_AFTER_FAILURES: usize = 2;
 
 /// How long a gaze stream must run after arming for its loss to count as a
 /// stream that died rather than an open that failed (see [`FailedOpens`]).
@@ -363,66 +368,108 @@ const REOPEN_PAUSE: Duration = Duration::from_millis(700);
 enum AfterFailedOpen {
     /// Open the device again.
     Reopen,
+    /// Open the device again: the open was the prime, which is not counted.
+    ReopenPrimed,
     /// USB-reset the device, then open it again.
     ResetAndReopen,
     /// Give up: the engine stops.
     GiveUp,
 }
 
-/// Opens that failed in a row: they never armed, or lost the stream within
-/// [`HEALTHY_STREAM`]. The device is USB-reset before the
-/// [`RESET_ESCALATION_ATTEMPT`]th open of a run and given up on after
+/// How an open failed, as [`FailedOpens`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenFailure {
+    /// The device accepted the init but the gaze stream never armed
+    /// ([`StreamStartupTimeout`]).
+    NotArmed,
+    /// The gaze stream armed, ran this long, then died (a [`StreamLost`]
+    /// context).
+    Lost(Duration),
+    /// Anything else: no device, or an init that failed (a write timeout, …).
+    Failed,
+}
+
+impl OpenFailure {
+    /// Classify the error an open failed with. The [`StreamLost`] tag is
+    /// checked first, defensively: a failure after arming is a lost stream
+    /// whatever its cause. No tagged chain holds a [`StreamStartupTimeout`]
+    /// today, which fails an open only before it arms.
+    fn of(e: &anyhow::Error) -> Self {
+        if let Some(lost) = e.downcast_ref::<StreamLost>() {
+            Self::Lost(lost.ran)
+        } else if e.downcast_ref::<StreamStartupTimeout>().is_some() {
+            Self::NotArmed
+        } else {
+            Self::Failed
+        }
+    }
+}
+
+/// Failures counted in a row: opens whose init failed, that did not arm, or
+/// that lost the stream within [`HEALTHY_STREAM`]. The first open that does
+/// not arm since the engine started or a stream last armed is the prime and
+/// is not counted: the ET5 needs one such open to arm, cold and after its
+/// stream died alike (a firmware quirk). An init failure is counted and
+/// leaves the prime due. The device is USB-reset once
+/// [`RESET_AFTER_FAILURES`] failures are counted and given up on at
 /// [`MAX_REPLAY_ATTEMPTS`]. An open whose gaze stream ran for
 /// [`HEALTHY_STREAM`] ends the run, and its own loss starts none: the re-open
 /// that follows gets the whole budget, prime included, as a new engine would.
 #[derive(Debug, Default)]
 struct FailedOpens {
-    /// Failed opens since the engine started or a stream last ran.
+    /// Failures counted since the engine started or a stream last ran.
     in_a_row: usize,
+    /// An open accepted the init but did not arm (the prime) since the engine
+    /// started or a stream last armed: the next such open is counted.
+    prime_spent: bool,
 }
 
 impl FailedOpens {
-    /// Count an open that failed after its gaze stream ran for `ran` since
-    /// arming (`None`: it never armed), and say what comes next.
+    /// Count an open that failed with `failure`, and say what comes next.
     #[must_use]
-    fn record(&mut self, ran: Option<Duration>) -> AfterFailedOpen {
-        if ran.is_some_and(|ran| ran >= HEALTHY_STREAM) {
-            self.in_a_row = 0;
-            return AfterFailedOpen::Reopen;
+    fn record(&mut self, failure: OpenFailure) -> AfterFailedOpen {
+        match failure {
+            OpenFailure::NotArmed if !self.prime_spent => {
+                self.prime_spent = true;
+                return AfterFailedOpen::ReopenPrimed;
+            }
+            OpenFailure::Lost(ran) => {
+                // It armed, so the next open that does not is a prime again.
+                self.prime_spent = false;
+                if ran >= HEALTHY_STREAM {
+                    self.in_a_row = 0;
+                    return AfterFailedOpen::Reopen;
+                }
+            }
+            OpenFailure::NotArmed | OpenFailure::Failed => {}
         }
         self.in_a_row += 1;
         if self.in_a_row >= MAX_REPLAY_ATTEMPTS {
             AfterFailedOpen::GiveUp
-        } else if self.in_a_row + 1 == RESET_ESCALATION_ATTEMPT {
+        } else if self.in_a_row == RESET_AFTER_FAILURES {
             AfterFailedOpen::ResetAndReopen
         } else {
             AfterFailedOpen::Reopen
         }
     }
 
-    /// Failed opens in the current run.
+    /// Failures counted in the current run.
     fn in_a_row(&self) -> usize {
         self.in_a_row
     }
 }
 
-/// How long the stream of the open that failed with `e` ran after arming,
-/// read from its [`StreamLost`] context; `None` when that open never armed.
-fn stream_ran(e: &anyhow::Error) -> Option<Duration> {
-    e.downcast_ref::<StreamLost>().map(|lost| lost.ran)
-}
-
 /// Own the device for the daemon engine and stream samples into `tx` until
 /// `shared.stop` is set, running the commands that arrive on `commands` in
 /// between. A stream that dies (a stall, a USB error) is re-opened in place,
-/// and only opens that fail in a row count toward giving up (see
+/// and only failures in a row count toward giving up, the prime aside (see
 /// [`run_opens`] and the note on the reset-escalation constant above).
 ///
 /// # Errors
 ///
-/// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] opens in a row
-/// fail, as soon as an open fails after `shared.stop` is set, or at once when
-/// libusb cannot be initialised.
+/// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
+/// row are counted, as soon as an open fails after `shared.stop` is set, or at
+/// once when libusb cannot be initialised.
 pub(crate) fn run_gaze_engine(
     shared: &Arc<Shared>,
     commands: &Receiver<QueuedCommand>,
@@ -464,16 +511,16 @@ pub(crate) fn run_gaze_engine(
 
 /// The engine's open loop: call `open` until an open returns `Ok` (a clean
 /// stop) or `stop` is set, waiting `pause` after each failed open. Every
-/// error is retried. [`FailedOpens`] counts the failures in a row, which
-/// decides when `reset` runs (before the [`RESET_ESCALATION_ATTEMPT`]th open
-/// of a run) and when to give up; a failure whose [`StreamLost`] context says
-/// the stream ran for [`HEALTHY_STREAM`] ends the run instead of adding to
-/// it.
+/// error is retried. [`FailedOpens`] counts the failures in a row by their
+/// [`OpenFailure`], which decides when `reset` runs (once
+/// [`RESET_AFTER_FAILURES`] are counted) and when to give up; the prime is
+/// not counted, and a failure whose [`StreamLost`] context says the stream
+/// ran for [`HEALTHY_STREAM`] ends the run instead of adding to it.
 ///
 /// # Errors
 ///
-/// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] opens in a row
-/// fail, or as soon as an open fails after `stop` is set.
+/// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
+/// row are counted, or as soon as an open fails after `stop` is set.
 fn run_opens(
     stop: &AtomicBool,
     mut open: impl FnMut() -> Result<()>,
@@ -486,9 +533,10 @@ fn run_opens(
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        // A normal cold start arms by its second open and never gets here;
-        // opens that keep failing (never arm, or lose the stream within
-        // `HEALTHY_STREAM`) get a USB reset to recover.
+        // A normal cold start or re-open arms on the open after its prime and
+        // never gets here; opens that keep failing (the init fails, they do
+        // not arm past the prime, or lose the stream within `HEALTHY_STREAM`)
+        // get a USB reset to recover.
         if reset_first {
             warn!(
                 in_a_row = failed.in_a_row(),
@@ -502,38 +550,41 @@ fn run_opens(
         if stop.load(Ordering::Relaxed) {
             return Err(e);
         }
-        let ran = stream_ran(&e);
-        reset_first = match failed.record(ran) {
+        let failure = OpenFailure::of(&e);
+        let after = failed.record(failure);
+        reset_first = match after {
             AfterFailedOpen::GiveUp => return Err(e),
-            AfterFailedOpen::Reopen => false,
+            AfterFailedOpen::Reopen | AfterFailedOpen::ReopenPrimed => false,
             AfterFailedOpen::ResetAndReopen => true,
         };
         let in_a_row = failed.in_a_row();
-        // The tag is checked first, defensively: `record` counted a lost
-        // stream by its tag alone, so it is logged by the tag too. No tagged
-        // chain holds a `StreamStartupTimeout` today, which fails an open
-        // only before it arms.
-        if let Some(ran) = ran {
-            warn!(
+        match failure {
+            OpenFailure::Lost(ran) => warn!(
                 ?ran,
                 in_a_row,
                 error = format_args!("{e:#}"),
                 "gaze: stream lost; re-opening the device"
-            );
-        } else if e.downcast_ref::<StreamStartupTimeout>().is_some() {
-            // A cold device accepts the first init but doesn't start
-            // streaming; a fresh re-open is what arms it (expected, not an
-            // error). Report real failures loudly, the prime quietly.
-            info!(
+            ),
+            // A cold device, or one whose stream just died, accepts the first
+            // init but doesn't start streaming; a fresh re-open is what arms
+            // it (expected, not an error). Report real failures loudly, the
+            // prime quietly.
+            OpenFailure::NotArmed if after == AfterFailedOpen::ReopenPrimed => info!(
                 in_a_row,
                 "gaze: stream not armed; re-opening to prime (cold-start quirk)"
-            );
-        } else {
-            error!(
+            ),
+            // An open past the prime that did not arm is a real failure too,
+            // though its init did not fail.
+            OpenFailure::NotArmed => error!(
+                in_a_row,
+                error = format_args!("{e:#}"),
+                "gaze: stream not armed past the prime; re-opening"
+            ),
+            OpenFailure::Failed => error!(
                 in_a_row,
                 error = format_args!("{e:#}"),
                 "tobii gaze init failed; re-opening"
-            );
+            ),
         }
         thread::sleep(pause);
     }
@@ -1292,7 +1343,8 @@ const PRESENCE_STATE_PRESENT: u32 = 2;
 /// streaming, and re-running the init on the same handle does not help (unlike
 /// the camera path; verified empirically). So if the stream doesn't arm here we
 /// bail with `StreamStartupTimeout` and let the caller re-open, which is what
-/// actually primes it. A failure after arming carries a [`StreamLost`] context
+/// actually arms it; the first such bail is the prime, not a failure (see
+/// [`FailedOpens`]). A failure after arming carries a [`StreamLost`] context
 /// saying how long the stream ran (see [`after_arming`]).
 fn gaze_stream_loop(
     h: &mut rusb::DeviceHandle<UsbContext>,
@@ -1436,7 +1488,8 @@ fn pump_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use AfterFailedOpen::{GiveUp, Reopen, ResetAndReopen};
+    use AfterFailedOpen::{GiveUp, Reopen, ReopenPrimed, ResetAndReopen};
+    use OpenFailure::{Failed, Lost, NotArmed};
     use Step::{Open, Reset};
     use std::cell::RefCell;
     use tobii_proto::protocol::hex_to_bytes;
@@ -1533,18 +1586,86 @@ mod tests {
         assert_eq!(w.since_resume(at(8)), None);
     }
 
-    /// What `failed` says after each open in turn, given how long each one's
-    /// stream ran (`None`: it never armed).
-    fn after_each(failed: &mut FailedOpens, ran: &[Option<Duration>]) -> Vec<AfterFailedOpen> {
-        ran.iter().map(|&ran| failed.record(ran)).collect()
+    /// What `failed` says after each open in turn, given how each one failed.
+    fn after_each(failed: &mut FailedOpens, failures: &[OpenFailure]) -> Vec<AfterFailedOpen> {
+        failures
+            .iter()
+            .map(|&failure| failed.record(failure))
+            .collect()
     }
 
     #[test]
-    fn opens_that_never_arm_are_reset_before_the_third_and_given_up_after_the_fifth() {
+    fn the_prime_of_a_cold_start_is_not_counted() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(after_each(&mut failed, &[NotArmed]), [ReopenPrimed]);
+        assert_eq!(failed.in_a_row(), 0, "the re-open arms and runs");
+    }
+
+    #[test]
+    fn a_stall_soon_after_a_primed_start_is_not_reset() {
+        // The hardware log: a cold start's prime, a stall 8 s after arming,
+        // then the re-open's own prime before it arms.
+        let mut failed = FailedOpens::default();
+        let stall = Lost(Duration::from_secs(8));
+        assert_eq!(
+            after_each(&mut failed, &[NotArmed, stall, NotArmed]),
+            [ReopenPrimed, Reopen, ReopenPrimed]
+        );
+        assert_eq!(failed.in_a_row(), 1);
+    }
+
+    #[test]
+    fn opens_that_never_arm_are_primed_once_reset_after_two_and_given_up_after_five() {
         let mut failed = FailedOpens::default();
         assert_eq!(
-            after_each(&mut failed, &[None; 5]),
+            after_each(&mut failed, &[NotArmed; 6]),
+            [ReopenPrimed, Reopen, ResetAndReopen, Reopen, Reopen, GiveUp]
+        );
+    }
+
+    #[test]
+    fn a_device_that_arms_and_dies_is_reset_after_the_second_loss_and_given_up_after_the_fifth() {
+        let mut failed = FailedOpens::default();
+        let quick = Lost(Duration::from_secs(1));
+        assert_eq!(
+            after_each(&mut failed, &[NotArmed, quick].repeat(5)),
+            [
+                ReopenPrimed,
+                Reopen,
+                ReopenPrimed,
+                ResetAndReopen,
+                ReopenPrimed,
+                Reopen,
+                ReopenPrimed,
+                Reopen,
+                ReopenPrimed,
+                GiveUp
+            ],
+            "each re-open after a loss is primed again"
+        );
+    }
+
+    #[test]
+    fn an_init_failure_counts_and_leaves_the_prime_due() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(&mut failed, &[Failed, NotArmed, NotArmed]),
+            [Reopen, ReopenPrimed, ResetAndReopen]
+        );
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(&mut failed, &[Failed; 5]),
             [Reopen, ResetAndReopen, Reopen, Reopen, GiveUp]
+        );
+    }
+
+    #[test]
+    fn an_init_failure_after_the_prime_leaves_it_spent() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(&mut failed, &[NotArmed, Failed, NotArmed]),
+            [ReopenPrimed, Reopen, ResetAndReopen],
+            "only a stream that armed makes the prime due again"
         );
     }
 
@@ -1553,15 +1674,15 @@ mod tests {
         let mut failed = FailedOpens::default();
         for _ in 0..100 {
             assert_eq!(
-                after_each(&mut failed, &[None, Some(HEALTHY_STREAM)]),
-                [Reopen, Reopen],
+                after_each(&mut failed, &[NotArmed, Lost(HEALTHY_STREAM)]),
+                [ReopenPrimed, Reopen],
                 "a prime, then a stream that ran exactly long enough"
             );
         }
         assert_eq!(failed.in_a_row(), 0);
         assert_eq!(
-            after_each(&mut failed, &[None; 5]),
-            [Reopen, ResetAndReopen, Reopen, Reopen, GiveUp],
+            after_each(&mut failed, &[NotArmed; 6]),
+            [ReopenPrimed, Reopen, ResetAndReopen, Reopen, Reopen, GiveUp],
             "as a new engine would"
         );
     }
@@ -1569,9 +1690,9 @@ mod tests {
     #[test]
     fn a_stream_that_dies_soon_after_arming_is_a_failed_open() {
         let mut failed = FailedOpens::default();
-        let short = HEALTHY_STREAM - Duration::from_secs(1);
+        let short = Lost(HEALTHY_STREAM - Duration::from_secs(1));
         assert_eq!(
-            after_each(&mut failed, &[Some(short); 5]),
+            after_each(&mut failed, &[short; 5]),
             [Reopen, ResetAndReopen, Reopen, Reopen, GiveUp]
         );
     }
@@ -1579,53 +1700,82 @@ mod tests {
     #[test]
     fn a_stream_that_ran_forgives_the_failures_before_it() {
         let mut failed = FailedOpens::default();
-        let hour = Duration::from_secs(3600);
+        let hour = Lost(Duration::from_secs(3600));
         assert_eq!(
-            after_each(&mut failed, &[None, None, Some(hour)]),
-            [Reopen, ResetAndReopen, Reopen]
+            after_each(&mut failed, &[NotArmed, NotArmed, NotArmed, hour]),
+            [ReopenPrimed, Reopen, ResetAndReopen, Reopen]
         );
         assert_eq!(
-            after_each(&mut failed, &[None, None]),
-            [Reopen, ResetAndReopen],
-            "a new run is reset again at its own third open"
+            after_each(&mut failed, &[NotArmed; 3]),
+            [ReopenPrimed, Reopen, ResetAndReopen],
+            "a new run is primed and reset again on its own"
         );
     }
 
     #[test]
-    fn short_streams_and_opens_that_never_arm_share_one_count() {
+    fn failures_of_every_kind_share_one_count() {
         let mut failed = FailedOpens::default();
-        let secs = |s| Some(Duration::from_secs(s));
+        let short = Lost(Duration::from_secs(10));
         assert_eq!(
-            after_each(&mut failed, &[None, secs(10), None, secs(5), None]),
-            [Reopen, ResetAndReopen, Reopen, Reopen, GiveUp]
+            after_each(
+                &mut failed,
+                &[
+                    NotArmed, NotArmed, short, Failed, NotArmed, NotArmed, Failed
+                ]
+            ),
+            [
+                ReopenPrimed,
+                Reopen,
+                ResetAndReopen,
+                Reopen,
+                ReopenPrimed,
+                Reopen,
+                GiveUp
+            ]
         );
     }
 
     #[test]
-    fn a_failure_after_arming_is_told_from_one_before() {
+    fn a_failed_open_is_classified_by_its_lost_tag_then_its_cause() {
         let armed_at = Instant::now()
             .checked_sub(HEALTHY_STREAM)
             .expect("a monotonic clock older than HEALTHY_STREAM");
+        let lost_long =
+            |e: &anyhow::Error| matches!(OpenFailure::of(e), Lost(ran) if ran >= HEALTHY_STREAM);
 
         // The two ways the pump fails, tagged as `gaze_stream_loop` tags them.
         let stalled = after_arming(Err(GazeStalled.into()), armed_at).expect_err("stalled");
-        assert!(stream_ran(&stalled).is_some_and(|ran| ran >= HEALTHY_STREAM));
+        assert!(lost_long(&stalled));
         assert_eq!(
             format!("{stalled:#}"),
             "gaze stream lost after arming: no gaze frame for over 5s"
         );
         let usb = after_arming(Err(rusb::Error::NoDevice.into()), armed_at).expect_err("usb");
-        assert!(stream_ran(&usb).is_some_and(|ran| ran >= HEALTHY_STREAM));
+        assert!(lost_long(&usb));
+        let tagged = after_arming(Err(StreamStartupTimeout.into()), armed_at).expect_err("tagged");
+        assert!(lost_long(&tagged), "the tag wins over any cause");
 
-        // The ways an open fails before it arms carry no tag.
-        assert_eq!(stream_ran(&StreamStartupTimeout.into()), None);
+        // An open that accepted the init but never armed, bare or wrapped.
+        assert_eq!(OpenFailure::of(&StreamStartupTimeout.into()), NotArmed);
+        let wrapped = anyhow::Error::new(StreamStartupTimeout).context("open 2");
+        assert_eq!(OpenFailure::of(&wrapped), NotArmed);
+
+        // Every other way an open fails before it arms.
         let not_found = None::<()>
             .context("Tobii 2104:0313 not found by libusb")
             .expect_err("not found");
-        assert_eq!(stream_ran(&not_found), None);
+        assert_eq!(OpenFailure::of(&not_found), Failed);
+        let write_timeout = Err::<(), _>(rusb::Error::Timeout)
+            .context("init packet 57 write failed (command seq Some(39), 2961 ms in)")
+            .expect_err("write timeout");
         assert_eq!(
-            stream_ran(&rusb::Error::NoDevice.into()),
-            None,
+            OpenFailure::of(&write_timeout),
+            Failed,
+            "an init that failed"
+        );
+        assert_eq!(
+            OpenFailure::of(&rusb::Error::NoDevice.into()),
+            Failed,
             "a USB error before arming"
         );
 
@@ -1686,10 +1836,10 @@ mod tests {
             outcomes.push(never_armed());
             outcomes.push(lost_after(HEALTHY_STREAM));
         }
-        outcomes.extend((0..5).map(|_| never_armed()));
+        outcomes.extend((0..6).map(|_| never_armed()));
         let (steps, result) = drive(outcomes);
         assert_eq!(steps[..20], [Open; 20], "no reset, no give-up");
-        assert_eq!(steps[20..], [Open, Open, Reset, Open, Open, Open]);
+        assert_eq!(steps[20..], [Open, Open, Open, Reset, Open, Open, Open]);
         assert!(
             result
                 .expect_err("gave up")
@@ -1703,7 +1853,57 @@ mod tests {
         let short = Duration::from_secs(1);
         let (steps, result) = drive((0..5).map(|_| lost_after(short)).collect());
         assert_eq!(steps, [Open, Open, Reset, Open, Open, Open]);
-        assert_eq!(stream_ran(&result.expect_err("gave up")), Some(short));
+        assert_eq!(OpenFailure::of(&result.expect_err("gave up")), Lost(short));
+    }
+
+    #[test]
+    fn the_open_loop_does_not_reset_a_tracker_that_stalls_soon_after_its_prime() {
+        // The hardware log: a cold start's prime, a stall 8 s after arming,
+        // the re-open's own prime, then a stream until the stop.
+        let (steps, result) = drive(vec![
+            never_armed(),
+            lost_after(Duration::from_secs(8)),
+            never_armed(),
+            Ok(()),
+        ]);
+        assert_eq!(steps, [Open; 4], "no reset");
+        assert!(result.is_ok(), "a clean stop");
+    }
+
+    #[test]
+    fn the_open_loop_counts_an_init_failure_after_the_prime_and_primes_no_more() {
+        // A cold start's prime, then an init write timeout: the next open that
+        // does not arm is the second failure, not a second prime.
+        let (steps, result) = drive(vec![
+            never_armed(),
+            Err(anyhow::anyhow!("init packet 57 write failed")),
+            never_armed(),
+            Ok(()),
+        ]);
+        assert_eq!(steps, [Open, Open, Open, Reset, Open]);
+        assert!(result.is_ok(), "a clean stop");
+    }
+
+    #[test]
+    fn the_open_loop_resets_a_tracker_that_arms_and_dies_after_its_second_loss() {
+        let short = Duration::from_secs(1);
+        let mut outcomes = Vec::new();
+        for _ in 0..5 {
+            outcomes.push(never_armed());
+            outcomes.push(lost_after(short));
+        }
+        let (steps, result) = drive(outcomes);
+        assert_eq!(
+            steps,
+            [
+                Open, Open, Open, Open, Reset, Open, Open, Open, Open, Open, Open
+            ]
+        );
+        assert_eq!(
+            OpenFailure::of(&result.expect_err("gave up")),
+            Lost(short),
+            "the fifth loss"
+        );
     }
 
     #[test]
@@ -1720,7 +1920,7 @@ mod tests {
         ]);
         assert_eq!(
             steps,
-            [Open, Open, Reset, Open, Open, Open, Open, Reset, Open, Open]
+            [Open, Open, Open, Reset, Open, Open, Open, Open, Reset, Open]
         );
         assert!(result.is_ok(), "a clean stop");
     }
@@ -1734,7 +1934,7 @@ mod tests {
             || {
                 opens += 1;
                 // Stopped during the open whose failure calls for the reset.
-                if opens == RESET_ESCALATION_ATTEMPT - 1 {
+                if opens == RESET_AFTER_FAILURES {
                     stop.store(true, Ordering::Relaxed);
                 }
                 Err(anyhow::anyhow!("open {opens}"))
@@ -1744,10 +1944,10 @@ mod tests {
         );
         assert_eq!(
             result.expect_err("stopped").to_string(),
-            format!("open {}", RESET_ESCALATION_ATTEMPT - 1),
+            format!("open {RESET_AFTER_FAILURES}"),
             "the stopped open's own error"
         );
-        assert_eq!((opens, resets), (RESET_ESCALATION_ATTEMPT - 1, 0));
+        assert_eq!((opens, resets), (RESET_AFTER_FAILURES, 0));
     }
 
     #[test]
