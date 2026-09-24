@@ -2,12 +2,12 @@
 //! does not cover (all but `tobii_calibration_stimulus_points_get`, which
 //! lives with calibration). Their argument counts come from the DLL (see
 //! `tools/abi`); their types are best-effort, which is safe because only the
-//! field-of-use, image, internal-stream and timesync functions below read
-//! their arguments.
+//! field-of-use, image, internal-stream, timesync and stream-type functions
+//! below read their arguments.
 
 use std::ffi::c_void;
 
-use tobii_ipc::request::{decode_timesync, kind};
+use tobii_ipc::request::{self, decode_stream_types, decode_timesync, kind};
 
 use crate::api::{FACTS_TIMEOUT, write_supported};
 use crate::device::{Device, device_mut};
@@ -16,7 +16,9 @@ use crate::status::{
 };
 use crate::streams::{subscribe, unsubscribe};
 use crate::stub::not_supported;
-use crate::types::{FieldOfUse, FieldOfUseFn, ImageFn, TimesyncData};
+use crate::types::{
+    FieldOfUse, FieldOfUseFn, ImageFn, StreamType, StreamTypeReceiver, TimesyncData, copy_c_string,
+};
 
 /// The field of use the device was created with.
 ///
@@ -174,6 +176,92 @@ pub unsafe extern "C" fn tobii_timesync(
     }
 }
 
+/// The Stream Engine's stream type for a device stream id: the DLL's three
+/// tables composed (id to TTP code at 0x18017c784, TTP to tracker at
+/// 0x180190ae8, tracker to Stream Engine at 0x180001e74). 0x509 is 0 in the
+/// DLL's table, and so are the ids the ET5 lists that the DLL has no type
+/// for (0x50e, 0x1771, 0x1772, 0x1774).
+const fn se_stream_type(id: u32) -> i32 {
+    match id {
+        0x500 => 1,
+        0x501 => 2,
+        0x502 => 3,
+        0x503 => 14,
+        0x504 => 4,
+        0x505 => 5,
+        0x506 => 8,
+        0x507 => 9,
+        0x508 => 11,
+        0x50a => 6,
+        0x1770 => 7,
+        _ => 0,
+    }
+}
+
+/// A catalogue entry as the DLL hands it over: the device's stream id
+/// becomes a Stream Engine type, and the strings are cut to 63 bytes.
+fn stream_type_c(t: &request::StreamType) -> StreamType {
+    let mut c = StreamType {
+        type_: se_stream_type(t.id),
+        value: t.value,
+        name: [0; 64],
+        text: [0; 64],
+    };
+    copy_c_string(&mut c.name, &t.name);
+    copy_c_string(&mut c.text, &t.text);
+    c
+}
+
+/// The tracker's stream catalogue: `receiver` is called once per stream,
+/// in the tracker's order.
+///
+/// The daemon answers from the catalogue the tracker reported at its last
+/// init (starting the tracker if needed), where the DLL asks the tracker on
+/// every call. The list is the tracker's own, so it names streams libtobii
+/// does not deliver, such as `image_collection` (internal stream 6 is
+/// unsupported). The DLL answers `TOBII_ERROR_NOT_SUPPORTED` on its PRP path
+/// and needs the internal feature group on its TTP path; libtobii has no
+/// licence gate here. Every entry is built before the first call, so the
+/// receiver may call back into this library, as the DLL allows.
+///
+/// `TOBII_ERROR_NOT_SUPPORTED` if the tracker reported no catalogue (the DLL
+/// answers `TOBII_ERROR_NO_ERROR` with no calls) or the daemon is older than
+/// this library; `TOBII_ERROR_TIMED_OUT` if no tracker has been seen.
+///
+/// # Safety
+/// `device` as `tobii_device_process_callbacks`; `receiver` must be null or
+/// sound to call with a `tobii_stream_type_t` (valid during the call only)
+/// and `user_data`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_enumerate_stream_types(
+    device: *mut Device,
+    receiver: Option<StreamTypeReceiver>,
+    user_data: *mut c_void,
+) -> Status {
+    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
+    let d = match unsafe { device_mut(device) } {
+        Ok(d) => d,
+        Err(status) => return status,
+    };
+    let Some(receiver) = receiver else {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    };
+    let entries: Vec<StreamType> = match d
+        .request(kind::STREAM_TYPES, &[], FACTS_TIMEOUT)
+        .map(|p| decode_stream_types(&p))
+    {
+        Ok(Some(types)) => types.iter().map(stream_type_c).collect(),
+        Ok(None) => return TOBII_ERROR_INTERNAL,
+        Err(status) => return status,
+    };
+    for entry in &entries {
+        // SAFETY: the caller guarantees `receiver` is sound to call like
+        // this; `entry` outlives the call.
+        unsafe { receiver(entry, user_data) };
+    }
+    TOBII_ERROR_NO_ERROR
+}
+
 type P = *mut c_void;
 type C = *const c_void;
 
@@ -194,7 +282,6 @@ not_supported! {
     fn tobii_enumerate_extensions(device: P, receiver: C, user_data: P);
     fn tobii_enumerate_illumination_modes(device: P, receiver: C, user_data: P);
     fn tobii_enumerate_stream_type_columns(device: P, stream_type: u32, receiver: C, user_data: P);
-    fn tobii_enumerate_stream_types(device: P, receiver: C, user_data: P);
     fn tobii_face_id_enroll(device: P, a: P, b: P);
     fn tobii_face_id_enroll_clear(device: P, a: P);
     fn tobii_face_id_parameters_subscribe(device: P, callback: C, user_data: P);
@@ -251,8 +338,9 @@ mod tests {
     use crate::api::tobii_device_destroy;
     use crate::status::TOBII_ERROR_NOT_AVAILABLE;
     use crate::types::{TOBII_NOT_SUPPORTED, TOBII_SUPPORTED};
+    use std::ffi::CStr;
     use std::ptr;
-    use tobii_ipc::request::{Timesync, encode_timesync, status};
+    use tobii_ipc::request::{Timesync, encode_stream_types, encode_timesync, status};
 
     #[test]
     fn only_the_ir_image_is_a_supported_internal_stream() {
@@ -363,5 +451,151 @@ mod tests {
             assert_eq!(tobii_device_destroy(d), 0);
         }
         assert_eq!(out, untouched);
+    }
+
+    /// What a stream-type receiver saw, and the device it may call back into.
+    #[derive(Default)]
+    struct Seen {
+        entries: Vec<(i32, u32, String, String)>,
+        reentry: Vec<Status>,
+        device: Option<*mut Device>,
+    }
+
+    unsafe extern "C" fn collect_type(t: *const StreamType, ud: *mut c_void) {
+        // SAFETY: the tests pass `&raw mut Seen` as `ud`, and the library a
+        // valid entry as `t`.
+        let (seen, t) = unsafe { (&mut *ud.cast::<Seen>(), &*t) };
+        let text = |s: &[std::ffi::c_char; 64]| {
+            // SAFETY: the library NUL-terminates both strings.
+            unsafe { CStr::from_ptr(s.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        seen.entries
+            .push((t.type_, t.value, text(&t.name), text(&t.text)));
+        if let Some(d) = seen.device {
+            let mut fou = 9;
+            // SAFETY: `d` is the live handle the enumeration runs on, and
+            // the library no longer borrows it while the receiver runs.
+            seen.reentry
+                .push(unsafe { tobii_get_field_of_use(d, &raw mut fou) });
+        }
+    }
+
+    /// The catalogue in the init fixture, as the daemon would send it.
+    fn fixture_catalogue() -> Vec<u8> {
+        let hex = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tobii-proto/fixtures/init-rsp-1200.hex"
+        ));
+        let bytes = tobii_proto::protocol::hex_to_bytes(hex).expect("hex");
+        let msg = tobii_proto::protocol::parse_message(&bytes).expect("msg");
+        encode_stream_types(&tobii_proto::facts::parse_stream_catalogue(&msg))
+    }
+
+    /// Enumerate from a daemon answering `status`/`payload`.
+    fn enumerate_with(status: u8, payload: Vec<u8>, reenter: bool) -> (Status, Seen) {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(status, payload)));
+        let mut seen = Seen {
+            device: reenter.then_some(d),
+            ..Seen::default()
+        };
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below; `seen` is a live local.
+        unsafe {
+            let got = tobii_enumerate_stream_types(
+                d,
+                Some(collect_type),
+                (&raw mut seen).cast::<c_void>(),
+            );
+            assert_eq!(tobii_device_destroy(d), 0);
+            (got, seen)
+        }
+    }
+
+    #[test]
+    fn stream_types_come_in_the_trackers_order_with_the_dlls_types() {
+        let (got, seen) = enumerate_with(0, fixture_catalogue(), false);
+
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        let types: Vec<i32> = seen.entries.iter().map(|e| e.0).collect();
+        assert_eq!(types, [1, 2, 4, 11, 0, 7, 0, 0, 0]);
+        let values: Vec<u32> = seen.entries.iter().map(|e| e.1).collect();
+        assert_eq!(values, [0, 0, 0, 1000, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            seen.entries[4],
+            (0, 0, "primary_camera_image".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn stream_type_strings_are_cut_to_63_bytes() {
+        let payload = encode_stream_types(&[request::StreamType {
+            id: 0x500,
+            name: "n".repeat(80),
+            text: "t".repeat(64),
+            value: 0,
+        }]);
+        let (got, seen) = enumerate_with(0, payload, false);
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        assert_eq!(seen.entries[0].2, "n".repeat(63));
+        assert_eq!(seen.entries[0].3, "t".repeat(63));
+    }
+
+    #[test]
+    fn a_stream_type_receiver_may_call_back_into_the_library() {
+        let (got, seen) = enumerate_with(0, fixture_catalogue(), true);
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        assert_eq!(seen.reentry, [TOBII_ERROR_NO_ERROR; 9]);
+    }
+
+    #[test]
+    fn stream_type_failures_call_nothing() {
+        let (got, seen) = enumerate_with(status::TIMED_OUT, vec![], false);
+        assert_eq!(got, crate::status::TOBII_ERROR_TIMED_OUT, "passed through");
+        assert!(seen.entries.is_empty());
+        let (got, seen) = enumerate_with(0, vec![9, 0, 0, 0], false);
+        assert_eq!(got, TOBII_ERROR_INTERNAL, "a malformed reply");
+        assert!(seen.entries.is_empty());
+
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below.
+        unsafe {
+            assert_eq!(
+                tobii_enumerate_stream_types(d, None, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_enumerate_stream_types(ptr::null_mut(), Some(collect_type), ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+    }
+
+    #[test]
+    fn stream_ids_map_as_in_the_dll() {
+        let ids = [
+            (0x500, 1),
+            (0x501, 2),
+            (0x502, 3),
+            (0x503, 14),
+            (0x504, 4),
+            (0x505, 5),
+            (0x506, 8),
+            (0x507, 9),
+            (0x508, 11),
+            (0x509, 0),
+            (0x50a, 6),
+            (0x1770, 7),
+            (0x50e, 0),
+            (0x1771, 0),
+            (0x1774, 0),
+            (0, 0),
+        ];
+        for (id, want) in ids {
+            assert_eq!(se_stream_type(id), want, "{id:#x}");
+        }
     }
 }

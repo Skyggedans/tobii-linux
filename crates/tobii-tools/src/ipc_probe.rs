@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tobii_ipc::geometry::display_area_basic;
 use tobii_ipc::request::{
-    self, decode_device_info, decode_display_area, decode_geometry_mounting, decode_timesync,
-    decode_track_box, encode_display_area, encode_request, kind, state,
+    self, decode_device_info, decode_display_area, decode_geometry_mounting, decode_stream_types,
+    decode_timesync, decode_track_box, encode_display_area, encode_request, kind, state,
 };
 use tobii_ipc::{ServerMsg, decode_server, encode_subscribe, read_frame, write_frame};
 
@@ -128,6 +128,16 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
                     .sqrt(),
                 a.top_left_mm
             )
+        })
+    });
+    let catalogue = p.ask(kind::STREAM_TYPES, &[])?;
+    show("stream types", &catalogue, |b| {
+        decode_stream_types(b).map_or("?".into(), |types| {
+            types
+                .iter()
+                .map(|t| format!("{:#x} {} ({})", t.id, t.name, t.value))
+                .collect::<Vec<_>>()
+                .join(", ")
         })
     });
     let id = p.ask(kind::STATE, &request::encode_u32(state::CALIBRATION_ID))?;

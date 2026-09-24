@@ -3,9 +3,10 @@
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
  * argument types are best guesses. Only the field-of-use, image,
- * internal-stream and timesync functions are implemented; every other entry
- * point here returns TOBII_ERROR_NOT_SUPPORTED without reading its arguments,
- * so the guessed types cannot matter at runtime. Companion to tobii/tobii.h.
+ * internal-stream, timesync and stream-type functions are implemented; every
+ * other entry point here returns TOBII_ERROR_NOT_SUPPORTED without reading its
+ * arguments, so the guessed types cannot matter at runtime. Companion to
+ * tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -77,6 +78,38 @@ typedef struct tobii_timesync_data_t
 TOBII_API tobii_error_t TOBII_CALL tobii_timesync( tobii_device_t* device,
     tobii_timesync_data_t* timesync );
 
+/* One entry of the tracker's stream catalogue. `type` is the Stream Engine's
+ * stream type the DLL maps the tracker's stream id to (0x500 gaze -> 1,
+ * 0x501 image -> 2, 0x502 -> 3, 0x503 -> 14, 0x504 presence -> 4, 0x505 -> 5,
+ * 0x506 -> 8, 0x507 -> 9, 0x508 image_collection -> 11, 0x50a -> 6,
+ * 0x1770 algodbg -> 7, anything else -> 0). `value` is the tracker's number
+ * for the stream (1000 for image_collection on the ET5, else 0) and `text` a
+ * second string (empty on the ET5); what they mean is unknown. Offsets from
+ * the DLL; the size (136 bytes) is inferred and the field names are ours. */
+typedef struct tobii_stream_type_t
+{
+    int type;
+    uint32_t value;
+    char name[ 64 ];
+    char text[ 64 ];
+} tobii_stream_type_t;
+
+typedef void ( *tobii_stream_type_receiver_t )( tobii_stream_type_t const* stream_type,
+    void* user_data );
+
+/* The tracker's stream catalogue, one receiver call per stream in the
+ * tracker's order (nine on the ET5). It is the catalogue the tracker reported
+ * at its last init, where the DLL asks the tracker on every call. It lists
+ * streams this library does not deliver, such as image_collection. The DLL
+ * answers only on its TTP path and with the internal feature group; this
+ * library has no licence gate. TOBII_ERROR_NOT_SUPPORTED if the tracker
+ * reported no catalogue (the DLL answers TOBII_ERROR_NO_ERROR with no calls)
+ * or the daemon is older than this library; TOBII_ERROR_TIMED_OUT if no
+ * tracker has been seen. The receiver may call back into the library; each
+ * entry is valid during its call only. */
+TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_stream_types( tobii_device_t* device,
+    tobii_stream_type_receiver_t receiver, void* user_data );
+
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED. Its point type is
  * unknown. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_stimulus_points_get( tobii_device_t* device,
@@ -100,7 +133,6 @@ TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_enabled_extensions( tobii_dev
 TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_extensions( tobii_device_t* device, void const* receiver, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_illumination_modes( tobii_device_t* device, void const* receiver, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_stream_type_columns( tobii_device_t* device, uint32_t stream_type, void const* receiver, void* user_data );
-TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_stream_types( tobii_device_t* device, void const* receiver, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_face_id_enroll( tobii_device_t* device, void* a, void* b );
 TOBII_API tobii_error_t TOBII_CALL tobii_face_id_enroll_clear( tobii_device_t* device, void* a );
 TOBII_API tobii_error_t TOBII_CALL tobii_face_id_parameters_subscribe( tobii_device_t* device, void const* callback, void* user_data );

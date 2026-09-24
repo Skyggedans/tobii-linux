@@ -217,6 +217,7 @@ impl State {
         match sample {
             Sample::DeviceReady(facts) => {
                 let mut facts = (**facts).clone();
+                keep_unreported(&mut facts, self.facts.as_deref());
                 if let Some(area) = self.display_override {
                     facts.display_area = Some(area);
                 }
@@ -243,6 +244,18 @@ impl State {
             }
             _ => {}
         }
+    }
+}
+
+/// Fill in, from the previous init's facts, what a new init did not report
+/// because a response was lost: the stream catalogue is the firmware's, so
+/// the old one still holds, and a lost 1200 must not blank it.
+fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if facts.streams.is_empty() {
+        facts.streams.clone_from(&previous.streams);
     }
 }
 
@@ -567,6 +580,41 @@ pub(crate) mod tests {
         // Nobody wants the engine (and prewarm is off): no engine starts.
         st.reconcile();
         assert_eq!(st.clock, None);
+    }
+
+    #[test]
+    fn an_init_without_a_catalogue_keeps_the_previous_one() {
+        let mut st = state_with_client(1);
+        let gaze = tobii_ipc::request::StreamType {
+            id: 0x500,
+            name: "gaze".into(),
+            ..Default::default()
+        };
+        let ready = |streams: Vec<_>| {
+            Sample::DeviceReady(Arc::new(DeviceFacts {
+                streams,
+                ..DeviceFacts::default()
+            }))
+        };
+        st.observe(&ready(vec![gaze.clone()]));
+
+        st.observe(&ready(vec![]));
+        assert_eq!(
+            st.facts.as_ref().map(|f| f.streams.clone()),
+            Some(vec![gaze])
+        );
+
+        let image = tobii_ipc::request::StreamType {
+            id: 0x501,
+            name: "image".into(),
+            ..Default::default()
+        };
+        st.observe(&ready(vec![image.clone()]));
+        assert_eq!(
+            st.facts.as_ref().map(|f| f.streams.clone()),
+            Some(vec![image]),
+            "a reported catalogue replaces the old one"
+        );
     }
 
     #[test]

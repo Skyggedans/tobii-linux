@@ -1,5 +1,6 @@
-//! Client requests: what the device reported about itself, its display area,
-//! states and clock. Calibration requests are handed to [`crate::calibration`].
+//! Client requests: what the device reported about itself (identity,
+//! geometry, stream catalogue), its display area, states and clock.
+//! Calibration requests are handed to [`crate::calibration`].
 //!
 //! Identity and geometry come from the facts collected during the engine's
 //! init, so answering them costs no USB traffic; a request made while the
@@ -12,8 +13,8 @@ use std::time::{Duration, Instant};
 use tobii_ipc::geometry::{DisplayArea, display_area_basic};
 use tobii_ipc::request::{
     self, DeviceInfo, Request, Timesync, decode_display_area, encode_device_info,
-    encode_display_area, encode_geometry_mounting, encode_timesync, encode_track_box, encode_u32,
-    kind, state, status,
+    encode_display_area, encode_geometry_mounting, encode_stream_types, encode_timesync,
+    encode_track_box, encode_u32, kind, state, status,
 };
 use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_payload};
 use tobii_proto::protocol::cmd;
@@ -78,6 +79,11 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
         }),
         kind::GEOMETRY_MOUNTING => facts(state, client, |f| {
             f.mounting.as_ref().map(encode_geometry_mounting)
+        }),
+        // From the init's 1200, not a new one per call as the DLL sends: the
+        // catalogue is the firmware's.
+        kind::STREAM_TYPES => facts(state, client, |f| {
+            (!f.streams.is_empty()).then(|| encode_stream_types(&f.streams))
         }),
         kind::DISPLAY_AREA_SET => match decode_display_area(req.payload) {
             Some(area) if is_finite(&area) => set_display_area(state, client, area),
@@ -445,6 +451,44 @@ mod tests {
         );
         assert_eq!(ask(state::CALIBRATION_ACTIVE), Reply::ok(vec![0]));
         assert_eq!(ask(3), Reply::err(status::NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn stream_types_answer_from_the_facts() {
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        let state = Mutex::new(st);
+        let req = Request {
+            id: 1,
+            kind: kind::STREAM_TYPES,
+            payload: &[],
+        };
+        let streams = vec![
+            request::StreamType {
+                id: 0x500,
+                name: "gaze".into(),
+                ..request::StreamType::default()
+            },
+            request::StreamType {
+                id: 0x508,
+                name: "image_collection".into(),
+                text: String::new(),
+                value: 1000,
+            },
+        ];
+        lock_state(&state).facts = Some(Arc::new(DeviceFacts {
+            streams: streams.clone(),
+            ..DeviceFacts::default()
+        }));
+
+        let reply = handle(&state, 1, &req);
+
+        assert_eq!(reply, Reply::ok(encode_stream_types(&streams)));
+        assert!(lock_state(&state).clients[0].holds_device);
+
+        // An init that reported no catalogue.
+        lock_state(&state).facts = Some(Arc::new(DeviceFacts::default()));
+        assert_eq!(handle(&state, 1, &req), Reply::err(status::NOT_SUPPORTED));
     }
 
     /// Ask for a clock pair from a state that has seen a gaze frame with

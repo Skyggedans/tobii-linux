@@ -359,6 +359,24 @@ pub struct TimesyncData {
     pub tracker_us: i64,
 }
 
+/// `tobii_stream_type_t` (undocumented; offsets from the DLL's receiver
+/// trampoline at 0x180001d90, size inferred from its 0x88-byte records, field
+/// names ours): one entry of the tracker's stream catalogue.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamType {
+    /// The Stream Engine's stream type, mapped from the device's stream id;
+    /// 0 for a stream it has no type for.
+    pub type_: i32,
+    /// The device's number for the stream (1000 for `image_collection`, 0
+    /// for the rest on the ET5); its meaning is unknown.
+    pub value: u32,
+    /// Stream name, NUL-terminated.
+    pub name: [c_char; 64],
+    /// A second string, NUL-terminated; empty on the ET5.
+    pub text: [c_char; 64],
+}
+
 /// `tobii_calibration_point_data_t`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -413,6 +431,8 @@ pub type FieldOfUseFn = unsafe extern "C" fn(FieldOfUse, *mut c_void);
 pub type DataReceiver = unsafe extern "C" fn(*const c_void, usize, *mut c_void);
 /// `tobii_output_frequency_receiver_t`.
 pub type OutputFrequencyReceiver = unsafe extern "C" fn(f32, *mut c_void);
+/// `tobii_stream_type_receiver_t`.
+pub type StreamTypeReceiver = unsafe extern "C" fn(*const StreamType, *mut c_void);
 /// `tobii_calibration_point_data_receiver_t`.
 pub type CalibrationPointReceiver = unsafe extern "C" fn(*const CalibrationPointData, *mut c_void);
 
@@ -471,6 +491,12 @@ mod tests {
         assert_eq!(align_of::<TimesyncData>(), 8);
         assert_eq!(offset_of!(TimesyncData, system_end_us), 8);
         assert_eq!(offset_of!(TimesyncData, tracker_us), 16);
+
+        assert_eq!(size_of::<StreamType>(), 136);
+        assert_eq!(offset_of!(StreamType, type_), 0);
+        assert_eq!(offset_of!(StreamType, value), 4);
+        assert_eq!(offset_of!(StreamType, name), 8);
+        assert_eq!(offset_of!(StreamType, text), 72);
 
         assert_eq!(size_of::<CalibrationPointData>(), 32);
         assert_eq!(offset_of!(CalibrationPointData, right_status), 20);

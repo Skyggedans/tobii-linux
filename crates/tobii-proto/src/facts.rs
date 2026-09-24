@@ -7,15 +7,18 @@
 //! out here in millimetres.
 
 use tobii_ipc::geometry::{DisplayArea, GeometryMounting, TrackBox};
-use tobii_ipc::request::DeviceInfo;
+use tobii_ipc::request::{DeviceInfo, StreamType};
 
 use crate::protocol::{MARKER_NOTIFICATION, MARKER_RESPONSE, Message, cmd, notify};
-use crate::tlv::{FIELD_POINT_3D, Tlv, TlvWriter, UNITS_PER_MM};
+use crate::tlv::{FIELD_POINT_3D, TYPE_U32, Tlv, TlvWriter, UNITS_PER_MM};
 
 /// Field id of an indexed string (`05 ID, 02 index, 14 string`).
 const FIELD_INDEXED_STRING: u32 = 0x0002_2710;
 /// Field id of a stream catalogue entry.
 const FIELD_STREAM_ENTRY: u32 = 0x0004_1389;
+/// Low half of a list header's field id; the high half's low 12 bits are
+/// the entry count plus one.
+const FIELD_LIST: u32 = 0x0100;
 /// Field id announcing the display id after the three corners.
 const FIELD_DISPLAY_ID: u32 = 0x0001_0100;
 /// Field id announcing the output rate pair.
@@ -32,8 +35,8 @@ pub struct DeviceFacts {
     pub info: DeviceInfo,
     /// Property strings by index (command 1330).
     pub properties: Vec<(u32, String)>,
-    /// Stream catalogue: id and name (command 1200).
-    pub streams: Vec<(u32, String)>,
+    /// Stream catalogue, in the device's order (command 1200).
+    pub streams: Vec<StreamType>,
     /// The display area in effect (command 1430, or the last 1440/1450).
     pub display_area: Option<DisplayArea>,
     /// The display id that accompanies the display area.
@@ -133,15 +136,44 @@ pub fn parse_indexed_strings(msg: &Message<'_>) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// Command 1200: `(stream id, name)` per catalogue entry.
+/// Command 1200: the stream catalogue, in wire order.
+///
+/// The payload is a list header (field `((n + 1) << 16) | 0x0100`, then a
+/// `u32` entry type, which is not checked, as the DLL does not check it),
+/// then `n` entries of field `0x0004_1389`, `u32` id, string name, string
+/// text, `u32` value (the DLL's reader at 0x180004b20). One malformed entry
+/// empties the whole catalogue, as it fails the DLL's whole reply.
 #[must_use]
-pub fn parse_stream_catalogue(msg: &Message<'_>) -> Vec<(u32, String)> {
-    let entries: Vec<Tlv<'_>> = msg.tlvs().collect();
-    entries
-        .windows(3)
-        .filter(|w| w[0].field_id() == Some(FIELD_STREAM_ENTRY))
-        .filter_map(|w| Some((w[1].u32()?, w[2].string()?)))
+pub fn parse_stream_catalogue(msg: &Message<'_>) -> Vec<StreamType> {
+    stream_entries(msg).unwrap_or_default()
+}
+
+fn stream_entries(msg: &Message<'_>) -> Option<Vec<StreamType>> {
+    let mut entries = msg.tlvs();
+    let header = entries.next()?.field_id()?;
+    if header & 0xffff != FIELD_LIST {
+        return None;
+    }
+    let count = ((header >> 16) & 0xfff).checked_sub(1)?;
+    entries.next()?.u32()?;
+    (0..count)
+        .map(|_| {
+            if entries.next()?.field_id()? != FIELD_STREAM_ENTRY {
+                return None;
+            }
+            Some(StreamType {
+                id: typed_u32(entries.next()?)?,
+                name: entries.next()?.string()?,
+                text: entries.next()?.string()?,
+                value: typed_u32(entries.next()?)?,
+            })
+        })
         .collect()
+}
+
+/// A `u32` of type 0x02 (`Tlv::u32` reads any 4 bytes).
+fn typed_u32(t: Tlv<'_>) -> Option<u32> {
+    (t.typ == TYPE_U32).then(|| t.u32()).flatten()
 }
 
 /// Every 3-D point in a payload, mm.
@@ -309,15 +341,59 @@ mod tests {
         assert_eq!(facts.info.generation, "IS5");
         assert_eq!(facts.info.firmware_version, "02a1a6a977");
         assert!(facts.info.serial_number.starts_with("IS50F-"));
-        assert!(facts.streams.contains(&(0x500, "gaze".into())));
-        assert!(
-            facts
-                .streams
-                .contains(&(0x50e, "primary_camera_image".into()))
-        );
         assert!(facts.properties.iter().any(|(_, s)| s == "IS5LEYETRACKER5"));
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
         assert_eq!(facts.output_hz, Some(33));
+        assert_eq!(facts.streams.len(), 9);
+    }
+
+    #[test]
+    fn the_stream_catalogue_keeps_every_field_in_wire_order() {
+        let bytes = crate::fixture!("init-rsp-1200");
+        let streams = parse_stream_catalogue(&parse_message(&bytes).expect("msg"));
+
+        let got: Vec<(u32, &str, &str, u32)> = streams
+            .iter()
+            .map(|t| (t.id, t.name.as_str(), t.text.as_str(), t.value))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0x500, "gaze", "", 0),
+                (0x501, "image", "", 0),
+                (0x504, "presence", "", 0),
+                (0x508, "image_collection", "", 1000),
+                (0x50e, "primary_camera_image", "", 0),
+                (0x1770, "algodbg", "", 0),
+                (0x1771, "is5_sync_stream", "", 0),
+                (0x1772, "log", "", 0),
+                (0x1774, "custom", "", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_catalogue_entry_empties_the_catalogue() {
+        let good = crate::fixture!("init-rsp-1200");
+        let catalogue = |bytes: &[u8]| parse_stream_catalogue(&parse_message(bytes).expect("msg"));
+        // The first entry's id type byte: after the 32-byte header, `00 00`,
+        // and three 9-byte TLVs (list header, entry type, entry field).
+        let id_type = 32 + 2 + 3 * 9;
+        assert_eq!(good[id_type], TYPE_U32);
+
+        let mut wrong_type = good.clone();
+        wrong_type[id_type] = crate::tlv::TYPE_U32_ALT;
+        assert_eq!(catalogue(&wrong_type), vec![]);
+
+        // The header announces one entry more than the payload holds.
+        let mut too_many = good.clone();
+        too_many[32 + 2 + 5 + 1] += 1;
+        assert_eq!(catalogue(&too_many), vec![]);
+
+        // One entry fewer: the rest is ignored.
+        let mut fewer = good;
+        fewer[32 + 2 + 5 + 1] -= 1;
+        assert_eq!(catalogue(&fewer).len(), 8);
     }
 
     #[test]

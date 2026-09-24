@@ -492,4 +492,40 @@ mod tests {
         );
         assert_eq!(decode_display_area(&[0; 35]), None);
     }
+
+    #[test]
+    fn stream_types_round_trip_and_a_count_past_the_payload_is_rejected() {
+        use request::*;
+        let types = vec![
+            StreamType {
+                id: 0x500,
+                name: "gaze".into(),
+                ..StreamType::default()
+            },
+            StreamType {
+                id: 0x508,
+                name: "image_collection".into(),
+                text: "Bildsammlung ü".into(),
+                value: 1000,
+            },
+        ];
+        let body = encode_stream_types(&types);
+        assert_eq!(decode_stream_types(&body), Some(types));
+        assert_eq!(decode_stream_types(&encode_stream_types(&[])), Some(vec![]));
+
+        for len in 0..body.len() {
+            assert_eq!(decode_stream_types(&body[..len]), None, "cut at {len}");
+        }
+        // A huge count with a short payload fails before allocating.
+        let mut huge = u32::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(&[0; 12]);
+        assert_eq!(decode_stream_types(&huge), None);
+        // Exactly as many minimal entries as the payload holds.
+        let mut two = 2u32.to_le_bytes().to_vec();
+        two.extend_from_slice(&[0; 24]);
+        assert_eq!(
+            decode_stream_types(&two),
+            Some(vec![StreamType::default(), StreamType::default()])
+        );
+    }
 }

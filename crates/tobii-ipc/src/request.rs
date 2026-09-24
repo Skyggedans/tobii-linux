@@ -25,6 +25,9 @@ pub mod kind {
     pub const STATE: u8 = 6;
     /// Device/host clock pair: reply is a [`super::Timesync`].
     pub const TIMESYNC: u8 = 7;
+    /// The tracker's stream catalogue: reply is a list of
+    /// [`super::StreamType`] (see [`super::encode_stream_types`]).
+    pub const STREAM_TYPES: u8 = 8;
     /// Start a calibration session: payload `u8 tobii_enabled_eye_t`.
     pub const CALIBRATION_START: u8 = 0x10;
     /// End the calibration session: payload [`super::STOP_KEEP`] (keep
@@ -257,6 +260,60 @@ pub fn decode_timesync(payload: &[u8]) -> Option<Timesync> {
         device_us: r.i64()?,
         host_end_us: r.i64()?,
     })
+}
+
+/// One entry of the tracker's stream catalogue (command 1200), as the device
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamType {
+    /// The device's stream id (0x500 gaze, 0x501 image, ...).
+    pub id: u32,
+    /// Stream name.
+    pub name: String,
+    /// A second string, empty on the ET5.
+    pub text: String,
+    /// A number whose meaning is unknown (1000 for `image_collection`, 0
+    /// for the rest on the ET5).
+    pub value: u32,
+}
+
+/// The smallest encoded [`StreamType`]: id, two empty strings, value.
+const STREAM_TYPE_MIN_LEN: usize = 4 + 2 + 2 + 4;
+
+/// Reply payload of [`kind::STREAM_TYPES`]: `u32` count, then per entry
+/// `u32 id`, name, text, `u32 value`, in the device's order.
+#[must_use]
+pub fn encode_stream_types(types: &[StreamType]) -> Vec<u8> {
+    let count = u32::try_from(types.len()).unwrap_or(u32::MAX);
+    let mut w = Writer::default();
+    w.u32(count);
+    // Never more entries than the count says (only past `u32::MAX` would
+    // that drop any).
+    for t in types.iter().take(count as usize) {
+        w.u32(t.id).str(&t.name).str(&t.text).u32(t.value);
+    }
+    w.finish()
+}
+
+/// Decode a [`kind::STREAM_TYPES`] reply payload. A count the payload is too
+/// short to hold is `None` before anything is allocated.
+#[must_use]
+pub fn decode_stream_types(payload: &[u8]) -> Option<Vec<StreamType>> {
+    let mut r = Reader::new(payload);
+    let count = usize::try_from(r.u32()?).ok()?;
+    if count > payload.len().saturating_sub(4) / STREAM_TYPE_MIN_LEN {
+        return None;
+    }
+    let mut types = Vec::new();
+    for _ in 0..count {
+        types.push(StreamType {
+            id: r.u32()?,
+            name: r.str()?,
+            text: r.str()?,
+            value: r.u32()?,
+        });
+    }
+    Some(types)
 }
 
 /// A single `u32` payload (state id, state value, calibration id).
