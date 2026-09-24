@@ -13,6 +13,10 @@ BINDIR      ?= $(PREFIX)/bin
 LIBDIR      ?= $(PREFIX)/lib
 INCLUDEDIR  ?= $(PREFIX)/include
 UDEVDIR     ?= /etc/udev/rules.d
+# The dynamic loader does not search /usr/local/lib everywhere (Fedora, for
+# one): a Stream Engine client linked with -ltobii would not start. This
+# file adds LIBDIR to its search path.
+LDCONF      ?= /etc/ld.so.conf.d/tobii.conf
 USERUNITDIR ?= $(HOME)/.config/systemd/user
 SUDO        ?= sudo
 
@@ -74,6 +78,7 @@ install-bin:
 	$(SUDO) install -d $(BINDIR) $(LIBDIR)
 	$(SUDO) install -m 0755 $(addprefix $(REL)/,$(BINS)) $(BINDIR)/
 	$(SUDO) install -m 0644 $(REL)/$(LIB) $(LIBDIR)/
+	echo '$(abspath $(LIBDIR))' | $(SUDO) tee $(LDCONF) > /dev/null
 	$(SUDO) ldconfig || true
 
 # The C headers a Stream Engine client compiles against, e.g.
@@ -115,7 +120,7 @@ disable:
 uninstall: disable
 	-rm -f $(USERUNITDIR)/tobiid.service $(USERUNITDIR)/tobiid.socket $(USERUNITDIR)/tobii-gaze-keys.service
 	systemctl --user daemon-reload
-	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS) $(LEGACY_BINS)) $(LIBDIR)/$(LIB)
+	$(SUDO) rm -f $(addprefix $(BINDIR)/,$(BINS) $(LEGACY_BINS)) $(LIBDIR)/$(LIB) $(LDCONF)
 	$(SUDO) rm -f $(addprefix $(INCLUDEDIR)/tobii/,$(notdir $(HEADERS)))
 	-$(SUDO) rmdir $(INCLUDEDIR)/tobii 2>/dev/null
 	$(SUDO) rm -f $(UDEVDIR)/99-tobii-uaccess.rules $(UDEVDIR)/99-tobii-no-uvcvideo.rules $(UDEVDIR)/99-tobii-uinput.rules

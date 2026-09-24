@@ -79,7 +79,9 @@ prototype against the DLL's machine code (`tools/abi/README.md`).
 
 ## 2b. One-shot install (Makefile)
 
-The fastest path — installs binaries + `libtobii.so` to `/usr/local`, the udev
+The fastest path — installs binaries + `libtobii.so` to `/usr/local` (plus
+`/etc/ld.so.conf.d/tobii.conf`, so the dynamic loader finds the library
+where it does not search `/usr/local/lib` by itself, e.g. Fedora), the udev
 rule, and the systemd **user** units (with `ExecStart` rewritten to the
 installed binary). Run it as **your user**; it invokes `sudo` for the system
 parts itself:
