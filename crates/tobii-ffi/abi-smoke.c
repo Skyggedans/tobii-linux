@@ -110,6 +110,7 @@ int main( void )
     /* Device-less calls are rejected before any device work. */
     assert( tobii_get_output_frequency( NULL, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_calibration_start( NULL, TOBII_ENABLED_EYE_BOTH ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_calibration_discard_data_2d( NULL, 0.5f, 0.5f ) == TOBII_ERROR_INVALID_PARAMETER );
     tobii_supported_t supported = TOBII_SUPPORTED;
     assert( tobii_internal_stream_supported( NULL, 0, &supported ) == TOBII_ERROR_INVALID_PARAMETER );
     tobii_lens_configuration_writable_t writable = TOBII_LENS_CONFIGURATION_WRITABLE;

@@ -12,6 +12,9 @@
 //! 1020 stop
 //! ```
 //!
+//! Discarding a 2-D point is 1080 with the same payload as a collect. It
+//! comes from the DLL (its builder at 0x1801805e0) and was never captured.
+//!
 //! Commands without parameters (start, stop, clear, compute, read) carry no
 //! payload at all, not even the `00 00` a TLV payload starts with.
 //!
@@ -32,6 +35,9 @@ pub mod cmd {
     pub const CLEAR: u32 = 1060;
     /// Compute and apply.
     pub const COMPUTE: u32 = 1070;
+    /// Discard the data collected at one 2-D point. From the DLL (builder
+    /// 0x1801805e0); never captured.
+    pub const DISCARD_2D: u32 = 1080;
     /// Read the active calibration.
     pub const READ: u32 = 1100;
     /// Write a calibration.
@@ -53,6 +59,18 @@ pub fn fixed_32_32(v: f32) -> i64 {
 /// Payload of command 1030 (collect a 2-D point).
 #[must_use]
 pub fn collect_payload(x: f32, y: f32, eye_mask: u32) -> Vec<u8> {
+    point_payload(x, y, eye_mask)
+}
+
+/// Payload of command 1080 (discard a 2-D point): the same as a collect's,
+/// so the device sees the very coordinate it collected.
+#[must_use]
+pub fn discard_payload(x: f32, y: f32, eye_mask: u32) -> Vec<u8> {
+    point_payload(x, y, eye_mask)
+}
+
+/// A 2-D point and an eye mask: `x`, `y` as 32.32 fixed point, then the mask.
+fn point_payload(x: f32, y: f32, eye_mask: u32) -> Vec<u8> {
     TlvWriter::new()
         .fixed32_raw(fixed_32_32(x))
         .fixed32_raw(fixed_32_32(y))
@@ -91,6 +109,27 @@ mod tests {
         for (captured, seq, x, y) in cases {
             let built = chunk_command(cmd::COLLECT_2D, seq, &collect_payload(x, y, EYES_BOTH));
             assert_eq!(built, vec![captured], "({x}, {y})");
+        }
+    }
+
+    /// A discard was never captured: it is the captured collect with 1080
+    /// in the id word.
+    #[test]
+    fn discard_is_the_captured_collect_with_its_own_id() {
+        let cases: [(Vec<u8>, u32, f32, f32); 4] = [
+            (crate::fixture!("calib-cmd-1030-seq48"), 48, 0.5, 0.5),
+            (crate::fixture!("calib-cmd-1030-seq51"), 51, 0.5, 0.1),
+            (crate::fixture!("calib-cmd-1030-seq52"), 52, 0.9, 0.9),
+            (crate::fixture!("calib-cmd-1030-seq53"), 53, 0.1, 0.9),
+        ];
+        for (mut expected, seq, x, y) in cases {
+            // The id word follows the 8-byte prefix, marker, seq and a zero.
+            assert_eq!(&expected[20..24], &cmd::COLLECT_2D.to_be_bytes());
+            expected[20..24].copy_from_slice(&cmd::DISCARD_2D.to_be_bytes());
+
+            let built = chunk_command(cmd::DISCARD_2D, seq, &discard_payload(x, y, EYES_BOTH));
+
+            assert_eq!(built, vec![expected], "({x}, {y})");
         }
     }
 

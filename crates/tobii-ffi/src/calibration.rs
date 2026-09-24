@@ -3,8 +3,9 @@
 //! here.
 //!
 //! 2-D calibration of both eyes is what the Windows engine was captured doing;
-//! 3-D and per-eye variants, and discarding a point, were never observed and
-//! return `TOBII_ERROR_NOT_SUPPORTED`.
+//! discarding a 2-D point uses the command the DLL sends for it. 3-D and
+//! per-eye variants were never observed and return
+//! `TOBII_ERROR_NOT_SUPPORTED`.
 
 use std::ffi::c_void;
 use std::time::Duration;
@@ -24,6 +25,8 @@ use crate::types::{
 const START_TIMEOUT: Duration = Duration::from_secs(25);
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// The daemon's 5 s command timeout plus the 30 s a command may wait queued.
+const DISCARD_TIMEOUT: Duration = Duration::from_secs(40);
 const COMPUTE_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(8);
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,6 +93,28 @@ pub unsafe extern "C" fn tobii_calibration_collect_data_2d(
             kind::CALIBRATION_COLLECT_2D,
             &encode_point_2d(x, y),
             COLLECT_TIMEOUT,
+        )
+    }
+}
+
+/// Discard the data collected at `(x, y)` in this session: the point as it
+/// was given to `tobii_calibration_collect_data_2d`.
+///
+/// # Safety
+/// As `tobii_calibration_start`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_calibration_discard_data_2d(
+    device: *mut Device,
+    x: f32,
+    y: f32,
+) -> Status {
+    // SAFETY: forwarded under the same contract.
+    unsafe {
+        request(
+            device,
+            kind::CALIBRATION_DISCARD_2D,
+            &encode_point_2d(x, y),
+            DISCARD_TIMEOUT,
         )
     }
 }
@@ -221,8 +246,6 @@ not_supported! {
     fn tobii_calibration_collect_data_3d(device: *mut c_void, x: f32, y: f32, z: f32);
     /// Per-eye calibration was never captured.
     fn tobii_calibration_collect_data_per_eye_2d(device: *mut c_void, x: f32, y: f32, requested_eyes: u32, collected_eyes: *mut c_void);
-    /// Discarding a point was never captured; its command is unknown.
-    fn tobii_calibration_discard_data_2d(device: *mut c_void, x: f32, y: f32);
     /// 3-D calibration was never captured.
     fn tobii_calibration_discard_data_3d(device: *mut c_void, x: f32, y: f32, z: f32);
     /// Per-eye calibration was never captured.
@@ -303,12 +326,43 @@ mod tests {
     }
 
     #[test]
+    fn a_discard_sends_its_point_to_the_daemon() {
+        use std::sync::{Arc, Mutex};
+        use tobii_ipc::encode_reply;
+        use tobii_ipc::request::{decode_point_2d, decode_request};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let connect = crate::device::tests::fake_daemon(move |body| {
+            let req = decode_request(body).expect("request");
+            log.lock()
+                .expect("log")
+                .push((req.kind, decode_point_2d(req.payload)));
+            vec![encode_reply(req.id, 0, &[])]
+        });
+        let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        // SAFETY: `d` is live and destroyed once; a null device is allowed.
+        unsafe {
+            assert_eq!(tobii_calibration_discard_data_2d(d, 0.25, 0.75), 0);
+            assert_eq!(crate::api::tobii_device_destroy(d), 0);
+            assert_eq!(
+                tobii_calibration_discard_data_2d(ptr::null_mut(), 0.25, 0.75),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+        }
+        assert_eq!(
+            *seen.lock().expect("log"),
+            vec![(kind::CALIBRATION_DISCARD_2D, Some((0.25, 0.75)))]
+        );
+    }
+
+    #[test]
     fn requests_carry_the_daemon_status() {
         // The daemon says another client is calibrating.
         let d = Box::into_raw(Box::new(crate::device::tests::device_with(15, vec![])));
         // SAFETY: `d` is live and destroyed once.
         unsafe {
             assert_eq!(tobii_calibration_start(d, 2), 15);
+            assert_eq!(tobii_calibration_discard_data_2d(d, 0.5, 0.5), 15);
             assert_eq!(
                 tobii_calibration_apply(d, ptr::null(), 0),
                 TOBII_ERROR_INVALID_PARAMETER

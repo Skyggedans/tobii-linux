@@ -33,7 +33,8 @@ pub mod kind {
     pub const CALIBRATION_STOP: u8 = 0x11;
     /// Collect a 2-D point: payload `f32 x, f32 y` (normalised display).
     pub const CALIBRATION_COLLECT_2D: u8 = 0x12;
-    /// Discard a 2-D point: payload `f32 x, f32 y`.
+    /// Discard the data collected at a 2-D point in this session: payload
+    /// `f32 x, f32 y`, as collected.
     pub const CALIBRATION_DISCARD_2D: u8 = 0x13;
     /// Compute and apply: reply `u32` new calibration id.
     pub const CALIBRATION_COMPUTE: u8 = 0x14;

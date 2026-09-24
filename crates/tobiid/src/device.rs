@@ -139,7 +139,7 @@ mod tests {
         for cmd in [
             calibration::cmd::START,
             collect,
-            1080, // discard a 2-D point
+            calibration::cmd::DISCARD_2D,
             calibration::cmd::WRITE,
         ] {
             assert_eq!(

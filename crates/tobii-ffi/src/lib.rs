@@ -87,10 +87,6 @@ mod tests {
                 crate::calibration::tobii_calibration_collect_data_3d(n, 0.5, 0.5, 0.5),
             ),
             (
-                "discard_data_2d",
-                crate::calibration::tobii_calibration_discard_data_2d(n, 0.5, 0.5),
-            ),
-            (
                 "stimulus_points_get",
                 crate::calibration::tobii_calibration_stimulus_points_get(n, n),
             ),

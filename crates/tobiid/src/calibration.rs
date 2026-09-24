@@ -9,6 +9,11 @@
 //! depend on whether 1020 keeps a computed calibration (never established
 //! from the captures).
 //!
+//! Discard = 1080 with a collect's payload, taken from the DLL (never
+//! captured). It leaves the session as it is. A collect or discard point
+//! outside the display is refused before the session is looked at; the DLL
+//! checks the session first and sends any point unchecked.
+//!
 //! A session commits only when its owner stops it asking to keep the result
 //! ([`STOP_KEEP`], what `tobii_calibration_stop` sends): the last computed
 //! calibration then stays on the device and is saved as the user's, uploaded
@@ -34,7 +39,9 @@ use tobii_ipc::request::{STOP_DISCARD, STOP_KEEP, decode_point_2d, encode_u32, k
 use tobii_ipc::{
     Notification, NotificationValue, STREAM_NOTIFICATIONS, encode_notification, notification,
 };
-use tobii_proto::calibration::{EYES_BOTH, blob_from_payload, cmd, collect_payload, write_payload};
+use tobii_proto::calibration::{
+    EYES_BOTH, blob_from_payload, cmd, collect_payload, discard_payload, write_payload,
+};
 use tracing::{info, warn};
 
 use crate::daemon::{State, lock_state};
@@ -240,22 +247,12 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, request: u8, payload: &[
             STOP_DISCARD => stop(state, client, false).into(),
             _ => Reply::err(status::INVALID_PARAMETER),
         },
-        kind::CALIBRATION_COLLECT_2D => match decode_point_2d(payload) {
-            Some((x, y)) if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) => {
-                prepare(state, client, &Access::Owner)
-                    .and_then(|(device, _, _)| {
-                        run(
-                            device.as_ref(),
-                            cmd::COLLECT_2D,
-                            collect_payload(x, y, EYES_BOTH),
-                            QUICK,
-                        )
-                    })
-                    .map(|_| Vec::new())
-                    .into()
-            }
-            _ => Reply::err(status::INVALID_PARAMETER),
-        },
+        kind::CALIBRATION_COLLECT_2D => {
+            point_2d(state, client, payload, cmd::COLLECT_2D, collect_payload)
+        }
+        kind::CALIBRATION_DISCARD_2D => {
+            point_2d(state, client, payload, cmd::DISCARD_2D, discard_payload)
+        }
         kind::CALIBRATION_CLEAR => prepare(state, client, &Access::Owner)
             .and_then(|(device, _, _)| run(device.as_ref(), cmd::CLEAR, Vec::new(), QUICK))
             .map(|_| Vec::new())
@@ -265,9 +262,28 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, request: u8, payload: &[
             .and_then(|(device, _, _)| read_blob(device.as_ref()))
             .into(),
         kind::CALIBRATION_APPLY => apply(state, client, payload).into(),
-        // Discarding a point was never captured; its command is unknown.
         _ => Reply::err(status::NOT_SUPPORTED),
     }
+}
+
+/// Send the point in `payload` to the device as `command` for the session's
+/// owner, both eyes. The point must lie on the display (0..=1 each way).
+fn point_2d(
+    state: &Mutex<State>,
+    client: u64,
+    payload: &[u8],
+    command: u32,
+    build: fn(f32, f32, u32) -> Vec<u8>,
+) -> Reply {
+    let Some((x, y)) = decode_point_2d(payload)
+        .filter(|(x, y)| (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y))
+    else {
+        return Reply::err(status::INVALID_PARAMETER);
+    };
+    prepare(state, client, &Access::Owner)
+        .and_then(|(device, _, _)| run(device.as_ref(), command, build(x, y, EYES_BOTH), QUICK))
+        .map(|_| Vec::new())
+        .into()
 }
 
 fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
@@ -492,6 +508,8 @@ mod tests {
     struct FakeDevice {
         blob: Vec<u8>,
         log: Mutex<Vec<u32>>,
+        /// Every command with its payload.
+        payloads: Mutex<Vec<(u32, Vec<u8>)>>,
         /// A command the device refuses.
         refuse: Mutex<Option<u32>>,
     }
@@ -500,10 +518,11 @@ mod tests {
         fn run(
             &self,
             cmd: u32,
-            _payload: Vec<u8>,
+            payload: Vec<u8>,
             _timeout: Duration,
         ) -> Result<CommandResponse, CommandError> {
             self.log.lock().expect("log").push(cmd);
+            self.payloads.lock().expect("payloads").push((cmd, payload));
             if *self.refuse.lock().expect("refuse") == Some(cmd) {
                 return Ok(CommandResponse {
                     status: 2,
@@ -539,6 +558,7 @@ mod tests {
         let device = Arc::new(FakeDevice {
             blob,
             log: Mutex::new(Vec::new()),
+            payloads: Mutex::new(Vec::new()),
             refuse: Mutex::new(None),
         });
         let mut st = crate::daemon::tests::state_with_client(1);
@@ -681,14 +701,109 @@ mod tests {
             ask(&s, 1, kind::CALIBRATION_START, &[]).status,
             status::INVALID_PARAMETER
         );
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_DISCARD_2D, &[]).status,
-            status::NOT_SUPPORTED
-        );
         let outside = tobii_ipc::request::encode_point_2d(1.5, 0.5);
+        let nan = tobii_ipc::request::encode_point_2d(0.5, f32::NAN);
+        for k in [kind::CALIBRATION_COLLECT_2D, kind::CALIBRATION_DISCARD_2D] {
+            for payload in [&[][..], &outside, &nan] {
+                assert_eq!(
+                    ask(&s, 1, k, payload).status,
+                    status::INVALID_PARAMETER,
+                    "kind {k}, {payload:?}"
+                );
+            }
+        }
+        assert!(s.device.log.lock().expect("log").is_empty());
+    }
+
+    #[test]
+    fn a_discard_sends_1080_with_the_collected_point() {
+        let s = setup("discard-point");
+        let point = tobii_ipc::request::encode_point_2d(0.3, 0.3);
         assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &outside).status,
-            status::INVALID_PARAMETER
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]).status,
+            status::OK
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COLLECT_2D, &point),
+            Reply::ok(Vec::new())
+        );
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_DISCARD_2D, &point),
+            Reply::ok(Vec::new())
+        );
+
+        assert_eq!(
+            *s.device.log.lock().expect("log"),
+            vec![
+                cmd::START,
+                cmd::CLEAR,
+                cmd::WRITE,
+                cmd::COLLECT_2D,
+                cmd::DISCARD_2D
+            ]
+        );
+        let payloads = s.device.payloads.lock().expect("payloads").clone();
+        let expected = collect_payload(0.3, 0.3, EYES_BOTH);
+        assert_eq!(payloads[3], (cmd::COLLECT_2D, expected.clone()));
+        assert_eq!(payloads[4], (cmd::DISCARD_2D, expected));
+        assert_eq!(
+            lock_state(&s.state).calibration.owner(),
+            Some(1),
+            "the session goes on"
+        );
+    }
+
+    #[test]
+    fn a_discard_needs_its_clients_session() {
+        let s = setup("discard-session");
+        let point = tobii_ipc::request::encode_point_2d(0.3, 0.3);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_DISCARD_2D, &point).status,
+            status::CALIBRATION_NOT_STARTED
+        );
+        assert_eq!(
+            ask(&s, 2, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]).status,
+            status::OK
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_DISCARD_2D, &point).status,
+            status::CALIBRATION_NOT_STARTED,
+            "another client's session"
+        );
+        assert!(!s.device.log.lock().expect("log").contains(&cmd::DISCARD_2D));
+    }
+
+    #[test]
+    fn a_discard_accepted_or_refused_keeps_the_sessions_result() {
+        let s = setup("discard-result");
+        let point = tobii_ipc::request::encode_point_2d(0.3, 0.3);
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]).status,
+            status::OK
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_DISCARD_2D, &point),
+            Reply::ok(Vec::new())
+        );
+        *s.device.refuse.lock().expect("refuse") = Some(cmd::DISCARD_2D);
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_DISCARD_2D, &point).status,
+            status::OPERATION_FAILED
+        );
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::ok(Vec::new())
+        );
+        assert!(
+            s.dir.join("calibration.bin").exists(),
+            "what the session computed is still committed"
         );
     }
 

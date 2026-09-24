@@ -46,7 +46,7 @@ TOBII_API tobii_error_t TOBII_CALL tobii_calibration_collect_data_3d( tobii_devi
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_collect_data_per_eye_2d( tobii_device_t* device,
     float x, float y, tobii_enabled_eye_t requested_eyes, tobii_enabled_eye_t* collected_eyes );
-/* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED */
+/* Discards the data collected at (x, y) in this session; pass the point as collected. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_discard_data_2d( tobii_device_t* device,
     float x, float y );
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED */
