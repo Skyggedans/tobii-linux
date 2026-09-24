@@ -140,6 +140,10 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
                 .join(", ")
         })
     });
+    let name = p.ask(kind::DEVICE_NAME_GET, &[])?;
+    show("device name", &name, |b| {
+        format!("{:?}", String::from_utf8_lossy(b))
+    });
     let id = p.ask(kind::STATE, &request::encode_u32(state::CALIBRATION_ID))?;
     show("calibration id", &id, |b| {
         format!("{:?}", request::decode_u32(b))

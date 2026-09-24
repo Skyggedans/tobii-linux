@@ -110,10 +110,13 @@ TOBII_API tobii_error_t TOBII_CALL tobii_calculate_display_area_basic( tobii_api
 
 typedef char tobii_device_name_t[ 64 ];
 
-/* The device's model string. */
+/* The name a client set, else the device's model string. Asked of the daemon on
+ * every call: another process may have renamed the device. */
 TOBII_API tobii_error_t TOBII_CALL tobii_get_device_name( tobii_device_t* device,
     tobii_device_name_t* device_name );
-/* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED */
+/* Kept by the daemon ($XDG_CONFIG_HOME/tobii/device-name) for every client and
+ * later sessions; nothing is written to the tracker. At most 63 bytes are read,
+ * up to the NUL. A NULL name is TOBII_ERROR_INVALID_PARAMETER. */
 TOBII_API tobii_error_t TOBII_CALL tobii_set_device_name( tobii_device_t* device,
     tobii_device_name_t const device_name );
 

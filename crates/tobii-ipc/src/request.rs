@@ -28,6 +28,14 @@ pub mod kind {
     /// The tracker's stream catalogue: reply is a list of
     /// [`super::StreamType`] (see [`super::encode_stream_types`]).
     pub const STREAM_TYPES: u8 = 8;
+    /// The device's name: reply is its bytes, at most
+    /// [`super::DEVICE_NAME_MAX`] and no NUL. The name a client set, else
+    /// the model.
+    pub const DEVICE_NAME_GET: u8 = 0x0b;
+    /// Name the device: payload is the name's bytes, reply is empty. The
+    /// daemon keeps what comes before the first NUL, at most
+    /// [`super::DEVICE_NAME_MAX`] bytes, and saves it for later sessions.
+    pub const DEVICE_NAME_SET: u8 = 0x0c;
     /// Start a calibration session: payload `u8 tobii_enabled_eye_t`.
     pub const CALIBRATION_START: u8 = 0x10;
     /// End the calibration session: payload [`super::STOP_KEEP`] (keep
@@ -55,6 +63,11 @@ pub const STOP_KEEP: &[u8] = &[];
 /// [`kind::CALIBRATION_STOP`] payload: discard the session, putting back the
 /// calibration and display area it started from.
 pub const STOP_DISCARD: &[u8] = &[1];
+
+/// The longest device name, in bytes: a `tobii_device_name_t` less its NUL.
+/// Names are raw bytes, as the Stream Engine passes them, and need not be
+/// UTF-8.
+pub const DEVICE_NAME_MAX: usize = 63;
 
 /// `tobii_state_t` ids understood by [`kind::STATE`].
 pub mod state {

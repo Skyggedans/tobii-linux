@@ -62,10 +62,6 @@ mod tests {
         let c: *const c_void = null();
         let results: Vec<(&str, Status)> = vec![
             (
-                "set_device_name",
-                crate::config::tobii_set_device_name(n, c.cast()),
-            ),
-            (
                 "license_key_store",
                 crate::licensing::tobii_license_key_store(n, n, 0),
             ),

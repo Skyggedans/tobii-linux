@@ -438,8 +438,14 @@ pub type CalibrationPointReceiver = unsafe extern "C" fn(*const CalibrationPoint
 
 /// Copy `s` into a fixed C string buffer, truncated to leave room for the NUL.
 pub(crate) fn copy_c_string(dst: &mut [c_char], s: &str) {
-    let n = s.len().min(dst.len().saturating_sub(1));
-    for (d, b) in dst.iter_mut().zip(&s.as_bytes()[..n]) {
+    copy_c_bytes(dst, s.as_bytes());
+}
+
+/// Copy raw bytes (not necessarily UTF-8) into a fixed C string buffer,
+/// truncated to leave room for the NUL.
+pub(crate) fn copy_c_bytes(dst: &mut [c_char], bytes: &[u8]) {
+    let n = bytes.len().min(dst.len().saturating_sub(1));
+    for (d, b) in dst.iter_mut().zip(&bytes[..n]) {
         *d = c_char::from_ne_bytes([*b]);
     }
     if let Some(end) = dst.get_mut(n) {
@@ -512,5 +518,11 @@ mod tests {
         assert_eq!(buf.map(|c| c.to_ne_bytes()[0]), *b"IS5\0");
         copy_c_string(&mut buf, "");
         assert_eq!(buf[0], 0);
+        copy_c_bytes(&mut buf, &[0xff, 0xfe]);
+        assert_eq!(buf.map(|c| c.to_ne_bytes()[0]), [0xff, 0xfe, 0, 0]);
+        let mut name: DeviceName = [1; 64];
+        copy_c_bytes(&mut name, &[b'x'; 100]);
+        assert_eq!(name[62].to_ne_bytes(), *b"x");
+        assert_eq!(name[63], 0);
     }
 }

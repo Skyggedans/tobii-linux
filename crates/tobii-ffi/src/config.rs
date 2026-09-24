@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tobii_ipc::geometry::{self, GeometryMounting as WireMounting};
 use tobii_ipc::request::{
-    decode_display_area, decode_geometry_mounting, encode_display_area, kind,
+    DEVICE_NAME_MAX, decode_display_area, decode_geometry_mounting, encode_display_area, kind,
 };
 
 use crate::api::{FACTS_TIMEOUT, fetch_device_info};
@@ -15,10 +15,9 @@ use crate::status::{
     Status, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
     TOBII_ERROR_NOT_SUPPORTED,
 };
-use crate::stub::not_supported;
 use crate::types::{
     DeviceName, DisplayArea, GeometryMounting, OutputFrequencyReceiver, TOBII_ENABLED_EYE_BOTH,
-    copy_c_string,
+    copy_c_bytes,
 };
 
 /// The ET5's output frequency, Hz (what command 1650 reports).
@@ -222,7 +221,9 @@ pub unsafe extern "C" fn tobii_calculate_display_area_basic(
     TOBII_ERROR_NO_ERROR
 }
 
-/// The device's name: its model string.
+/// The device's name: the one a client set, kept by the daemon, else its
+/// model string. Asked of the daemon on every call, since another process
+/// may rename the device; a daemon that predates names gives the model.
 ///
 /// # Safety
 /// `device` as `tobii_set_enabled_eye`; `device_name` must be null or valid
@@ -240,21 +241,68 @@ pub unsafe extern "C" fn tobii_get_device_name(
     if device_name.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    match fetch_device_info(d) {
-        Ok(info) => {
-            let mut name: DeviceName = [0; 64];
-            copy_c_string(&mut name, &info.model);
-            // SAFETY: non-null, and the caller guarantees 64 writable bytes.
-            unsafe { device_name.write(name) };
-            TOBII_ERROR_NO_ERROR
-        }
+    let bytes = match d.request(kind::DEVICE_NAME_GET, &[], FACTS_TIMEOUT) {
+        Ok(bytes) => bytes,
+        Err(TOBII_ERROR_NOT_SUPPORTED) => match fetch_device_info(d) {
+            Ok(info) => info.model.into_bytes(),
+            Err(status) => return status,
+        },
+        Err(status) => return status,
+    };
+    let mut name: DeviceName = [0; 64];
+    copy_c_bytes(&mut name, &bytes);
+    // SAFETY: non-null, and the caller guarantees 64 writable bytes.
+    unsafe { device_name.write(name) };
+    TOBII_ERROR_NO_ERROR
+}
+
+/// Name the device. The daemon keeps the name, for every client and later
+/// sessions; nothing is written to the tracker. At most 63 bytes are read,
+/// up to the NUL, and kept as they are (empty and non-UTF-8 names too). A
+/// null name is `TOBII_ERROR_INVALID_PARAMETER`, where the DLL crashes.
+///
+/// # Safety
+/// `device` as `tobii_set_enabled_eye`; `device_name` must be null, or
+/// readable up to its NUL or for 63 bytes, whichever comes first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_set_device_name(
+    device: *mut Device,
+    device_name: *const c_char,
+) -> Status {
+    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
+    let d = match unsafe { device_mut(device) } {
+        Ok(d) => d,
+        Err(status) => return status,
+    };
+    if device_name.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: non-null, and the caller guarantees it is readable that far.
+    let name = unsafe { name_bytes(device_name) };
+    match d.request(kind::DEVICE_NAME_SET, &name, FACTS_TIMEOUT) {
+        Ok(_) => TOBII_ERROR_NO_ERROR,
         Err(status) => status,
     }
 }
 
-not_supported! {
-    /// Renaming the device was never captured.
-    fn tobii_set_device_name(device: *mut c_void, device_name: *const c_char);
+/// The bytes of a C name before its NUL, at most [`DEVICE_NAME_MAX`]: never
+/// past the 64 of a `tobii_device_name_t`, however it ends.
+///
+/// # Safety
+/// `name` must be readable up to its NUL or for [`DEVICE_NAME_MAX`] bytes,
+/// whichever comes first.
+unsafe fn name_bytes(name: *const c_char) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(DEVICE_NAME_MAX);
+    for i in 0..DEVICE_NAME_MAX {
+        // SAFETY: `i` is below the limit and no NUL came before it, so the
+        // caller guarantees this byte is readable.
+        let c = unsafe { name.add(i).read() };
+        if c == 0 {
+            break;
+        }
+        bytes.push(c.to_ne_bytes()[0]);
+    }
+    bytes
 }
 
 /// The one output frequency the ET5 runs at.
@@ -330,6 +378,9 @@ pub unsafe extern "C" fn tobii_get_output_frequency(
 mod tests {
     use super::*;
     use std::ptr;
+    use std::sync::{Arc, Mutex};
+    use tobii_ipc::encode_reply;
+    use tobii_ipc::request::{DeviceInfo, decode_request, encode_device_info};
 
     /// The mounting and monitor from the Windows capture: the result must be
     /// the display area the Windows engine wrote.
@@ -380,6 +431,138 @@ mod tests {
             assert!((got - want).abs() < 1e-3, "{:?}", area.top_left_mm_xyz);
         }
         assert!((area.top_right_mm_xyz[0] - area.top_left_mm_xyz[0] - 597.0).abs() < 1e-3);
+    }
+
+    /// Every request a fake daemon got: (kind, payload).
+    type RequestLog = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+
+    /// A daemon that knows the device as `name`, or predates names when it
+    /// is `None`; every request it gets is logged as (kind, payload).
+    fn named_device(name: Option<&'static [u8]>) -> (*mut Device, RequestLog) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let connect = crate::device::tests::fake_daemon(move |body| {
+            let req = decode_request(body).expect("request");
+            log.lock()
+                .expect("log")
+                .push((req.kind, req.payload.to_vec()));
+            let (status, payload) = match (req.kind, name) {
+                (kind::DEVICE_NAME_GET, Some(name)) => (0, name.to_vec()),
+                (kind::DEVICE_NAME_SET, Some(_)) => (0, Vec::new()),
+                (kind::DEVICE_INFO, _) => (
+                    0,
+                    encode_device_info(&DeviceInfo {
+                        model: "IS5_Large_Eyetracker_5".into(),
+                        ..DeviceInfo::default()
+                    }),
+                ),
+                _ => (tobii_ipc::request::status::NOT_SUPPORTED, Vec::new()),
+            };
+            vec![encode_reply(req.id, status, &payload)]
+        });
+        let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        (d, seen)
+    }
+
+    fn c_name(bytes: &[u8]) -> DeviceName {
+        let mut name: DeviceName = [0; 64];
+        for (c, b) in name.iter_mut().zip(bytes) {
+            *c = c_char::from_ne_bytes([*b]);
+        }
+        name
+    }
+
+    #[test]
+    fn a_set_name_is_read_up_to_its_nul_and_never_past_63_bytes() {
+        let (d, seen) = named_device(Some(b""));
+        // No NUL anywhere in the 64 bytes.
+        let full = c_name(&[b'x'; 64]);
+        let desk = c_name(b"Desk\0junk");
+        let raw = c_name(&[0xff, 0xfe]);
+        // SAFETY: `d` is live and destroyed once; the names are live locals.
+        unsafe {
+            assert_eq!(tobii_set_device_name(d, full.as_ptr()), 0);
+            assert_eq!(tobii_set_device_name(d, desk.as_ptr()), 0);
+            assert_eq!(tobii_set_device_name(d, raw.as_ptr()), 0);
+            assert_eq!(
+                tobii_set_device_name(d, ptr::null()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_set_device_name(ptr::null_mut(), desk.as_ptr()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(crate::api::tobii_device_destroy(d), 0);
+        }
+        assert_eq!(
+            *seen.lock().expect("log"),
+            vec![
+                (kind::DEVICE_NAME_SET, vec![b'x'; 63]),
+                (kind::DEVICE_NAME_SET, b"Desk".to_vec()),
+                (kind::DEVICE_NAME_SET, vec![0xff, 0xfe]),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_name_get_asks_the_daemon() {
+        let (d, seen) = named_device(Some(&[b'D', b'e', b's', b'k', 0xff]));
+        let mut name: DeviceName = [1; 64];
+        // SAFETY: `d` is live and destroyed once; `name` a live local.
+        unsafe {
+            assert_eq!(tobii_get_device_name(d, &raw mut name), 0);
+            assert_eq!(tobii_get_device_name(d, &raw mut name), 0);
+            assert_eq!(
+                tobii_get_device_name(d, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_get_device_name(ptr::null_mut(), &raw mut name),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(crate::api::tobii_device_destroy(d), 0);
+        }
+        assert_eq!(name, c_name(&[b'D', b'e', b's', b'k', 0xff]));
+        assert_eq!(
+            *seen.lock().expect("log"),
+            vec![(kind::DEVICE_NAME_GET, vec![]); 2],
+            "no cached answer"
+        );
+    }
+
+    #[test]
+    fn a_daemon_without_names_gives_the_model_and_refuses_a_set() {
+        let (d, seen) = named_device(None);
+        let mut name: DeviceName = [1; 64];
+        let desk = c_name(b"Desk");
+        // SAFETY: `d` is live and destroyed once; the names are live locals.
+        unsafe {
+            assert_eq!(tobii_get_device_name(d, &raw mut name), 0);
+            assert_eq!(
+                tobii_set_device_name(d, desk.as_ptr()),
+                TOBII_ERROR_NOT_SUPPORTED
+            );
+            assert_eq!(crate::api::tobii_device_destroy(d), 0);
+        }
+        assert_eq!(name, c_name(b"IS5_Large_Eyetracker_5"));
+        let kinds: Vec<u8> = seen.lock().expect("log").iter().map(|r| r.0).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                kind::DEVICE_NAME_GET,
+                kind::DEVICE_INFO,
+                kind::DEVICE_NAME_SET
+            ]
+        );
+
+        // Any other failure is the daemon's status.
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(6, vec![])));
+        // SAFETY: `d` is live and destroyed once; the names are live locals.
+        unsafe {
+            assert_eq!(tobii_get_device_name(d, &raw mut name), 6);
+            assert_eq!(tobii_set_device_name(d, desk.as_ptr()), 6);
+            assert_eq!(crate::api::tobii_device_destroy(d), 0);
+        }
     }
 
     #[test]

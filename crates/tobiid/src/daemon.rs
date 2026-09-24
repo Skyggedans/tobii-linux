@@ -97,6 +97,15 @@ pub(crate) struct State {
     /// Where a display area a client sets is saved (see [`crate::display`]);
     /// `None` keeps it in memory only.
     pub(crate) display_file: Option<PathBuf>,
+    /// The name a client gave the device (or the saved one); `None` until
+    /// one is set, when the model stands in (see [`crate::name`]).
+    pub(crate) device_name: Option<Vec<u8>>,
+    /// Where a device name a client sets is saved; `None` keeps it in memory
+    /// only.
+    pub(crate) name_file: Option<PathBuf>,
+    /// Held while a name is saved and recorded, so that the file and
+    /// `device_name` agree. Taken before the state lock, never under it.
+    pub(crate) name_lock: Arc<Mutex<()>>,
     /// The calibration session, if any, and the active calibration id.
     pub(crate) calibration: Calibration,
     /// Stand-in for the engine's command queue in tests.
@@ -117,6 +126,9 @@ impl State {
             display_override: None,
             display_request: crate::requests::DisplaySize::from_env(),
             display_file: None,
+            device_name: None,
+            name_file: None,
+            name_lock: Arc::default(),
             calibration: Calibration::default(),
             #[cfg(test)]
             fake_device: None,
@@ -325,6 +337,8 @@ pub fn run() -> Result<()> {
         let mut st = lock_state(&state);
         st.display_file = crate::display::default_path();
         crate::requests::restore_saved_display_area(&mut st);
+        st.name_file = crate::name::default_path();
+        crate::name::restore(&mut st);
     }
 
     // Pre-warm: bring the device up now (pays the cold-start lottery once) and

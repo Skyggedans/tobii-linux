@@ -1,12 +1,14 @@
 //! The Tobii daemon: claims the device, serves its streams to clients over a
 //! Unix socket and answers their requests (device info, geometry, display
-//! area, calibration). Run it directly, or let a client auto-spawn it.
+//! area, device name, calibration). Run it directly, or let a client
+//! auto-spawn it.
 
 mod calibration;
 mod daemon;
 mod device;
 mod display;
 mod frames;
+mod name;
 mod requests;
 
 fn main() {

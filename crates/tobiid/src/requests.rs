@@ -1,6 +1,7 @@
 //! Client requests: what the device reported about itself (identity,
 //! geometry, stream catalogue), its display area, states and clock.
-//! Calibration requests are handed to [`crate::calibration`].
+//! Calibration requests are handed to [`crate::calibration`], the device
+//! name to [`crate::name`].
 //!
 //! Identity and geometry come from the facts collected during the engine's
 //! init, so answering them costs no USB traffic; a request made while the
@@ -105,6 +106,8 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
             None => Reply::err(status::INVALID_PARAMETER),
         },
         kind::TIMESYNC => timesync(state, client),
+        kind::DEVICE_NAME_GET => crate::name::get(state, client),
+        kind::DEVICE_NAME_SET => crate::name::set(state, req.payload),
         k if (kind::CALIBRATION_START..=kind::CALIBRATION_CLEAR).contains(&k) => {
             crate::calibration::handle(state, client, k, req.payload)
         }
@@ -125,7 +128,7 @@ fn is_finite(area: &DisplayArea) -> bool {
 
 /// Wait for the device's facts (starting the engine if needed) and answer
 /// from them; `NOT_SUPPORTED` when the device did not report that fact.
-fn facts(
+pub(crate) fn facts(
     state: &Mutex<State>,
     client: u64,
     answer: impl Fn(&DeviceFacts) -> Option<Vec<u8>>,
@@ -408,7 +411,7 @@ pub(crate) fn apply_display_request(st: &mut State) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use tobii_proto::time::now_us;
@@ -570,7 +573,7 @@ mod tests {
     }
 
     /// Answers every command with `status`.
-    struct Answering(u32);
+    pub(crate) struct Answering(pub(crate) u32);
 
     impl crate::device::DeviceCommands for Answering {
         fn run(
