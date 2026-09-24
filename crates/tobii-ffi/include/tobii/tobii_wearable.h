@@ -1,6 +1,8 @@
 /* tobii/tobii_wearable.h — head-mounted devices. Declared so wearable-aware
- * code builds; nothing here applies to the screen-based ET5, and every entry
- * point returns TOBII_ERROR_NOT_SUPPORTED. Companion to tobii/tobii.h.
+ * code builds; nothing here applies to the screen-based ET5. Every entry
+ * point returns TOBII_ERROR_NOT_SUPPORTED, except
+ * tobii_lens_configuration_writable, which answers
+ * TOBII_LENS_CONFIGURATION_NOT_WRITABLE. Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
  */

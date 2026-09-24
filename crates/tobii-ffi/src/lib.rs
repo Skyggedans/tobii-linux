@@ -83,10 +83,6 @@ mod tests {
                 crate::wearable::tobii_wearable_consumer_data_subscribe(n, c, n),
             ),
             (
-                "lens_configuration_writable",
-                crate::wearable::tobii_lens_configuration_writable(n, n),
-            ),
-            (
                 "collect_data_3d",
                 crate::calibration::tobii_calibration_collect_data_3d(n, 0.5, 0.5, 0.5),
             ),

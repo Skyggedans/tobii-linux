@@ -577,12 +577,12 @@ const fn stream_supported(stream: u32) -> bool {
     )
 }
 
-/// Shared shape of the two `*_supported` queries: an unknown value is "not
+/// Shared shape of the `*_supported` queries: an unknown value is "not
 /// supported", not an error (as in the DLL).
 ///
 /// # Safety
 /// As `tobii_capability_supported`.
-unsafe fn write_supported(
+pub(crate) unsafe fn write_supported(
     device: *mut Device,
     value: u32,
     supported: *mut u32,

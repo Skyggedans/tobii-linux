@@ -2,10 +2,10 @@
  * that the Stream Engine never documented, as provided by libtobii.so.
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
- * argument types are best guesses. Only the field-of-use and image functions
- * are implemented; every other entry point here returns
- * TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the guessed
- * types cannot matter at runtime. Companion to tobii/tobii.h.
+ * argument types are best guesses. Only the field-of-use, image and
+ * internal-stream functions are implemented; every other entry point here
+ * returns TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the
+ * guessed types cannot matter at runtime. Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -46,6 +46,16 @@ typedef void ( *tobii_image_callback_t )( tobii_image_t const* image, void* user
 TOBII_API tobii_error_t TOBII_CALL tobii_image_subscribe( tobii_device_t* device,
     tobii_image_callback_t callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_unsubscribe( tobii_device_t* device );
+
+/* Internal stream ids (the names of 0..2 are inferred): 0 image, 1 clean IR,
+ * 2 custom, 3 low-frequency head rotation, 4 low-frequency head position,
+ * 5 multiple faces position, 6 image collection, 7 wearable limited image,
+ * 8 secondary camera image. Supported: 0 (the IR image) only, which is what
+ * this library delivers; it is not the DLL's answer. An unknown id is
+ * reported unsupported, not an error; an id above INT32_MAX is
+ * TOBII_ERROR_INVALID_PARAMETER. */
+TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device_t* device,
+    uint32_t stream, tobii_supported_t* supported );
 
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED. Its point type is
  * unknown. */
@@ -94,7 +104,6 @@ TOBII_API tobii_error_t TOBII_CALL tobii_hardware_configuration_get( tobii_devic
 TOBII_API tobii_error_t TOBII_CALL tobii_image_collection_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_collection_unsubscribe( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_internal_capability_supported( tobii_device_t* device, uint32_t capability, void* supported );
-TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device_t* device, uint32_t stream, void* supported );
 TOBII_API tobii_error_t TOBII_CALL tobii_logs_retrieve( tobii_device_t* device, void const* receiver, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_low_frequency_head_position_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_low_frequency_head_position_unsubscribe( tobii_device_t* device );

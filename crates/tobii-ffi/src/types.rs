@@ -59,6 +59,11 @@ pub const TOBII_NOT_SUPPORTED: u32 = 0;
 /// `tobii_supported_t` yes.
 pub const TOBII_SUPPORTED: u32 = 1;
 
+/// `tobii_lens_configuration_writable_t` no.
+pub const TOBII_LENS_CONFIGURATION_NOT_WRITABLE: u32 = 0;
+/// `tobii_lens_configuration_writable_t` yes.
+pub const TOBII_LENS_CONFIGURATION_WRITABLE: u32 = 1;
+
 /// `tobii_capability_t`: the display area can be written.
 pub const TOBII_CAPABILITY_DISPLAY_AREA_WRITABLE: u32 = 0;
 /// `tobii_capability_t`: 2-D calibration.
