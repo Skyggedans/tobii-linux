@@ -286,12 +286,30 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   normalised), gaze data (per eye, tracker frame; no pupil diameter on this
   device), presence (on change), head pose (mm, radians about x/y/z), the IR
   image (280×280, `tobii_image_subscribe`), notifications (display area,
-  calibration), device info, track box, display area (get and set — kept
-  across re-inits and, like the Stream Engine, across sessions), mounting,
-  states, capabilities, and 2-D calibration.
+  calibration, pause), device info, track box, display area (get and set —
+  kept across re-inits and, like the Stream Engine, across sessions),
+  mounting, states, capabilities, 2-D calibration (discarding a point too),
+  a device/host clock pair (`tobii_timesync`), the tracker's stream
+  catalogue (`tobii_enumerate_stream_types`), pause and resume, and the
+  device name. `tobii_hardware_configuration_get` is provisional: the ET5
+  has reported no hardware configuration on Linux, so it returns
+  `TOBII_ERROR_NOT_SUPPORTED`.
   Timestamps are the device clock. Everything the ET5 was never observed doing
   (wearable, face id, illumination, power, firmware, diagnostics, 3-D and
-  per-eye calibration) returns `TOBII_ERROR_NOT_SUPPORTED`.
+  per-eye calibration) returns `TOBII_ERROR_NOT_SUPPORTED`. No licence is
+  checked: what the Stream Engine reserves for its professional, config or
+  internal feature groups, or for an additional-features licence (the IR
+  image), works too.
+
+  A name set with `tobii_set_device_name` is kept by the daemon, not the
+  tracker, in `~/.config/tobii/device-name` (`$XDG_CONFIG_HOME/tobii`): the
+  name on one line, at most 63 bytes. The daemon reads it at start, so
+  `echo Desk > ~/.config/tobii/device-name` and a daemon restart (§5) name
+  the device too; delete the file (and restart) to get the model back.
+
+  A pause (`tobii_pause_device`) holds for every client until any client
+  resumes, the client that paused last disconnects, or the tracker
+  re-initialises; a calibration cannot start while the tracker is paused.
 
   #### OpenTrack's `tracker-tobii` plugin
 
@@ -419,8 +437,11 @@ gaze has no rest pose.)
 - **Head pose arrives ~1 s after the first frame.** The tracker averages the
   first 30 frames as the rest pose (recenter to redo it); a cold device may
   additionally take one re-open (~10 s) before any stream arms.
-- **Lazy claim.** An idle daemon holds no device; it opens the tracker only on
-  the first subscription and releases it when the last client disconnects.
+- **Lazy claim.** An idle daemon holds no device; it opens the tracker on the
+  first subscription or the first request that needs it (device info, a
+  clock pair, a pause, …) and releases it when the last such client
+  disconnects. Facts from the last init (device info, track box, the stream
+  catalogue, …) are answered even while the tracker is unplugged.
 - **"It flies around."** You're talking to an **old daemon** (pre-rebuild) — it
   still has the previous code/units. Restart it (§5).
 - **"Rotations slide."** Tune `TOBII_PIVOT_DOWN` / `TOBII_PIVOT_BACK` (§7).
@@ -429,5 +450,6 @@ gaze has no rest pose.)
 - **Permission denied on the device.** Re-check §3 (udev rule + re-plug).
 - **Checking the daemon end to end.** `target/release/tobii5-init-replay
   ipc-probe` asks the running daemon for everything (device info, track box,
-  mounting, display area, calibration id, clock) and reports the rate of every
-  stream; `--set-display 597,336` also writes a display area.
+  mounting, display area, stream types, hardware configuration, device name,
+  calibration id, calibrating and paused states, clock) and reports the rate
+  of every stream; `--set-display 597,336` also writes a display area.

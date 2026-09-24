@@ -1,6 +1,10 @@
 //! `tobii_licensing.h`. There is nothing to license on Linux: every key
-//! validates, and the feature group is consumer (gaze data, which the Stream
-//! Engine reserves for the professional group, is served anyway).
+//! validates, and the feature group is consumer. No entry point checks it.
+//! What the Stream Engine reserves for a higher group is served anyway: gaze
+//! data and `tobii_timesync` (professional), calibration and the
+//! display-area and device-name writes (config or professional), the IR
+//! image (additional features), the stream catalogue (internal) and, in the
+//! DLL's own service, pause (internal).
 
 use std::ffi::{c_char, c_void};
 

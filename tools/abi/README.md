@@ -59,9 +59,14 @@ Layouts, and where each comes from:
 | `tobii_gaze_data_t` | 168 (8+8+76+76) | 4.1 docs field list |
 | `tobii_geometry_mounting_t` | 36 | 4.1 docs + the device's 2110 response shape |
 | `tobii_calibration_point_data_t` | 32 | 4.1 docs |
+| `tobii_timesync_data_t` | 24 | DLL (`tobii_timesync` writes three qwords at +0/+8/+16); which field is which, and the names, inferred |
+| `tobii_stream_type_t` | 136 | DLL (offsets 0/4/8/72 in `tobii_enumerate_stream_types`); size inferred, field names ours |
+| `tobii_hardware_configuration_t` | 2472, align 8 | DLL (its copy at 0x18014abe0 and the PRP deserialiser at 0x180045056); **provisional**: the values decoded from one Windows 2120 answer, field names and units ours |
 | everything else in `tobii_streams.h` / `tobii_wearable.h` | — | 4.1 docs, unchanged since 1.x |
 
 Undocumented exports are declared in `tobii_internal.h` with the arity the DLL
-shows and best-effort types; all but a handful return
-`TOBII_ERROR_NOT_SUPPORTED` without reading their arguments, so the exact
-parameter types cannot matter at runtime.
+shows. The 11 implemented ones (field of use, IR image, internal-stream
+support, timesync, the stream catalogue, pause and resume, hardware
+configuration) have real types; the other 62 return
+`TOBII_ERROR_NOT_SUPPORTED` without reading their arguments, so their
+best-effort parameter types cannot matter at runtime.

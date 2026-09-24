@@ -91,9 +91,46 @@ the archived 4.1.0 reference. What stands behind the entry points:
 
 | | Entry points |
 |---|---|
-| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, IR image and notification streams; device info, track box, display area (get/set), mounting, states; 2-D calibration |
-| Answered locally | API version, system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing |
-| `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power and pause, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration |
+| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, IR image and notification streams; device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
+| Answered locally | API version, system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing, internal-stream support (the IR image only), lens-configuration writability (never) |
+| `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration |
+
+Where the answers come from, and where they differ from Windows:
+
+- **No licences.** Every key validates and the feature group is consumer, but
+  nothing checks it: gaze data, timesync, calibration, display-area and name
+  writes, the IR image, the stream catalogue and pause all work, though the
+  Stream Engine reserves them for higher feature groups or, for the IR
+  image, an additional-features licence.
+- **Facts from the last init.** Device info, track box, display area,
+  mounting, the stream catalogue and the hardware configuration are what the
+  tracker reported at its last init, so they are answered even while it is
+  unplugged (`TOBII_ERROR_TIMED_OUT` only if the daemon has not seen a tracker
+  yet). The first call that needs the tracker starts it, and it then stays on
+  (IR illuminator lit) for as long as that connection is open, as for an
+  open device in the Stream Engine.
+- **Pause.** One state for the tracker, shared by every client, as in the
+  Stream Engine: the last call wins and any client may resume.
+  `TOBII_STATE_DEVICE_PAUSED` and a `DEVICE_PAUSED_STATE_CHANGED`
+  notification change as soon as the tracker accepts the call. A pause ends
+  when the client that paused last disconnects, and when the tracker
+  re-initialises (after a USB failure or an unplug). A resume the tracker
+  does not answer still succeeds: the daemon re-opens the silent tracker, and
+  its init resumes it. Pausing during a calibration session is
+  `TOBII_ERROR_CALIBRATION_BUSY`; starting one, or asking for
+  `tobii_timesync`, while paused is `TOBII_ERROR_NOT_AVAILABLE`.
+- **Device name.** A name set with `tobii_set_device_name` is kept by the
+  daemon in `~/.config/tobii/device-name`, for every client and later
+  sessions; nothing is written to the tracker. Until one is set,
+  `tobii_get_device_name` gives the model.
+- **Clock pair.** `tobii_timesync` pairs the device timestamp of the next gaze
+  frame with the host clock (`CLOCK_REALTIME`) in a fixed 30 ms bracket; the
+  Stream Engine times a round trip instead.
+- **Hardware configuration.** Its layout is the DLL's, but what the fields
+  hold is inferred from one Windows capture, and on Linux the ET5 has
+  answered its command (2120) with no data, so
+  `tobii_hardware_configuration_get` is `TOBII_ERROR_NOT_SUPPORTED` until it
+  reports one.
 
 The headers are in `crates/tobii-ffi/include/tobii/` (installed to
 `/usr/local/include/tobii/`); OpenTrack's `tracker-tobii` plugin builds against
@@ -164,7 +201,9 @@ tools/abi/dll_abi.py headers                                 # headers vs tobii_
   (you line two ticks up with the marks on the tracker), and the daemon keeps
   whatever display area is set (`~/.config/tobii/display-area`).
 - The calibration sequence mirrors the one captured from Windows; 3-D and
-  per-eye calibration were never captured and are not supported.
+  per-eye calibration were never captured and are not supported. Discarding a
+  2-D point and pausing the tracker send the commands the DLL sends for them
+  (1080, and 3100 with 1), which were never captured.
 - The ET5 reports no pupil diameter; `tobii_gaze_data_t.pupil_validity` is
   always invalid.
 

@@ -1,6 +1,8 @@
 /* tobii/tobii_licensing.h — licensing, as provided by libtobii.so. There is
- * nothing to license: every key validates and the feature group is consumer.
- * Companion to tobii/tobii.h.
+ * nothing to license: every key validates and the feature group is consumer,
+ * and no entry point checks it (what the Stream Engine reserves for the
+ * professional, config or internal groups, or for an additional-features
+ * licence, works too). Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
  */

@@ -9,16 +9,36 @@
 //! - **Implemented** — device lifetime and callbacks, device info, track box,
 //!   display area and mounting (read and write), states, capabilities, the
 //!   gaze point, gaze origin, eye position, user position guide, presence,
-//!   head pose, gaze data, IR image and notification streams, and 2-D
-//!   calibration (the result is saved as the user's calibration).
+//!   head pose, gaze data, IR image and notification streams, 2-D
+//!   calibration (the result is saved as the user's calibration) and
+//!   discarding a 2-D point, the device/host clock pair (`tobii_timesync`),
+//!   the tracker's stream catalogue, device pause and resume, and the device
+//!   name (kept by the host, not the tracker). The hardware configuration is
+//!   implemented provisionally; the ET5 has reported none on Linux, so it
+//!   answers `TOBII_ERROR_NOT_SUPPORTED` there.
 //! - **Answered locally** — API version (4.1.0.3), system clock, output
 //!   frequency (33 Hz), enabled eye (both), feature group (consumer),
 //!   license validation (every key valid), display-area calculation,
-//!   calibration parsing.
+//!   calibration parsing, internal-stream support (the IR image only), lens
+//!   configuration writability (never).
 //! - **`TOBII_ERROR_NOT_SUPPORTED`** — everything the ET5 was never observed
-//!   doing: wearable, face id, illumination, power and pause control,
-//!   firmware, diagnostics, extensions, custom streams, 3-D and per-eye
-//!   calibration.
+//!   doing: wearable, face id, illumination, power control, firmware,
+//!   diagnostics, extensions, custom streams, 3-D and per-eye calibration.
+//!
+//! Nothing is gated by a licence. What the Stream Engine reserves for a
+//! higher feature group or an extra licence (gaze data, timesync,
+//! calibration, display-area and name writes, the IR image, the stream
+//! catalogue, pause) works here under the consumer group this library
+//! reports (see `licensing`).
+//!
+//! An entry point that takes a device checks its arguments in one order: a
+//! call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, then a
+//! null device is `TOBII_ERROR_INVALID_PARAMETER`, then its other arguments
+//! are checked (`TOBII_ERROR_INVALID_PARAMETER` again). Two check an
+//! argument first: `tobii_calibration_start` its eye and
+//! `tobii_calibration_apply` its blob. The DLL checks null pointers before
+//! the callback in some entry points, so the two differ only for an invalid
+//! argument passed from inside a callback.
 //!
 //! `tobii_device_create` connects to the daemon (auto-spawning it if needed),
 //! so several processes can use the device at once. Pump with
