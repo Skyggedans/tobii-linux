@@ -64,8 +64,8 @@ pub struct GazeDataEye {
 pub struct GazeData {
     /// Device timestamp, microseconds.
     pub timestamp_tracker_us: i64,
-    /// Host timestamp at receipt, microseconds; same clock as
-    /// `tobii_system_clock`.
+    /// Host timestamp at receipt, microseconds: [`crate::host_clock_us`],
+    /// the clock of `tobii_system_clock`.
     pub timestamp_system_us: i64,
     /// The user's left eye.
     pub left: GazeDataEye,

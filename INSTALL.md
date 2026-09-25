@@ -59,7 +59,7 @@ embedded assets (it is ~0.45 MB rather than ~20 MB).
 | `tobii-proto` | wire formats: framing, TLV, commands and responses, the 0x500/0x504/0x50e streams, device facts, the `TBI5LOG1` log | none |
 | `tobii-pose` | face landmarks and the head-pose fit; owns `models/` | `ort` |
 | `tobii-usb` | USB transport and the live 0x83 engine; owns `init_packets_ep.txt` | `rusb` |
-| `tobii-ipc` | the daemon protocol and the display geometry | none (std only) |
+| `tobii-ipc` | the daemon protocol, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
 | `tobii-log` | shared `tracing` subscriber setup | — |
 | `tobiid` | the daemon binary | — |

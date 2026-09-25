@@ -261,8 +261,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* devic
 /* A no-op: samples carry the device clock, and there is no offset estimate to
  * refresh (tobii_timesync takes a fresh clock pair on every call). */
 TOBII_API tobii_error_t TOBII_CALL tobii_update_timesync( tobii_device_t* device );
-/* Microseconds since the Unix epoch: the clock of gaze data's
- * timestamp_system_us. */
+/* CLOCK_MONOTONIC microseconds, whose epoch is undefined (the DLL reads
+ * QueryPerformanceCounter): the clock of gaze data's timestamp_system_us and
+ * of tobii_timesync's system times. */
 TOBII_API tobii_error_t TOBII_CALL tobii_system_clock( tobii_api_t* api, int64_t* timestamp_us );
 
 /* Serial, model, generation and firmware; runtime_build_version names

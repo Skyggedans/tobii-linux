@@ -1,6 +1,7 @@
-//! Tiny dependency-free IPC between the daemon (`tobiid`), thin executables,
-//! and the `libtobii.so` client. Length-prefixed binary frames over a Unix
-//! domain socket. One frame = `u32 LE length` + `1 byte tag` + body.
+//! Tiny IPC between the daemon (`tobiid`), thin executables, and the
+//! `libtobii.so` client, with no dependency but libc. Length-prefixed binary
+//! frames over a Unix domain socket. One frame = `u32 LE length` + `1 byte
+//! tag` + body.
 //!
 //! | tag | direction | body |
 //! |---|---|---|
@@ -11,7 +12,9 @@
 //! | `0x11` REPLY | daemon -> client | `u32 id`, `u8 status`, payload |
 //! | `0x20` HEAD .. `0x27` NOTIFICATION | daemon -> client | samples ([`ServerMsg`]) |
 //!
-//! Sample timestamps are the device clock in microseconds.
+//! Sample timestamps are the device clock in microseconds. Host timestamps
+//! (gaze data's system time, the TIMESYNC pair) are [`host_clock_us`], which
+//! is also what `tobii_system_clock` returns.
 //!
 //! The SUBSCRIBE mask is written as `u32 LE`, whose first byte is the low
 //! byte of the mask: a daemon that reads only one byte still sees every
@@ -22,11 +25,13 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod clock;
 pub mod geometry;
 pub mod request;
 mod sample;
 mod wire;
 
+pub use clock::host_clock_us;
 pub use sample::{
     EyePair, EyePoint, GazeData, GazeDataEye, Image, Notification, NotificationValue, ServerMsg,
     decode_server, encode_eye_position, encode_gaze, encode_gaze_data, encode_gaze_origin,

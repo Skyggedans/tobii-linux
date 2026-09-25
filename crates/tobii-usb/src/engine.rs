@@ -53,7 +53,8 @@ pub struct PoseSample {
 pub struct GazeSample {
     /// Everything the frame carries, device timestamp included.
     pub frame: GazeFrame,
-    /// Host wall clock when the frame was read, microseconds.
+    /// Host time when the frame was read, microseconds
+    /// ([`tobii_ipc::host_clock_us`]).
     pub host_rx_us: i64,
 }
 

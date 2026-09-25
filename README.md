@@ -155,8 +155,9 @@ Where the answers come from, and where they differ from Windows:
   sessions; nothing is written to the tracker. Until one is set,
   `tobii_get_device_name` gives the model.
 - **Clock pair.** `tobii_timesync` pairs the device timestamp of the next gaze
-  frame with the host clock (`CLOCK_REALTIME`) in a fixed 30 ms bracket; the
-  Stream Engine times a round trip instead. With no tracker plugged in it is
+  frame with the host clock (`CLOCK_MONOTONIC`, as `tobii_system_clock`) in a
+  fixed 30 ms bracket; the Stream Engine times a round trip instead, on
+  `QueryPerformanceCounter`. With no tracker plugged in it is
   `TOBII_ERROR_CONNECTION_FAILED` rather than a wait, and a tracker unplugged
   shortly before or during the call makes it so about a second after the
   daemon gives the tracker up.
@@ -181,7 +182,7 @@ rather than 20 MB).
 | `tobii-proto` | wire formats: framing, TLV, commands, the gaze/presence/image streams, device facts, the capture log | none |
 | `tobii-pose` | face landmarks and the head-pose fit; owns the model | `ort` |
 | `tobii-usb` | USB transport and the live `0x83` engine; owns the init capture | `rusb` |
-| `tobii-ipc` | the daemon protocol and the display geometry | none (std only) |
+| `tobii-ipc` | the daemon protocol, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
 | `tobii-log` | shared `tracing` setup | — |
 | `tobiid` | the daemon | — |

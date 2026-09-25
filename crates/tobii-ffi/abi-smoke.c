@@ -9,6 +9,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+/* clock_gettime is POSIX, not C11. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <tobii/tobii.h>
 #include <tobii/tobii_advanced.h>
 #include <tobii/tobii_config.h>
@@ -21,6 +24,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 /* Every listed symbol, by address: each must be declared (with C linkage) by
  * some header, or this does not compile, and exported, or it does not link. */
@@ -46,6 +50,20 @@ static void head_pose_callback( tobii_head_pose_t const* head_pose, void* user_d
 {
     (void)head_pose;
     (void)user_data;
+}
+
+/* How far the system clock reads behind the wall clock at least: 1e15 us,
+ * some 31.7 years, where the wall clock is some 1.8e15 us past its epoch and
+ * CLOCK_MONOTONIC counts from boot. */
+static int64_t const far_from_the_wall_clock_us = 1000000000000000LL;
+
+static int64_t clock_us( clockid_t clock )
+{
+    struct timespec ts = { 0 };
+    int const rc = clock_gettime( clock, &ts );
+    assert( rc == 0 );
+    (void)rc;
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 int main( void )
@@ -75,10 +93,16 @@ int main( void )
     assert( tobii_enumerate_local_device_urls_ex( api, url_receiver, &url_count, TOBII_DEVICE_GENERATION_IS4 )
         == TOBII_ERROR_NO_ERROR );
 
+    /* The system clock is CLOCK_MONOTONIC, as the daemon's host timestamps
+     * are: it reads between two readings of that, and far behind the wall
+     * clock. */
+    int64_t const before = clock_us( CLOCK_MONOTONIC );
     int64_t t0 = 0, t1 = 0;
     assert( tobii_system_clock( api, &t0 ) == TOBII_ERROR_NO_ERROR );
     assert( tobii_system_clock( api, &t1 ) == TOBII_ERROR_NO_ERROR );
-    assert( t0 > 0 && t1 >= t0 );
+    int64_t const after = clock_us( CLOCK_MONOTONIC );
+    assert( before <= t0 && t0 <= t1 && t1 <= after );
+    assert( clock_us( CLOCK_REALTIME ) - t1 > far_from_the_wall_clock_us );
 
     /* An out-of-range field_of_use is refused without writing the handle —
      * this is what a caller built against the pre-4.0 header trips over. */

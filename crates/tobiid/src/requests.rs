@@ -166,8 +166,9 @@ pub(crate) fn facts(
 
 /// A device/host clock pair from the first gaze frame seen after the
 /// request, so that it is fresh and belongs to the running device session.
-/// Frames are counted rather than compared with the wall clock, which may
-/// step back meanwhile. Starts the engine if needed and, as the facts do,
+/// Frames are counted rather than their host times compared with the
+/// request's: one read just before the request and handed over after it is
+/// still new to it. Starts the engine if needed and, as the facts do,
 /// keeps it up while `client` stays connected. `NOT_AVAILABLE` while the
 /// device is paused, since it sends none. `CONNECTION_FAILED` when no
 /// tracker can send one: at once when there is none on the bus to start an
@@ -515,7 +516,7 @@ pub(crate) fn apply_display_request(st: &mut State) {
 pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-    use tobii_proto::time::now_us;
+    use tobii_ipc::host_clock_us;
 
     #[test]
     #[allow(clippy::float_cmp)] // reason: parsed literals
@@ -674,13 +675,12 @@ pub(crate) mod tests {
 
     #[test]
     fn timesync_serves_the_first_gaze_frame_after_the_request() {
-        let asked = i64::try_from(now_us()).expect("now");
+        let asked = host_clock_us();
         let device_us = AtomicI64::new(5_000_000);
         // The gaze stream: a newer frame every 10 ms.
         let (reply, state) = timesync_from(Some((4_000_000, 1)), |state| {
             let device = device_us.fetch_add(10_000, Ordering::Relaxed);
-            let host = i64::try_from(now_us()).expect("now");
-            lock_state(state).note_clock(device, host);
+            lock_state(state).note_clock(device, host_clock_us());
         });
 
         assert_eq!(reply.status, status::OK);
@@ -695,10 +695,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn timesync_serves_a_new_frame_across_a_wall_clock_step_back() {
-        // The host clock went back an hour: new frames look older than the
-        // request, but they are still new.
-        let host_us = i64::try_from(now_us()).expect("now") - 3_600_000_000;
+    fn timesync_serves_a_new_frame_read_before_the_request() {
+        // Read before the request and handed over after it: the frame's host
+        // time is older than the request, here by far more than any latency
+        // bound a host-time check could allow, but it is still new.
+        let host_us = host_clock_us() - 10 * FRAME_LATENCY_US;
         let (reply, _) = timesync_from(Some((4_000_000, 1)), |state| {
             lock_state(state).note_clock(5_000_000, host_us);
         });

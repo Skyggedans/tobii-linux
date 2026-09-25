@@ -2,7 +2,7 @@
 //! and capabilities.
 
 use std::ffi::{c_char, c_void};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tobii_ipc::request::{self, decode_device_info, decode_track_box, kind};
 
@@ -406,8 +406,10 @@ pub unsafe extern "C" fn tobii_update_timesync(device: *mut Device) -> Status {
     }
 }
 
-/// The host clock `timestamp_system_us` in gaze data is taken from:
-/// microseconds since the Unix epoch.
+/// The host clock, `CLOCK_MONOTONIC` in microseconds
+/// ([`tobii_ipc::host_clock_us`], which the daemon reads too): the clock of
+/// gaze data's `timestamp_system_us` and of `tobii_timesync`'s host times.
+/// Its epoch is undefined, as that of the DLL's `QueryPerformanceCounter` is.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `timestamp_us` must be null or valid
@@ -417,9 +419,7 @@ pub unsafe extern "C" fn tobii_system_clock(api: *mut Api, timestamp_us: *mut i6
     if api.is_null() || timestamp_us.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+    let now = tobii_ipc::host_clock_us();
     // SAFETY: non-null, and the caller guarantees it is writable.
     unsafe { timestamp_us.write(now) };
     TOBII_ERROR_NO_ERROR
@@ -758,16 +758,23 @@ mod tests {
     }
 
     #[test]
-    fn the_system_clock_moves_forward() {
+    fn the_system_clock_is_the_daemons_host_clock() {
         let api = api();
-        let (mut a, mut b) = (0i64, 0i64);
-        // SAFETY: `api` is live; `a`/`b` are live locals.
-        unsafe {
-            assert_eq!(tobii_system_clock(api, &raw mut a), 0);
-            assert_eq!(tobii_system_clock(api, &raw mut b), 0);
-            assert_eq!(tobii_api_destroy(api), 0);
-        }
-        assert!(a > 1_600_000_000_000_000 && b >= a);
+        let mut t = 0i64;
+        let before = tobii_ipc::host_clock_us();
+        // SAFETY: `api` is live; `t` is a live local.
+        let status = unsafe { tobii_system_clock(api, &raw mut t) };
+        let after = tobii_ipc::host_clock_us();
+        // SAFETY: `api` is live and not used again.
+        assert_eq!(unsafe { tobii_api_destroy(api) }, 0);
+
+        assert_eq!(status, 0);
+        // That this is `CLOCK_MONOTONIC` and not the wall clock is
+        // `tobii_ipc`'s to show.
+        assert!(
+            (before..=after).contains(&t),
+            "{t} is not between {before} and {after}"
+        );
     }
 
     unsafe extern "C" fn count_urls(_url: *const c_char, ud: *mut c_void) {

@@ -20,6 +20,7 @@ use crate::engine::{
     Shared,
 };
 use std::sync::mpsc::Receiver;
+use tobii_ipc::host_clock_us;
 use tobii_proto::facts::{DeviceFacts, DeviceNotification, decode_notification};
 use tobii_proto::gaze83::{GazeFrame, PresenceFrame, decode_gaze_frame, decode_presence_frame};
 use tobii_proto::image83::{ImageFrame, decode_image_payload, upscale2x_into};
@@ -29,7 +30,6 @@ use tobii_proto::protocol::{
     MARKER_STREAM, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, chunk_command,
     declared_len, marker, parse_message, seq, stream_id, stream_start_packet, stream_stop_packet,
 };
-use tobii_proto::time::now_us;
 
 /// USB vendor id of the Tobii Eye Tracker 5.
 pub(crate) const VID: u16 = 0x2104;
@@ -1503,7 +1503,7 @@ impl Pump<'_> {
                 self.resume.on_gaze();
                 let _ = self.tx.send(Sample::Gaze(Box::new(GazeSample {
                     frame: *frame,
-                    host_rx_us: to_i64_us(now_us()),
+                    host_rx_us: host_clock_us(),
                 })));
             }
             Incoming::Presence(p) => {
@@ -1864,6 +1864,39 @@ mod tests {
             Incoming::Notification(DeviceNotification::DisplayAreaChanged(_))
         ));
         assert_eq!(classify(&[1, 2, 3]), Incoming::Other);
+    }
+
+    #[test]
+    fn a_gaze_frame_is_stamped_with_the_host_clock_when_read() {
+        let shared = Shared::default();
+        let (_queue, commands) = std::sync::mpsc::channel();
+        let (tx, samples) = std::sync::mpsc::channel();
+        let mailbox = PoseMailbox::default();
+        let mut pump = Pump {
+            shared: &shared,
+            commands: &commands,
+            tx: &tx,
+            mailbox: &mailbox,
+            cmd_seq: 0,
+            outstanding: None,
+            image_live: false,
+            last_gaze: Instant::now(),
+            resume: ResumeWatch::default(),
+        };
+
+        let before = host_clock_us();
+        pump.deliver(classify(&fixture("session1-gaze-frame")));
+        let after = host_clock_us();
+
+        let Ok(Sample::Gaze(gaze)) = samples.try_recv() else {
+            panic!("the frame was not delivered as gaze");
+        };
+        // The daemon's TIMESYNC pair and gaze data's system time are this.
+        assert!(
+            (before..=after).contains(&gaze.host_rx_us),
+            "{} is not between {before} and {after}",
+            gaze.host_rx_us
+        );
     }
 
     #[test]

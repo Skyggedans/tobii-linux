@@ -254,7 +254,8 @@ pub fn decode_geometry_mounting(payload: &[u8]) -> Option<GeometryMounting> {
 
 /// A device timestamp bracketed by two host timestamps: the device clock read
 /// `device_us` at some host time between `host_start_us` and `host_end_us`
-/// (microseconds, the host clock of `tobii_system_clock`).
+/// (microseconds, [`crate::host_clock_us`], the clock of
+/// `tobii_system_clock`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Timesync {
     /// Host time before the device timestamp was taken.

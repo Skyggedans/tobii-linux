@@ -7,9 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Deliberately dependency-free: libtobii.so links this and nothing else, which
-# is what keeps the shared object small.
+# libtobii.so links this, so it depends on libc alone (for the host clock,
+# `host_clock_us`), which is what keeps the shared object small.
 [dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

@@ -89,8 +89,8 @@ pub(crate) struct State {
     /// device init: the device clock restarts with the device, so a pair
     /// holds for one init only.
     pub(crate) clock: Option<(i64, i64)>,
-    /// Gaze frames seen so far. A TIMESYNC waits for this to move, which,
-    /// unlike the wall clock, never steps back.
+    /// Gaze frames seen so far. A TIMESYNC waits for this to move rather
+    /// than for a host time past its own (see `requests::timesync`).
     pub(crate) gaze_frames: u64,
     /// The display area a client set (or the saved one), re-applied at every
     /// device init.
@@ -937,7 +937,7 @@ pub(crate) mod tests {
     #[test]
     fn a_stopped_engine_takes_its_clock_pair_along() {
         let mut st = state_with_client(1);
-        st.clock = Some((5_000_000, 1_700_000_000_000_000));
+        st.clock = Some((5_000_000, 12_000_000_000));
         // Nobody wants the engine (and prewarm is off): no engine starts.
         st.reconcile();
         assert_eq!(st.clock, None);
@@ -1125,7 +1125,7 @@ pub(crate) mod tests {
     #[test]
     fn a_device_init_takes_the_clock_pair_along() {
         let mut st = state_with_client(1);
-        st.note_clock(5_000_000, 1_700_000_000_000_000);
+        st.note_clock(5_000_000, 12_000_000_000);
 
         st.observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
 

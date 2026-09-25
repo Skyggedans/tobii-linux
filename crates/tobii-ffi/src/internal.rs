@@ -145,10 +145,11 @@ const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(27);
 /// device timestamp and the bracket is the 30 ms before the daemon read it.
 /// The DLL instead times a round trip to its service, and its own offset
 /// estimator skips pairs wider than 6 ms, though it still returns them. The
-/// host clock is `tobii_system_clock`'s, `CLOCK_REALTIME` rather than the
-/// DLL's monotonic QPC. Nothing is written unless the call succeeds;
-/// `TOBII_ERROR_NOT_AVAILABLE` while the tracker is paused,
-/// `TOBII_ERROR_CONNECTION_FAILED` when no tracker is plugged in.
+/// host clock is `tobii_system_clock`'s, `CLOCK_MONOTONIC` rather than the
+/// DLL's QPC, though like it monotonic with an undefined epoch. Nothing is
+/// written unless the call succeeds; `TOBII_ERROR_NOT_AVAILABLE` while the
+/// tracker is paused, `TOBII_ERROR_CONNECTION_FAILED` when no tracker is
+/// plugged in.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `timesync` must be null or
@@ -544,17 +545,17 @@ mod tests {
     #[test]
     fn timesync_puts_the_daemon_pair_in_stream_engine_order() {
         let payload = encode_timesync(&Timesync {
-            host_start_us: 1_700_000_000_000_000,
+            host_start_us: 12_000_000_000,
             device_us: 5_000_000,
-            host_end_us: 1_700_000_000_030_000,
+            host_end_us: 12_000_030_000,
         });
         assert_eq!(
             timesync_with(0, payload),
             (
                 TOBII_ERROR_NO_ERROR,
                 TimesyncData {
-                    system_start_us: 1_700_000_000_000_000,
-                    system_end_us: 1_700_000_000_030_000,
+                    system_start_us: 12_000_000_000,
+                    system_end_us: 12_000_030_000,
                     tracker_us: 5_000_000,
                 }
             )

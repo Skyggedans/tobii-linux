@@ -1872,6 +1872,9 @@ dependencies = [
 [[package]]
 name = "tobii-ipc"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "tobii-log"
