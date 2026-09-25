@@ -218,6 +218,42 @@ systemctl --user start tobiid.socket
 
 `pgrep -a tobiid` should then list at most one daemon.
 
+**Running clients.** A restart, like a crash, closes every client's
+connection:
+
+- `paperwm-gaze` connects again by itself, once a second.
+- `tobii-opentrack`, and `tobii-gaze-keys` run by hand, exit with an error
+  about the lost connection; start them again. The `tobii-gaze-keys`
+  service (`make enable-keys`) needs nothing: systemd restarts it along with
+  `tobiid`, and 2 s after it exits on a crash.
+- `tobii-calibrate` fails a calibration under way and shows the error in its
+  window until Esc; run it again. Once a calibration has finished (and is
+  saved), its verification view only stops showing gaze.
+- A `libtobii.so` application is told by `tobii_device_process_callbacks`
+  (`TOBII_ERROR_CONNECTION_FAILED`, §8); libtobii does not reconnect by
+  itself. The application recovers when a `tobii_device_reconnect` succeeds
+  (it fails until a daemon is back, so retry it), or when it destroys the
+  device and creates it again, which, unlike a reconnect, spawns a daemon if
+  none listens. A reconnect connects to a running daemon and never spawns
+  one, so under 4b and 4c it succeeds once the restarted service is up, and
+  under 4a only once some client has spawned a new daemon. It restores the
+  application's subscriptions; a calibration session or pause the old
+  connection held has ended. An application that does neither gets no
+  samples again. OpenTrack's `tracker-tobii` plugin does neither by itself:
+  it recovers when tracking is stopped and started, which creates the device
+  again (§8).
+
+After a crash under 4c, systemd waits `RestartSec=2` before it starts the
+daemon again. A reconnect with subscriptions meanwhile connects into the
+socket's backlog, gets no answer within its ~500 ms and gives up. The
+restarted daemon still serves each such abandoned connection (it starts the
+tracker's engine for it, then drops it again unless another client wants
+it), which can make the first attempts after it is up miss their ~500 ms
+too. Expect a few seconds and some retries before samples resume. A
+reconnect with no subscriptions has nothing to wait for and succeeds as soon
+as it connects; the application's first requests then wait for the daemon to
+start, and can time out.
+
 ## 6. Logs & debug
 
 All binaries log through `tracing` to **stderr**: one line per event with a
@@ -332,6 +368,18 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   resumes, the client that paused last disconnects, or the tracker
   re-initialises; a calibration cannot start while the tracker is paused.
 
+  A lost daemon connection (a restart or crash, §5) is reported, not
+  repaired: `tobii_device_process_callbacks` delivers what had arrived and
+  then returns `TOBII_ERROR_CONNECTION_FAILED` on every call until a
+  `tobii_device_reconnect` succeeds (retry it: it fails while the daemon is
+  not back), and `tobii_wait_for_callbacks` wakes once for it. The same
+  error from a request (a clock pair, a pause, a calibration, a display-area
+  write) can instead mean the daemon has no tracker, over a connection that
+  is fine; a reconnect then succeeds without bringing the tracker back. An
+  unplugged tracker never shows in `tobii_device_process_callbacks`: its
+  samples stop and resume on the same connection once it is back (§9, *Lazy
+  claim*).
+
   #### OpenTrack's `tracker-tobii` plugin
 
   The Windows plugin builds against `libtobii.so` as-is once OpenTrack's
@@ -344,6 +392,19 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
 
   Then pick *Tobii Eye Tracker* as OpenTrack's tracker. This is the alternative
   to the `tobii-opentrack` UDP bridge above; the bridge needs no plugin at all.
+
+  The plugin needs a reconnect call to survive a daemon restart or crash
+  (§5). As it stands it never calls `tobii_device_reconnect`, and on any
+  error from `tobii_device_process_callbacks` it leaves the pose unset,
+  which OpenTrack takes as all zeros, the head at the tracker's origin. So
+  from the restart on, the view jumps away (with OpenTrack's centering on,
+  by the pose it was centered at) and stays there until you stop and start
+  tracking in OpenTrack, which creates the device again. A plugin that, on
+  `TOBII_ERROR_CONNECTION_FAILED`, calls `tobii_device_reconnect` at most
+  once a second and keeps reporting the last pose meanwhile picks up again
+  by itself once the daemon is back; that change to the plugin is a separate
+  patch. An unplugged tracker needs none of this: the pose holds, then
+  resumes once the tracker is back.
 - **`tobii-gaze-keys`** — subscribes to **gaze**. While you look at the left/right edge
   of the screen **and hold a Super/Meta key**, it taps the **Left**/**Right**
   arrow key once per second, via `/dev/uinput` (works under both X11 and Wayland).

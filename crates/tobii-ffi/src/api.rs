@@ -328,7 +328,11 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
 /// which is what the 4.1 documentation says to call. The DLL returns the error
 /// without emptying its queue on that call. A tracker unplugged while the
 /// daemon runs does not lose the connection: the daemon starts the tracker
-/// again once it is back, and its samples resume.
+/// again once it is back, and its samples resume. Requests that need the
+/// tracker fail with `TOBII_ERROR_CONNECTION_FAILED` all the same once the
+/// daemon has given it up, a few seconds after the unplug (see
+/// `tobii_device_reconnect`), so this is the call that says whether the
+/// connection is gone.
 ///
 /// # Safety
 /// `device` must be null or a live handle from `tobii_device_create` that no

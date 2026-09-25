@@ -60,18 +60,28 @@
 //! restarted, or dropped a client that stopped reading),
 //! `tobii_device_process_callbacks` delivers what had arrived and then
 //! returns `TOBII_ERROR_CONNECTION_FAILED` on every call until
-//! `tobii_device_reconnect` connects again; libtobii never reconnects by
-//! itself. A reconnect only connects (it never spawns a daemon), fails with
-//! `TOBII_ERROR_CONNECTION_FAILED` at once when none listens, and restores
-//! the subscriptions, not a calibration session or pause the lost connection
-//! held. `tobii_wait_for_callbacks` wakes for the loss until a process call
-//! reports it, so a wait-and-process loop wakes once, and then waits out its
-//! timeout as for a quiet device; as in the DLL it never returns
-//! `TOBII_ERROR_CONNECTION_FAILED`. A tracker unplugged while the daemon runs
-//! is not a lost connection: calls that need the tracker fail with
-//! `TOBII_ERROR_CONNECTION_FAILED` meanwhile (and a reconnect succeeds
-//! without bringing it back), but processing carries on and samples resume
-//! once it is back.
+//! `tobii_device_reconnect` connects again. libtobii never reconnects by
+//! itself, so an application that never calls it stays lost until it creates
+//! the device again. `tobii_wait_for_callbacks` wakes for the loss until a
+//! process call reports it, so a wait-and-process loop wakes once, and then
+//! waits out its timeout as for a quiet device; as in the DLL it never
+//! returns `TOBII_ERROR_CONNECTION_FAILED`. A reconnect only connects: unlike
+//! `tobii_device_create` it never spawns a daemon, and any failure is
+//! `TOBII_ERROR_CONNECTION_FAILED` within ~500 ms (at once when nothing
+//! listens). It restores the subscriptions, not a calibration session or
+//! pause the lost connection held.
+//!
+//! `TOBII_ERROR_CONNECTION_FAILED` has a second source: a request that needs
+//! the tracker live (a clock pair, a pause, a calibration, a display-area
+//! write) gets it from a daemon that has no tracker, over a connection that
+//! is fine. While the tracker is away, a reconnect succeeds without bringing
+//! it back. A tracker unplugged while the daemon runs is not a lost
+//! connection and never surfaces through `tobii_device_process_callbacks`:
+//! its samples stop, and resume on the same connection once the daemon has
+//! started the tracker again after a replug. The next process call tells the
+//! two apart: a request that failed because the connection is gone has marked it
+//! lost, so that call reports the loss, while after a daemon's answer that it
+//! has no tracker it returns `TOBII_ERROR_NO_ERROR`.
 //!
 //! Every entry point takes raw handles from C, so each is an `unsafe fn` whose
 //! `# Safety` section states what the caller must uphold; the `unsafe` blocks

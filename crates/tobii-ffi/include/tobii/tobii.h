@@ -239,20 +239,24 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_create( tobii_api_t* api, char c
 TOBII_API tobii_error_t TOBII_CALL tobii_device_destroy( tobii_device_t* device );
 
 /* Blocks until a device has a sample queued or a lost daemon connection not
- * yet reported by tobii_device_process_callbacks, or ~100 ms per idle device.
- * A reported loss waits like an idle device. Never
- * TOBII_ERROR_CONNECTION_FAILED. */
+ * yet reported by tobii_device_process_callbacks, or ~100 ms per idle device,
+ * so a wait-and-process loop wakes once for a loss. A reported loss waits
+ * like an idle device. Never TOBII_ERROR_CONNECTION_FAILED. */
 TOBII_API tobii_error_t TOBII_CALL tobii_wait_for_callbacks( int device_count,
     tobii_device_t* const* devices );
 /* Once the daemon connection is lost: delivers what had arrived, then returns
  * TOBII_ERROR_CONNECTION_FAILED on every call until tobii_device_reconnect
- * connects again. */
+ * connects again; libtobii never reconnects by itself. A tracker unplug is
+ * not reported here: the daemon keeps the connection, and the samples resume
+ * on it after a replug. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
 /* Connects to a running daemon (never spawns one) and restores the
  * subscriptions, not a calibration session or pause. Any failure is
  * TOBII_ERROR_CONNECTION_FAILED within ~500 ms and leaves the device as it
- * was. */
+ * was. While the daemon has no tracker (a request's
+ * TOBII_ERROR_CONNECTION_FAILED with the connection intact) it succeeds
+ * without bringing one back. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
 /* A no-op: samples carry the device clock, and there is no offset estimate to
  * refresh (tobii_timesync takes a fresh clock pair on every call). */
