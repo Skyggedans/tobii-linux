@@ -248,12 +248,24 @@ pub unsafe extern "C" fn tobii_device_destroy(device: *mut Device) -> Status {
 /// How long `tobii_wait_for_callbacks` blocks per idle device before giving up.
 const WAIT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Block until at least one of `devices` has a sample queued, waiting up to
-/// ~100 ms per idle device. Returns `TOBII_ERROR_TIMED_OUT` when none has.
-/// Devices from different API handles are refused, as in the DLL. A call
+/// Block until at least one of `devices` has something to process, waiting
+/// up to ~100 ms per idle device. Returns `TOBII_ERROR_TIMED_OUT` when none
+/// has. Devices from different API handles are refused, as in the DLL. A call
 /// from inside a callback is refused after the count and null checks and
 /// before any device is read, so before that API check, which the DLL makes
 /// first.
+///
+/// Something to process is a queued sample, or a lost daemon connection that
+/// `tobii_device_process_callbacks` has not reported yet. A loss wakes every
+/// wait until a process call reports it as `TOBII_ERROR_CONNECTION_FAILED`,
+/// so a wait-and-process loop wakes once for it. After that, until
+/// `tobii_device_reconnect`, a lost device waits out its ~100 ms like a quiet
+/// one rather than answering at once and spinning the caller's loop; a live
+/// device waited on with it is still reported, once that ~100 ms is up. The
+/// wake is libtobii's own choice, within what the 4.1 documentation promises
+/// for `TOBII_ERROR_NO_ERROR` ("there is something to process"); the DLL
+/// shows none. As in the DLL, whose internal wait gives back only 0 or 1,
+/// this never returns `TOBII_ERROR_CONNECTION_FAILED` itself.
 ///
 /// # Safety
 /// `devices` must be null or point to `device_count` initialised
@@ -309,6 +321,15 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
 
 /// Dispatch every queued sample to the subscribed callbacks, on this thread.
 ///
+/// Once the daemon connection is lost (tobiid stopped, crashed or was
+/// restarted, or dropped this client), the samples that had arrived are still
+/// delivered, and then this returns `TOBII_ERROR_CONNECTION_FAILED`, on that
+/// call and on every later one until `tobii_device_reconnect` connects again,
+/// which is what the 4.1 documentation says to call. The DLL returns the error
+/// without emptying its queue on that call. A tracker unplugged while the
+/// daemon runs does not lose the connection: the daemon starts the tracker
+/// again once it is back, and its samples resume.
+///
 /// # Safety
 /// `device` must be null or a live handle from `tobii_device_create` that no
 /// other thread uses during the call. The callbacks registered on it are
@@ -317,15 +338,13 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
 pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> Status {
     // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
     match unsafe { device_mut(device) } {
-        Ok(d) => {
-            d.process();
-            TOBII_ERROR_NO_ERROR
-        }
+        Ok(d) => d.process(),
         Err(status) => status,
     }
 }
 
-/// Drop every sample queued for `device` without delivering it.
+/// Drop every sample queued for `device` without delivering it. A lost
+/// daemon connection is still reported by the next process call.
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
@@ -341,7 +360,8 @@ pub unsafe extern "C" fn tobii_device_clear_callback_buffers(device: *mut Device
     }
 }
 
-/// Reconnect to the daemon, keeping the subscriptions.
+/// Reconnect to the daemon, keeping the subscriptions. Once it has
+/// connected, a later loss of the new connection is reported again.
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
@@ -859,6 +879,88 @@ mod tests {
                 assert_eq!(tobii_device_destroy(d), 0);
             }
         }
+    }
+
+    /// A lost daemon connection wakes the wait once, is reported by the
+    /// process call, and then waits out the timeout like a quiet device; a
+    /// live device waited on with it is still reported, and its samples
+    /// delivered.
+    #[test]
+    fn wait_for_callbacks_wakes_once_for_a_lost_connection_then_times_out() {
+        let (mut lost_hits, mut busy_hits) = (0u32, 0u32);
+        // Nothing queued, so only the loss can wake the first wait.
+        let (lost, _daemons) =
+            crate::device::tests::lost_device(0, vec![], (&raw mut lost_hits).cast());
+        let lost = Box::into_raw(Box::new(lost));
+        let busy = device_with_two_samples_per_ack();
+        let (one, both) = ([lost], [lost, busy]);
+        // SAFETY: the devices are live and each destroyed once below; the
+        // counters outlive them; the arrays are live locals of the length
+        // passed.
+        unsafe {
+            assert_eq!(
+                tobii_wait_for_callbacks(1, one.as_ptr()),
+                TOBII_ERROR_NO_ERROR,
+                "woken by the loss"
+            );
+            assert_eq!(
+                tobii_device_process_callbacks(lost),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+            let t = std::time::Instant::now();
+            assert_eq!(
+                tobii_wait_for_callbacks(1, one.as_ptr()),
+                TOBII_ERROR_TIMED_OUT
+            );
+            assert!(t.elapsed() >= WAIT_POLL_TIMEOUT, "slept out the timeout");
+            assert_eq!(
+                tobii_device_process_callbacks(lost),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+
+            assert_eq!(
+                crate::streams::tobii_gaze_origin_subscribe(
+                    busy,
+                    Some(crate::device::tests::count_pair as EyePairFn),
+                    (&raw mut busy_hits).cast()
+                ),
+                TOBII_ERROR_NO_ERROR
+            );
+            assert_eq!(
+                tobii_wait_for_callbacks(2, both.as_ptr()),
+                TOBII_ERROR_NO_ERROR
+            );
+            assert_eq!(tobii_device_process_callbacks(busy), TOBII_ERROR_NO_ERROR);
+            for d in [lost, busy] {
+                assert_eq!(tobii_device_destroy(d), TOBII_ERROR_NO_ERROR);
+            }
+        }
+        assert_eq!(lost_hits, 0);
+        assert_eq!(busy_hits, 2, "the live device's samples");
+    }
+
+    /// `tobii_recenter` to a daemon that stopped reading fails, and loses
+    /// the connection: the next process call reports it, after the sample
+    /// that came first, although the reader has seen nothing.
+    #[test]
+    fn a_failed_recenter_loses_the_connection() {
+        let mut hits = 0u32;
+        let (d, daemon) = crate::device::tests::deaf_daemon_device((&raw mut hits).cast());
+        let d = Box::into_raw(Box::new(d));
+        // SAFETY: `d` is live and destroyed once below; `hits` outlives it.
+        unsafe {
+            assert_eq!(
+                crate::streams::tobii_recenter(d),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+            assert_eq!(
+                tobii_device_process_callbacks(d),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+            assert_eq!(tobii_device_destroy(d), TOBII_ERROR_NO_ERROR);
+        }
+        assert_eq!(hits, 1);
+        drop(daemon);
     }
 
     /// The handles a callback tries to release, and what it got back: one

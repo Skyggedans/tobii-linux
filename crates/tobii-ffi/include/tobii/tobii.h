@@ -238,9 +238,15 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_create( tobii_api_t* api, char c
     tobii_field_of_use_t field_of_use, tobii_device_t** device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_destroy( tobii_device_t* device );
 
-/* Blocks until a device has a sample queued, or ~100 ms per idle device. */
+/* Blocks until a device has a sample queued or a lost daemon connection not
+ * yet reported by tobii_device_process_callbacks, or ~100 ms per idle device.
+ * A reported loss waits like an idle device. Never
+ * TOBII_ERROR_CONNECTION_FAILED. */
 TOBII_API tobii_error_t TOBII_CALL tobii_wait_for_callbacks( int device_count,
     tobii_device_t* const* devices );
+/* Once the daemon connection is lost: delivers what had arrived, then returns
+ * TOBII_ERROR_CONNECTION_FAILED on every call until tobii_device_reconnect
+ * connects again. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );

@@ -14,7 +14,7 @@ use std::fmt;
 use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -70,11 +70,25 @@ impl Api {
 /// Opens a connection to the daemon (a socket pair in tests).
 pub(crate) type Connector = Box<dyn FnMut() -> io::Result<UnixStream> + Send>;
 
+/// Whether a daemon connection is up, and whether its loss has been reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkState {
+    /// Nothing has seen the connection end.
+    Up,
+    /// The connection has ended and is closed; `process` has not said so yet.
+    Lost,
+    /// `process` has returned `TOBII_ERROR_CONNECTION_FAILED` for the loss.
+    Reported,
+}
+
 /// One daemon connection and the thread reading it.
 struct Link {
     stream: UnixStream,
     rx: Receiver<ServerMsg>,
     reader: Option<JoinHandle<()>>,
+    /// Kept with the link, so a new one (a reconnect) starts `Up` and a later
+    /// loss is reported again.
+    state: LinkState,
 }
 
 impl Link {
@@ -89,12 +103,13 @@ impl Link {
             stream,
             rx,
             reader: Some(reader),
+            state: LinkState::Up,
         })
     }
-}
 
-impl Drop for Link {
-    fn drop(&mut self) {
+    /// Close the connection and join the reader. Everything it read is then
+    /// in the channel, followed by a disconnect.
+    fn close(&mut self) {
         // Shutting down the socket makes the reader's blocking read return, so
         // the join below cannot hang; a shutdown error only means it is already
         // closed.
@@ -104,6 +119,12 @@ impl Drop for Link {
         {
             tracing::warn!("ffi reader thread panicked");
         }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -180,6 +201,7 @@ pub struct Device {
 impl fmt::Debug for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Device")
+            .field("link", &self.link.state)
             .field("streams", &self.callbacks.mask())
             .field("pending", &self.pending.len())
             .field("field_of_use", &self.field_of_use)
@@ -221,31 +243,47 @@ impl Device {
         Err(io::ErrorKind::NotConnected.into())
     }
 
-    /// The daemon connection, for fire-and-forget frames.
-    pub(crate) fn stream(&self) -> &UnixStream {
-        &self.link.stream
+    /// Note that the daemon connection has ended, and close it: the next
+    /// `process` reports the loss whether or not the reader has seen it.
+    fn lose(&mut self) {
+        if self.link.state == LinkState::Up {
+            self.link.close();
+            self.link.state = LinkState::Lost;
+        }
+    }
+
+    /// Write one frame to the daemon. A failed write loses the connection:
+    /// the daemon has closed it, or the frame is cut short mid-stream. A body
+    /// too long for a frame fails before a byte is written, and leaves the
+    /// connection as it was.
+    pub(crate) fn send(&mut self, body: &[u8]) -> Result<(), Status> {
+        if u32::try_from(body.len()).is_err() {
+            tracing::debug!(len = body.len(), "frame body too long for tobiid");
+            return Err(TOBII_ERROR_CONNECTION_FAILED);
+        }
+        write_frame(&mut self.link.stream, body).map_err(|e| {
+            tracing::debug!(error = %e, "could not write to tobiid");
+            self.lose();
+            TOBII_ERROR_CONNECTION_FAILED
+        })
     }
 
     /// Wait for the next message, keeping anything else in `pending`.
-    fn recv(&self, timeout: Duration) -> Result<ServerMsg, Status> {
+    fn recv(&mut self, timeout: Duration) -> Result<ServerMsg, Status> {
         match self.link.rx.recv_timeout(timeout) {
             Ok(msg) => Ok(msg),
             Err(RecvTimeoutError::Timeout) => Err(TOBII_ERROR_TIMED_OUT),
-            Err(RecvTimeoutError::Disconnected) => Err(TOBII_ERROR_CONNECTION_FAILED),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.lose();
+                Err(TOBII_ERROR_CONNECTION_FAILED)
+            }
         }
     }
 
     /// Resend the subscription mask and wait for the daemon's ack, queueing
     /// any samples that arrive meanwhile. Returns the ack's `ok` flag.
     fn resend_subscription(&mut self) -> Result<bool, Status> {
-        if write_frame(
-            &mut self.link.stream,
-            &encode_subscribe(self.callbacks.mask()),
-        )
-        .is_err()
-        {
-            return Err(TOBII_ERROR_CONNECTION_FAILED);
-        }
+        self.send(&encode_subscribe(self.callbacks.mask()))?;
         let deadline = Instant::now() + SUBSCRIBE_ACK_TIMEOUT;
         loop {
             match self.recv(deadline.saturating_duration_since(Instant::now()))? {
@@ -316,9 +354,7 @@ impl Device {
     ) -> Result<Vec<u8>, Status> {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let id = self.next_request_id;
-        if write_frame(&mut self.link.stream, &encode_request(id, kind, payload)).is_err() {
-            return Err(TOBII_ERROR_CONNECTION_FAILED);
-        }
+        self.send(&encode_request(id, kind, payload))?;
         let deadline = Instant::now() + timeout;
         loop {
             match self.recv(deadline.saturating_duration_since(Instant::now()))? {
@@ -341,7 +377,9 @@ impl Device {
         }
     }
 
-    /// Open a fresh connection and restore the subscriptions.
+    /// Open a fresh connection and restore the subscriptions. The new link
+    /// starts up, so its loss is reported again; a failed connect leaves the
+    /// old link, lost or not, as it was.
     pub(crate) fn reconnect(&mut self) -> Status {
         match Link::open(&mut self.connect) {
             Ok(link) => {
@@ -362,33 +400,68 @@ impl Device {
         }
     }
 
-    /// Drop every queued sample.
+    /// Drop every queued sample. A lost connection stays lost, and a loss not
+    /// reported yet is still reported.
     pub(crate) fn clear_buffers(&mut self) {
         while self.link.rx.try_recv().is_ok() {}
         self.pending.clear();
     }
 
-    /// Whether a sample is queued, waiting up to `timeout` for one.
+    /// Whether `process` has something to do, waiting up to `timeout` for
+    /// it: a queued sample, or a lost connection it has not reported yet.
+    /// Once it has, nothing arrives until a reconnect, so this sleeps out
+    /// `timeout` and says no, as for a quiet link; answering at once would
+    /// spin a wait-and-process loop.
     pub(crate) fn wait(&mut self, timeout: Duration) -> bool {
         if !self.pending.is_empty() {
             return true;
         }
-        match self.link.rx.recv_timeout(timeout) {
-            Ok(msg) => {
-                self.pending.push_back(msg);
-                true
+        if self.link.state == LinkState::Up {
+            match self.link.rx.recv_timeout(timeout) {
+                Ok(msg) => {
+                    self.pending.push_back(msg);
+                    return true;
+                }
+                Err(RecvTimeoutError::Timeout) => return false,
+                Err(RecvTimeoutError::Disconnected) => self.lose(),
             }
-            Err(_) => false,
         }
+        if self.link.state == LinkState::Reported {
+            thread::sleep(timeout);
+            return false;
+        }
+        true
     }
 
-    /// Deliver every queued sample to its callbacks, on this thread.
-    pub(crate) fn process(&mut self) {
-        while let Ok(msg) = self.link.rx.try_recv() {
-            self.pending.push_back(msg);
+    /// Deliver every queued sample to its callbacks, on this thread, then
+    /// say whether the daemon connection is up. Once it is lost, what had
+    /// arrived before is still delivered, and then this call and every later
+    /// one returns `TOBII_ERROR_CONNECTION_FAILED` until a reconnect connects
+    /// again.
+    #[must_use]
+    pub(crate) fn process(&mut self) -> Status {
+        loop {
+            match self.link.rx.try_recv() {
+                Ok(msg) => self.pending.push_back(msg),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.lose();
+                    break;
+                }
+            }
         }
         while let Some(msg) = self.pending.pop_front() {
             self.dispatch(&msg);
+        }
+        match self.link.state {
+            LinkState::Up => TOBII_ERROR_NO_ERROR,
+            LinkState::Lost => {
+                // Once per loss: a host keeps calling at its frame rate.
+                tracing::warn!("lost the connection to tobiid; tobii_device_reconnect restores it");
+                self.link.state = LinkState::Reported;
+                TOBII_ERROR_CONNECTION_FAILED
+            }
+            LinkState::Reported => TOBII_ERROR_CONNECTION_FAILED,
         }
     }
 
@@ -682,7 +755,7 @@ pub(crate) mod tests {
         );
     }
 
-    unsafe extern "C" fn count_pair(_p: *const EyePair, ud: *mut c_void) {
+    pub(crate) unsafe extern "C" fn count_pair(_p: *const EyePair, ud: *mut c_void) {
         // SAFETY: the tests pass `&raw mut u32` as `ud`.
         unsafe { *ud.cast::<u32>() += 1 };
     }
@@ -752,7 +825,7 @@ pub(crate) mod tests {
         let body = encode_gaze_origin(&tobii_ipc::EyePair::default());
         d.pending.push_back(decode_server(&body).expect("decodes"));
 
-        d.process();
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
 
         assert_eq!(hits, 1);
     }
@@ -822,5 +895,254 @@ pub(crate) mod tests {
         assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN);
         d.clear_buffers();
         assert!(!d.wait(Duration::from_millis(10)));
+    }
+
+    /// Far longer than any wait answered at once takes.
+    const LONG_WAIT: Duration = Duration::from_secs(5);
+    /// What "at once" means here: well under `LONG_WAIT`.
+    const PROMPT: Duration = Duration::from_secs(1);
+    /// A wait that is meant to run out.
+    const SHORT_WAIT: Duration = Duration::from_millis(50);
+
+    /// A daemon stand-in the test drives by hand. Each connect makes a socket
+    /// pair, writes the next entry of `greetings` (whole frame bodies) into
+    /// the daemon's end and hands that end to the test, which reads what the
+    /// client sent and hangs up by dropping it. A greeting can hold the ack
+    /// of the subscription the client is about to send: it waits in the
+    /// socket until the client asks. Once the test drops the receiver, a
+    /// connect fails as if nothing listened. A read of a frame the client
+    /// never sends fails after `LONG_WAIT` rather than hanging the suite.
+    fn scripted_daemon(greetings: Vec<Vec<Vec<u8>>>) -> (Connector, Receiver<UnixStream>) {
+        let (tx, daemons) = mpsc::channel();
+        let mut greetings = VecDeque::from(greetings);
+        let connect: Connector = Box::new(move || {
+            let (client, mut daemon) = UnixStream::pair()?;
+            daemon.set_read_timeout(Some(LONG_WAIT))?;
+            for body in greetings.pop_front().unwrap_or_default() {
+                write_frame(&mut daemon, &body)?;
+            }
+            tx.send(daemon)
+                .map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused))?;
+            Ok(client)
+        });
+        (connect, daemons)
+    }
+
+    /// A subscription ack followed by `samples` gaze-origin samples.
+    fn ack_then_gaze_origin(samples: usize) -> Vec<Vec<u8>> {
+        let sample = encode_gaze_origin(&tobii_ipc::EyePair::default());
+        let mut frames = vec![encode_subscribed(true)];
+        frames.extend(std::iter::repeat_n(sample, samples));
+        frames
+    }
+
+    /// The stream mask of the next frame the client sent, if it is a
+    /// subscription.
+    fn subscription(daemon: &mut UnixStream) -> Option<u32> {
+        let body = read_frame(daemon).expect("read").expect("a frame");
+        tobii_ipc::decode_subscribe(&body)
+    }
+
+    /// Wait for the reader to see the daemon hang up, so everything the
+    /// daemon sent is in the channel before the test looks.
+    fn hung_up(d: &mut Device) {
+        if let Some(h) = d.link.reader.take() {
+            h.join().expect("reader");
+        }
+    }
+
+    /// A device subscribed to gaze origin, `ud` counting the deliveries,
+    /// whose daemon acked, sent `samples` samples and hung up. Later connects
+    /// get `later`, one greeting each; their daemon ends come out of the
+    /// receiver.
+    pub(crate) fn lost_device(
+        samples: usize,
+        later: Vec<Vec<Vec<u8>>>,
+        ud: *mut c_void,
+    ) -> (Device, Receiver<UnixStream>) {
+        let mut greetings = vec![ack_then_gaze_origin(samples)];
+        greetings.extend(later);
+        let (connect, daemons) = scripted_daemon(greetings);
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut daemon = daemons.recv().expect("daemon end");
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        drop(daemon);
+        hung_up(&mut d);
+        (d, daemons)
+    }
+
+    #[test]
+    fn process_delivers_what_arrived_then_reports_the_loss() {
+        let mut hits = 0u32;
+        let (mut d, _daemons) = lost_device(2, vec![], (&raw mut hits).cast());
+
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert_eq!(hits, 2, "both samples came before the hang-up");
+        assert_eq!(
+            d.process(),
+            TOBII_ERROR_CONNECTION_FAILED,
+            "until a reconnect"
+        );
+        assert_eq!(hits, 2);
+    }
+
+    #[test]
+    fn wait_wakes_for_a_loss_until_process_reports_it_then_sleeps() {
+        let mut hits = 0u32;
+        let (mut d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT), "the loss is something to process");
+        assert!(d.wait(LONG_WAIT), "until process has reported it");
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        for _ in 0..2 {
+            let t = Instant::now();
+            assert!(!d.wait(SHORT_WAIT), "reported: nothing left to process");
+            assert!(t.elapsed() >= SHORT_WAIT, "slept out the timeout");
+        }
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+    }
+
+    #[test]
+    fn clearing_the_buffers_does_not_hide_the_loss() {
+        let mut hits = 0u32;
+        let (mut d, _daemons) = lost_device(1, vec![], (&raw mut hits).cast());
+
+        d.clear_buffers();
+
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT));
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert_eq!(hits, 0, "cleared, not delivered");
+    }
+
+    /// A device subscribed to gaze origin, `ud` counting the deliveries,
+    /// whose daemon acked, sent one sample and stopped reading. The daemon's
+    /// end, returned, stays open, so the reader sees nothing, but a write
+    /// fails.
+    pub(crate) fn deaf_daemon_device(ud: *mut c_void) -> (Device, UnixStream) {
+        let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(1)]);
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut daemon = daemons.recv().expect("daemon end");
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        daemon.shutdown(Shutdown::Read).expect("shutdown");
+        (d, daemon)
+    }
+
+    /// A write fails once the daemon stops reading, although its end is
+    /// still open and the reader has seen nothing: the loss is reported all
+    /// the same, after the sample that came first.
+    #[test]
+    fn a_failed_write_loses_the_connection_while_the_reader_still_runs() {
+        let mut hits = 0u32;
+        let (mut d, daemon) = deaf_daemon_device((&raw mut hits).cast());
+
+        assert_eq!(
+            d.request(tobii_ipc::request::kind::TRACK_BOX, &[], LONG_WAIT),
+            Err(TOBII_ERROR_CONNECTION_FAILED)
+        );
+
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT));
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert_eq!(hits, 1);
+        drop(daemon);
+    }
+
+    /// The requests, the recenter frame and the subscription failing at once
+    /// held before losses were reported, and are kept as a regression guard.
+    /// New is that they leave the loss for `process` to report.
+    #[test]
+    fn requests_and_new_subscriptions_on_a_lost_connection_fail_at_once() {
+        let mut hits = 0u32;
+        let ud = (&raw mut hits).cast::<c_void>();
+        let (mut d, _daemons) = lost_device(0, vec![], ud);
+
+        let t = Instant::now();
+        assert_eq!(
+            d.request(tobii_ipc::request::kind::TRACK_BOX, &[], LONG_WAIT),
+            Err(TOBII_ERROR_CONNECTION_FAILED)
+        );
+        assert_eq!(
+            d.send(&tobii_ipc::encode_recenter()),
+            Err(TOBII_ERROR_CONNECTION_FAILED),
+            "what tobii_recenter sends"
+        );
+        assert_eq!(
+            d.subscribe(|c| &mut c.eye_position, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_CONNECTION_FAILED
+        );
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN, "rolled back");
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+    }
+
+    #[test]
+    fn reconnect_restores_the_subscription_and_samples_flow_again() {
+        let mut hits = 0u32;
+        let (mut d, daemons) =
+            lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT));
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(hits, 1);
+        let t = Instant::now();
+        assert!(!d.wait(SHORT_WAIT), "a quiet connection that is up");
+        assert!(t.elapsed() >= SHORT_WAIT);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(daemon);
+    }
+
+    #[test]
+    fn a_second_loss_after_a_reconnect_wakes_wait_again() {
+        let mut hits = 0u32;
+        let (mut d, daemons) =
+            lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        drop(daemon);
+        hung_up(&mut d);
+
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT), "the new loss is something to process");
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+    }
+
+    #[test]
+    fn a_failed_reconnect_leaves_the_loss_reported() {
+        let mut hits = 0u32;
+        let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        drop(daemons);
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        let t = Instant::now();
+        assert!(!d.wait(SHORT_WAIT), "no second wake for the same loss");
+        assert!(t.elapsed() >= SHORT_WAIT);
     }
 }

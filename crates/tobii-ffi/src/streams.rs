@@ -13,10 +13,8 @@
 
 use std::ffi::c_void;
 
-use tobii_ipc::write_frame;
-
 use crate::device::{Callbacks, Device, Slot, device_mut};
-use crate::status::{Status, TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_NO_ERROR};
+use crate::status::{Status, TOBII_ERROR_NO_ERROR};
 use crate::types::{EyePairFn, GazePointFn, HeadPoseFn, NotificationsFn, PresenceFn};
 
 /// Subscribe `callback` into `slot` of the device behind `device`.
@@ -113,8 +111,8 @@ pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
         Ok(d) => d,
         Err(status) => return status,
     };
-    match write_frame(&mut d.stream(), &tobii_ipc::encode_recenter()) {
+    match d.send(&tobii_ipc::encode_recenter()) {
         Ok(()) => TOBII_ERROR_NO_ERROR,
-        Err(_) => TOBII_ERROR_CONNECTION_FAILED,
+        Err(status) => status,
     }
 }
