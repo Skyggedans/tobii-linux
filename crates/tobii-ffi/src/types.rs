@@ -117,6 +117,8 @@ pub const TOBII_LICENSE_VALIDATION_RESULT_OK: u32 = 0;
 
 /// `tobii_calibration_point_status_t`: failed or invalid.
 pub const TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID: u32 = 0;
+/// `tobii_calibration_point_status_t`: valid but not used.
+pub const TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION: u32 = 1;
 /// `tobii_calibration_point_status_t`: valid and used.
 pub const TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION: u32 = 2;
 

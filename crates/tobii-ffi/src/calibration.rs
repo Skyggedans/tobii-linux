@@ -21,6 +21,7 @@ use crate::types::{
     CalibrationPointData, CalibrationPointReceiver, DataReceiver,
     TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
     TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+    TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
 };
 
 // Client-side timeouts cover the daemon's own device timeouts plus queueing.
@@ -205,18 +206,26 @@ pub unsafe extern "C" fn tobii_calibration_apply(
     unsafe { request(device, kind::CALIBRATION_APPLY, blob, APPLY_TIMEOUT) }
 }
 
+/// A record's status word as a `tobii_calibration_point_status_t`, mapped as
+/// the DLL maps it (0x180147910): only the low 32 bits count; 1 was used in
+/// the calibration, 0 is valid but was not used, and anything else (the DLL
+/// tests for -1 explicitly) failed or is invalid. The mask only mirrors the
+/// DLL: `tobii_calib::blob::points` passes no word above 2.
 fn point_status(word: u64) -> u32 {
-    if word == 0 {
-        TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID
-    } else {
-        TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION
+    match word & 0xffff_ffff {
+        1 => TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+        0 => TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
+        _ => TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
     }
 }
 
 /// Hand each calibration point stored in `data` to `receiver`. The first
-/// measurement of each record is reported as the left eye. A call from inside
-/// a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS` once the arguments have
-/// been checked, before `data` is parsed, as in the DLL.
+/// measurement of each record is reported as the left eye, and each eye's
+/// status word is mapped as the DLL maps it; a word above 2, the DLL's -1
+/// included, makes the blob invalid here (`TOBII_ERROR_INVALID_PARAMETER`, no
+/// points), where the DLL reports that eye as `FAILED_OR_INVALID`. A call from
+/// inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS` once the arguments
+/// have been checked, before `data` is parsed, as in the DLL.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `data` must be null or point to
@@ -341,6 +350,103 @@ mod tests {
             points[1].left_status,
             TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION
         );
+    }
+
+    #[test]
+    fn point_status_maps_status_words_as_the_dll_does() {
+        // The numbers the DLL writes (0x180147932, 0x180147928, 0x18014791e).
+        assert_eq!(TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID, 0);
+        assert_eq!(
+            TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
+            1
+        );
+        assert_eq!(
+            TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+            2
+        );
+        for (word, status) in [
+            (
+                1,
+                TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+            ),
+            (
+                0,
+                TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
+            ),
+            // -1 as the DLL reads it, a 32-bit int.
+            (
+                0xffff_ffff,
+                TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
+            ),
+            (2, TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID),
+            // The upper half is never read.
+            (
+                0x1_0000_0001,
+                TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+            ),
+            (
+                0x1_0000_0000,
+                TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
+            ),
+        ] {
+            assert_eq!(point_status(word), status, "{word:#x}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: the points are copied, not computed
+    fn parse_reports_each_eyes_own_status() {
+        let mut blob = embedded_blob();
+        let records = tobii_calib::blob::points(&blob).expect("points");
+        let total =
+            usize::try_from(tobii_calib::blob::header(&blob).expect("header").total).expect("fits");
+        let first = total + 8;
+        // The first measurement's word is at +16, the second's at +32. 2 is
+        // the one word besides 0 and 1 that the blob check lets through.
+        for (i, offset, word) in [(2, 16, 0u64), (2, 32, 2), (4, 16, 2), (4, 32, 0)] {
+            let o = first + tobii_calib::blob::RECORD_LEN * i + offset;
+            blob[o..o + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut api: *mut Api = ptr::null_mut();
+        let mut points: Vec<CalibrationPointData> = Vec::new();
+        // SAFETY: live locals; `collect` matches the receiver contract.
+        unsafe {
+            assert_eq!(
+                crate::api::tobii_api_create(&raw mut api, ptr::null(), ptr::null()),
+                0
+            );
+            let status = tobii_calibration_parse(
+                api,
+                blob.as_ptr().cast(),
+                blob.len(),
+                Some(collect),
+                (&raw mut points).cast(),
+            );
+            assert_eq!(status, 0);
+            assert_eq!(crate::api::tobii_api_destroy(api), 0);
+        }
+        assert_eq!(points.len(), 14);
+        for (i, (p, r)) in points.iter().zip(&records).enumerate() {
+            let statuses = match i {
+                2 => (
+                    TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
+                    TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
+                ),
+                4 => (
+                    TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
+                    TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
+                ),
+                _ => (
+                    TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+                    TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
+                ),
+            };
+            assert_eq!((p.left_status, p.right_status), statuses, "point {i}");
+            // The first measurement is the left eye, as in the DLL.
+            assert_eq!(p.point_xy, r.target, "point {i}");
+            assert_eq!(p.left_mapping_xy, r.a, "point {i}");
+            assert_eq!(p.right_mapping_xy, r.b, "point {i}");
+        }
     }
 
     #[test]

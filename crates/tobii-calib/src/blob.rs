@@ -17,8 +17,11 @@
 //!
 //! A record is `f32 target_x, target_y, a_x, a_y; u64 a_status; f32 b_x, b_y;
 //! u64 b_status`, all little-endian: the stimulus point, then where each eye
-//! was measured looking. The device keeps a ring of 14 records (two per target
-//! of the 7-point pattern); a new session pushes the oldest out.
+//! was measured looking. `a` is the measurement the Stream Engine reports as
+//! the left eye and `b` the one it reports as the right
+//! (`tobii_calibration_parse`, 0x1801478f4 and 0x180147937). The device keeps
+//! a ring of 14 records (two per target of the 7-point pattern); a new session
+//! pushes the oldest out.
 
 use std::fmt;
 
@@ -67,13 +70,17 @@ pub struct BlobHeader {
 pub struct PointRecord {
     /// Where the stimulus was, normalised display coordinates.
     pub target: [f32; 2],
-    /// First eye's measured point (believed to be the left eye).
+    /// The measurement the Stream Engine reports as the left eye
+    /// (`tobii_calibration_parse`, 0x1801478f4).
     pub a: [f32; 2],
-    /// First eye's status word (1 on every captured record).
+    /// Status word of `a` (1 on every captured record). The Stream Engine
+    /// reads its low 32 bits: 1 used in the calibration, 0 valid but not
+    /// used, anything else failed. [`points`] accepts only `0..=2`.
     pub a_status: u64,
-    /// Second eye's measured point.
+    /// The measurement the Stream Engine reports as the right eye
+    /// (0x180147937).
     pub b: [f32; 2],
-    /// Second eye's status word.
+    /// Status word of `b`, read as `a_status` is.
     pub b_status: u64,
 }
 
@@ -183,8 +190,8 @@ pub fn calibration_id(blob: &[u8]) -> Option<u32> {
 /// # Errors
 ///
 /// Any [`BlobError`]: the list must sit where the header says and end
-/// exactly at the end of the blob, and every value must be finite and within
-/// a margin of the display.
+/// exactly at the end of the blob, every value must be finite and within a
+/// margin of the display, and each status word at most 2.
 pub fn points(blob: &[u8]) -> Result<Vec<PointRecord>, BlobError> {
     let h = header(blob)?;
     let list = usize::try_from(h.total).map_err(|_| BlobError::PointList)?;

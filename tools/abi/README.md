@@ -73,12 +73,17 @@ prototype declares or a float/integer position disagrees.
   0x180141972).
   Consistent, with the names only from the docs: feature group (the mapping
   at 0x18015026e in `tobii_get_feature_group`), enabled eye
-  (`tobii_set_enabled_eye` at 0x180149c40), calibration point status (the
-  mapping at 0x180147910 in `tobii_calibration_parse`), user presence status
-  (the presence notification at 0x180153f6e), log level (error paths pass 0,
-  and "Connected to platform module" passes 2, INFO, at 0x180153c19),
-  validity (the real DLL's Windows session output: 0 with position (-1,-1),
-  1 otherwise).
+  (`tobii_set_enabled_eye` at 0x180149c40), user presence status (the
+  presence notification at 0x180153f6e), log level (error paths pass 0, and
+  "Connected to platform module" passes 2, INFO, at 0x180153c19), validity
+  (the real DLL's Windows session output: 0 with position (-1,-1), 1
+  otherwise).
+  Calibration point status: values from the DLL, names from the SDK header
+  (the 4.1 docs never define it). `tobii_calibration_parse` maps each eye's
+  status word in the blob, reading its low 32 bits, at 0x180147910 (left) and
+  0x180147950 (right): 1 gives 2 (`VALID_AND_USED_IN_CALIBRATION`), 0 gives 1
+  (`VALID_BUT_NOT_USED_IN_CALIBRATION`), anything else 0
+  (`FAILED_OR_INVALID`; it tests for -1 explicitly).
   No DLL evidence: wearable foveated tracking state, device generation.
 
 Layouts, and where each comes from:
@@ -92,7 +97,7 @@ Layouts, and where each comes from:
 | `tobii_version_t` | 16 | DLL (`tobii_get_api_version` writes {4,1,0,3}) |
 | `tobii_gaze_data_t` | 168 (8+8+76+76) | 4.1 docs field list |
 | `tobii_geometry_mounting_t` | 36 | 4.1 docs + the device's 2110 response shape |
-| `tobii_calibration_point_data_t` | 32 | 4.1 docs |
+| `tobii_calibration_point_data_t` | 32 | SDK header; DLL (`tobii_calibration_parse` fills +8/+0xc/+0x14/+0x18 at 0x1801478ee..0x180147972) |
 | `tobii_timesync_data_t` | 24 | DLL (`tobii_timesync` writes three qwords at +0/+8/+16); which field is which, and the names, inferred |
 | `tobii_stream_type_t` | 136 | DLL (offsets 0/4/8/72 in `tobii_enumerate_stream_types`); size inferred, field names ours |
 | `tobii_hardware_configuration_t` | 2472, align 8 | DLL (its copy at 0x18014abe0 and the PRP deserialiser at 0x180045056); **provisional**: the values decoded from one Windows 2120 answer, field names and units ours |

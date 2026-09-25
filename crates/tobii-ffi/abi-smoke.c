@@ -175,6 +175,10 @@ int main( void )
     assert( TOBII_STATE_CALIBRATION_ACTIVE == 7 );
     assert( TOBII_NOTIFICATION_TYPE_FACE_TYPE_CHANGED == 12 && TOBII_NOTIFICATION_VALUE_TYPE_STRING == 6 );
     assert( TOBII_LENS_CONFIGURATION_NOT_WRITABLE == 0 && TOBII_LENS_CONFIGURATION_WRITABLE == 1 );
+    _Static_assert( TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID == 0
+            && TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION == 1
+            && TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION == 2,
+        "numbered as tobii_calibration_parse writes them" );
 
     /* Struct layouts are shared memory between this program and the library;
      * the same numbers are pinned in the Rust tests. */
