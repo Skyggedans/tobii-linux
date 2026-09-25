@@ -551,7 +551,9 @@ impl Device {
         }
     }
 
-    /// Deliver one daemon message to the matching callbacks, if any.
+    /// Deliver one daemon message to the matching callbacks, if any. The
+    /// timestamps go through as the daemon sent them, on the host clock
+    /// already (gaze data's tracker time aside): nothing is converted here.
     fn dispatch(&self, msg: &ServerMsg) {
         let cb = &self.callbacks;
         match msg {

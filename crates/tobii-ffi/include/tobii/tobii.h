@@ -259,8 +259,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_de
  * without bringing one back. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
 /* A no-op: the daemon maps the tracker's clock to the host clock for every
- * sample and keeps the mapping current itself, so there is nothing here to
- * refresh (tobii_timesync takes a fresh clock pair on every call). */
+ * sample and keeps the mapping current itself (tobii_streams.h says how), so
+ * there is nothing here to refresh (tobii_timesync takes a fresh clock pair
+ * on every call). */
 TOBII_API tobii_error_t TOBII_CALL tobii_update_timesync( tobii_device_t* device );
 /* CLOCK_MONOTONIC microseconds, whose epoch is undefined (the DLL reads
  * QueryPerformanceCounter): the clock of every callback timestamp (bar gaze

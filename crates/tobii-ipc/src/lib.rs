@@ -14,8 +14,15 @@
 //!
 //! Sample timestamps are the host clock, [`host_clock_us`] in microseconds,
 //! which is also what `tobii_system_clock` returns: the daemon maps the
-//! device time each sample was taken at onto it. The device clock is left
-//! only in gaze data's tracker time and the TIMESYNC pair's device time.
+//! device time each sample was taken at onto it. Its USB engine estimates
+//! the offset from the smallest `receipt - device` time of the gaze frames
+//! and IR images of the last 120 s, afresh at every device init. Within one
+//! open the stamps of a stream strictly increase (a PRESENCE replayed to a
+//! new subscriber keeps the stamp it was last sent with); the device clock
+//! may restart at an init, and the stamps then run on with the host's
+//! instead of jumping back. A head pose has the time of the image it was
+//! made from. The device clock is left only in gaze data's tracker time and
+//! the TIMESYNC pair's device time.
 //!
 //! The SUBSCRIBE mask is written as `u32 LE`, whose first byte is the low
 //! byte of the mask: a daemon that reads only one byte still sees every

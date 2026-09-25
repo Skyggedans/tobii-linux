@@ -155,17 +155,25 @@ Where the answers come from, and where they differ from Windows:
   sessions; nothing is written to the tracker. Until one is set,
   `tobii_get_device_name` gives the model.
 - **Timestamps.** Every callback timestamp is on `tobii_system_clock`'s
-  clock, as in the Stream Engine, and gaze data's `timestamp_tracker_us` keeps
-  the tracker's. The Stream Engine adds one offset per connection, from round
-  trips to its service, and refreshes it only in `tobii_update_timesync` and
-  `tobii_timesync`. Here the daemon estimates the offset from the arrivals
-  (the smallest receipt-minus-device time of the gaze frames and images of
-  the last 120 s, afresh at each tracker open), so it follows the drift
-  between the clocks, and every client gets the same stamps. The interval
-  between two stamps can then differ from the tracker's by a couple of ms
-  when the estimate moves (the Stream Engine's are exact within a
-  connection), though never below 1 µs within a stream. A stamp is no later
-  than the daemon's read of its sample, but for a sample read during the
+  clock, as in the Stream Engine; the tracker's clock is left only in gaze
+  data's `timestamp_tracker_us` and `tobii_timesync`'s `tracker_us`. A head
+  pose carries the time of the IR image it was made from, as there. The
+  Stream Engine adds one offset per connection, from round trips to its
+  service, and refreshes it only in `tobii_update_timesync` and
+  `tobii_timesync`. Here the daemon's USB engine estimates the offset from
+  the arrivals: the smallest receipt-minus-device time of the gaze frames and
+  IR images of the last 120 s (the gaze frames alone when the image stream is
+  off), started afresh at every tracker init, which may restart the
+  tracker's clock. So it follows the drift between the clocks (5 to 13 ppm
+  in the captures, some 50 ms an hour for a fixed offset), and every client
+  gets the same stamps. The interval between two stamps can then differ
+  from the tracker's by a couple of ms when the estimate moves (the Stream
+  Engine's are exact within a connection), though never below 1 µs within a
+  stream while the tracker stays open; across an init the stamps run on with
+  the host clock instead of jumping back, and a presence reported again to a
+  new subscriber keeps the stamp it was last reported with. A stamp is no
+  later than the daemon's read of its sample (1 µs past it when two samples
+  of a stream are read together), but for a sample read during the
   tracker's init, which gets the time it is delivered, a few ms late.
 - **Clock pair.** `tobii_timesync` pairs the device timestamp of the next gaze
   frame with the host clock (`CLOCK_MONOTONIC`, as `tobii_system_clock`) in a

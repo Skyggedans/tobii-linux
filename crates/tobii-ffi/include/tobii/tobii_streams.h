@@ -2,7 +2,19 @@
  *
  * Companion to tobii/tobii.h; see that file for what these headers are.
  * Every sample's timestamp_us is when it was taken, on the clock
- * tobii_system_clock reads (the daemon maps the tracker's clock onto it).
+ * tobii_system_clock reads. The daemon maps the tracker's clock onto it by an
+ * offset it estimates from the arrivals: the smallest receipt-minus-tracker
+ * time of the gaze frames and IR images of the last 120 s, started afresh
+ * at every tracker init (which may restart the tracker's clock). A stamp is
+ * no later than the daemon's read of its sample (a microsecond past it when
+ * two samples of a stream are read together; one read during the init gets
+ * the time it is delivered, a few ms late). While the tracker stays open the
+ * stamps of each stream strictly increase; across an init they run on with
+ * the host clock instead of jumping back. A presence reported again on
+ * subscribe or tobii_device_reconnect keeps the stamp it was last reported
+ * with. A head pose has the time of the IR image it was made from. Tracker
+ * time is left only in gaze data's timestamp_tracker_us (tobii_advanced.h)
+ * and tobii_timesync's tracker_us (tobii_internal.h).
  * Callbacks run on the thread that calls tobii_device_process_callbacks;
  * calling an implemented device function from one (creating or destroying a
  * device included), tobii_calibration_parse or tobii_api_destroy returns

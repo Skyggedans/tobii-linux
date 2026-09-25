@@ -146,10 +146,14 @@ const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(27);
 /// The DLL instead times a round trip to its service, and its own offset
 /// estimator skips pairs wider than 6 ms, though it still returns them. The
 /// host clock is `tobii_system_clock`'s, `CLOCK_MONOTONIC` rather than the
-/// DLL's QPC, though like it monotonic with an undefined epoch. Nothing is
-/// written unless the call succeeds; `TOBII_ERROR_NOT_AVAILABLE` while the
-/// tracker is paused, `TOBII_ERROR_CONNECTION_FAILED` when no tracker is
-/// plugged in.
+/// DLL's QPC, though like it monotonic with an undefined epoch. The
+/// callbacks' `timestamp_us` (and gaze data's `timestamp_system_us`) need no
+/// pair: the daemon sends them on the host clock already; gaze data's
+/// `timestamp_tracker_us` is the tracker time a pair maps. The tracker's
+/// clock may restart when the tracker re-initialises, so a pair holds until
+/// then only. Nothing is written unless the call succeeds;
+/// `TOBII_ERROR_NOT_AVAILABLE` while the tracker is paused,
+/// `TOBII_ERROR_CONNECTION_FAILED` when no tracker is plugged in.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `timesync` must be null or

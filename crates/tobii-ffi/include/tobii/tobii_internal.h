@@ -32,7 +32,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_field_of_use_subscribe( tobii_device_t*
 TOBII_API tobii_error_t TOBII_CALL tobii_field_of_use_unsubscribe( tobii_device_t* device );
 
 /* An IR camera frame: 280x280, 8 bits per pixel, ~33 Hz on the ET5. `data` is
- * valid only during the callback. Layout from the DLL's image dispatcher. */
+ * valid only during the callback. timestamp_us is when the frame was taken,
+ * on the tobii_system_clock clock, as every sample's (tobii_streams.h).
+ * Layout from the DLL's image dispatcher. */
 typedef struct tobii_image_t
 {
     int64_t timestamp_us;
@@ -68,8 +70,12 @@ TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device
  * (the tracker is started if needed), and the bracket is a fixed 30 ms
  * before the daemon read it. The DLL times a round trip instead; its own
  * offset estimator skips pairs wider than 6 ms, though it still returns them
- * with TOBII_ERROR_NO_ERROR. Nothing is written unless the call succeeds;
- * TOBII_ERROR_NOT_AVAILABLE while the tracker is paused,
+ * with TOBII_ERROR_NO_ERROR. The callbacks' timestamp_us (and gaze data's
+ * timestamp_system_us) need no pair: the daemon has already put them on the
+ * host clock (tobii_streams.h); gaze data's timestamp_tracker_us is the
+ * tracker time a pair maps. The tracker's clock may restart when the tracker
+ * re-initialises, so a pair holds until then only. Nothing is written unless
+ * the call succeeds; TOBII_ERROR_NOT_AVAILABLE while the tracker is paused,
  * TOBII_ERROR_CONNECTION_FAILED when no tracker is plugged in. Layout from
  * the DLL (24 bytes); the field names follow the older public headers. */
 typedef struct tobii_timesync_data_t

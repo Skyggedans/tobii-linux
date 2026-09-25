@@ -362,8 +362,10 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   has reported no hardware configuration on Linux, so it returns
   `TOBII_ERROR_NOT_SUPPORTED`.
   Timestamps are the host clock `tobii_system_clock` reads (`CLOCK_MONOTONIC`),
-  onto which the daemon maps the tracker's; gaze data keeps the tracker's time
-  too. Everything the ET5 was never observed doing (wearable, face id,
+  onto which the daemon maps the tracker's with an offset it estimates from
+  the arrivals, afresh at every tracker init (README.md, Architecture,
+  "Timestamps"); gaze data and `tobii_timesync` keep the tracker's time too.
+  Everything the ET5 was never observed doing (wearable, face id,
   illumination, power, firmware, diagnostics, 3-D and per-eye calibration)
   returns `TOBII_ERROR_NOT_SUPPORTED`. No licence is checked: what the Stream
   Engine reserves for its professional, config or internal feature groups, or
