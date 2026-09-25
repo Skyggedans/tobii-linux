@@ -249,6 +249,10 @@ TOBII_API tobii_error_t TOBII_CALL tobii_wait_for_callbacks( int device_count,
  * connects again. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
+/* Connects to a running daemon (never spawns one) and restores the
+ * subscriptions, not a calibration session or pause. Any failure is
+ * TOBII_ERROR_CONNECTION_FAILED within ~500 ms and leaves the device as it
+ * was. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
 /* A no-op: samples carry the device clock, and there is no offset estimate to
  * refresh (tobii_timesync takes a fresh clock pair on every call). */

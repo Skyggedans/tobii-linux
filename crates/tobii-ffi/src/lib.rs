@@ -61,13 +61,17 @@
 //! `tobii_device_process_callbacks` delivers what had arrived and then
 //! returns `TOBII_ERROR_CONNECTION_FAILED` on every call until
 //! `tobii_device_reconnect` connects again; libtobii never reconnects by
-//! itself. `tobii_wait_for_callbacks` wakes for the loss until a process call
+//! itself. A reconnect only connects (it never spawns a daemon), fails with
+//! `TOBII_ERROR_CONNECTION_FAILED` at once when none listens, and restores
+//! the subscriptions, not a calibration session or pause the lost connection
+//! held. `tobii_wait_for_callbacks` wakes for the loss until a process call
 //! reports it, so a wait-and-process loop wakes once, and then waits out its
 //! timeout as for a quiet device; as in the DLL it never returns
 //! `TOBII_ERROR_CONNECTION_FAILED`. A tracker unplugged while the daemon runs
 //! is not a lost connection: calls that need the tracker fail with
-//! `TOBII_ERROR_CONNECTION_FAILED` meanwhile, but processing carries on and
-//! samples resume once it is back.
+//! `TOBII_ERROR_CONNECTION_FAILED` meanwhile (and a reconnect succeeds
+//! without bringing it back), but processing carries on and samples resume
+//! once it is back.
 //!
 //! Every entry point takes raw handles from C, so each is an `unsafe fn` whose
 //! `# Safety` section states what the caller must uphold; the `unsafe` blocks

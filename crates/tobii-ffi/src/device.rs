@@ -41,6 +41,26 @@ use crate::types::{
 /// How long a subscription change waits for the daemon's acknowledgement.
 const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a reconnect waits for the daemon to acknowledge the restored
+/// subscriptions. A running daemon's reader for the connection queues the
+/// ack once it has scanned the USB bus (when no engine runs) and taken the
+/// state lock, and the pump writes it on its next 8 ms tick. The lock is
+/// the slow part: it is held while an engine is dropped (its thread
+/// joined) and while the pump writes to clients, so the ack usually comes
+/// well within this, but not always. One that is not running yet (systemd
+/// holds the socket while the service restarts) is left to the caller's
+/// next attempt, rather than holding a call an application may make from
+/// its frame loop.
+///
+/// An attempt that gives up closes a connection that already carries its
+/// subscription, and the daemon still reads it (under socket activation,
+/// once it starts and accepts it from systemd's backlog): it starts the
+/// engine for it, then sees the hang-up and drops the engine again unless
+/// another client wants it, under the state lock a later attempt's ack
+/// waits on. Skipping a subscription whose peer has hung up is the
+/// daemon's to do.
+const RECONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
 thread_local! {
     /// Set while this thread runs a user callback. The entry points the crate
     /// documentation lists refuse a call made from inside one, as the Stream
@@ -69,6 +89,20 @@ impl Api {
 
 /// Opens a connection to the daemon (a socket pair in tests).
 pub(crate) type Connector = Box<dyn FnMut() -> io::Result<UnixStream> + Send>;
+
+/// A connector that makes its first connection with `first` and every later
+/// one with `later`: a device's first connection is the one
+/// `tobii_device_create` makes, and each later one a reconnect.
+fn first_then(
+    first: impl FnOnce() -> io::Result<UnixStream> + Send + 'static,
+    mut later: impl FnMut() -> io::Result<UnixStream> + Send + 'static,
+) -> Connector {
+    let mut first = Some(first);
+    Box::new(move || match first.take() {
+        Some(connect) => connect(),
+        None => later(),
+    })
+}
 
 /// Whether a daemon connection is up, and whether its loss has been reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +152,62 @@ impl Link {
             && h.join().is_err()
         {
             tracing::warn!("ffi reader thread panicked");
+        }
+    }
+
+    /// Note that the connection has ended, and close it: the next `process`
+    /// reports the loss whether or not the reader has seen it.
+    fn lose(&mut self) {
+        if self.state == LinkState::Up {
+            self.close();
+            self.state = LinkState::Lost;
+        }
+    }
+
+    /// Write one frame to the daemon. A failed write loses the connection:
+    /// the daemon has closed it, or the frame is cut short mid-stream. A body
+    /// too long for a frame fails before a byte is written, and leaves the
+    /// connection as it was.
+    fn send(&mut self, body: &[u8]) -> Result<(), Status> {
+        if u32::try_from(body.len()).is_err() {
+            tracing::debug!(len = body.len(), "frame body too long for tobiid");
+            return Err(TOBII_ERROR_CONNECTION_FAILED);
+        }
+        write_frame(&mut self.stream, body).map_err(|e| {
+            tracing::debug!(error = %e, "could not write to tobiid");
+            self.lose();
+            TOBII_ERROR_CONNECTION_FAILED
+        })
+    }
+
+    /// Wait up to `timeout` for the next message.
+    fn recv(&mut self, timeout: Duration) -> Result<ServerMsg, Status> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(msg) => Ok(msg),
+            Err(RecvTimeoutError::Timeout) => Err(TOBII_ERROR_TIMED_OUT),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.lose();
+                Err(TOBII_ERROR_CONNECTION_FAILED)
+            }
+        }
+    }
+
+    /// Subscribe to the streams in `mask` and wait up to `timeout` for the
+    /// daemon's ack, queueing in `pending` any samples that arrive meanwhile.
+    /// Returns the ack's `ok` flag.
+    fn send_subscription(
+        &mut self,
+        mask: u32,
+        timeout: Duration,
+        pending: &mut VecDeque<ServerMsg>,
+    ) -> Result<bool, Status> {
+        self.send(&encode_subscribe(mask))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.recv(deadline.saturating_duration_since(Instant::now()))? {
+                ServerMsg::Subscribed { ok } => return Ok(ok),
+                other => pending.push_back(other),
+            }
         }
     }
 }
@@ -194,7 +284,8 @@ pub struct Device {
     /// Address of the API handle this device was created from.
     pub(crate) api: usize,
     next_request_id: u32,
-    /// Identity, fetched once.
+    /// Identity, fetched once per connection: a reconnect clears it, since a
+    /// restarted daemon may serve another tracker.
     pub(crate) device_info: Option<DeviceInfoMsg>,
 }
 
@@ -229,10 +320,14 @@ impl Device {
         })
     }
 
-    /// Connect to the daemon, spawning it if needed.
+    /// Connect to the daemon, spawning it if needed. A reconnect only
+    /// connects: it fails at once when no daemon listens, and never spawns
+    /// one, which could start a daemon outside systemd or race other clients
+    /// into starting two.
     #[cfg(not(test))]
     pub(crate) fn connect_daemon(api: usize, field_of_use: FieldOfUse) -> io::Result<Self> {
-        Self::new(Box::new(tobii_ipc::connect_or_spawn), api, field_of_use)
+        let connect = first_then(tobii_ipc::connect_or_spawn, tobii_ipc::connect);
+        Self::new(connect, api, field_of_use)
     }
 
     /// Unit tests never reach the real daemon, which would open the tracker:
@@ -243,54 +338,19 @@ impl Device {
         Err(io::ErrorKind::NotConnected.into())
     }
 
-    /// Note that the daemon connection has ended, and close it: the next
-    /// `process` reports the loss whether or not the reader has seen it.
-    fn lose(&mut self) {
-        if self.link.state == LinkState::Up {
-            self.link.close();
-            self.link.state = LinkState::Lost;
-        }
-    }
-
-    /// Write one frame to the daemon. A failed write loses the connection:
-    /// the daemon has closed it, or the frame is cut short mid-stream. A body
-    /// too long for a frame fails before a byte is written, and leaves the
-    /// connection as it was.
+    /// Write one frame to the daemon (see [`Link::send`]).
     pub(crate) fn send(&mut self, body: &[u8]) -> Result<(), Status> {
-        if u32::try_from(body.len()).is_err() {
-            tracing::debug!(len = body.len(), "frame body too long for tobiid");
-            return Err(TOBII_ERROR_CONNECTION_FAILED);
-        }
-        write_frame(&mut self.link.stream, body).map_err(|e| {
-            tracing::debug!(error = %e, "could not write to tobiid");
-            self.lose();
-            TOBII_ERROR_CONNECTION_FAILED
-        })
-    }
-
-    /// Wait for the next message, keeping anything else in `pending`.
-    fn recv(&mut self, timeout: Duration) -> Result<ServerMsg, Status> {
-        match self.link.rx.recv_timeout(timeout) {
-            Ok(msg) => Ok(msg),
-            Err(RecvTimeoutError::Timeout) => Err(TOBII_ERROR_TIMED_OUT),
-            Err(RecvTimeoutError::Disconnected) => {
-                self.lose();
-                Err(TOBII_ERROR_CONNECTION_FAILED)
-            }
-        }
+        self.link.send(body)
     }
 
     /// Resend the subscription mask and wait for the daemon's ack, queueing
     /// any samples that arrive meanwhile. Returns the ack's `ok` flag.
     fn resend_subscription(&mut self) -> Result<bool, Status> {
-        self.send(&encode_subscribe(self.callbacks.mask()))?;
-        let deadline = Instant::now() + SUBSCRIBE_ACK_TIMEOUT;
-        loop {
-            match self.recv(deadline.saturating_duration_since(Instant::now()))? {
-                ServerMsg::Subscribed { ok } => return Ok(ok),
-                other => self.pending.push_back(other),
-            }
-        }
+        self.link.send_subscription(
+            self.callbacks.mask(),
+            SUBSCRIBE_ACK_TIMEOUT,
+            &mut self.pending,
+        )
     }
 
     /// Register `callback` in `slot` and subscribe its stream. The Stream
@@ -357,7 +417,10 @@ impl Device {
         self.send(&encode_request(id, kind, payload))?;
         let deadline = Instant::now() + timeout;
         loop {
-            match self.recv(deadline.saturating_duration_since(Instant::now()))? {
+            match self
+                .link
+                .recv(deadline.saturating_duration_since(Instant::now()))?
+            {
                 ServerMsg::Reply {
                     request_id,
                     status,
@@ -377,27 +440,50 @@ impl Device {
         }
     }
 
-    /// Open a fresh connection and restore the subscriptions. The new link
-    /// starts up, so its loss is reported again; a failed connect leaves the
-    /// old link, lost or not, as it was.
+    /// Open a fresh connection and subscribe every registered stream on it,
+    /// then drop the old one. As in the DLL, any failure (nothing listens,
+    /// the daemon hangs up, refuses the subscriptions, or does not ack
+    /// within [`RECONNECT_ACK_TIMEOUT`]) is `TOBII_ERROR_CONNECTION_FAILED`,
+    /// and it changes nothing: the old link, lost or not, stays as it was,
+    /// so a lost device stays lost and a loss already reported is not
+    /// reported again.
+    ///
+    /// The old link goes only once the new one is subscribed, so reconnecting
+    /// a live connection never leaves the daemon a moment with no client
+    /// wanting the subscribed streams, in which it would drop its engine and
+    /// start the tracker cold again. A device with no subscription has
+    /// nothing to send first, so the daemon may still drop an engine that
+    /// only the old connection's requests kept, until the next request.
+    /// Samples queued from the old link are dropped. The new link starts up,
+    /// so its loss is reported again. The device info is fetched again: a
+    /// restarted daemon may serve another tracker.
     pub(crate) fn reconnect(&mut self) -> Status {
-        match Link::open(&mut self.connect) {
-            Ok(link) => {
-                self.link = link;
-                self.pending.clear();
-                if self.callbacks.mask() == 0 {
-                    return TOBII_ERROR_NO_ERROR;
-                }
-                match self.resend_subscription() {
-                    Ok(_) => TOBII_ERROR_NO_ERROR,
-                    Err(status) => status,
-                }
-            }
+        let mut link = match Link::open(&mut self.connect) {
+            Ok(link) => link,
             Err(e) => {
                 tracing::warn!(error = %e, "could not reconnect to tobiid");
-                TOBII_ERROR_CONNECTION_FAILED
+                return TOBII_ERROR_CONNECTION_FAILED;
+            }
+        };
+        let mut pending = VecDeque::new();
+        let mask = self.callbacks.mask();
+        if mask != 0 {
+            match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT, &mut pending) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(mask, "tobiid refused the subscriptions back");
+                    return TOBII_ERROR_CONNECTION_FAILED;
+                }
+                Err(status) => {
+                    tracing::warn!(status, mask, "tobiid did not take the subscriptions back");
+                    return TOBII_ERROR_CONNECTION_FAILED;
+                }
             }
         }
+        self.link = link;
+        self.pending = pending;
+        self.device_info = None;
+        TOBII_ERROR_NO_ERROR
     }
 
     /// Drop every queued sample. A lost connection stays lost, and a loss not
@@ -423,7 +509,7 @@ impl Device {
                     return true;
                 }
                 Err(RecvTimeoutError::Timeout) => return false,
-                Err(RecvTimeoutError::Disconnected) => self.lose(),
+                Err(RecvTimeoutError::Disconnected) => self.link.lose(),
             }
         }
         if self.link.state == LinkState::Reported {
@@ -445,7 +531,7 @@ impl Device {
                 Ok(msg) => self.pending.push_back(msg),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.lose();
+                    self.link.lose();
                     break;
                 }
             }
@@ -1131,18 +1217,243 @@ pub(crate) mod tests {
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
     }
 
+    /// Wait out `SHORT_WAIT` and say no, as for a loss already reported, then
+    /// report the loss still: the device is lost, and was not woken again.
+    fn assert_still_lost(d: &mut Device) {
+        let t = Instant::now();
+        assert!(!d.wait(SHORT_WAIT), "no second wake for the same loss");
+        assert!(t.elapsed() >= SHORT_WAIT, "slept out the timeout");
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+    }
+
+    /// A regression guard: the scripted connector fails at once, as
+    /// `tobii_ipc::connect` does, and this held before. `first_then`'s test
+    /// below shows the order it calls its connectors in; that
+    /// `connect_daemon` passes `tobii_ipc::connect` as `later` is by
+    /// inspection, since no test may reach the real socket.
     #[test]
-    fn a_failed_reconnect_leaves_the_loss_reported() {
+    fn reconnecting_while_nothing_listens_fails_at_once_and_leaves_the_device_lost() {
         let mut hits = 0u32;
         let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         drop(daemons);
 
+        let t = Instant::now();
+        assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+        assert!(t.elapsed() < PROMPT);
+
+        assert_still_lost(&mut d);
+    }
+
+    /// The daemon takes the connection and the subscription but never acks:
+    /// the reconnect gives up after its own short timeout, not the 2 s a
+    /// subscription change waits, with `TOBII_ERROR_CONNECTION_FAILED`, never
+    /// `TOBII_ERROR_TIMED_OUT`, and hangs up on that daemon.
+    #[test]
+    fn a_reconnect_the_daemon_does_not_ack_fails_soon_and_leaves_the_device_lost() {
+        let mut hits = 0u32;
+        // The second connection's daemon is sent nothing to answer with.
+        let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+
+        let t = Instant::now();
+        assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+        let took = t.elapsed();
+
+        assert!(
+            (RECONNECT_ACK_TIMEOUT..SUBSCRIBE_ACK_TIMEOUT).contains(&took),
+            "{took:?}"
+        );
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert!(
+            matches!(read_frame(&mut daemon), Ok(None)),
+            "the attempt's connection is closed"
+        );
+        assert_still_lost(&mut d);
+    }
+
+    #[test]
+    fn a_reconnect_the_daemon_hangs_up_on_fails_and_leaves_the_device_lost() {
+        let mut hits = 0u32;
+        let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        // Reads the subscription, then hangs up without acking it.
+        let daemon = thread::spawn(move || {
+            let mut daemon = daemons.recv().expect("second daemon end");
+            subscription(&mut daemon)
+        });
+
         assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
 
+        assert_eq!(daemon.join().expect("daemon"), Some(STREAM_GAZE_ORIGIN));
+        assert_still_lost(&mut d);
+    }
+
+    /// No daemon refuses a subscription today, but only an ack that takes
+    /// them counts: a reconnect never reports success for streams the
+    /// daemon will not serve.
+    #[test]
+    fn a_reconnect_the_daemon_refuses_fails_and_leaves_the_device_lost() {
+        let mut hits = 0u32;
+        let refusal = vec![encode_subscribed(false)];
+        let (mut d, daemons) = lost_device(0, vec![refusal], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+
         let t = Instant::now();
-        assert!(!d.wait(SHORT_WAIT), "no second wake for the same loss");
-        assert!(t.elapsed() >= SHORT_WAIT);
+        assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+        assert!(t.elapsed() < PROMPT);
+
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert!(
+            matches!(read_frame(&mut daemon), Ok(None)),
+            "the attempt's connection is closed"
+        );
+        assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN, "kept for a retry");
+        assert_still_lost(&mut d);
+    }
+
+    /// Were the old connection closed first, the daemon could see no client
+    /// wanting the streams between the two and stop the tracker.
+    #[test]
+    fn reconnecting_a_live_connection_subscribes_the_new_one_before_closing_the_old() {
+        let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(0)]);
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut old = daemons.recv().expect("daemon end");
+        let ud = std::ptr::null_mut();
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, Some(ignore_pair as EyePairFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(subscription(&mut old), Some(STREAM_GAZE_ORIGIN));
+        // The new daemon answers from its own thread, so it can look at the
+        // old connection while the client waits for the ack.
+        let daemon = thread::spawn(move || {
+            let mut new = daemons.recv().expect("new daemon end");
+            let mask = subscription(&mut new);
+            old.set_read_timeout(Some(SHORT_WAIT))
+                .expect("read timeout");
+            let old_open = matches!(
+                read_frame(&mut old),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+            );
+            write_frame(&mut new, &encode_subscribed(true)).expect("ack");
+            (mask, old_open, old, new)
+        });
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        let (mask, old_open, mut old, new) = daemon.join().expect("daemon");
+        assert_eq!(mask, Some(STREAM_GAZE_ORIGIN));
+        assert!(
+            old_open,
+            "the old connection was up while the new subscribed"
+        );
+        assert!(
+            matches!(read_frame(&mut old), Ok(None)),
+            "and closed once it had"
+        );
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(new);
+    }
+
+    unsafe extern "C" fn ignore_pair(_p: *const EyePair, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_head(_p: *const HeadPose, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_gaze(_p: *const GazePoint, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_presence(_s: PresenceStatus, _ts: i64, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_gaze_data(_p: *const GazeData, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_image(_p: *const Image, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_notification(_p: *const Notification, _ud: *mut c_void) {}
+
+    #[test]
+    fn a_reconnect_restores_every_stream_and_fetches_the_device_info_again() {
+        use std::sync::{Arc, Mutex};
+        use tobii_ipc::request::{DeviceInfo, decode_request, encode_device_info};
+        // Acks every subscription, recording its mask, and gives each device
+        // info request the next serial number.
+        let masks = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&masks);
+        let mut serials = 0u32;
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                log.lock()
+                    .expect("log")
+                    .push(tobii_ipc::decode_subscribe(body));
+                vec![encode_subscribed(true)]
+            }
+            Some(&tobii_ipc::TAG_REQUEST) => {
+                let req = decode_request(body).expect("request");
+                serials += 1;
+                let info = DeviceInfo {
+                    serial_number: serials.to_string(),
+                    ..DeviceInfo::default()
+                };
+                vec![encode_reply(req.id, 0, &encode_device_info(&info))]
+            }
+            _ => vec![],
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let ud = std::ptr::null_mut();
+        d.callbacks = Callbacks {
+            head: Some((ignore_head as HeadPoseFn, ud)),
+            gaze: Some((ignore_gaze as GazePointFn, ud)),
+            presence: Some((ignore_presence as PresenceFn, ud)),
+            gaze_origin: Some((ignore_pair as EyePairFn, ud)),
+            user_position_guide: Some((ignore_pair as EyePairFn, ud)),
+            gaze_data: Some((ignore_gaze_data as GazeDataFn, ud)),
+            image: Some((ignore_image as ImageFn, ud)),
+            notifications: Some((ignore_notification as NotificationsFn, ud)),
+            ..Callbacks::default()
+        };
+        let serial =
+            |d: &mut Device| crate::api::fetch_device_info(d).map(|info| info.serial_number);
+        assert_eq!(serial(&mut d), Ok("1".into()));
+        assert_eq!(serial(&mut d), Ok("1".into()), "fetched once");
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        let every = STREAM_HEAD
+            | STREAM_GAZE
+            | STREAM_PRESENCE
+            | STREAM_GAZE_ORIGIN
+            | STREAM_EYE_POSITION
+            | STREAM_GAZE_DATA
+            | STREAM_IMAGE
+            | STREAM_NOTIFICATIONS;
+        assert_eq!(*masks.lock().expect("log"), [Some(every)]);
+        assert_eq!(serial(&mut d), Ok("2".into()), "asked the daemon again");
+    }
+
+    /// A device's first connection goes through `first` (`connect_daemon`
+    /// passes `tobii_ipc::connect_or_spawn`), and every reconnect through
+    /// `later` (`tobii_ipc::connect`, which never spawns).
+    #[test]
+    fn first_then_uses_first_once_then_later() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (firsts, laters) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (f, l) = (Arc::clone(&firsts), Arc::clone(&laters));
+        let connect = first_then(
+            move || {
+                f.fetch_add(1, Ordering::Relaxed);
+                UnixStream::pair().map(|(client, _daemon)| client)
+            },
+            move || {
+                l.fetch_add(1, Ordering::Relaxed);
+                Err(io::ErrorKind::ConnectionRefused.into())
+            },
+        );
+        let mut d = Device::new(connect, 1, 1).expect("device");
+
+        for _ in 0..2 {
+            assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+        }
+
+        let calls = (
+            firsts.load(Ordering::Relaxed),
+            laters.load(Ordering::Relaxed),
+        );
+        assert_eq!(calls, (1, 2));
     }
 }
