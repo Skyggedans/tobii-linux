@@ -59,19 +59,19 @@ TOBII_API tobii_error_t TOBII_CALL tobii_image_unsubscribe( tobii_device_t* devi
 TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device_t* device,
     uint32_t stream, tobii_supported_t* supported );
 
-/* One tracker/host clock pair: the tracker clock (the clock of the samples'
- * timestamps) read tracker_us at some host time between system_start_us and
- * system_end_us, all in microseconds. The host clock is tobii_system_clock's:
- * CLOCK_MONOTONIC, not the DLL's QueryPerformanceCounter, though like it
- * monotonic with an undefined epoch. The pair comes from the first gaze
- * frame the daemon receives after the call (the tracker is started if
- * needed), and the bracket is a fixed 30 ms before the daemon read it. The
- * DLL times a round trip instead; its own offset estimator skips pairs wider
- * than 6 ms, though it still returns them with TOBII_ERROR_NO_ERROR. Nothing
- * is written unless the call succeeds; TOBII_ERROR_NOT_AVAILABLE while the
- * tracker is paused, TOBII_ERROR_CONNECTION_FAILED when no tracker is
- * plugged in. Layout from the DLL (24 bytes); the field names follow the
- * older public headers. */
+/* One tracker/host clock pair: the tracker clock (the clock of gaze data's
+ * timestamp_tracker_us) read tracker_us at some host time between
+ * system_start_us and system_end_us, all in microseconds. The host clock is
+ * tobii_system_clock's: CLOCK_MONOTONIC, not the DLL's
+ * QueryPerformanceCounter, though like it monotonic with an undefined epoch.
+ * The pair comes from the first gaze frame the daemon receives after the call
+ * (the tracker is started if needed), and the bracket is a fixed 30 ms
+ * before the daemon read it. The DLL times a round trip instead; its own
+ * offset estimator skips pairs wider than 6 ms, though it still returns them
+ * with TOBII_ERROR_NO_ERROR. Nothing is written unless the call succeeds;
+ * TOBII_ERROR_NOT_AVAILABLE while the tracker is paused,
+ * TOBII_ERROR_CONNECTION_FAILED when no tracker is plugged in. Layout from
+ * the DLL (24 bytes); the field names follow the older public headers. */
 typedef struct tobii_timesync_data_t
 {
     int64_t system_start_us;

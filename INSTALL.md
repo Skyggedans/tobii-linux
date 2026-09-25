@@ -218,6 +218,16 @@ systemctl --user start tobiid.socket
 
 `pgrep -a tobiid` should then list at most one daemon.
 
+**Once, when moving to host-clock timestamps.** A `tobiid` built without the
+commit "daemon: send sample timestamps on the host clock" (any build before
+it, whatever its date) sends sample timestamps on the tracker's clock, which
+a `libtobii.so` with that commit hands to its callbacks as
+`tobii_system_clock` times; an application still running an older
+`libtobii.so` gets the new daemon's host times where it expects the
+tracker's. Nothing detects the mismatch: after installing the first build
+with that commit, restart the daemon, and restart the applications that read
+timestamps.
+
 **Running clients.** A restart, like a crash, closes every client's
 connection:
 
@@ -351,12 +361,13 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   device name. `tobii_hardware_configuration_get` is provisional: the ET5
   has reported no hardware configuration on Linux, so it returns
   `TOBII_ERROR_NOT_SUPPORTED`.
-  Timestamps are the device clock. Everything the ET5 was never observed doing
-  (wearable, face id, illumination, power, firmware, diagnostics, 3-D and
-  per-eye calibration) returns `TOBII_ERROR_NOT_SUPPORTED`. No licence is
-  checked: what the Stream Engine reserves for its professional, config or
-  internal feature groups, or for an additional-features licence (the IR
-  image), works too.
+  Timestamps are the host clock `tobii_system_clock` reads (`CLOCK_MONOTONIC`),
+  onto which the daemon maps the tracker's; gaze data keeps the tracker's time
+  too. Everything the ET5 was never observed doing (wearable, face id,
+  illumination, power, firmware, diagnostics, 3-D and per-eye calibration)
+  returns `TOBII_ERROR_NOT_SUPPORTED`. No licence is checked: what the Stream
+  Engine reserves for its professional, config or internal feature groups, or
+  for an additional-features licence (the IR image), works too.
 
   A name set with `tobii_set_device_name` is kept by the daemon, not the
   tracker, in `~/.config/tobii/device-name` (`$XDG_CONFIG_HOME/tobii`): the

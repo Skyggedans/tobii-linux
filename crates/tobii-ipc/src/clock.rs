@@ -6,11 +6,12 @@
 
 /// The host clock, `CLOCK_MONOTONIC`, in microseconds.
 ///
-/// `tobii_system_clock` returns it, and the engine stamps each gaze frame's
-/// receipt with it, which is where gaze data's `timestamp_system_us` and the
-/// TIMESYNC clock pair take their host time from. Like the DLL's
-/// `QueryPerformanceCounter` it never steps back and its epoch is undefined
-/// (on Linux it counts from boot and stops while suspended).
+/// `tobii_system_clock` returns it, every sample timestamp the daemon sends
+/// is on it (bar gaze data's tracker time), and the engine stamps each gaze
+/// frame's receipt with it, which is where the TIMESYNC clock pair takes its
+/// host time from. Like the DLL's `QueryPerformanceCounter` it never steps
+/// back and its epoch is undefined (on Linux it counts from boot and stops
+/// while suspended).
 ///
 /// `clock_gettime` fails only for a clock the kernel lacks (`EINVAL`) or a
 /// result it cannot write (`EFAULT`). Every Linux since 2.6 has

@@ -33,6 +33,9 @@ typedef struct tobii_gaze_data_eye_t
     float pupil_diameter_mm;
 } tobii_gaze_data_eye_t;
 
+/* timestamp_tracker_us is on the tracker's clock; timestamp_system_us is the
+ * same instant on the tobii_system_clock clock, as the DLL gives it, not the
+ * time the sample was received. */
 typedef struct tobii_gaze_data_t
 {
     int64_t timestamp_tracker_us;

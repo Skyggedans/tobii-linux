@@ -81,10 +81,12 @@ pub(crate) struct State {
     prewarm: bool,
     /// What the device reported at its last init (kept across restarts).
     pub(crate) facts: Option<Arc<DeviceFacts>>,
-    /// The last presence change, replayed to each new presence subscriber
-    /// (the device reports presence only when it changes).
+    /// The last presence report (the device sends one at stream start and
+    /// on change), replayed to each new presence subscriber with the host
+    /// time it was stamped with.
     last_presence: Option<PresenceSample>,
-    /// The newest `(device_us, host_us)` pair seen on the gaze stream.
+    /// The newest `(device_us, host_rx_us)` pair seen on the gaze stream: a
+    /// frame's device timestamp and the host time it was read at.
     /// Cleared whenever the engine is dropped or replaced and at every
     /// device init: the device clock restarts with the device, so a pair
     /// holds for one init only.
@@ -377,9 +379,10 @@ impl State {
         }
     }
 
-    /// Note the `(device_us, host_us)` pair of a gaze frame.
-    pub(crate) fn note_clock(&mut self, device_us: i64, host_us: i64) {
-        self.clock = Some((device_us, host_us));
+    /// Note the `(device_us, host_rx_us)` pair of a gaze frame: its device
+    /// timestamp and the host time it was read at.
+    pub(crate) fn note_clock(&mut self, device_us: i64, host_rx_us: i64) {
+        self.clock = Some((device_us, host_rx_us));
         self.gaze_frames = self.gaze_frames.wrapping_add(1);
     }
 
@@ -1132,6 +1135,35 @@ pub(crate) mod tests {
         assert_eq!(st.clock, None);
     }
 
+    /// The clock pair takes a gaze frame's read time, which `tobii_timesync`
+    /// brackets, not the host time the frame is sent with.
+    #[test]
+    fn the_clock_pair_takes_a_gaze_frames_read_time() {
+        let mut st = state_with_client(1);
+        let frame = tobii_proto::gaze83::GazeFrame {
+            device_ts_us: 5_000_000,
+            ..tobii_proto::gaze83::GazeFrame::default()
+        };
+        // Read at 100, taken at 90 on the host clock.
+        let gaze = Sample::Gaze(Box::new(tobii_usb::engine::GazeSample::new(frame, 100, 90)));
+
+        st.observe(&gaze);
+
+        assert_eq!((st.clock, st.gaze_frames), (Some((5_000_000, 100)), 1));
+        let mut sent = Vec::new();
+        push_sample_frames(&gaze, tobii_ipc::STREAM_GAZE_DATA, None, &mut sent);
+        let [(_, body)] = &sent[..] else {
+            panic!("no gaze data frame: {sent:?}");
+        };
+        let Some(tobii_ipc::ServerMsg::GazeData(data)) = tobii_ipc::decode_server(body) else {
+            panic!("not gaze data: {body:?}");
+        };
+        assert_eq!(
+            (data.timestamp_tracker_us, data.timestamp_system_us),
+            (5_000_000, 90)
+        );
+    }
+
     #[test]
     fn an_init_without_a_catalogue_keeps_the_previous_one() {
         let mut st = state_with_client(1);
@@ -1193,9 +1225,11 @@ pub(crate) mod tests {
     #[test]
     fn a_new_presence_subscriber_gets_the_last_state() {
         let state = Mutex::new(state_with_client(1));
+        // Device time 77, which is 70 on the host clock.
+        let presence = Sample::Presence(PresenceSample::new(77, 70, true));
         {
             let mut st = lock_state(&state);
-            st.observe(&Sample::Presence(PresenceSample::new(77, 70, true)));
+            st.observe(&presence);
             // No engine in tests: keep reconcile/ensure_engine from starting one.
             st.prewarm = false;
         }
@@ -1210,9 +1244,16 @@ pub(crate) mod tests {
         assert_eq!(
             tobii_ipc::decode_server(&sent[0]),
             Some(tobii_ipc::ServerMsg::Presence {
-                ts_us: 77,
+                ts_us: 70,
                 status: tobii_ipc::PRESENCE_PRESENT
             })
+        );
+        let mut live = Vec::new();
+        push_sample_frames(&presence, STREAM_PRESENCE, None, &mut live);
+        assert_eq!(
+            live,
+            [(STREAM_PRESENCE, sent[0].clone())],
+            "the frame the subscribers of the time got, host time and all"
         );
     }
 
@@ -1231,7 +1272,7 @@ pub(crate) mod tests {
         assert_eq!(
             tobii_ipc::decode_server(&outbox(&st, 1)[0]),
             Some(tobii_ipc::ServerMsg::Presence {
-                ts_us: 77,
+                ts_us: 70,
                 status: tobii_ipc::PRESENCE_PRESENT
             }),
             "the presence from before the pause is kept"

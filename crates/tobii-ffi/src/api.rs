@@ -391,9 +391,10 @@ pub unsafe extern "C" fn tobii_device_reconnect(device: *mut Device) -> Status {
     }
 }
 
-/// Accepted and a no-op: samples carry the device clock, and there is no
-/// offset estimate to refresh (`tobii_timesync` takes a fresh clock pair
-/// from the daemon on every call).
+/// Accepted and a no-op: the daemon maps the device clock to the host clock
+/// for every sample and keeps the mapping current itself, so there is no
+/// offset here to refresh (`tobii_timesync` takes a fresh clock pair from the
+/// daemon on every call).
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
@@ -408,8 +409,9 @@ pub unsafe extern "C" fn tobii_update_timesync(device: *mut Device) -> Status {
 
 /// The host clock, `CLOCK_MONOTONIC` in microseconds
 /// ([`tobii_ipc::host_clock_us`], which the daemon reads too): the clock of
-/// gaze data's `timestamp_system_us` and of `tobii_timesync`'s host times.
-/// Its epoch is undefined, as that of the DLL's `QueryPerformanceCounter` is.
+/// every callback timestamp (bar gaze data's `timestamp_tracker_us`) and of
+/// `tobii_timesync`'s host times. Its epoch is undefined, as that of the
+/// DLL's `QueryPerformanceCounter` is.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `timestamp_us` must be null or valid
@@ -775,6 +777,93 @@ mod tests {
             (before..=after).contains(&t),
             "{t} is not between {before} and {after}"
         );
+    }
+
+    /// Through the C entry points, a callback gets the daemon's stamp
+    /// unchanged, on the clock `tobii_system_clock` reads. The fake daemon
+    /// stands in for tobiid, stamping a frame on [`tobii_ipc::host_clock_us`]
+    /// a latency before it is sent; the stamp lands within the
+    /// `tobii_system_clock` bracket around the callbacks, less the most a
+    /// capture precedes its read, only while libtobii neither converts it nor
+    /// reads another clock. The daemon's own mapping (a stamp no later than
+    /// its read, on the latency floor) is checked by `tobii-usb`'s `time_map`
+    /// tests. Gaze data gives the tracker time beside the same stamp.
+    #[test]
+    fn a_frame_the_daemon_stamps_reads_on_the_system_clock() {
+        use crate::device::tests::{Stamps, fake_daemon, stamp_gaze, stamp_gaze_data};
+        use crate::types::{GazeDataFn, GazePointFn};
+        /// The frame's tracker time.
+        const TRACKER_US: i64 = 9_613_320_391;
+        /// The frame was taken this long before the daemon read it.
+        const LATENCY_US: i64 = 8_000;
+        /// The most a gaze frame is taken before the daemon reads it: the
+        /// bracket `tobii_timesync` gives one.
+        const TAKEN_BEFORE_READ_US: i64 = 30_000;
+        let both = tobii_ipc::STREAM_GAZE | tobii_ipc::STREAM_GAZE_DATA;
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                let mut out = Vec::new();
+                if tobii_ipc::decode_subscribe(body) == Some(both) {
+                    // tobiid's stamp, stood in for, of a frame it reads now.
+                    let host_us = tobii_ipc::host_clock_us() - LATENCY_US;
+                    out.push(tobii_ipc::encode_gaze(
+                        host_us,
+                        true,
+                        [0.5; 2],
+                        [f32::NAN; 2],
+                    ));
+                    out.push(tobii_ipc::encode_gaze_data(&tobii_ipc::GazeData {
+                        timestamp_tracker_us: TRACKER_US,
+                        timestamp_system_us: host_us,
+                        ..tobii_ipc::GazeData::default()
+                    }));
+                }
+                out.push(tobii_ipc::encode_subscribed(true));
+                out
+            }
+            _ => vec![],
+        });
+        let api = api();
+        let device = Box::into_raw(Box::new(
+            Device::new(connect, api as usize, 1).expect("device"),
+        ));
+        let mut stamps = Stamps::default();
+        let ud = (&raw mut stamps).cast::<c_void>();
+        let (mut before, mut after) = (0i64, 0i64);
+        // SAFETY: `api` and `device` are live and each destroyed once, last;
+        // the callbacks match their slots and `ud` is the live `stamps`,
+        // which outlives the device; `before` and `after` are live locals.
+        unsafe {
+            assert_eq!(tobii_system_clock(api, &raw mut before), 0);
+            assert_eq!(
+                crate::streams::tobii_gaze_point_subscribe(
+                    device,
+                    Some(stamp_gaze as GazePointFn),
+                    ud
+                ),
+                0
+            );
+            assert_eq!(
+                crate::advanced::tobii_gaze_data_subscribe(
+                    device,
+                    Some(stamp_gaze_data as GazeDataFn),
+                    ud
+                ),
+                0
+            );
+            assert_eq!(tobii_device_process_callbacks(device), 0);
+            assert_eq!(tobii_system_clock(api, &raw mut after), 0);
+            assert_eq!(tobii_device_destroy(device), 0);
+            assert_eq!(tobii_api_destroy(api), 0);
+        }
+
+        let earliest = before - TAKEN_BEFORE_READ_US;
+        assert!(
+            (earliest..=after).contains(&stamps.gaze),
+            "{} is not between {earliest} and {after}",
+            stamps.gaze
+        );
+        assert_eq!(stamps.gaze_data, (TRACKER_US, stamps.gaze));
     }
 
     unsafe extern "C" fn count_urls(_url: *const c_char, ud: *mut c_void) {

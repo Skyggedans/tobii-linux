@@ -69,6 +69,20 @@ pub struct PoseSample {
     pub rot_deg: [f64; 3],
 }
 
+impl PoseSample {
+    /// A pose made from the image of device time `timestamp_us`, which is
+    /// `host_us` on the host clock.
+    #[must_use]
+    pub fn new(timestamp_us: i64, host_us: i64, pos_cm: [f64; 3], rot_deg: [f64; 3]) -> Self {
+        Self {
+            timestamp_us,
+            host_us,
+            pos_cm,
+            rot_deg,
+        }
+    }
+}
+
 /// One decoded 0x500 gaze frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]

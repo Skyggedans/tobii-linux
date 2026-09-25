@@ -23,6 +23,8 @@ export function subscribeFrame(streams = STREAM_GAZE) {
 
 // Parse all complete frames in `buf`. Returns decoded gaze samples, the last
 // SUBSCRIBED ack seen (or null), and the unconsumed tail bytes (`rest`).
+// A sample's `tsUs` is when it was taken, in host CLOCK_MONOTONIC
+// microseconds: comparable with GLib.get_monotonic_time().
 export function parseFrames(buf) {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const gaze = [];

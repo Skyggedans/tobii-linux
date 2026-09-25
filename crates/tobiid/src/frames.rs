@@ -5,7 +5,10 @@
 //! goes out mirrors the Stream Engine: the gaze point is the device's
 //! filtered combined point, unclamped; gaze origins are in the display frame;
 //! values are passed through with their validity flags; every timestamp is
-//! the device clock.
+//! the sample's host time (the engine's `host_us`, on
+//! [`tobii_ipc::host_clock_us`]), bar gaze data's tracker time, which stays
+//! the device clock. Gaze data's system time is that tracker time on the
+//! host clock, as in the Stream Engine, not the time the frame was read.
 
 use tobii_ipc::geometry::{DisplayArea, display_to_tracker};
 use tobii_ipc::{
@@ -65,12 +68,11 @@ fn gaze_frames(
     out: &mut Vec<(u32, Vec<u8>)>,
 ) {
     let frame: &GazeFrame = &g.frame;
-    let device_ts = ts(frame.device_ts_us);
     if wanted & STREAM_GAZE != 0 {
         out.push((
             STREAM_GAZE,
             encode_gaze(
-                device_ts,
+                g.host_us,
                 frame.gaze.valid,
                 f32s(frame.gaze.value),
                 [f32::NAN; 2],
@@ -81,7 +83,7 @@ fn gaze_frames(
         out.push((
             STREAM_GAZE_ORIGIN,
             encode_gaze_origin(&EyePair {
-                ts_us: device_ts,
+                ts_us: g.host_us,
                 left: point(frame.left.origin_display_mm),
                 right: point(frame.right.origin_display_mm),
             }),
@@ -91,7 +93,7 @@ fn gaze_frames(
         out.push((
             STREAM_EYE_POSITION,
             encode_eye_position(&EyePair {
-                ts_us: device_ts,
+                ts_us: g.host_us,
                 left: point(frame.left.track_box),
                 right: point(frame.right.track_box),
             }),
@@ -101,8 +103,8 @@ fn gaze_frames(
         out.push((
             STREAM_GAZE_DATA,
             encode_gaze_data(&GazeData {
-                timestamp_tracker_us: device_ts,
-                timestamp_system_us: g.host_rx_us,
+                timestamp_tracker_us: ts(frame.device_ts_us),
+                timestamp_system_us: g.host_us,
                 left: gaze_data_eye(&frame.left, display),
                 right: gaze_data_eye(&frame.right, display),
             }),
@@ -110,14 +112,15 @@ fn gaze_frames(
     }
 }
 
-/// A presence sample as its PRESENCE frame body.
+/// A presence sample as its PRESENCE frame body, stamped with its host time:
+/// the frame a new subscriber is replayed is the one the others got.
 pub(crate) fn presence_frame(p: &PresenceSample) -> Vec<u8> {
     let status = if p.present {
         PRESENCE_PRESENT
     } else {
         PRESENCE_AWAY
     };
-    encode_presence(p.timestamp_us, status)
+    encode_presence(p.host_us, status)
 }
 
 /// A device notification in the Stream Engine's terms; `None` for the ones it
@@ -155,7 +158,7 @@ pub(crate) fn push_sample_frames(
                 p.rot_deg[0].to_radians(),
                 p.rot_deg[2].to_radians(),
             ]);
-            out.push((STREAM_HEAD, encode_head(p.timestamp_us, pos, rot)));
+            out.push((STREAM_HEAD, encode_head(p.host_us, pos, rot)));
         }
         Sample::Gaze(g) => gaze_frames(g, wanted, display, out),
         Sample::Presence(p) if wanted & STREAM_PRESENCE != 0 => {
@@ -169,7 +172,7 @@ pub(crate) fn push_sample_frames(
             };
             out.push((
                 STREAM_IMAGE,
-                encode_image(ts(frame.device_ts_us), width, height, 8, &frame.pixels),
+                encode_image(image.host_us, width, height, 8, &frame.pixels),
             ));
         }
         Sample::Notification(n) if wanted & STREAM_NOTIFICATIONS != 0 => {
@@ -186,9 +189,20 @@ pub(crate) fn push_sample_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tobii_ipc::{ServerMsg, decode_server};
     use tobii_proto::gaze83::decode_gaze_frame;
+    use tobii_proto::image83::ImageFrame;
     use tobii_proto::protocol::{hex_to_bytes, parse_message};
+    use tobii_usb::engine::{ImageSample, PoseSample};
+
+    /// The session1 fixture frame's device timestamp.
+    const DEVICE_US: i64 = 9_613_320_391;
+    /// When the host read that frame.
+    const READ_US: i64 = 12_000_008_000;
+    /// The frame's device timestamp on the host clock: 6 ms before the read,
+    /// as for a read that far above the latency floor.
+    const HOST_US: i64 = 12_000_002_000;
 
     fn session1_sample() -> Sample {
         let path = concat!(
@@ -197,7 +211,7 @@ mod tests {
         );
         let bytes = hex_to_bytes(&std::fs::read_to_string(path).expect("fixture")).expect("hex");
         let frame = decode_gaze_frame(&parse_message(&bytes).expect("msg")).expect("frame");
-        Sample::Gaze(Box::new(GazeSample::new(frame, 42, 40)))
+        Sample::Gaze(Box::new(GazeSample::new(frame, READ_US, HOST_US)))
     }
 
     fn frames(sample: &Sample, wanted: u32) -> Vec<(u32, ServerMsg)> {
@@ -222,7 +236,7 @@ mod tests {
                     },
                 ),
             ] => {
-                assert_eq!(*ts_us, 9_613_320_391);
+                assert_eq!(*ts_us, HOST_US);
                 assert!(*valid);
                 // The f64 values session1.jsonl recorded, narrowed like the DLL's f32.
                 #[allow(clippy::cast_possible_truncation)] // reason: the DLL hands out f32
@@ -263,7 +277,6 @@ mod tests {
         }
         match &all[3].1 {
             ServerMsg::GazeData(data) => {
-                assert_eq!(data.timestamp_system_us, 42);
                 assert!(
                     !data.left.gaze_point_valid,
                     "no display area, no tracker-frame gaze point"
@@ -272,5 +285,55 @@ mod tests {
             }
             other => panic!("expected gaze data, got {other:?}"),
         }
+    }
+
+    /// Every sample frame carries the sample's host time, as the Stream
+    /// Engine's callbacks do. Gaze data keeps the device time beside it, and
+    /// its system time is that device time on the host clock, not the read.
+    #[test]
+    fn every_sample_frame_carries_its_host_time() {
+        let wanted = STREAM_GAZE
+            | STREAM_GAZE_ORIGIN
+            | STREAM_EYE_POSITION
+            | STREAM_GAZE_DATA
+            | STREAM_HEAD
+            | STREAM_PRESENCE
+            | STREAM_IMAGE;
+        let [
+            (_, ServerMsg::Gaze { ts_us, .. }),
+            (_, ServerMsg::GazeOrigin(origin)),
+            (_, ServerMsg::EyePosition(eyes)),
+            (_, ServerMsg::GazeData(data)),
+        ] = &frames(&session1_sample(), wanted)[..]
+        else {
+            panic!("the gaze sample did not give its four frames");
+        };
+        assert_eq!([*ts_us, origin.ts_us, eyes.ts_us], [HOST_US; 3]);
+        assert_eq!(
+            (data.timestamp_tracker_us, data.timestamp_system_us),
+            (DEVICE_US, HOST_US)
+        );
+
+        let image = ImageFrame {
+            device_ts_us: DEVICE_US.unsigned_abs(),
+            width: 2,
+            height: 2,
+            pixels: vec![0; 4],
+        };
+        let others = [
+            Sample::Pose(PoseSample::new(DEVICE_US, HOST_US, [0.0; 3], [0.0; 3])),
+            Sample::Presence(PresenceSample::new(DEVICE_US, HOST_US, true)),
+            Sample::Image(ImageSample::new(Arc::new(image), HOST_US)),
+        ];
+        let stamps: Vec<i64> = others
+            .iter()
+            .flat_map(|s| frames(s, wanted))
+            .map(|(_, msg)| match msg {
+                ServerMsg::Head { ts_us, .. } | ServerMsg::Presence { ts_us, .. } => ts_us,
+                ServerMsg::Image(image) => image.ts_us,
+                other => panic!("unexpected frame {other:?}"),
+            })
+            .collect();
+        assert_eq!(stamps, [HOST_US; 3], "head, presence and image");
     }
 }

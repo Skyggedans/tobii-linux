@@ -258,12 +258,13 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_de
  * TOBII_ERROR_CONNECTION_FAILED with the connection intact) it succeeds
  * without bringing one back. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
-/* A no-op: samples carry the device clock, and there is no offset estimate to
+/* A no-op: the daemon maps the tracker's clock to the host clock for every
+ * sample and keeps the mapping current itself, so there is nothing here to
  * refresh (tobii_timesync takes a fresh clock pair on every call). */
 TOBII_API tobii_error_t TOBII_CALL tobii_update_timesync( tobii_device_t* device );
 /* CLOCK_MONOTONIC microseconds, whose epoch is undefined (the DLL reads
- * QueryPerformanceCounter): the clock of gaze data's timestamp_system_us and
- * of tobii_timesync's system times. */
+ * QueryPerformanceCounter): the clock of every callback timestamp (bar gaze
+ * data's timestamp_tracker_us) and of tobii_timesync's system times. */
 TOBII_API tobii_error_t TOBII_CALL tobii_system_clock( tobii_api_t* api, int64_t* timestamp_us );
 
 /* Serial, model, generation and firmware; runtime_build_version names

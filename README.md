@@ -154,6 +154,19 @@ Where the answers come from, and where they differ from Windows:
   daemon in `~/.config/tobii/device-name`, for every client and later
   sessions; nothing is written to the tracker. Until one is set,
   `tobii_get_device_name` gives the model.
+- **Timestamps.** Every callback timestamp is on `tobii_system_clock`'s
+  clock, as in the Stream Engine, and gaze data's `timestamp_tracker_us` keeps
+  the tracker's. The Stream Engine adds one offset per connection, from round
+  trips to its service, and refreshes it only in `tobii_update_timesync` and
+  `tobii_timesync`. Here the daemon estimates the offset from the arrivals
+  (the smallest receipt-minus-device time of the gaze frames and images of
+  the last 120 s, afresh at each tracker open), so it follows the drift
+  between the clocks, and every client gets the same stamps. The interval
+  between two stamps can then differ from the tracker's by a couple of ms
+  when the estimate moves (the Stream Engine's are exact within a
+  connection), though never below 1 µs within a stream. A stamp is no later
+  than the daemon's read of its sample, but for a sample read during the
+  tracker's init, which gets the time it is delivered, a few ms late.
 - **Clock pair.** `tobii_timesync` pairs the device timestamp of the next gaze
   frame with the host clock (`CLOCK_MONOTONIC`, as `tobii_system_clock`) in a
   fixed 30 ms bracket; the Stream Engine times a round trip instead, on

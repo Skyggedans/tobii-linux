@@ -1,10 +1,11 @@
 /* tobii/tobii_streams.h — the sample streams, as provided by libtobii.so.
  *
  * Companion to tobii/tobii.h; see that file for what these headers are.
- * Every sample carries the device clock in timestamp_us. Callbacks run on the
- * thread that calls tobii_device_process_callbacks; calling an implemented
- * device function from one (creating or destroying a device included),
- * tobii_calibration_parse or tobii_api_destroy returns
+ * Every sample's timestamp_us is when it was taken, on the clock
+ * tobii_system_clock reads (the daemon maps the tracker's clock onto it).
+ * Callbacks run on the thread that calls tobii_device_process_callbacks;
+ * calling an implemented device function from one (creating or destroying a
+ * device included), tobii_calibration_parse or tobii_api_destroy returns
  * TOBII_ERROR_CALLBACK_IN_PROGRESS.
  *
  * SPDX-License-Identifier: MIT
@@ -85,7 +86,8 @@ typedef enum tobii_user_presence_status_t
 typedef void ( *tobii_user_presence_callback_t )( tobii_user_presence_status_t status,
     int64_t timestamp_us, void* user_data );
 
-/* Reported once on subscribe (the last known state) and then on change. */
+/* Reported once on subscribe (the last known state, with the time it was
+ * last reported; not while paused) and then on change. */
 TOBII_API tobii_error_t TOBII_CALL tobii_user_presence_subscribe( tobii_device_t* device,
     tobii_user_presence_callback_t callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_user_presence_unsubscribe( tobii_device_t* device );

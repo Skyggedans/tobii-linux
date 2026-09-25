@@ -1,9 +1,11 @@
 //! Daemon -> client frames: the sample streams, subscription acks and request
 //! replies, and their codecs.
 //!
-//! Every sample timestamp is the **device** clock in microseconds, as the
-//! Stream Engine reports it; [`crate::request::Timesync`] maps it to the host
-//! clock.
+//! Every sample timestamp is the **host** clock ([`crate::host_clock_us`],
+//! microseconds): the device time the sample was taken at, which the daemon
+//! maps onto the host clock, as the Stream Engine's callbacks carry it. Only
+//! [`GazeData::timestamp_tracker_us`] keeps the device clock, which
+//! [`crate::request::Timesync`] pairs with the host clock.
 
 use crate::geometry::DisplayArea;
 use crate::wire::{Reader, Writer};
@@ -26,7 +28,7 @@ pub struct EyePoint {
 /// (track-box-normalised, `0..1` per axis).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct EyePair {
-    /// Device timestamp, microseconds.
+    /// When the sample was taken, on the host clock, microseconds.
     pub ts_us: i64,
     /// The user's left eye.
     pub left: EyePoint,
@@ -62,10 +64,11 @@ pub struct GazeDataEye {
 /// The per-eye "gaze data" sample: `tobii_gaze_data_t`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GazeData {
-    /// Device timestamp, microseconds.
+    /// When the sample was taken, on the device clock, microseconds.
     pub timestamp_tracker_us: i64,
-    /// Host timestamp at receipt, microseconds: [`crate::host_clock_us`],
-    /// the clock of `tobii_system_clock`.
+    /// `timestamp_tracker_us` on the host clock ([`crate::host_clock_us`],
+    /// the clock of `tobii_system_clock`), microseconds: as in the Stream
+    /// Engine, not the time the sample was received.
     pub timestamp_system_us: i64,
     /// The user's left eye.
     pub left: GazeDataEye,
@@ -76,7 +79,7 @@ pub struct GazeData {
 /// One IR camera frame.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Image {
-    /// Device timestamp, microseconds.
+    /// When the frame was taken, on the host clock, microseconds.
     pub ts_us: i64,
     /// Width, pixels.
     pub width: u32,
@@ -167,7 +170,7 @@ pub enum ServerMsg {
     },
     /// Head pose.
     Head {
-        /// Device timestamp, microseconds.
+        /// When the sample was taken, on the host clock, microseconds.
         ts_us: i64,
         /// Translation `[x, y, z]` in millimetres.
         pos_mm: [f32; 3],
@@ -176,7 +179,7 @@ pub enum ServerMsg {
     },
     /// Gaze point.
     Gaze {
-        /// Device timestamp, microseconds.
+        /// When the sample was taken, on the host clock, microseconds.
         ts_us: i64,
         /// Whether `xy` holds a usable gaze point.
         valid: bool,
@@ -190,7 +193,7 @@ pub enum ServerMsg {
     },
     /// User presence.
     Presence {
-        /// Device timestamp, microseconds.
+        /// When the sample was taken, on the host clock, microseconds.
         ts_us: i64,
         /// One of [`crate::PRESENCE_AWAY`] / [`crate::PRESENCE_PRESENT`].
         status: u8,

@@ -229,7 +229,8 @@ pub struct GeometryMounting {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeadPose {
-    /// Device timestamp, microseconds.
+    /// When the source image was taken, microseconds on the
+    /// `tobii_system_clock` clock.
     pub timestamp_us: i64,
     /// Validity of `position_xyz`.
     pub position_validity: Validity,
@@ -245,7 +246,8 @@ pub struct HeadPose {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GazePoint {
-    /// Device timestamp, microseconds.
+    /// When the sample was taken, microseconds on the `tobii_system_clock`
+    /// clock.
     pub timestamp_us: i64,
     /// Validity of `position_xy`.
     pub validity: Validity,
@@ -258,7 +260,8 @@ pub struct GazePoint {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EyePair {
-    /// Device timestamp, microseconds.
+    /// When the sample was taken, microseconds on the `tobii_system_clock`
+    /// clock.
     pub timestamp_us: i64,
     /// Validity of `left_xyz`.
     pub left_validity: Validity,
@@ -300,9 +303,10 @@ pub struct GazeDataEye {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GazeData {
-    /// Device timestamp, microseconds.
+    /// When the sample was taken, microseconds on the tracker's clock.
     pub timestamp_tracker_us: i64,
-    /// Host timestamp, microseconds (the `tobii_system_clock` clock).
+    /// `timestamp_tracker_us` on the `tobii_system_clock` clock, as the DLL
+    /// gives it (not the time the sample was received).
     pub timestamp_system_us: i64,
     /// Left eye.
     pub left: GazeDataEye,
@@ -344,7 +348,8 @@ pub struct Notification {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Image {
-    /// Device timestamp, microseconds.
+    /// When the frame was taken, microseconds on the `tobii_system_clock`
+    /// clock.
     pub timestamp_us: i64,
     /// Width, pixels.
     pub width: i32,
@@ -370,7 +375,8 @@ pub struct TimesyncData {
     pub system_start_us: i64,
     /// Host time after the tracker time was taken, microseconds.
     pub system_end_us: i64,
-    /// Tracker time, microseconds (the clock of the samples' timestamps).
+    /// Tracker time, microseconds (the clock of gaze data's
+    /// `timestamp_tracker_us`).
     pub tracker_us: i64,
 }
 

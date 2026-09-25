@@ -200,12 +200,12 @@ fn timesync(state: &Mutex<State>, client: u64) -> Reply {
         }
         // A stop clears `clock` after the count moved: wait for the next one.
         if frames != asked
-            && let Some((device_us, host_us)) = clock
+            && let Some((device_us, host_rx_us)) = clock
         {
             return Reply::ok(encode_timesync(&Timesync {
-                host_start_us: host_us - FRAME_LATENCY_US,
+                host_start_us: host_rx_us - FRAME_LATENCY_US,
                 device_us,
-                host_end_us: host_us,
+                host_end_us: host_rx_us,
             }));
         }
         if running {

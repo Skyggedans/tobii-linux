@@ -700,12 +700,12 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
         match tracker.process(&upscaled, frame.width * 2, frame.height * 2) {
             Ok(Some(p)) => {
                 posed += 1;
-                let _ = tx.send(Sample::Pose(PoseSample {
-                    timestamp_us: to_i64_us(frame.device_ts_us),
+                let _ = tx.send(Sample::Pose(PoseSample::new(
+                    to_i64_us(frame.device_ts_us),
                     host_us,
-                    pos_cm: [p[0], p[1], p[2]],
-                    rot_deg: [p[3], p[4], p[5]],
-                }));
+                    [p[0], p[1], p[2]],
+                    [p[3], p[4], p[5]],
+                )));
             }
             Ok(None) => {}
             Err(e) => warn!(error = format_args!("{e:#}"), "image83 pose failed"),
@@ -1985,7 +1985,7 @@ mod tests {
         let [Sample::Gaze(gaze)] = &rig.samples()[..] else {
             panic!("the frame was not delivered as gaze");
         };
-        // The daemon's TIMESYNC pair and gaze data's system time are this.
+        // The daemon's TIMESYNC pair takes its host time from this.
         assert!(
             (before..=after).contains(&gaze.host_rx_us),
             "{} is not between {before} and {after}",

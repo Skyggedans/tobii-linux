@@ -54,7 +54,9 @@
 //! `tobii_device_create` connects to the daemon (auto-spawning it if needed),
 //! so several processes can use the device at once. Pump with
 //! `tobii_wait_for_callbacks` + `tobii_device_process_callbacks` exactly like
-//! the Stream Engine. Every sample carries the device clock.
+//! the Stream Engine. Every sample's timestamp is on the host clock
+//! `tobii_system_clock` reads, as the daemon sends it (gaze data's tracker
+//! time aside): libtobii passes the daemon's values through.
 //!
 //! When the daemon connection is lost (tobiid stopped, crashed or was
 //! restarted, or dropped a client that stopped reading),

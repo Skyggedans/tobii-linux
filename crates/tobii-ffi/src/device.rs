@@ -916,6 +916,132 @@ pub(crate) mod tests {
         assert_eq!(hits, 1);
     }
 
+    /// The timestamps each callback got last.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Stamps {
+        pub(crate) head: i64,
+        pub(crate) gaze: i64,
+        pub(crate) presence: i64,
+        pub(crate) gaze_origin: i64,
+        pub(crate) eye_position: i64,
+        pub(crate) user_position_guide: i64,
+        /// `(timestamp_tracker_us, timestamp_system_us)`.
+        pub(crate) gaze_data: (i64, i64),
+        pub(crate) image: i64,
+    }
+
+    // The `stamp_*` callbacks note their sample's timestamps in the `Stamps`
+    // that the tests pass as `ud`.
+
+    unsafe extern "C" fn stamp_head(p: *const HeadPose, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).head = (*p).timestamp_us };
+    }
+
+    pub(crate) unsafe extern "C" fn stamp_gaze(p: *const GazePoint, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).gaze = (*p).timestamp_us };
+    }
+
+    unsafe extern "C" fn stamp_presence(_s: PresenceStatus, ts: i64, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps` (see above).
+        unsafe { (*ud.cast::<Stamps>()).presence = ts };
+    }
+
+    unsafe extern "C" fn stamp_gaze_origin(p: *const EyePair, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).gaze_origin = (*p).timestamp_us };
+    }
+
+    unsafe extern "C" fn stamp_eye_position(p: *const EyePair, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).eye_position = (*p).timestamp_us };
+    }
+
+    unsafe extern "C" fn stamp_user_position_guide(p: *const EyePair, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).user_position_guide = (*p).timestamp_us };
+    }
+
+    pub(crate) unsafe extern "C" fn stamp_gaze_data(p: *const GazeData, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe {
+            (*ud.cast::<Stamps>()).gaze_data =
+                ((*p).timestamp_tracker_us, (*p).timestamp_system_us);
+        }
+    }
+
+    unsafe extern "C" fn stamp_image(p: *const Image, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).image = (*p).timestamp_us };
+    }
+
+    /// libtobii hands each callback the timestamp its frame carried, which
+    /// the daemon sends on the host clock, and gaze data's tracker time
+    /// beside it: nothing is converted on this side.
+    #[test]
+    fn every_callback_gets_the_timestamps_its_frame_carried() {
+        let pair = |ts_us| tobii_ipc::EyePair {
+            ts_us,
+            ..tobii_ipc::EyePair::default()
+        };
+        let frames = vec![
+            tobii_ipc::encode_head(11, [0.0; 3], [0.0; 3]),
+            encode_gaze(12, true, [0.5; 2], [f32::NAN; 2]),
+            tobii_ipc::encode_presence(13, tobii_ipc::PRESENCE_PRESENT),
+            encode_gaze_origin(&pair(14)),
+            tobii_ipc::encode_eye_position(&pair(15)),
+            tobii_ipc::encode_gaze_data(&tobii_ipc::GazeData {
+                timestamp_tracker_us: 7,
+                timestamp_system_us: 16,
+                ..tobii_ipc::GazeData::default()
+            }),
+            tobii_ipc::encode_image(17, 1, 1, 8, &[0]),
+        ];
+        // Sends them all ahead of every subscription ack, so that they wait
+        // for `process`.
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                let mut out = frames.clone();
+                out.push(encode_subscribed(true));
+                out
+            }
+            _ => vec![],
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut stamps = Stamps::default();
+        let ud = (&raw mut stamps).cast::<c_void>();
+        d.callbacks = Callbacks {
+            head: Some((stamp_head as HeadPoseFn, ud)),
+            gaze: Some((stamp_gaze as GazePointFn, ud)),
+            presence: Some((stamp_presence as PresenceFn, ud)),
+            gaze_origin: Some((stamp_gaze_origin as EyePairFn, ud)),
+            eye_position: Some((stamp_eye_position as EyePairFn, ud)),
+            user_position_guide: Some((stamp_user_position_guide as EyePairFn, ud)),
+            gaze_data: Some((stamp_gaze_data as GazeDataFn, ud)),
+            image: Some((stamp_image as ImageFn, ud)),
+            ..Callbacks::default()
+        };
+
+        assert_eq!(d.resend_subscription(), Ok(true));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+
+        assert_eq!(
+            stamps,
+            Stamps {
+                head: 11,
+                gaze: 12,
+                presence: 13,
+                gaze_origin: 14,
+                eye_position: 15,
+                user_position_guide: 15,
+                gaze_data: (7, 16),
+                image: 17,
+            }
+        );
+    }
+
     unsafe extern "C" fn reenter(_p: *const EyePair, ud: *mut c_void) {
         // SAFETY: the test passes `&raw mut Status` as `ud`.
         let out = unsafe { &mut *ud.cast::<Status>() };

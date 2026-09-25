@@ -12,9 +12,10 @@
 //! | `0x11` REPLY | daemon -> client | `u32 id`, `u8 status`, payload |
 //! | `0x20` HEAD .. `0x27` NOTIFICATION | daemon -> client | samples ([`ServerMsg`]) |
 //!
-//! Sample timestamps are the device clock in microseconds. Host timestamps
-//! (gaze data's system time, the TIMESYNC pair) are [`host_clock_us`], which
-//! is also what `tobii_system_clock` returns.
+//! Sample timestamps are the host clock, [`host_clock_us`] in microseconds,
+//! which is also what `tobii_system_clock` returns: the daemon maps the
+//! device time each sample was taken at onto it. The device clock is left
+//! only in gaze data's tracker time and the TIMESYNC pair's device time.
 //!
 //! The SUBSCRIBE mask is written as `u32 LE`, whose first byte is the low
 //! byte of the mask: a daemon that reads only one byte still sees every
