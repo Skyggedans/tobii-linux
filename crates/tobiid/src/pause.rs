@@ -647,6 +647,7 @@ mod tests {
         st.observe(&Sample::Gaze(Box::new(GazeSample::new(
             tobii_proto::gaze83::GazeFrame::default(),
             7,
+            7,
         ))));
         assert_eq!((st.clock, st.gaze_frames), (None, 0));
     }

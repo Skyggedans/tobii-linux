@@ -1195,7 +1195,7 @@ pub(crate) mod tests {
         let state = Mutex::new(state_with_client(1));
         {
             let mut st = lock_state(&state);
-            st.observe(&Sample::Presence(PresenceSample::new(77, true)));
+            st.observe(&Sample::Presence(PresenceSample::new(77, 70, true)));
             // No engine in tests: keep reconcile/ensure_engine from starting one.
             st.prewarm = false;
         }
@@ -1219,10 +1219,10 @@ pub(crate) mod tests {
     #[test]
     fn a_paused_device_replays_no_presence() {
         let mut st = state_with_client(1);
-        st.observe(&Sample::Presence(PresenceSample::new(77, true)));
+        st.observe(&Sample::Presence(PresenceSample::new(77, 70, true)));
         st.paused = true;
 
-        st.observe(&Sample::Presence(PresenceSample::new(88, false)));
+        st.observe(&Sample::Presence(PresenceSample::new(88, 80, false)));
         replay_presence(&mut st, 1, 0, STREAM_PRESENCE);
 
         assert!(outbox(&st, 1).is_empty());

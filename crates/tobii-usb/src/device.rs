@@ -16,9 +16,10 @@ use std::{error, fmt, thread};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::engine::{
-    CommandError, CommandResponse, GazeSample, PoseSample, PresenceSample, QueuedCommand, Sample,
-    Shared,
+    CommandError, CommandResponse, GazeSample, ImageSample, PoseSample, PresenceSample,
+    QueuedCommand, Sample, Shared,
 };
+use crate::time_map::{Stream, TimeMap};
 use std::sync::mpsc::Receiver;
 use tobii_ipc::host_clock_us;
 use tobii_proto::facts::{DeviceFacts, DeviceNotification, decode_notification};
@@ -625,18 +626,20 @@ fn run_opens(
     }
 }
 
-/// Single-slot hand-off of the newest image frame to the pose worker.
-type PoseMailbox = Arc<(Mutex<Option<Arc<ImageFrame>>>, Condvar)>;
+/// Single-slot hand-off of the newest image frame to the pose worker, with
+/// its host time, which the pose it makes carries (the pose may come after a
+/// re-open, whose time map knows nothing of the image).
+type PoseMailbox = Arc<(Mutex<Option<ImageSample>>, Condvar)>;
 
-/// Replace the mailbox slot with `frame` (dropping any frame the worker
+/// Replace the mailbox slot with `image` (dropping any frame the worker
 /// has not taken yet) and wake the worker.
 ///
 /// The slot only ever holds an `Option` that is written whole, so a poisoned
 /// lock (a panicking worker) leaves nothing half-updated and the guard is
 /// reused rather than propagating the panic to the USB reader.
-fn mailbox_put(mailbox: &PoseMailbox, frame: Arc<ImageFrame>) {
+fn mailbox_put(mailbox: &PoseMailbox, image: ImageSample) {
     let (lock, cv) = &**mailbox;
-    *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+    *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
     cv.notify_one();
 }
 
@@ -667,7 +670,7 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
     // Relaxed everywhere below: the flags are pure signals; the frame itself
     // is handed over under the mailbox mutex.
     while !shared.stop.load(Ordering::Relaxed) {
-        let frame = {
+        let image = {
             // Poisoning cannot leave the slot half-written (see `mailbox_put`).
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
             while slot.is_none() && !shared.stop.load(Ordering::Relaxed) {
@@ -678,7 +681,9 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
             }
             slot.take()
         };
-        let Some(frame) = frame else { continue };
+        let Some(ImageSample { frame, host_us, .. }) = image else {
+            continue;
+        };
         if shared.recenter.swap(false, Ordering::Relaxed) {
             tracker.recenter();
         }
@@ -697,6 +702,7 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
                 posed += 1;
                 let _ = tx.send(Sample::Pose(PoseSample {
                     timestamp_us: to_i64_us(frame.device_ts_us),
+                    host_us,
                     pos_cm: [p[0], p[1], p[2]],
                     rot_deg: [p[3], p[4], p[5]],
                 }));
@@ -1189,17 +1195,27 @@ pub fn wait_for_gaze_stream(
     dur: Duration,
     asm: &mut BulkReassembler,
 ) -> bool {
-    wait_for_gaze_stream_with(h, stop, dur, asm, |_| {})
+    wait_for_gaze_stream_with(h, stop, dur, asm, |_, _| {}).is_some()
 }
 
-/// [`wait_for_gaze_stream`], handing every other message to `side`.
+/// A message's device timestamp and the host time it was read at
+/// ([`host_clock_us`]), microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Arrival {
+    device_us: i64,
+    host_rx_us: i64,
+}
+
+/// [`wait_for_gaze_stream`], handing every other message to `side` with the
+/// host time it was read at. Returns the arrival of the gaze frame that armed
+/// the stream, or `None` when the wait ended without one.
 fn wait_for_gaze_stream_with(
     h: &mut rusb::DeviceHandle<UsbContext>,
     stop: &AtomicBool,
     dur: Duration,
     asm: &mut BulkReassembler,
-    mut side: impl FnMut(&[u8]),
-) -> bool {
+    mut side: impl FnMut(&[u8], i64),
+) -> Option<Arrival> {
     let mut buf = vec![0u8; READ_BUF];
     let mut msgs = Vec::new();
     let mut seen = 0usize;
@@ -1207,16 +1223,18 @@ fn wait_for_gaze_stream_with(
     while start.elapsed() < dur && !stop.load(Ordering::Relaxed) {
         match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
             Ok(n) => {
+                let host_rx_us = host_clock_us();
                 asm.push_into(&buf[..n], &mut msgs);
                 for msg in &msgs {
                     seen += 1;
-                    if stream_id(msg) == Some(STREAM_ID_GAZE)
-                        && parse_message(msg)
-                            .as_ref()
-                            .and_then(decode_gaze_frame)
-                            .is_some()
-                    {
-                        return true;
+                    let gaze = (stream_id(msg) == Some(STREAM_ID_GAZE))
+                        .then(|| parse_message(msg).as_ref().and_then(decode_gaze_frame))
+                        .flatten();
+                    if let Some(frame) = gaze {
+                        return Some(Arrival {
+                            device_us: to_i64_us(frame.device_ts_us),
+                            host_rx_us,
+                        });
                     }
                     debug!(
                         len = msg.len(),
@@ -1224,19 +1242,19 @@ fn wait_for_gaze_stream_with(
                         stream = ?stream_id(msg),
                         "arming: not a gaze frame"
                     );
-                    side(msg);
+                    side(msg, host_rx_us);
                 }
             }
             Err(rusb::Error::Timeout) => {}
             Err(e) => {
                 // Not a stream that is merely slow to start: re-open.
                 debug!(error = ?e, "arming: read failed");
-                return false;
+                return None;
             }
         }
     }
     debug!(messages = seen, "arming: no gaze frame");
-    false
+    None
 }
 
 /// Longest the armed gaze stream may stay silent before the open is torn down
@@ -1470,6 +1488,12 @@ pub(crate) fn classify(msg: &[u8]) -> Incoming {
     }
 }
 
+/// The device time of `frame`, or `None` when it carried none (which
+/// [`decode_image_payload`] gives as 0).
+fn image_device_us(frame: &ImageFrame) -> Option<i64> {
+    (frame.device_ts_us != 0).then(|| to_i64_us(frame.device_ts_us))
+}
+
 /// A command written to the device and not yet answered.
 #[derive(Debug)]
 struct Outstanding {
@@ -1491,24 +1515,81 @@ struct Pump<'a> {
     image_live: bool,
     last_gaze: Instant,
     resume: ResumeWatch,
+    /// This open's device-to-host time map: a new open may restart the
+    /// tracker's clock, and a new pump starts a new map.
+    time: TimeMap,
 }
 
 impl Pump<'_> {
-    /// Route one message outside of command matching: samples to `tx`, image
-    /// frames to the pose worker.
+    /// Route one message outside of command matching, as read now: samples
+    /// to `tx`, image frames to the pose worker.
     fn deliver(&mut self, incoming: Incoming) {
+        self.deliver_at(incoming, host_clock_us());
+    }
+
+    /// [`Pump::deliver`] for a message read at host time `rx_us`. The time
+    /// map learns from it before it is stamped: a gaze frame whose device
+    /// clock went back must not be mapped with the offset from before.
+    fn deliver_at(&mut self, incoming: Incoming, rx_us: i64) {
+        self.observe(&incoming, rx_us);
+        self.route(incoming, rx_us);
+    }
+
+    /// Deliver the messages read while the stream armed, each with the host
+    /// time it was read at, once the time map has learnt from them all and
+    /// from the gaze frame that armed the stream (`armed`, itself not
+    /// delivered): a message read early in the wait, presence at stream
+    /// start among them, is stamped from the arrivals that followed it rather
+    /// than when it was read or delivered.
+    fn deliver_early(&mut self, early: Vec<(Incoming, i64)>, armed: Option<Arrival>) {
+        for (incoming, rx_us) in &early {
+            self.observe(incoming, *rx_us);
+        }
+        if let Some(armed) = armed {
+            self.time
+                .observe(Stream::Gaze, armed.device_us, armed.host_rx_us);
+        }
+        for (incoming, rx_us) in early {
+            self.route(incoming, rx_us);
+        }
+    }
+
+    /// Teach the time map a message read at host time `rx_us`: gaze frames and
+    /// images, the two streams that arrive at 33 Hz. An image without a
+    /// device time teaches it nothing.
+    fn observe(&mut self, incoming: &Incoming, rx_us: i64) {
+        let (stream, device_us) = match incoming {
+            Incoming::Gaze(frame) => (Stream::Gaze, to_i64_us(frame.device_ts_us)),
+            Incoming::Image(frame) => match image_device_us(frame) {
+                Some(device_us) => (Stream::Image, device_us),
+                None => return,
+            },
+            _ => return,
+        };
+        self.time.observe(stream, device_us, rx_us);
+    }
+
+    /// Stamp a message read at host time `rx_us` and route it (see
+    /// [`Pump::deliver`]); the time map has already seen it.
+    fn route(&mut self, incoming: Incoming, rx_us: i64) {
         match incoming {
             Incoming::Gaze(frame) => {
                 self.last_gaze = Instant::now();
                 self.resume.on_gaze();
+                let host_us = self
+                    .time
+                    .stamp(Stream::Gaze, to_i64_us(frame.device_ts_us), rx_us);
                 let _ = self.tx.send(Sample::Gaze(Box::new(GazeSample {
                     frame: *frame,
-                    host_rx_us: host_clock_us(),
+                    host_rx_us: rx_us,
+                    host_us,
                 })));
             }
             Incoming::Presence(p) => {
+                let timestamp_us = to_i64_us(p.device_ts_us);
                 let _ = self.tx.send(Sample::Presence(PresenceSample {
-                    timestamp_us: to_i64_us(p.device_ts_us),
+                    timestamp_us,
+                    host_us: self.time.stamp(Stream::Presence, timestamp_us, rx_us),
                     present: p.state == PRESENCE_STATE_PRESENT,
                 }));
             }
@@ -1521,12 +1602,22 @@ impl Pump<'_> {
                     );
                     self.image_live = true;
                 }
-                let frame = Arc::new(frame);
+                let host_us = match image_device_us(&frame) {
+                    Some(device_us) => self.time.stamp(Stream::Image, device_us, rx_us),
+                    None => {
+                        debug!("image without a device time: stamped as read");
+                        self.time.stamp_read(Stream::Image, rx_us)
+                    }
+                };
+                let image = ImageSample {
+                    frame: Arc::new(frame),
+                    host_us,
+                };
                 // Relaxed: a pure signal.
                 if self.shared.image_wanted.load(Ordering::Relaxed) {
-                    let _ = self.tx.send(Sample::Image(Arc::clone(&frame)));
+                    let _ = self.tx.send(Sample::Image(image.clone()));
                 }
-                mailbox_put(self.mailbox, frame);
+                mailbox_put(self.mailbox, image);
             }
             Incoming::Notification(n) => {
                 debug!(notification = ?n, "device notification");
@@ -1632,9 +1723,11 @@ impl Pump<'_> {
             let Ok(n) = h.read_bulk(EP_IN, buf, PIECE_DRAIN_TIMEOUT) else {
                 break;
             };
+            // Before the decoding, as in `pump_streams`.
+            let rx_us = host_clock_us();
             asm.push_into(&buf[..n], msgs);
             for msg in msgs.drain(..) {
-                self.deliver(classify(&msg));
+                self.deliver_at(classify(&msg), rx_us);
             }
         }
     }
@@ -1711,7 +1804,10 @@ fn gaze_stream_loop(
         image_live: false,
         last_gaze: Instant::now(),
         resume: ResumeWatch::default(),
+        time: TimeMap::default(),
     };
+    // Read during the replay, which has just ended: stamped as read now, as
+    // no arrival of this open has come yet to map them.
     for msg in &capture.side {
         pump.deliver(classify(msg));
     }
@@ -1743,15 +1839,19 @@ fn gaze_stream_loop(
     // The device's first 0x53 frame lands ~3s after a good init; give it margin.
     let mut asm = BulkReassembler::new();
     let mut early = Vec::new();
-    let armed = wait_for_gaze_stream_with(h, stop, Duration::from_secs_f64(4.5), &mut asm, |msg| {
-        if early.len() < MAX_SIDE_MESSAGES {
-            early.push(msg.to_vec());
-        }
-    });
-    for msg in &early {
-        pump.deliver(classify(msg));
-    }
-    if !armed {
+    let armed = wait_for_gaze_stream_with(
+        h,
+        stop,
+        Duration::from_secs_f64(4.5),
+        &mut asm,
+        |msg, rx_us| {
+            if early.len() < MAX_SIDE_MESSAGES {
+                early.push((classify(msg), rx_us));
+            }
+        },
+    );
+    pump.deliver_early(early, armed);
+    if armed.is_none() {
         if image {
             let _ = stop_stream(h, pump.cmd_seq, STREAM_ID_IMAGE);
         }
@@ -1811,9 +1911,13 @@ fn pump_streams(
         pump.expire(asm);
         match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(100)) {
             Ok(n) if n > 0 => {
+                // The read time of every message in the transfer, taken
+                // before they are decoded (an image's copies 78 KB), as the
+                // arming wait takes it.
+                let rx_us = host_clock_us();
                 asm.push_into(&buf[..n], &mut msgs);
                 for msg in msgs.drain(..) {
-                    pump.deliver(classify(&msg));
+                    pump.deliver_at(classify(&msg), rx_us);
                 }
             }
             Ok(_) | Err(rusb::Error::Timeout) => {}
@@ -1833,6 +1937,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use tobii_proto::protocol::hex_to_bytes;
+
+    const MS: i64 = 1_000;
+    const S: i64 = 1_000_000;
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = format!(
@@ -1868,27 +1975,14 @@ mod tests {
 
     #[test]
     fn a_gaze_frame_is_stamped_with_the_host_clock_when_read() {
-        let shared = Shared::default();
-        let (_queue, commands) = std::sync::mpsc::channel();
-        let (tx, samples) = std::sync::mpsc::channel();
-        let mailbox = PoseMailbox::default();
-        let mut pump = Pump {
-            shared: &shared,
-            commands: &commands,
-            tx: &tx,
-            mailbox: &mailbox,
-            cmd_seq: 0,
-            outstanding: None,
-            image_live: false,
-            last_gaze: Instant::now(),
-            resume: ResumeWatch::default(),
-        };
+        let rig = Rig::new();
+        let mut pump = rig.pump();
 
         let before = host_clock_us();
         pump.deliver(classify(&fixture("session1-gaze-frame")));
         let after = host_clock_us();
 
-        let Ok(Sample::Gaze(gaze)) = samples.try_recv() else {
+        let [Sample::Gaze(gaze)] = &rig.samples()[..] else {
             panic!("the frame was not delivered as gaze");
         };
         // The daemon's TIMESYNC pair and gaze data's system time are this.
@@ -1897,6 +1991,217 @@ mod tests {
             "{} is not between {before} and {after}",
             gaze.host_rx_us
         );
+        // The first arrival of an open maps to when it was read.
+        assert_eq!(gaze.host_us, gaze.host_rx_us);
+    }
+
+    /// What a [`Pump`] borrows, to drive one without a device.
+    struct Rig {
+        shared: Shared,
+        _queue: Sender<QueuedCommand>,
+        commands: Receiver<QueuedCommand>,
+        tx: Sender<Sample>,
+        samples: Receiver<Sample>,
+        mailbox: PoseMailbox,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let (queue, commands) = std::sync::mpsc::channel();
+            let (tx, samples) = std::sync::mpsc::channel();
+            Self {
+                shared: Shared::default(),
+                _queue: queue,
+                commands,
+                tx,
+                samples,
+                mailbox: PoseMailbox::default(),
+            }
+        }
+
+        /// A pump as a fresh open starts one.
+        fn pump(&self) -> Pump<'_> {
+            Pump {
+                shared: &self.shared,
+                commands: &self.commands,
+                tx: &self.tx,
+                mailbox: &self.mailbox,
+                cmd_seq: 0,
+                outstanding: None,
+                image_live: false,
+                last_gaze: Instant::now(),
+                resume: ResumeWatch::default(),
+                time: TimeMap::default(),
+            }
+        }
+
+        /// The samples sent so far.
+        fn samples(&self) -> Vec<Sample> {
+            self.samples.try_iter().collect()
+        }
+
+        /// The kind and host time of each sample sent so far.
+        fn host_times(&self) -> Vec<(&'static str, i64)> {
+            self.samples()
+                .iter()
+                .map(|sample| match sample {
+                    Sample::Gaze(g) => ("gaze", g.host_us),
+                    Sample::Presence(p) => ("presence", p.host_us),
+                    Sample::Image(i) => ("image", i.host_us),
+                    other => panic!("unexpected sample {other:?}"),
+                })
+                .collect()
+        }
+
+        /// The host time of the image waiting for the pose worker, which the
+        /// pose made from it carries.
+        fn pose_host_us(&self) -> Option<i64> {
+            let slot = self
+                .mailbox
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.as_ref().map(|image| image.host_us)
+        }
+    }
+
+    fn device_us(t: i64) -> u64 {
+        u64::try_from(t).expect("a device time")
+    }
+
+    fn gaze_at(t: i64) -> Incoming {
+        Incoming::Gaze(Box::new(GazeFrame {
+            device_ts_us: device_us(t),
+            ..GazeFrame::default()
+        }))
+    }
+
+    fn image_at(t: i64) -> Incoming {
+        Incoming::Image(ImageFrame {
+            device_ts_us: device_us(t),
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0],
+        })
+    }
+
+    fn presence_at(t: i64) -> Incoming {
+        Incoming::Presence(PresenceFrame {
+            device_ts_us: device_us(t),
+            state: PRESENCE_STATE_PRESENT,
+        })
+    }
+
+    #[test]
+    fn the_pump_maps_every_stream_from_gaze_and_image_arrivals() {
+        let rig = Rig::new();
+        rig.shared.image_wanted.store(true, Ordering::Relaxed);
+        let mut pump = rig.pump();
+
+        // Device time plus 40 s, and the latency: 4 ms for the first gaze
+        // frame, 1 ms for the image that follows.
+        pump.deliver_at(gaze_at(10 * S), 50 * S + 4 * MS);
+        pump.deliver_at(image_at(10 * S + 15 * MS), 50 * S + 16 * MS);
+        pump.deliver_at(gaze_at(10 * S + 30 * MS), 50 * S + 36 * MS);
+        pump.deliver_at(presence_at(10 * S + 31 * MS), 50 * S + 40 * MS);
+
+        // From the image on, everything maps at 40 s + 1 ms: gaze fed alone
+        // would have put the second frame at 50.034 s.
+        assert_eq!(
+            rig.host_times(),
+            [
+                ("gaze", 50 * S + 4 * MS),
+                ("image", 50 * S + 16 * MS),
+                ("gaze", 50 * S + 31 * MS),
+                ("presence", 50 * S + 32 * MS),
+            ]
+        );
+        assert_eq!(rig.pose_host_us(), Some(50 * S + 16 * MS));
+    }
+
+    #[test]
+    fn a_gaze_frame_whose_device_clock_went_back_maps_from_itself() {
+        let rig = Rig::new();
+        let mut pump = rig.pump();
+
+        pump.deliver_at(gaze_at(600 * S), 640 * S + 3 * MS);
+        // The device clock restarts: mapped with the old offset, this frame
+        // would come out 60 s before it was read.
+        pump.deliver_at(gaze_at(12 * S), 700 * S);
+
+        assert_eq!(
+            rig.host_times(),
+            [("gaze", 640 * S + 3 * MS), ("gaze", 700 * S)]
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_device_time_is_stamped_as_read_and_teaches_nothing() {
+        let rig = Rig::new();
+        rig.shared.image_wanted.store(true, Ordering::Relaxed);
+        let mut pump = rig.pump();
+
+        pump.deliver_at(image_at(10 * S), 50 * S + MS);
+        pump.deliver_at(image_at(0), 50 * S + 31 * MS);
+        assert_eq!(rig.pose_host_us(), Some(50 * S + 31 * MS));
+        // No restart, so the first image's offset stays: taken for a device
+        // time, the 0 would have started the map over, and the gaze frame
+        // would map to 50.045 s, the image after it to 50.062 s.
+        pump.deliver_at(gaze_at(10 * S + 40 * MS), 50 * S + 45 * MS);
+        pump.deliver_at(image_at(10 * S + 60 * MS), 50 * S + 62 * MS);
+
+        assert_eq!(
+            rig.host_times(),
+            [
+                ("image", 50 * S + MS),
+                ("image", 50 * S + 31 * MS),
+                ("gaze", 50 * S + 41 * MS),
+                ("image", 50 * S + 61 * MS),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_gaze_frame_that_arms_the_stream_stamps_what_was_read_before_it() {
+        let rig = Rig::new();
+        let mut pump = rig.pump();
+
+        // Presence at stream start, read 5 ms after device time plus 40 s,
+        // then the gaze frame that arms the stream, 1 ms after.
+        let early = vec![(presence_at(9 * S + 900 * MS), 49 * S + 905 * MS)];
+        let armed = Arrival {
+            device_us: 10 * S,
+            host_rx_us: 50 * S + MS,
+        };
+        pump.deliver_early(early, Some(armed));
+
+        // Stamped as read, or as delivered, presence would be 4 ms late or
+        // more; the arming frame itself is not delivered.
+        assert_eq!(rig.host_times(), [("presence", 49 * S + 901 * MS)]);
+    }
+
+    #[test]
+    fn messages_read_while_arming_are_stamped_from_the_arrivals_that_followed() {
+        let rig = Rig::new();
+        let mut pump = rig.pump();
+
+        // Presence at stream start, then an image (which nobody wants) read
+        // 1 ms after device time plus 40 s, then the gaze frame that arms the
+        // stream, 3 ms after.
+        let early = vec![
+            (presence_at(9 * S + 900 * MS), 49 * S + 905 * MS),
+            (image_at(9 * S + 950 * MS), 49 * S + 951 * MS),
+        ];
+        let armed = Arrival {
+            device_us: 10 * S,
+            host_rx_us: 50 * S + 3 * MS,
+        };
+        pump.deliver_early(early, Some(armed));
+
+        // Presence maps from the image read after it, not from the arming
+        // frame (which would make it 49.903 s).
+        assert_eq!(rig.host_times(), [("presence", 49 * S + 901 * MS)]);
+        assert_eq!(rig.pose_host_us(), Some(49 * S + 951 * MS));
     }
 
     #[test]

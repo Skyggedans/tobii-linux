@@ -161,7 +161,8 @@ pub(crate) fn push_sample_frames(
         Sample::Presence(p) if wanted & STREAM_PRESENCE != 0 => {
             out.push((STREAM_PRESENCE, presence_frame(p)));
         }
-        Sample::Image(frame) if wanted & STREAM_IMAGE != 0 => {
+        Sample::Image(image) if wanted & STREAM_IMAGE != 0 => {
+            let frame = &image.frame;
             let (Ok(width), Ok(height)) = (u32::try_from(frame.width), u32::try_from(frame.height))
             else {
                 return;
@@ -196,7 +197,7 @@ mod tests {
         );
         let bytes = hex_to_bytes(&std::fs::read_to_string(path).expect("fixture")).expect("hex");
         let frame = decode_gaze_frame(&parse_message(&bytes).expect("msg")).expect("frame");
-        Sample::Gaze(Box::new(GazeSample::new(frame, 42)))
+        Sample::Gaze(Box::new(GazeSample::new(frame, 42, 40)))
     }
 
     fn frames(sample: &Sample, wanted: u32) -> Vec<(u32, ServerMsg)> {

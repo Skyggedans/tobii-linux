@@ -19,6 +19,26 @@
 //! The `stop` / `recenter` / `head_wanted` / `image_wanted` / `paused` flags
 //! are pure signals (no data is published alongside them), so every access
 //! uses `Ordering::Relaxed`.
+//!
+//! # Timestamps
+//!
+//! Every sample keeps the device's timestamp (the tracker's clock, in
+//! microseconds) and also gives it on the host clock
+//! ([`tobii_ipc::host_clock_us`]) as `host_us`. The engine maps the one to the
+//! other with the smallest `host_rx - device` over the last 120 s of gaze and
+//! image arrivals, which follows the drift between the clocks and starts
+//! afresh with each open of the device (a new open may restart the tracker's
+//! clock). A host time strictly increases within each stream and is no later
+//! than the host read its message, except for a message read during the
+//! device's init: delivered before any arrival of its open, it gets the time
+//! it was delivered, a few ms after it was read. (The order may also pass the
+//! read time by a microsecond when two messages of a stream share it, as the
+//! messages of one transfer do.) The messages read while the stream arms,
+//! delivered once it has, map from all the arrivals of that wait, the gaze
+//! frame that ends it included.
+//! A message read with no arrival in the 120 s before it (presence as a long
+//! pause ends), and an image without a device timestamp, get the time they
+//! were read. A head pose has the host time of the image it was made from.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -41,6 +61,8 @@ use tracing::error;
 pub struct PoseSample {
     /// Device timestamp of the source image frame, microseconds.
     pub timestamp_us: i64,
+    /// The source image's host time ([`ImageSample::host_us`]).
+    pub host_us: i64,
     /// Head translation `[tx, ty, tz]` in centimetres.
     pub pos_cm: [f64; 3],
     /// Head rotation `[yaw, pitch, roll]` in degrees.
@@ -56,13 +78,21 @@ pub struct GazeSample {
     /// Host time when the frame was read, microseconds
     /// ([`tobii_ipc::host_clock_us`]).
     pub host_rx_us: i64,
+    /// The frame's device timestamp on the host clock, microseconds (see
+    /// [Timestamps](crate::engine#timestamps)).
+    pub host_us: i64,
 }
 
 impl GazeSample {
-    /// A sample of `frame` read at host time `host_rx_us`.
+    /// A sample of `frame` read at host time `host_rx_us`, whose device
+    /// timestamp is `host_us` on the host clock.
     #[must_use]
-    pub fn new(frame: GazeFrame, host_rx_us: i64) -> Self {
-        Self { frame, host_rx_us }
+    pub fn new(frame: GazeFrame, host_rx_us: i64, host_us: i64) -> Self {
+        Self {
+            frame,
+            host_rx_us,
+            host_us,
+        }
     }
 }
 
@@ -73,18 +103,43 @@ impl GazeSample {
 pub struct PresenceSample {
     /// Device timestamp, microseconds.
     pub timestamp_us: i64,
+    /// The device timestamp on the host clock, microseconds (see
+    /// [Timestamps](crate::engine#timestamps)).
+    pub host_us: i64,
     /// Whether a user is in front of the tracker.
     pub present: bool,
 }
 
 impl PresenceSample {
-    /// Presence `present` at device time `timestamp_us`.
+    /// Presence `present` at device time `timestamp_us`, which is `host_us`
+    /// on the host clock.
     #[must_use]
-    pub fn new(timestamp_us: i64, present: bool) -> Self {
+    pub fn new(timestamp_us: i64, host_us: i64, present: bool) -> Self {
         Self {
             timestamp_us,
+            host_us,
             present,
         }
+    }
+}
+
+/// One 0x50e IR frame.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ImageSample {
+    /// The frame, device timestamp included (shared with the pose worker).
+    pub frame: Arc<ImageFrame>,
+    /// The frame's device timestamp on the host clock, microseconds (see
+    /// [Timestamps](crate::engine#timestamps)).
+    pub host_us: i64,
+}
+
+impl ImageSample {
+    /// A sample of `frame`, whose device timestamp is `host_us` on the host
+    /// clock.
+    #[must_use]
+    pub fn new(frame: Arc<ImageFrame>, host_us: i64) -> Self {
+        Self { frame, host_us }
     }
 }
 
@@ -99,7 +154,7 @@ pub enum Sample {
     /// A presence change.
     Presence(PresenceSample),
     /// An IR frame (only while images are wanted, see [`Engine::set_image_wanted`]).
-    Image(Arc<ImageFrame>),
+    Image(ImageSample),
     /// A device notification.
     Notification(DeviceNotification),
     /// The device finished its init; what it reported about itself.
