@@ -13,7 +13,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 
 use crate::engine::{
     CommandError, CommandResponse, GazeSample, PoseSample, PresenceSample, QueuedCommand, Sample,
@@ -281,9 +281,15 @@ pub fn wait_for_response_seq(
 ///
 /// The engine resets only as an escalation once opens keep failing (see
 /// [`RESET_AFTER_FAILURES`]), and not at all with `TOBII_NO_RESET=1` (see
-/// [`run_gaze_engine`]): now that uvcvideo is kept off the device the reset
-/// may no longer be needed. It logs what came of the reset, a skip when the
+/// [`run_gaze_engine`]). It logs what came of the reset, a skip when the
 /// tracker cannot be opened included: the escalation only says it tries one.
+///
+/// Whether the reset helps is unconfirmed on hardware: the logs show the
+/// open after a reset finding the tracker starting its sensor (notification
+/// 1271, about 0.3 s after control OUT 65), so that a piece of the
+/// calibration upload is refused for about 3 s, and until the init waited
+/// that out (see [`WRITE_DEADLINE`]) every such open failed on its 2 s write
+/// timeout.
 fn reset_device_baseline(ctx: &UsbContext) {
     match open_tobii(ctx) {
         Ok(h) => {
@@ -350,20 +356,25 @@ const RESET_AFTER_FAILURES: usize = 2;
 ///
 /// A device that arms and dies at once fails well inside it, so it is still
 /// USB-reset and given up on: its silence is caught after the
-/// [`GAZE_LIVENESS_TIMEOUT`] plus the longest command deadline, which the
-/// liveness check waits out (the daemon's longest is 10 s), and after a
-/// resume only once the [`RESUME_GRACE`] has passed too. A healthy tracker
-/// streams for hours between stalls. Paused time and the silent tail before
-/// the liveness check fires count toward the run on purpose: a resume the
-/// tracker did not answer after a long pause is the pause's normal recovery,
-/// not a failed open.
+/// [`GAZE_LIVENESS_TIMEOUT`] plus a command's write (a piece the device
+/// refuses fails within [`WRITE_DEADLINE`] and a try) and deadline, which the
+/// liveness check waits out (the daemon's longest deadline is 10 s), and
+/// after a resume only once the [`RESUME_GRACE`] has passed too. A healthy
+/// tracker streams for hours between stalls. Paused time and the silent tail
+/// before the liveness check fires count toward the run on purpose: a resume
+/// the tracker did not answer after a long pause is the pause's normal
+/// recovery, not a failed open.
 const HEALTHY_STREAM: Duration = Duration::from_secs(30);
 
 // A stream that arms and dies at once must fail inside `HEALTHY_STREAM`, or
 // the reset escalation and the give-up never come for it.
 const _: () = assert!(
-    GAZE_LIVENESS_TIMEOUT.as_millis() + RESUME_GRACE.as_millis() < HEALTHY_STREAM.as_millis(),
-    "HEALTHY_STREAM must outlast the liveness timeout plus the resume grace"
+    GAZE_LIVENESS_TIMEOUT.as_millis()
+        + RESUME_GRACE.as_millis()
+        + WRITE_DEADLINE.as_millis()
+        + WRITE_TRY.as_millis()
+        < HEALTHY_STREAM.as_millis(),
+    "HEALTHY_STREAM must outlast the liveness timeout, the resume grace and a refused write"
 );
 
 /// How long the engine waits after a failed open before the next.
@@ -733,6 +744,203 @@ fn gaze_engine_attempt(
     result
 }
 
+/// How long one try of a bulk OUT write waits for the device during the init
+/// replay. A piece it refuses for longer is tried again after the caller's
+/// step in between, which reads what the device sent meanwhile (see
+/// [`write_piece`]). Nothing reads EP 0x83 while a try waits, so a refusal
+/// because a message is unread costs a whole try; during the init only the
+/// rare notification comes, and 500 ms still reads EP 0x83 twice a second
+/// while a 3 s refusal costs only a handful of tries.
+const WRITE_TRY: Duration = Duration::from_millis(500);
+
+/// [`WRITE_TRY`] while the streams run (the pump's commands, the stream
+/// start and stop). The gaze and image streams each send a message every
+/// 30 ms, so a try spans under two frame periods and the step between
+/// ([`PIECE_DRAIN_READS`] reads) takes all that came meanwhile: a refused
+/// write holds the streams up by at most a try, and a refusal because a
+/// message is unread costs only that.
+const STREAMING_WRITE_TRY: Duration = Duration::from_millis(50);
+
+/// How long the device may refuse a piece before its write fails; each piece
+/// of a command gets its own. A try under way when it passes runs out first,
+/// so a refused piece fails within the deadline plus a try. A tracker
+/// starting its sensor (notification 1271) answers no command until
+/// 3.60-3.66 s after it (22 starts in the logs), and takes no data on EP 0x05
+/// from about 0.6 s after it until then. A cold start's init meets that window
+/// inside the calibration upload, where one piece waits about 1.5 s; so does
+/// the open after a USB reset, where one piece waits about 3 s. The single
+/// 2 s write timeout used before cleared the first by only half a second and
+/// failed every open after a reset (3 of 3 in the logs).
+const WRITE_DEADLINE: Duration = Duration::from_secs(6);
+
+/// A piece that waited this long for the device is logged (at debug).
+const SLOW_WRITE: Duration = Duration::from_millis(100);
+
+/// How [`write_piece`] paces a piece: each try waits up to `per_try`, and
+/// the write fails once `deadline` has passed since it began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteLimits {
+    per_try: Duration,
+    deadline: Duration,
+}
+
+impl WriteLimits {
+    /// Whether the tries fit the deadline: libusb waits forever on a zero
+    /// timeout, and a try as long as the deadline leaves nothing to retry.
+    const fn is_paced(self) -> bool {
+        self.per_try.as_millis() > 0 && self.per_try.as_millis() < self.deadline.as_millis()
+    }
+}
+
+/// The limits of the init replay's writes.
+const INIT_WRITE: WriteLimits = WriteLimits {
+    per_try: WRITE_TRY,
+    deadline: WRITE_DEADLINE,
+};
+
+/// The limits of a command written while the streams run.
+const COMMAND_WRITE: WriteLimits = WriteLimits {
+    per_try: STREAMING_WRITE_TRY,
+    deadline: WRITE_DEADLINE,
+};
+
+/// The limits of the stream stop sent on the way out of an open. It is
+/// best-effort (control OUT 66 then stops the streams anyway), so a tracker
+/// that refuses it is not waited out, only read in case a message it sent
+/// is what holds the write up.
+const STREAM_STOP_WRITE: WriteLimits = WriteLimits {
+    per_try: STREAMING_WRITE_TRY,
+    deadline: Duration::from_millis(500),
+};
+
+const _: () = assert!(
+    INIT_WRITE.is_paced() && COMMAND_WRITE.is_paced() && STREAM_STOP_WRITE.is_paced(),
+    "every write's tries must be nonzero and shorter than its deadline"
+);
+
+/// Why [`write_piece`] did not write the whole piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteError {
+    /// A try failed: [`rusb::Error::Timeout`] once the device still refused
+    /// the rest of the piece at the deadline, any other error at once.
+    Usb(rusb::Error),
+    /// `stop` was set while the device refused all of the piece.
+    Stopped,
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usb(e) => e.fmt(f),
+            Self::Stopped => f.write_str("write stopped"),
+        }
+    }
+}
+
+impl error::Error for WriteError {}
+
+/// Write one piece (`data`, at most 4 KB) in tries of `limits.per_try`,
+/// until the device has taken all of it. After each try that leaves part of
+/// it unwritten `between` runs; then, while the device has taken none of the
+/// piece, the write ends if `stop` is set, and it fails once
+/// `limits.deadline` has passed since the piece began; otherwise the next
+/// try resumes after the bytes the device took. Returns how long the piece
+/// took; one that waited [`SLOW_WRITE`] or more is logged at debug. The
+/// callers enter a span saying which piece of what is written.
+///
+/// The ET5 refuses a piece while it starts its sensor (see
+/// [`WRITE_DEADLINE`]) and while a message it sent is unread, so the callers
+/// read EP 0x83 in `between`: the streams are read between the tries of a
+/// long refusal, and a device waiting to be read is read.
+///
+/// A try that times out part-way is `Ok(n)`, `n` short of the rest (rusb
+/// returns `Err(Timeout)` only when nothing moved). A high-speed bulk OUT
+/// counts only the 512-byte packets the device acknowledged, so the next try
+/// starts with the packet it refused. That has never been seen (the device
+/// refuses whole pieces) and is logged at warn. A stop never cuts short a
+/// piece the device has begun to take.
+///
+/// `write` is one try: it writes what it is given to the device `io`,
+/// waiting up to the duration it is given. `between` gets the same `io`.
+///
+/// # Errors
+///
+/// [`WriteError::Usb`] with the error of a try that failed other than by
+/// timing out, at once, or with [`rusb::Error::Timeout`] once the deadline
+/// has passed. [`WriteError::Stopped`] when `stop` is set after a try while
+/// the device has taken none of the piece.
+fn write_piece<T>(
+    io: &mut T,
+    data: &[u8],
+    limits: WriteLimits,
+    stop: Option<&AtomicBool>,
+    mut write: impl FnMut(&mut T, &[u8], Duration) -> Result<usize, rusb::Error>,
+    mut between: impl FnMut(&mut T),
+) -> Result<Duration, WriteError> {
+    let start = Instant::now();
+    let mut sent = 0;
+    loop {
+        let rest = &data[sent..];
+        match write(io, rest, limits.per_try) {
+            Ok(n) => {
+                // Never more than the rest, even from a device that says so.
+                sent += n.min(rest.len());
+                if n > 0 && sent < data.len() {
+                    warn!(
+                        took = n,
+                        sent,
+                        len = data.len(),
+                        "write: the device took part of a piece; writing the rest"
+                    );
+                }
+            }
+            Err(rusb::Error::Timeout) => {}
+            Err(e) => return Err(WriteError::Usb(e)),
+        }
+        if sent == data.len() {
+            let waited = start.elapsed();
+            if waited >= SLOW_WRITE {
+                debug!(
+                    waited_ms = waited.as_millis(),
+                    "write: the device made a piece wait"
+                );
+            }
+            return Ok(waited);
+        }
+        between(io);
+        // Relaxed: a pure signal.
+        if sent == 0 && stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            return Err(WriteError::Stopped);
+        }
+        if start.elapsed() >= limits.deadline {
+            return Err(WriteError::Usb(rusb::Error::Timeout));
+        }
+    }
+}
+
+/// The error a packet's unfinished write fails the init replay with: none
+/// for a stop, which ends the replay without error (a stop is not a
+/// failure).
+fn init_write_error(e: WriteError) -> Option<rusb::Error> {
+    match e {
+        WriteError::Usb(e) => Some(e),
+        WriteError::Stopped => None,
+    }
+}
+
+/// What a command's unfinished write answers its client: a piece the device
+/// refused past the deadline is a command it did not take in time, a stop is
+/// the engine going away.
+impl From<WriteError> for CommandError {
+    fn from(e: WriteError) -> Self {
+        match e {
+            WriteError::Usb(rusb::Error::Timeout) => Self::Timeout,
+            WriteError::Usb(e) => Self::Usb(e.to_string()),
+            WriteError::Stopped => Self::EngineGone,
+        }
+    }
+}
+
 /// What the init replay collected: each command's response, and the other
 /// messages (stream, notification) that arrived while it waited.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -750,7 +958,8 @@ const MAX_SIDE_MESSAGES: usize = 64;
 const INIT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long one read waits while draining EP 0x83 between the pieces of a
-/// chunked command: only what the device already sent is wanted.
+/// chunked command, or the tries of a piece the device refuses: only what
+/// the device already sent is wanted.
 const DRAIN_READ_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Most reads per drain, so a device that keeps streaming cannot hold the
@@ -902,9 +1111,12 @@ fn after_write(packets: &[InitPacket], i: usize, awaiting: &mut Option<u32>) -> 
 /// A command split over several writes is answered after its last piece, so
 /// the wait happens there. Between the pieces EP 0x83 is drained: the device
 /// sends a notification after the first piece of the calibration upload and
-/// stops accepting further pieces until the host has read it. Returns early
-/// without error once `stop` is set; a failed write ends the replay with an
-/// error.
+/// stops accepting further pieces until the host has read it. A packet the
+/// device refuses is retried, draining between the tries, for up to
+/// `WRITE_DEADLINE` per packet (see `write_piece`): a tracker starting its
+/// sensor refuses one inside the calibration upload for up to about 3 s.
+/// Returns early without error once `stop` is set, also while the device
+/// refuses a packet; a failed write ends the replay with an error.
 ///
 /// # Errors
 ///
@@ -922,14 +1134,28 @@ pub fn replay_init_packets(
         if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
             return Ok(capture);
         }
-        h.write_bulk(pkt.ep, &pkt.data, Duration::from_millis(2000))
-            .with_context(|| {
+        let command = command_seq(&pkt.data).or(awaiting);
+        let written = info_span!("init_packet", packet = i, seq = ?command).in_scope(|| {
+            write_piece(
+                h,
+                &pkt.data,
+                INIT_WRITE,
+                stop,
+                |h, rest, timeout| h.write_bulk(pkt.ep, rest, timeout),
+                |h| reader.drain(h, &mut capture.side),
+            )
+        });
+        if let Err(e) = written {
+            let Some(e) = init_write_error(e) else {
+                return Ok(capture);
+            };
+            return Err(e).with_context(|| {
                 format!(
-                    "init packet {i} write failed (command seq {:?}, {} ms in)",
-                    command_seq(&pkt.data).or(awaiting),
+                    "init packet {i} write failed (command seq {command:?}, {} ms in)",
                     started.elapsed().as_millis()
                 )
-            })?;
+            });
+        }
         match after_write(packets, i, &mut awaiting) {
             AfterWrite::Drain => reader.drain(h, &mut capture.side),
             AfterWrite::Await(s) => {
@@ -1098,16 +1324,33 @@ pub fn next_command_seq(packets: &[InitPacket]) -> u32 {
 /// Send one command message and wait (briefly) for its 0x52 response. Stream
 /// messages that arrive meanwhile are discarded, so this is only for the few
 /// commands sent around stream start/stop. Uses a full-size read buffer since
-/// a 78 KB image message may already be in flight.
+/// a 78 KB image message may already be in flight. A write the device
+/// refuses is retried within `limits`, discarding what it sends between the
+/// tries (see [`write_piece`]), and ends if `stop` is set while the device
+/// has taken none of it; `deadline` counts from the end of the write.
 fn send_command(
     h: &mut rusb::DeviceHandle<UsbContext>,
     packet: &[u8],
     deadline: Duration,
+    limits: WriteLimits,
+    stop: Option<&AtomicBool>,
 ) -> Result<()> {
-    let expected = seq(packet).context("command packet without seq")?;
-    h.write_bulk(EP_OUT, packet, Duration::from_millis(2000))
-        .context("command write failed")?;
+    let (cmd, expected) = parse_message(packet)
+        .map(|m| (m.id, m.seq))
+        .context("command packet without a header")?;
     let mut buf = vec![0u8; READ_BUF];
+    info_span!("command", cmd, seq = expected)
+        .in_scope(|| {
+            write_piece(
+                h,
+                packet,
+                limits,
+                stop,
+                |h, rest, timeout| h.write_bulk(EP_OUT, rest, timeout),
+                |h| discard_pending(h, &mut buf),
+            )
+        })
+        .context("command write failed")?;
     let start = Instant::now();
     while start.elapsed() < deadline {
         match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(200)) {
@@ -1124,21 +1367,44 @@ fn send_command(
     anyhow::bail!("no response to command seq {expected} within {deadline:?}")
 }
 
+/// Read and drop what EP 0x83 holds, up to [`PIECE_DRAIN_READS`] reads and
+/// until one finds nothing: [`send_command`]'s step between the tries of a
+/// write the device refuses, which drops stream messages anyway.
+fn discard_pending(h: &mut rusb::DeviceHandle<UsbContext>, buf: &mut [u8]) {
+    for _ in 0..PIECE_DRAIN_READS {
+        if h.read_bulk(EP_IN, buf, PIECE_DRAIN_TIMEOUT).is_err() {
+            return;
+        }
+    }
+}
+
 /// Ask the device to start stream `id` (command 1220) and wait for the ack.
+/// A tracker that refuses the command is waited out for up to
+/// `WRITE_DEADLINE`, unless `stop` is set before it takes any of it.
 ///
 /// # Errors
 ///
-/// Fails when the command cannot be written or is not acknowledged in time.
-pub fn start_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32) -> Result<()> {
+/// Fails when the command cannot be written (a stop included) or is not
+/// acknowledged in time.
+pub fn start_stream(
+    h: &mut rusb::DeviceHandle<UsbContext>,
+    cmd_seq: u32,
+    id: u32,
+    stop: Option<&AtomicBool>,
+) -> Result<()> {
     send_command(
         h,
         &stream_start_packet(cmd_seq, id),
         Duration::from_millis(1500),
+        COMMAND_WRITE,
+        stop,
     )
     .with_context(|| format!("start stream {id:#x}"))
 }
 
 /// Ask the device to stop stream `id` (command 1230) and wait for the ack.
+/// Best-effort, on the way out of an open: a tracker that refuses it is not
+/// waited out (see `STREAM_STOP_WRITE`).
 ///
 /// # Errors
 ///
@@ -1148,6 +1414,8 @@ pub fn stop_stream(h: &mut rusb::DeviceHandle<UsbContext>, cmd_seq: u32, id: u32
         h,
         &stream_stop_packet(cmd_seq, id),
         Duration::from_millis(700),
+        STREAM_STOP_WRITE,
+        None,
     )
     .with_context(|| format!("stop stream {id:#x}"))
 }
@@ -1293,7 +1561,15 @@ impl Pump<'_> {
     }
 
     /// Write the next queued command, if none is outstanding. Reads between
-    /// the pieces of a large command so the stream keeps draining.
+    /// the pieces of a large command so the stream keeps draining, and
+    /// between the tries of a piece the device refuses, which is retried for
+    /// up to [`WRITE_DEADLINE`] per piece (see [`write_piece`]). The liveness
+    /// check waits for the write as it waits for an outstanding command; the
+    /// command's deadline starts once it is written. A stop while the device
+    /// refuses the first piece, before it has taken any of the command, fails
+    /// it with [`CommandError::EngineGone`]; once it has taken some, the
+    /// command is written to its end, so the teardown's stream stop never
+    /// lands inside it.
     fn send_next(&mut self, h: &mut rusb::DeviceHandle<UsbContext>, asm: &mut BulkReassembler) {
         if self.outstanding.is_some() {
             return;
@@ -1305,26 +1581,32 @@ impl Pump<'_> {
         self.cmd_seq += 1;
         let pieces = chunk_command(command.cmd, seq, &command.payload);
         debug!(cmd = command.cmd, seq, pieces = pieces.len(), "command");
+        let shared = self.shared;
         let mut buf = vec![0u8; READ_BUF];
         let mut msgs = Vec::new();
         for (i, piece) in pieces.iter().enumerate() {
-            if let Err(e) = h.write_bulk(EP_OUT, piece, Duration::from_millis(2000)) {
-                let _ = reply.send(Err(CommandError::Usb(e.to_string())));
+            let span = info_span!("command", cmd = command.cmd, seq, piece = i);
+            let written = span.in_scope(|| {
+                write_piece(
+                    h,
+                    piece,
+                    COMMAND_WRITE,
+                    (i == 0).then_some(&shared.stop),
+                    |h, rest, timeout| h.write_bulk(EP_OUT, rest, timeout),
+                    |h| self.drain_between_writes(h, asm, &mut buf, &mut msgs),
+                )
+            });
+            if let Err(e) = written {
+                // The daemon logs the failure it answers its client with.
+                debug!(cmd = command.cmd, seq, piece = i, error = %e, "command write failed");
+                let _ = reply.send(Err(e.into()));
                 return;
             }
             if i + 1 < pieces.len() {
                 // The device stops taking pieces while what it sent is unread
                 // (see `replay_init_packets`); with the streams running that
                 // includes image frames, so take everything it has.
-                for _ in 0..PIECE_DRAIN_READS {
-                    let Ok(n) = h.read_bulk(EP_IN, &mut buf, PIECE_DRAIN_TIMEOUT) else {
-                        break;
-                    };
-                    asm.push_into(&buf[..n], &mut msgs);
-                    for msg in msgs.drain(..) {
-                        self.deliver(classify(&msg));
-                    }
-                }
+                self.drain_between_writes(h, asm, &mut buf, &mut msgs);
             }
         }
         self.outstanding = Some(Outstanding {
@@ -1333,6 +1615,28 @@ impl Pump<'_> {
             deadline: Instant::now() + command.timeout,
             reply,
         });
+    }
+
+    /// Take what the device sent and deliver it, up to
+    /// [`PIECE_DRAIN_READS`] reads and until one finds nothing: the step
+    /// between the pieces of a command and between the tries of a piece the
+    /// device refuses.
+    fn drain_between_writes(
+        &mut self,
+        h: &mut rusb::DeviceHandle<UsbContext>,
+        asm: &mut BulkReassembler,
+        buf: &mut [u8],
+        msgs: &mut Vec<Vec<u8>>,
+    ) {
+        for _ in 0..PIECE_DRAIN_READS {
+            let Ok(n) = h.read_bulk(EP_IN, buf, PIECE_DRAIN_TIMEOUT) else {
+                break;
+            };
+            asm.push_into(&buf[..n], msgs);
+            for msg in msgs.drain(..) {
+                self.deliver(classify(&msg));
+            }
+        }
     }
 
     /// Fail the outstanding command once its deadline has passed.
@@ -1416,8 +1720,16 @@ fn gaze_stream_loop(
     // init; we do the same. Failure here is not fatal — gaze still works.
     let mut image = is_image_stream_enabled();
     if image {
-        match start_stream(h, pump.cmd_seq, STREAM_ID_IMAGE) {
+        match start_stream(h, pump.cmd_seq, STREAM_ID_IMAGE, Some(stop)) {
             Ok(()) => info!("gaze: image stream 0x50e requested (head pose via IR frames)"),
+            // The arming wait below ends on the stop too.
+            Err(e) if stop.load(Ordering::Relaxed) => {
+                debug!(
+                    error = format_args!("{e:#}"),
+                    "gaze: image stream start ended by the stop"
+                );
+                image = false;
+            }
             Err(e) => {
                 warn!(
                     error = format_args!("{e:#}"),
@@ -1516,8 +1828,10 @@ mod tests {
     use super::*;
     use AfterFailedOpen::{GiveUp, Reopen, ReopenPrimed, ResetAndReopen};
     use OpenFailure::{Failed, Lost, NotArmed};
+    use Seen::{Between, Try};
     use Step::{Open, Reset};
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use tobii_proto::protocol::hex_to_bytes;
 
     fn fixture(name: &str) -> Vec<u8> {
@@ -2043,5 +2357,261 @@ mod tests {
         assert!(steps[38..199].iter().all(|s| *s == AfterWrite::Drain));
         assert_eq!(steps[199], AfterWrite::Await(39));
         assert_eq!(steps[200..], [AfterWrite::Await(40), AfterWrite::Await(41)]);
+    }
+
+    /// What a fake EP 0x05 saw, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Seen {
+        /// A try, offered this many bytes.
+        Try(usize),
+        /// The caller's step between two tries.
+        Between,
+    }
+
+    /// More tries than any test here makes: past it the write has missed
+    /// its deadline and the fake fails the test rather than spin.
+    const MAX_FAKE_TRIES: usize = 1000;
+
+    /// A fake EP 0x05 for [`write_piece`]: each try returns the next of
+    /// `tries` (past the end, a refusal), and one that takes `n` bytes keeps
+    /// the first `n` it was offered. A refused try waits its whole timeout,
+    /// as libusb does.
+    struct FakeOut {
+        tries: VecDeque<Result<usize, rusb::Error>>,
+        taken: Vec<u8>,
+        seen: Vec<Seen>,
+    }
+
+    impl FakeOut {
+        fn new(tries: impl IntoIterator<Item = Result<usize, rusb::Error>>) -> Self {
+            Self {
+                tries: tries.into_iter().collect(),
+                taken: Vec::new(),
+                seen: Vec::new(),
+            }
+        }
+
+        fn write(&mut self, data: &[u8], timeout: Duration) -> Result<usize, rusb::Error> {
+            self.seen.push(Try(data.len()));
+            assert!(
+                self.seen.len() <= 2 * MAX_FAKE_TRIES,
+                "the write went on past its deadline"
+            );
+            let result = self.tries.pop_front().unwrap_or(Err(rusb::Error::Timeout));
+            match result {
+                Ok(n) => self.taken.extend_from_slice(&data[..n]),
+                Err(rusb::Error::Timeout) => thread::sleep(timeout),
+                Err(_) => {}
+            }
+            result
+        }
+
+        fn between(&mut self) {
+            self.seen.push(Between);
+        }
+    }
+
+    /// A 4095-byte piece, as the replay and `chunk_command` write. Its bytes
+    /// repeat every 251 (a prime), so no whole number of 512-byte packets
+    /// lines it up with itself: a rest resumed at the wrong offset differs.
+    fn a_piece() -> Vec<u8> {
+        (0..4095u32)
+            .map(|i| u8::try_from(i % 251).expect("below 251"))
+            .collect()
+    }
+
+    /// Short tries and a deadline no test here reaches unless it means to.
+    const QUICK_TRIES: WriteLimits = WriteLimits {
+        per_try: Duration::from_millis(1),
+        deadline: Duration::from_secs(5),
+    };
+
+    /// Write `data` to `out` as the callers do, with `limits` and `stop`.
+    fn write_to(
+        out: &mut FakeOut,
+        data: &[u8],
+        limits: WriteLimits,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Duration, WriteError> {
+        write_piece(out, data, limits, stop, FakeOut::write, FakeOut::between)
+    }
+
+    #[test]
+    fn every_write_is_paced_to_fit_its_deadline() {
+        for limits in [INIT_WRITE, COMMAND_WRITE, STREAM_STOP_WRITE] {
+            assert!(limits.is_paced(), "{limits:?}");
+        }
+        let zero_try = WriteLimits {
+            per_try: Duration::ZERO,
+            deadline: WRITE_DEADLINE,
+        };
+        assert!(!zero_try.is_paced(), "libusb would wait forever");
+        let one_try = WriteLimits {
+            per_try: WRITE_TRY,
+            deadline: WRITE_TRY,
+        };
+        assert!(!one_try.is_paced(), "nothing left to retry");
+    }
+
+    #[test]
+    fn a_refused_piece_is_tried_again_after_the_step_between_until_it_is_taken() {
+        let piece = a_piece();
+        let mut out = FakeOut::new([
+            Err(rusb::Error::Timeout),
+            Err(rusb::Error::Timeout),
+            Ok(piece.len()),
+        ]);
+        let waited = write_to(&mut out, &piece, QUICK_TRIES, None).expect("written");
+        assert!(
+            waited >= 2 * QUICK_TRIES.per_try,
+            "counted from the first try: {waited:?}"
+        );
+        assert_eq!(out.taken, piece);
+        assert_eq!(
+            out.seen,
+            [Try(4095), Between, Try(4095), Between, Try(4095)],
+            "no step after the try that took it"
+        );
+    }
+
+    #[test]
+    fn a_piece_taken_in_part_is_written_on_from_where_the_device_stopped() {
+        // The device takes the first two 512-byte packets, refuses a try,
+        // then takes the rest.
+        let piece = a_piece();
+        let mut out = FakeOut::new([Ok(1024), Err(rusb::Error::Timeout), Ok(3071)]);
+        let result = write_to(&mut out, &piece, QUICK_TRIES, None);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out.taken, piece, "every byte once, in order");
+        assert_eq!(
+            out.seen,
+            [Try(4095), Between, Try(3071), Between, Try(3071)]
+        );
+
+        // Split three ways.
+        let mut out = FakeOut::new([Ok(512), Ok(1536), Ok(2047)]);
+        let result = write_to(&mut out, &piece, QUICK_TRIES, None);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out.taken, piece, "every byte once, in order");
+        assert_eq!(
+            out.seen,
+            [Try(4095), Between, Try(3583), Between, Try(2047)]
+        );
+    }
+
+    #[test]
+    fn a_piece_refused_past_the_deadline_times_out_after_the_step_between() {
+        let piece = a_piece();
+        let mut out = FakeOut::new([]);
+        let limits = WriteLimits {
+            per_try: Duration::from_millis(2),
+            deadline: Duration::from_millis(100),
+        };
+        let start = Instant::now();
+        let result = write_to(&mut out, &piece, limits, None);
+        assert_eq!(result, Err(WriteError::Usb(rusb::Error::Timeout)));
+        assert!(start.elapsed() >= limits.deadline);
+        assert!(out.taken.is_empty());
+        let tries = out.seen.iter().filter(|s| **s == Try(4095)).count();
+        assert!(tries >= 2, "tried again before giving up: {:?}", out.seen);
+        let expected: Vec<Seen> = (0..tries).flat_map(|_| [Try(4095), Between]).collect();
+        assert_eq!(out.seen, expected, "a step after every refused try");
+    }
+
+    #[test]
+    fn a_stop_ends_a_refused_write_after_the_try_under_way() {
+        let piece = a_piece();
+        let stop = AtomicBool::new(true);
+        let mut out = FakeOut::new([]);
+        let start = Instant::now();
+        let result = write_to(&mut out, &piece, QUICK_TRIES, Some(&stop));
+        assert_eq!(result, Err(WriteError::Stopped));
+        assert!(start.elapsed() < Duration::from_secs(1), "not the deadline");
+        assert_eq!(out.seen, [Try(4095), Between]);
+
+        // A stop does not cut a piece the device takes.
+        let mut out = FakeOut::new([Ok(piece.len())]);
+        let result = write_to(&mut out, &piece, QUICK_TRIES, Some(&stop));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out.taken, piece);
+    }
+
+    #[test]
+    fn a_stop_that_comes_while_the_device_refuses_a_piece_ends_the_write() {
+        let piece = a_piece();
+        let stop = AtomicBool::new(false);
+        let mut out = FakeOut::new([]);
+        let start = Instant::now();
+        let result = write_piece(
+            &mut out,
+            &piece,
+            QUICK_TRIES,
+            Some(&stop),
+            FakeOut::write,
+            |out| {
+                out.between();
+                if out.seen.iter().filter(|s| **s == Between).count() == 2 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert_eq!(result, Err(WriteError::Stopped));
+        assert!(start.elapsed() < Duration::from_secs(1), "not the deadline");
+        assert_eq!(out.seen, [Try(4095), Between, Try(4095), Between]);
+    }
+
+    #[test]
+    fn a_stop_does_not_cut_short_a_piece_the_device_has_begun_to_take() {
+        let piece = a_piece();
+        let stop = AtomicBool::new(true);
+        let mut out = FakeOut::new([Ok(512), Err(rusb::Error::Timeout), Ok(3583)]);
+        let result = write_to(&mut out, &piece, QUICK_TRIES, Some(&stop));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out.taken, piece);
+    }
+
+    #[test]
+    fn a_write_error_other_than_a_timeout_ends_the_write_at_once() {
+        let piece = a_piece();
+        let mut out = FakeOut::new([Err(rusb::Error::NoDevice), Ok(piece.len())]);
+        let result = write_to(&mut out, &piece, QUICK_TRIES, None);
+        assert_eq!(result, Err(WriteError::Usb(rusb::Error::NoDevice)));
+        assert_eq!(out.seen, [Try(4095)], "no step between, no retry");
+
+        // Also after the device took part of the piece.
+        let mut out = FakeOut::new([Ok(512), Err(rusb::Error::Pipe)]);
+        let result = write_to(&mut out, &piece, QUICK_TRIES, None);
+        assert_eq!(result, Err(WriteError::Usb(rusb::Error::Pipe)));
+        assert_eq!(out.taken, piece[..512]);
+    }
+
+    #[test]
+    fn a_stop_ends_the_init_replay_without_error_and_a_failed_write_fails_it() {
+        assert_eq!(init_write_error(WriteError::Stopped), None, "not a failure");
+        assert_eq!(
+            init_write_error(WriteError::Usb(rusb::Error::Timeout)),
+            Some(rusb::Error::Timeout)
+        );
+        assert_eq!(
+            init_write_error(WriteError::Usb(rusb::Error::NoDevice)),
+            Some(rusb::Error::NoDevice)
+        );
+    }
+
+    #[test]
+    fn a_command_write_that_did_not_finish_answers_its_client() {
+        assert_eq!(
+            CommandError::from(WriteError::Usb(rusb::Error::Timeout)),
+            CommandError::Timeout,
+            "a tracker that refused it past the deadline is there, only busy"
+        );
+        assert_eq!(
+            CommandError::from(WriteError::Stopped),
+            CommandError::EngineGone
+        );
+        assert_eq!(
+            CommandError::from(WriteError::Usb(rusb::Error::NoDevice)),
+            CommandError::Usb(rusb::Error::NoDevice.to_string())
+        );
     }
 }

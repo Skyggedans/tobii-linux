@@ -113,7 +113,8 @@ pub struct DeviceCommand {
     pub cmd: u32,
     /// Payload (`00 00` + TLVs), or empty.
     pub payload: Vec<u8>,
-    /// Answer deadline, counted from the write.
+    /// Answer deadline, counted from the end of the write (which waits out
+    /// a tracker that refuses it for a while).
     pub timeout: Duration,
 }
 
@@ -145,11 +146,12 @@ impl CommandResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CommandError {
-    /// The device did not answer in time.
+    /// The device did not answer in time, or refused the command's write
+    /// past the write deadline (it is there, but busy).
     Timeout,
     /// The engine stopped (device lost or shutting down).
     EngineGone,
-    /// The command could not be written.
+    /// The command could not be written (a USB error).
     Usb(String),
 }
 
@@ -173,7 +175,9 @@ pub(crate) struct QueuedCommand {
 }
 
 /// How long a command may wait for the USB thread to reach it (queued behind
-/// others, or the device still initialising) before its own deadline starts.
+/// others, or the device still initialising) and to write it (a tracker
+/// starting its sensor refuses writes for up to about 3 s; its sensor start
+/// takes 3.6 s) before its own deadline starts.
 const QUEUE_ALLOWANCE: Duration = Duration::from_secs(30);
 
 /// Runs commands on the engine's device; cheap to clone and usable from any
@@ -187,8 +191,10 @@ impl Commands {
     /// # Errors
     ///
     /// [`CommandError::Timeout`] when no answer arrives within the command's
-    /// timeout (plus time spent queued), [`CommandError::EngineGone`] when
-    /// the engine stops first, [`CommandError::Usb`] when the write fails.
+    /// timeout (plus the time spent queued and writing it) or the device
+    /// refuses the write past its deadline, [`CommandError::EngineGone`] when
+    /// the engine stops first, [`CommandError::Usb`] when the write fails
+    /// otherwise.
     pub fn run(&self, command: DeviceCommand) -> Result<CommandResponse, CommandError> {
         let deadline = command.timeout + QUEUE_ALLOWANCE;
         let (reply, answer) = mpsc::channel();

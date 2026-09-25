@@ -718,7 +718,7 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
         let mut cmd_seq = next_command_seq(&packets);
         let image = !*no_image;
         if image {
-            match start_stream(&mut h, cmd_seq, STREAM_ID_IMAGE) {
+            match start_stream(&mut h, cmd_seq, STREAM_ID_IMAGE, Some(&stop)) {
                 Ok(()) => {
                     println!("image stream 0x50e start acknowledged (cmd 1220, seq {cmd_seq:#x})");
                 }

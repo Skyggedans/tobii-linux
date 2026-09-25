@@ -232,7 +232,7 @@ tracker runs in the daemon, not in the client):
 | `TOBII_POSE_DEBUG` | unset | log raw `t` vs pivoted `t'` and angles |
 | `TOBII_ROLL_EYELINE` | unset | `1` measures roll directly from the eye line (decoupled from yaw/pitch, symmetric by construction) instead of from the euler solve |
 | `TOBII_PREWARM` | unset | `1` (or the historical `head` / `gaze`): init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). |
-| `TOBII_NO_RESET` | unset | `1` skips the USB reset the engine tries once opens keep failing, after two failures in a row: opens whose init fails, that do not arm the stream (bar the first after a start or a lost stream: the tracker needs that one to arm), or that lose it within 30 s (the reset rarely helps now that uvcvideo is kept off the device) |
+| `TOBII_NO_RESET` | unset | `1` skips the USB reset the engine tries once opens keep failing, after two failures in a row: opens whose init fails, that do not arm the stream (bar the first after a start or a lost stream: the tracker needs that one to arm), or that lose it within 30 s (until the engine waited out a tracker starting its sensor, every open right after the reset failed its init on a 2 s write timeout; whether the reset helps is unconfirmed on hardware) |
 | `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
 | `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s (an `info` event with `frames_per_s`/`poses_per_s`/`mean_ms` fields) |
 | `RUST_LOG` | `info` | log filter for all binaries (`debug`, `tobii=debug,ort=warn`, …); see §6 |
@@ -457,6 +457,12 @@ gaze has no rest pose.)
   After two failures in a row the tracker is USB-reset, and after five the
   engine stops; the daemon starts a new one if a client still needs the
   tracker (or pre-warm is on) and it is plugged in.
+- **A tracker starting its sensor is waited out.** For about 3.6 s after it
+  starts its sensor (on a cold start, or in the open after a USB reset) the
+  tracker takes no commands, which lands inside the init's calibration
+  upload. The engine retries each 4 KB piece of a write the tracker refuses
+  for up to 6 s (per piece), reading what it sends meanwhile, before it
+  calls the init or command failed.
 - **Lazy claim.** An idle daemon holds no device; it opens the tracker on the
   first subscription or the first request that needs it (device info, a
   clock pair, a pause, …) and releases it when the last such client
