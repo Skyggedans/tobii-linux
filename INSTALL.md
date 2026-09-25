@@ -598,5 +598,6 @@ gaze has no rest pose.)
 - **Checking the daemon end to end.** `target/release/tobii5-init-replay
   ipc-probe` asks the running daemon for everything (device info, track box,
   mounting, display area, stream types, hardware configuration, device name,
-  calibration id, calibrating and paused states, clock) and reports the rate
-  of every stream; `--set-display 597,336` also writes a display area.
+  calibration id, calibrating and paused states, fault and warning lists,
+  clock) and reports the rate of every stream; `--set-display 597,336` also
+  writes a display area.

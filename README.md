@@ -103,20 +103,23 @@ Where the answers come from, and where they differ from Windows:
   Stream Engine reserves them for higher feature groups or, for the IR
   image, an additional-features licence.
 - **Facts from the last init.** Device info, track box, display area,
-  mounting, the stream catalogue and the hardware configuration are what the
-  tracker reported at its last init, so they are answered even while it is
-  unplugged (`TOBII_ERROR_TIMED_OUT` only if the daemon has not seen a tracker
-  yet). The first call that needs the tracker starts it, and it then stays on
-  (IR illuminator lit) for as long as that connection is open, as for an
-  open device in the Stream Engine. While it is unplugged, such a call (a
-  clock pair, a pause, starting, retrieving or applying a calibration, a
-  display-area write) is `TOBII_ERROR_CONNECTION_FAILED` at once from when
-  the daemon has given the tracker up, a few seconds after the unplug (until
-  then the call waits on the daemon's re-opens), and the daemon starts the
-  tracker once it is plugged back in, for a connection still open. A
-  calibration session its owner is not already stopping ends, saving
-  nothing, when the daemon loses the tracker or the tracker re-initialises:
-  its owner's later calls in it, `tobii_calibration_stop` included, are
+  mounting, the stream catalogue, the hardware configuration and the fault
+  and warning lists (`tobii_get_state_string`) are what the tracker reported
+  at its last init, so they are answered even while it is unplugged
+  (`TOBII_ERROR_TIMED_OUT` only if the daemon has not seen a tracker yet). A
+  change to the fault or warning list that the tracker announces later shows
+  only after its next init; the Stream Engine follows it. The first call
+  that needs the tracker starts it, and it then stays on (IR illuminator
+  lit) for as long as that connection is open, as for an open device in the
+  Stream Engine. While it is unplugged, such a call (a clock pair, a pause,
+  starting, retrieving or applying a calibration, a display-area write) is
+  `TOBII_ERROR_CONNECTION_FAILED` at once from when the daemon has given the
+  tracker up, a few seconds after the unplug (until then the call waits on
+  the daemon's re-opens), and the daemon starts the tracker once it is
+  plugged back in, for a connection still open. A calibration session its
+  owner is not already stopping ends, saving nothing, when the daemon loses
+  the tracker or the tracker re-initialises: its owner's later calls in it,
+  `tobii_calibration_stop` included, are
   `TOBII_ERROR_CALIBRATION_NOT_STARTED`. A stop under way finishes, and a
   calibration it has saved stays saved even if the stop then fails
   (`TOBII_ERROR_CONNECTION_FAILED` when the tracker went away); the tracker

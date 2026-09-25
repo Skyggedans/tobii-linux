@@ -31,6 +31,12 @@ const FIELD_HARDWARE_ENTRY: u32 = 0x001a_332c;
 const FIELD_DISPLAY_ID: u32 = 0x0001_0100;
 /// Field id announcing the output rate pair.
 const FIELD_OUTPUT_RATE: u32 = 0x0002_2af8;
+/// Index of the fault list in the status strings (the DLL's
+/// `tracker_get_status`, 0x1801a0ac0, index table at RVA 0x1a1610); per the
+/// 4.1 docs comma-separated, "ok" when there are none.
+pub const STATUS_FAULTS: u32 = 5;
+/// Index of the warning list in the status strings, as [`STATUS_FAULTS`].
+pub const STATUS_WARNINGS: u32 = 6;
 /// Index of the calibration id in the status strings.
 const STATUS_CALIBRATION_ID: u32 = 7;
 /// The display id the Windows engine writes with every display area.
@@ -107,10 +113,8 @@ impl DeviceFacts {
             cmd::STATUS if is_response => {
                 self.status = parse_indexed_strings(msg);
                 self.calibration_id = self
-                    .status
-                    .iter()
-                    .find(|(i, _)| *i == STATUS_CALIBRATION_ID)
-                    .and_then(|(_, s)| s.parse().ok());
+                    .status_string(STATUS_CALIBRATION_ID)
+                    .and_then(|s| s.parse().ok());
                 true
             }
             cmd::OUTPUT_RATE if is_response => parse_output_rate(msg)
@@ -121,6 +125,16 @@ impl DeviceFacts {
                 .is_some(),
             _ => false,
         }
+    }
+
+    /// Status string `index` of the last command 1490 (the first entry for
+    /// it); `None` when the tracker left it out or the 1490 was lost.
+    #[must_use]
+    pub fn status_string(&self, index: u32) -> Option<&str> {
+        self.status
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, s)| s.as_str())
     }
 
     /// Facts from the init replay's responses, in order.
@@ -495,6 +509,9 @@ mod tests {
         assert!(facts.info.serial_number.starts_with("IS50F-"));
         assert!(facts.properties.iter().any(|(_, s)| s == "IS5LEYETRACKER5"));
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
+        assert_eq!(facts.status_string(STATUS_FAULTS), Some("ok"));
+        assert_eq!(facts.status_string(STATUS_WARNINGS), Some("ok"));
+        assert_eq!(facts.status_string(9), None);
         assert_eq!(facts.output_hz, Some(33));
         assert_eq!(facts.streams.len(), 9);
     }

@@ -1,6 +1,6 @@
 //! Client requests: what the device reported about itself (identity,
-//! geometry, stream catalogue, hardware configuration), its display area,
-//! states and clock.
+//! geometry, stream catalogue, hardware configuration, fault and warning
+//! lists), its display area, states and clock.
 //! Calibration requests are handed to [`crate::calibration`], the device
 //! name to [`crate::name`], pause and resume to [`crate::pause`].
 //!
@@ -18,7 +18,9 @@ use tobii_ipc::request::{
     encode_display_area, encode_geometry_mounting, encode_hardware_configuration,
     encode_stream_types, encode_timesync, encode_track_box, encode_u32, kind, state, status,
 };
-use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_payload};
+use tobii_proto::facts::{
+    DEFAULT_DISPLAY_ID, DeviceFacts, STATUS_FAULTS, STATUS_WARNINGS, display_area_set_payload,
+};
 use tobii_proto::protocol::cmd;
 use tracing::{info, warn};
 
@@ -118,6 +120,18 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
                 Reply::ok(vec![u8::from(active)])
             }
             Some(state::DEVICE_PAUSED) => Reply::ok(vec![u8::from(lock_state(state).paused)]),
+            // From the last init's 1490, as the DLL answers from the cache
+            // its create and reconnect fill: no 1490 per call.
+            Some(id @ (state::FAULT | state::WARNING)) => {
+                let index = if id == state::FAULT {
+                    STATUS_FAULTS
+                } else {
+                    STATUS_WARNINGS
+                };
+                facts(state, client, |f| {
+                    f.status_string(index).map(|s| s.as_bytes().to_vec())
+                })
+            }
             Some(_) => Reply::err(status::NOT_SUPPORTED),
             None => Reply::err(status::INVALID_PARAMETER),
         },
@@ -597,6 +611,49 @@ pub(crate) mod tests {
         // An init that reported no catalogue.
         lock_state(&state).facts = Some(Arc::new(DeviceFacts::default()));
         assert_eq!(handle(&state, 1, &req), Reply::err(status::NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn fault_and_warning_states_answer_from_the_last_init() {
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        let state = Mutex::new(st);
+        let ask = |id| {
+            handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind: kind::STATE,
+                    payload: &encode_u32(id),
+                },
+            )
+        };
+        let with_status = |status: &[(u32, &str)]| {
+            lock_state(&state).facts = Some(Arc::new(DeviceFacts {
+                status: status.iter().map(|(i, s)| (*i, (*s).to_owned())).collect(),
+                ..DeviceFacts::default()
+            }));
+        };
+
+        // The lists as the ET5 reports them in every Windows capture
+        // (abridged).
+        with_status(&[(4, "HELLO_RGB"), (5, "ok"), (6, "ok"), (7, "1904654973")]);
+        assert_eq!(ask(state::FAULT), Reply::ok(b"ok".to_vec()));
+        assert_eq!(ask(state::WARNING), Reply::ok(b"ok".to_vec()));
+        assert!(lock_state(&state).clients[0].holds_device);
+
+        // Invented lists, to tell the indices apart.
+        with_status(&[(5, "FAULT_A,FAULT_B"), (6, "WARNING_A")]);
+        assert_eq!(ask(state::FAULT), Reply::ok(b"FAULT_A,FAULT_B".to_vec()));
+        assert_eq!(ask(state::WARNING), Reply::ok(b"WARNING_A".to_vec()));
+
+        // An init whose 1490 left the lists out, and one whose 1490 was lost.
+        for lists in [&[(7, "1904654973")][..], &[]] {
+            with_status(lists);
+            assert_eq!(ask(state::FAULT), Reply::err(status::NOT_SUPPORTED));
+            assert_eq!(ask(state::WARNING), Reply::err(status::NOT_SUPPORTED));
+        }
     }
 
     #[test]

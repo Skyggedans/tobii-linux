@@ -82,6 +82,12 @@ pub const DEVICE_NAME_MAX: usize = 63;
 pub mod state {
     /// Reply `u8`: whether the device is paused.
     pub const DEVICE_PAUSED: u32 = 2;
+    /// Reply: the tracker's fault list, its bytes with no NUL, as status
+    /// string 5 of the last init's command 1490 gave it ("ok" when there are
+    /// none). `NOT_SUPPORTED` when that init reported none.
+    pub const FAULT: u32 = 4;
+    /// Reply: the tracker's warning list, as [`FAULT`] (status string 6).
+    pub const WARNING: u32 = 5;
     /// Reply `u32`: the active calibration id.
     pub const CALIBRATION_ID: u32 = 6;
     /// Reply `u8`: whether a calibration session is running.

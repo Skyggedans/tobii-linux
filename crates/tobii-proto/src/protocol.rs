@@ -485,7 +485,8 @@ pub mod cmd {
     pub const DISPLAY_AREA_GET: u32 = 1430;
     /// Write the display area.
     pub const DISPLAY_AREA_SET: u32 = 1440;
-    /// Status strings (index 7 is the calibration id).
+    /// Status strings: 5 the fault list, 6 the warning list, 7 the
+    /// calibration id.
     pub const STATUS: u32 = 1490;
     /// Output rate pair.
     pub const OUTPUT_RATE: u32 = 1650;

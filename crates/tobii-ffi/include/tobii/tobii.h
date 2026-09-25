@@ -275,12 +275,22 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_device_info( tobii_device_t* device
 TOBII_API tobii_error_t TOBII_CALL tobii_get_track_box( tobii_device_t* device,
     tobii_track_box_t* track_box );
 
-/* Bool states 0, 1, 3, 4 and 5 are always false; DEVICE_PAUSED and
- * CALIBRATION_ACTIVE come from the daemon. Unlike the DLL, DEVICE_PAUSED
- * changes as soon as the tracker accepts a pause or resume, and a tracker
- * re-init ends a pause. The uint32 state is CALIBRATION_ID (DEVICE_PAUSED
- * there is TOBII_ERROR_INVALID_PARAMETER, as in the DLL); the string states
- * (FAULT, WARNING) are always empty. */
+/* Bool states 0, 1 and 3 are always false, and so are FAULT and WARNING,
+ * which the DLL refuses as bool states (TOBII_ERROR_INVALID_PARAMETER);
+ * DEVICE_PAUSED and CALIBRATION_ACTIVE come from the daemon. Unlike the DLL,
+ * DEVICE_PAUSED changes as soon as the tracker accepts a pause or resume,
+ * and a tracker re-init ends a pause. The uint32 state is CALIBRATION_ID
+ * (DEVICE_PAUSED there is TOBII_ERROR_INVALID_PARAMETER, as in the DLL).
+ * The string states FAULT and WARNING are the tracker's fault and warning
+ * lists ("ok" when there are none) as its last init reported them (command
+ * 1490), cut to 511 bytes (the DLL's own copy seems to hold 119 bytes);
+ * TOBII_ERROR_NOT_SUPPORTED, with the value untouched, when that init
+ * reported none, or from a daemon too old to know these states. Unlike the
+ * DLL, which answers from its cache, a string read can also be
+ * TOBII_ERROR_TIMED_OUT if the daemon has not seen a tracker yet (the call
+ * waits for its first init) or TOBII_ERROR_CONNECTION_FAILED when the daemon
+ * is gone, and a change the tracker announces later shows only after its
+ * next init. */
 TOBII_API tobii_error_t TOBII_CALL tobii_get_state_bool( tobii_device_t* device,
     tobii_state_t state, tobii_state_bool_t* value );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_state_uint32( tobii_device_t* device,

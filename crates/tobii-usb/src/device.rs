@@ -22,7 +22,9 @@ use crate::engine::{
 use crate::time_map::{Stream, TimeMap};
 use std::sync::mpsc::Receiver;
 use tobii_ipc::host_clock_us;
-use tobii_proto::facts::{DeviceFacts, DeviceNotification, decode_notification};
+use tobii_proto::facts::{
+    DeviceFacts, DeviceNotification, STATUS_FAULTS, STATUS_WARNINGS, decode_notification,
+};
 use tobii_proto::gaze83::{GazeFrame, PresenceFrame, decode_gaze_frame, decode_presence_frame};
 use tobii_proto::image83::{ImageFrame, decode_image_payload, upscale2x_into};
 use tobii_proto::log::{PacketLog, log_packet};
@@ -1790,6 +1792,8 @@ fn gaze_stream_loop(
         model = %facts.info.model,
         firmware = %facts.info.firmware_version,
         calibration_id = ?facts.calibration_id,
+        faults = ?facts.status_string(STATUS_FAULTS),
+        warnings = ?facts.status_string(STATUS_WARNINGS),
         "device ready"
     );
     let _ = tx.send(Sample::DeviceReady(Arc::new(facts)));

@@ -21,7 +21,7 @@ use crate::types::{
     TOBII_STATE_DEVICE_PAUSED, TOBII_STATE_FAULT, TOBII_STATE_WARNING,
     TOBII_STREAM_EYE_POSITION_NORMALIZED, TOBII_STREAM_GAZE_DATA, TOBII_STREAM_GAZE_ORIGIN,
     TOBII_STREAM_GAZE_POINT, TOBII_STREAM_HEAD_POSE, TOBII_STREAM_USER_POSITION_GUIDE,
-    TOBII_STREAM_USER_PRESENCE, TOBII_SUPPORTED, TrackBox, Version, copy_c_string,
+    TOBII_STREAM_USER_PRESENCE, TOBII_SUPPORTED, TrackBox, Version, copy_c_bytes, copy_c_string,
 };
 
 /// The URL `tobii_enumerate_local_device_urls` reports. There is exactly one
@@ -539,7 +539,9 @@ fn query_state(d: &mut Device, state: u32) -> Result<Vec<u8>, Status> {
 
 /// A boolean state. Power save, remote wake, exclusive mode and the
 /// fault/warning flags are always false here; paused and calibration-active
-/// come from the daemon.
+/// come from the daemon. The DLL refuses FAULT and WARNING as bool states
+/// (`TOBII_ERROR_INVALID_PARAMETER`, its state map at 0x180142ba0); they are
+/// string states (`tobii_get_state_string`).
 ///
 /// Unlike the DLL, which learns it from the tracker, the paused state
 /// changes as soon as the tracker accepts a pause or resume; a tracker
@@ -613,7 +615,24 @@ pub unsafe extern "C" fn tobii_get_state_uint32(
     }
 }
 
-/// A string state: the fault and warning lists, always empty here.
+/// A string state: the tracker's fault or warning list ("ok" when there are
+/// none), as its last init reported them (status strings 5 and 6 of command
+/// 1490), from the daemon.
+///
+/// The DLL (0x1801422c0) copies them from a cache that its create and
+/// reconnect fill from 1490 (0x18016db40, through `tracker_get_status` at
+/// 0x1801a0ac0), and that the tracker's notifications 3200 and 3210 update
+/// (0x18016efa0); those are not followed here, so a change shows at the next
+/// init. Up to the first NUL and at most 511 bytes are copied, and all 512
+/// written, as the DLL's `strncpy(value, .., 0x200)` and forced NUL at
+/// `[0x1ff]` do; the DLL's own copy of a 1490 string holds at most 119
+/// bytes (its TTP record, 0x18017c3a4, inferred to be the 1490 path), where
+/// a longer one is passed on here. `TOBII_ERROR_NOT_SUPPORTED` when the
+/// init reported no such list, as the DLL, and from a daemon too old to
+/// know these states. Unlike the DLL, which answers from its cache,
+/// `TOBII_ERROR_TIMED_OUT` if the daemon has not seen a tracker yet (the
+/// call waits for its first init) and `TOBII_ERROR_CONNECTION_FAILED` when
+/// the daemon is gone. On any error `value` is left untouched.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `value` must be null or valid
@@ -625,14 +644,26 @@ pub unsafe extern "C" fn tobii_get_state_string(
     value: *mut StateString,
 ) -> Status {
     // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
-        return status;
-    }
+    let d = match unsafe { device_mut(device) } {
+        Ok(d) => d,
+        Err(status) => return status,
+    };
     if value.is_null() || !matches!(state, TOBII_STATE_FAULT | TOBII_STATE_WARNING) {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
+    // The daemon may wait for the tracker's first init: the facts timeout.
+    let bytes = match d.request(kind::STATE, &request::encode_u32(state), FACTS_TIMEOUT) {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let text = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .map_or(&bytes[..], |end| &bytes[..end]);
+    let mut out: StateString = [0; 512];
+    copy_c_bytes(&mut out, text);
     // SAFETY: non-null, and the caller guarantees 512 writable bytes.
-    unsafe { value.write([0; 512]) };
+    unsafe { value.write(out) };
     TOBII_ERROR_NO_ERROR
 }
 
@@ -1374,19 +1405,18 @@ mod tests {
                 TOBII_ERROR_INVALID_PARAMETER,
                 "a bool state, as in the DLL"
             );
-            let mut s: StateString = [1; 512];
-            assert_eq!(tobii_get_state_string(d, TOBII_STATE_FAULT, &raw mut s), 0);
-            assert_eq!(s[0], 0);
             assert_eq!(tobii_device_destroy(d), 0);
         }
     }
 
-    /// The paused state a daemon answering `status`/`payload` gives. It must
-    /// be asked for with STATE 2.
-    fn paused_state(status: u8, payload: Vec<u8>) -> (Status, u32) {
-        use std::sync::{Arc, Mutex};
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&seen);
+    /// Requests a fake daemon was sent, as `(kind, payload)`.
+    type Requests = std::sync::Arc<std::sync::Mutex<Vec<(u8, Vec<u8>)>>>;
+
+    /// A device on a fake daemon that answers every request with
+    /// `status`/`payload`, and the requests it is sent.
+    fn recording_device(status: u8, payload: Vec<u8>) -> (*mut Device, Requests) {
+        let seen = Requests::default();
+        let log = std::sync::Arc::clone(&seen);
         let connect = crate::device::tests::fake_daemon(move |body| {
             let req = request::decode_request(body).expect("request");
             log.lock()
@@ -1395,6 +1425,13 @@ mod tests {
             vec![tobii_ipc::encode_reply(req.id, status, &payload)]
         });
         let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        (d, seen)
+    }
+
+    /// The paused state a daemon answering `status`/`payload` gives. It must
+    /// be asked for with STATE 2.
+    fn paused_state(status: u8, payload: Vec<u8>) -> (Status, u32) {
+        let (d, seen) = recording_device(status, payload);
         let mut v = 7u32;
         // SAFETY: `d` is live and destroyed once; `v` a live local.
         let got = unsafe {
@@ -1410,6 +1447,131 @@ mod tests {
             )]
         );
         (got, v)
+    }
+
+    /// What `tobii_get_state_string(state)` gives on a daemon answering
+    /// `status`/`payload`: its status, the buffer (filled with 1s before the
+    /// call) and the requests sent.
+    fn state_string(
+        state: u32,
+        status: u8,
+        payload: &[u8],
+    ) -> (Status, StateString, Vec<(u8, Vec<u8>)>) {
+        let (d, seen) = recording_device(status, payload.to_vec());
+        let mut s: StateString = [1; 512];
+        // SAFETY: `d` is live and destroyed once; `s` a live local.
+        let got = unsafe {
+            let got = tobii_get_state_string(d, state, &raw mut s);
+            assert_eq!(tobii_device_destroy(d), 0);
+            got
+        };
+        let requests = seen.lock().expect("log").clone();
+        (got, s, requests)
+    }
+
+    fn bytes(s: &StateString) -> Vec<u8> {
+        s.iter().map(|c| c.to_ne_bytes()[0]).collect()
+    }
+
+    /// `text` then zeros, as a 512-byte state string.
+    fn padded(text: &[u8]) -> Vec<u8> {
+        let mut v = text.to_vec();
+        v.resize(512, 0);
+        v
+    }
+
+    #[test]
+    fn the_fault_and_warning_strings_come_from_the_daemon() {
+        use tobii_ipc::request::state;
+        let (got, s, requests) = state_string(TOBII_STATE_FAULT, 0, b"ok");
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        assert_eq!(bytes(&s), padded(b"ok"), "all 512 bytes written");
+        assert_eq!(requests, [(kind::STATE, request::encode_u32(state::FAULT))]);
+
+        let (got, s, requests) = state_string(TOBII_STATE_WARNING, 0, b"W_A,W_B");
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        assert_eq!(bytes(&s), padded(b"W_A,W_B"));
+        assert_eq!(
+            requests,
+            [(kind::STATE, request::encode_u32(state::WARNING))]
+        );
+
+        // Up to the first NUL, as strncpy.
+        let (got, s, _) = state_string(TOBII_STATE_FAULT, 0, b"a\0b");
+        assert_eq!((got, bytes(&s)), (TOBII_ERROR_NO_ERROR, padded(b"a")));
+    }
+
+    #[test]
+    fn a_long_state_string_is_cut_to_511_bytes() {
+        let (got, s, _) = state_string(TOBII_STATE_FAULT, 0, &[b'x'; 600]);
+        assert_eq!(got, TOBII_ERROR_NO_ERROR);
+        let s = bytes(&s);
+        assert!(s[..511].iter().all(|&b| b == b'x'));
+        assert_eq!(s[511], 0);
+    }
+
+    #[test]
+    fn a_state_string_the_daemon_lacks_leaves_the_value_untouched() {
+        for (status, want, what) in [
+            (
+                tobii_ipc::request::status::NOT_SUPPORTED,
+                TOBII_ERROR_NOT_SUPPORTED,
+                "an older daemon, or an init without the list",
+            ),
+            (
+                tobii_ipc::request::status::TIMED_OUT,
+                TOBII_ERROR_TIMED_OUT,
+                "no init yet",
+            ),
+        ] {
+            let (got, s, requests) = state_string(TOBII_STATE_WARNING, status, &[]);
+            assert_eq!(got, want, "{what}");
+            assert_eq!(s, [1; 512], "{what}");
+            assert_eq!(requests.len(), 1, "{what}");
+        }
+    }
+
+    #[test]
+    fn other_string_states_are_refused_unasked() {
+        for state in [
+            0,
+            TOBII_STATE_DEVICE_PAUSED,
+            TOBII_STATE_CALIBRATION_ID,
+            TOBII_STATE_CALIBRATION_ACTIVE,
+            8,
+        ] {
+            let (got, s, requests) = state_string(state, 0, b"ok");
+            assert_eq!(got, TOBII_ERROR_INVALID_PARAMETER, "state {state}");
+            assert_eq!(s, [1; 512], "state {state}");
+            assert_eq!(requests, [], "state {state}");
+        }
+        let (d, seen) = recording_device(0, b"ok".to_vec());
+        // SAFETY: `d` is live and destroyed once; a null value is refused.
+        unsafe {
+            assert_eq!(
+                tobii_get_state_string(d, TOBII_STATE_FAULT, std::ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+        assert_eq!(*seen.lock().expect("log"), []);
+    }
+
+    /// STATE 4 and 5 now carry the lists: a bool read of them must not ask,
+    /// or "ok" would read as TRUE.
+    #[test]
+    fn the_fault_and_warning_bools_are_not_asked() {
+        let (d, seen) = recording_device(0, b"ok".to_vec());
+        let mut v = 7u32;
+        // SAFETY: `d` is live and destroyed once; `v` a live local.
+        unsafe {
+            for state in [TOBII_STATE_FAULT, TOBII_STATE_WARNING] {
+                assert_eq!(tobii_get_state_bool(d, state, &raw mut v), 0);
+                assert_eq!(v, TOBII_STATE_BOOL_FALSE);
+            }
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+        assert_eq!(*seen.lock().expect("log"), []);
     }
 
     #[test]

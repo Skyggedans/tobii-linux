@@ -434,7 +434,8 @@ impl State {
 /// Fill in, from the previous init's facts, what a new init did not report
 /// because a response was lost: the stream catalogue and the hardware
 /// configuration are the firmware's, so the old ones still hold, and a lost
-/// 1200 or 2120 must not blank them.
+/// 1200 or 2120 must not blank them. The status strings (1490) are not kept:
+/// the DLL's reconnect empties its copy of the fault and warning lists too.
 fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
     let Some(previous) = previous else {
         return;
@@ -1220,6 +1221,40 @@ pub(crate) mod tests {
             st.facts.as_ref().and_then(|f| f.hardware.clone()),
             Some(hardware)
         );
+    }
+
+    #[test]
+    fn an_init_without_a_status_drops_the_fault_and_warning_lists() {
+        use crate::requests::{Reply, handle, tests::Answering};
+        use tobii_ipc::request::{Request, encode_u32, kind, state, status};
+        let mut st = state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        let state = Mutex::new(st);
+        let ready = |status: Vec<(u32, String)>| {
+            Sample::DeviceReady(Arc::new(DeviceFacts {
+                status,
+                ..DeviceFacts::default()
+            }))
+        };
+        let ask = |id| {
+            handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind: kind::STATE,
+                    payload: &encode_u32(id),
+                },
+            )
+        };
+        lock_state(&state).observe(&ready(vec![(5, "ok".into()), (6, "ok".into())]));
+        assert_eq!(ask(state::FAULT), Reply::ok(b"ok".to_vec()));
+        assert_eq!(ask(state::WARNING), Reply::ok(b"ok".to_vec()));
+
+        lock_state(&state).observe(&ready(vec![]));
+
+        assert_eq!(ask(state::FAULT), Reply::err(status::NOT_SUPPORTED));
+        assert_eq!(ask(state::WARNING), Reply::err(status::NOT_SUPPORTED));
     }
 
     #[test]

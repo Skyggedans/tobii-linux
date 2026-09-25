@@ -168,6 +168,14 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
     show("paused", &paused, |b| {
         format!("{}", b.first().is_some_and(|v| *v != 0))
     });
+    let faults = p.ask(kind::STATE, &request::encode_u32(state::FAULT))?;
+    show("faults", &faults, |b| {
+        format!("{:?}", String::from_utf8_lossy(b))
+    });
+    let warnings = p.ask(kind::STATE, &request::encode_u32(state::WARNING))?;
+    show("warnings", &warnings, |b| {
+        format!("{:?}", String::from_utf8_lossy(b))
+    });
 
     if let Some((w, h, x)) = set_display {
         let Some(m) = (mounting.0 == 0)
