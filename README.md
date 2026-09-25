@@ -109,11 +109,18 @@ Where the answers come from, and where they differ from Windows:
   yet). The first call that needs the tracker starts it, and it then stays on
   (IR illuminator lit) for as long as that connection is open, as for an
   open device in the Stream Engine. While it is unplugged, such a call (a
-  clock pair, a pause, a calibration, a display-area write) is
-  `TOBII_ERROR_CONNECTION_FAILED` at once from when the daemon has given the
-  tracker up, a few seconds after the unplug (until then the call waits on
-  the daemon's re-opens), and the daemon starts the tracker once it is
-  plugged back in, for a connection still open.
+  clock pair, a pause, starting, retrieving or applying a calibration, a
+  display-area write) is `TOBII_ERROR_CONNECTION_FAILED` at once from when
+  the daemon has given the tracker up, a few seconds after the unplug (until
+  then the call waits on the daemon's re-opens), and the daemon starts the
+  tracker once it is plugged back in, for a connection still open. A
+  calibration session its owner is not already stopping ends, saving
+  nothing, when the daemon loses the tracker or the tracker re-initialises:
+  its owner's later calls in it, `tobii_calibration_stop` included, are
+  `TOBII_ERROR_CALIBRATION_NOT_STARTED`. A stop under way finishes, and a
+  calibration it has saved stays saved even if the stop then fails
+  (`TOBII_ERROR_CONNECTION_FAILED` when the tracker went away); the tracker
+  loads it at its next init.
 - **Pause.** One state for the tracker, shared by every client, as in the
   Stream Engine: the last call wins and any client may resume.
   `TOBII_STATE_DEVICE_PAUSED` and a `DEVICE_PAUSED_STATE_CHANGED`

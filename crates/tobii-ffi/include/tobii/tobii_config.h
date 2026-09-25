@@ -3,9 +3,14 @@
  *
  * Calibration runs in the tobiid daemon, one client at a time: another
  * client's session makes tobii_calibration_start return
- * TOBII_ERROR_CALIBRATION_BUSY. A computed calibration is saved as the user's
+ * TOBII_ERROR_CALIBRATION_BUSY. Only tobii_calibration_stop commits a
+ * session: the last calibration it computed is saved as the user's
  * calibration ($XDG_CONFIG_HOME/tobii/calibration.bin) and uploaded at every
- * later init. Only 2-D calibration of both eyes is supported.
+ * later init. A session that ends any other way (its owner disconnects, the
+ * tracker re-initialises or goes away) saves nothing: the calibration and
+ * display area it started from go back, and its owner's later calls in it,
+ * tobii_calibration_stop included, return TOBII_ERROR_CALIBRATION_NOT_STARTED.
+ * Only 2-D calibration of both eyes is supported.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -35,7 +40,13 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_enabled_eye( tobii_device_t* device
 /* Only TOBII_ENABLED_EYE_BOTH. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_start( tobii_device_t* device,
     tobii_enabled_eye_t enabled_eye );
-/* Restores the previous calibration when nothing was computed. */
+/* Keeps the last calibration computed and the display area set in the
+ * session. Restores the previous ones only when nothing was computed, or when
+ * the daemon cannot save the calibration (TOBII_ERROR_OPERATION_FAILED). Once
+ * saved, both are kept even if the tracker then refuses the calibration or
+ * goes away before taking it (TOBII_ERROR_OPERATION_FAILED or
+ * TOBII_ERROR_CONNECTION_FAILED all the same): it loads them at its next
+ * init. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_stop( tobii_device_t* device );
 /* Normalised display coordinates; blocks for most of a second. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_collect_data_2d( tobii_device_t* device,
@@ -56,6 +67,7 @@ TOBII_API tobii_error_t TOBII_CALL tobii_calibration_discard_data_3d( tobii_devi
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_discard_data_per_eye_2d( tobii_device_t* device,
     float x, float y, tobii_enabled_eye_t eyes );
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_clear( tobii_device_t* device );
+/* Active at once, but saved only by tobii_calibration_stop. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_compute_and_apply( tobii_device_t* device );
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_compute_and_apply_per_eye(

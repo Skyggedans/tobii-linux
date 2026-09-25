@@ -3,8 +3,9 @@
  * Companion to tobii/tobii.h; see that file for what these headers are.
  * Every sample carries the device clock in timestamp_us. Callbacks run on the
  * thread that calls tobii_device_process_callbacks; calling an implemented
- * device function from one (creating or destroying a device included), or
- * tobii_api_destroy, returns TOBII_ERROR_CALLBACK_IN_PROGRESS.
+ * device function from one (creating or destroying a device included),
+ * tobii_calibration_parse or tobii_api_destroy returns
+ * TOBII_ERROR_CALLBACK_IN_PROGRESS.
  *
  * SPDX-License-Identifier: MIT
  */

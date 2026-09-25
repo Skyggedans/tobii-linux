@@ -374,10 +374,10 @@ current setting puts them, so usually Enter is all it takes. A calibration
 only holds for the display area it is made on, so the setup runs inside the
 calibration session, before the points: the daemon writes the display area
 to the tracker at once, and saves it (in `~/.config/tobii/display-area`, for
-every later start) together with the first calibration computed on it. If
-the session ends without a calibration (Esc, a failure, the client dying,
-the daemon or tracker going away, or the tracker re-initialising), the
-tracker gets the previous display area back along with the previous
+every later start) with the calibration made on it when the session is
+kept. If the session ends without a calibration (Esc, a failure, the client
+dying, the daemon or tracker going away, or the tracker re-initialising),
+the tracker gets the previous display area back along with the previous
 calibration. Outside a calibration session, a display area set through
 `tobii_set_display_area` is saved at once. `--no-display-setup`
 skips the setup, and so does `--windowed` (it needs the whole monitor).
@@ -390,7 +390,10 @@ kept as `calibration.bin.prev`), with the display area it was made on, and
 uploads it at every later start. A session that does not run to its end
 (Esc, a failure, the client dying, the daemon or tracker going away, or the
 tracker re-initialising) leaves nothing behind: the calibration and display
-area it started from stay. The result screen shows the targets and your live
+area it started from stay. A stop that has saved the calibration keeps it
+even if the tracker then refuses it or goes away before taking it: the stop
+reports the failure, but the tracker loads the saved calibration and display
+area at its next init. The result screen shows the targets and your live
 gaze to check it.
 
 - `--rounds 1` for a quick 7-point pass (half the tracker's 14 stored points
@@ -404,7 +407,13 @@ gaze to check it.
   busy. If the calibrating client dies, the daemon stops the session and puts
   the previous calibration back.
 - Stream Engine applications can calibrate too, through `tobii_calibration_*`
-  in `libtobii.so`; the result is saved the same way.
+  in `libtobii.so`; the result is saved the same way, once the application
+  calls `tobii_calibration_stop`. A session that ends before that (the
+  application exiting, the daemon or tracker going away, or the tracker
+  re-initialising) leaves nothing behind, as above. When the tracker went
+  away or re-initialised, the application's later calls in it,
+  `tobii_calibration_stop` included, are
+  `TOBII_ERROR_CALIBRATION_NOT_STARTED`.
 
 If the compositor opens the window on another monitor, or not fullscreen
 (PaperWM puts new windows on the monitor in use), `tobii-calibrate` asks for
@@ -453,11 +462,14 @@ gaze has no rest pose.)
   clock pair, a pause, …) and releases it when the last such client
   disconnects. Facts from the last init (device info, track box, the stream
   catalogue, …) are answered even while the tracker is unplugged. Requests
-  that need it live (a clock pair, a pause, a calibration, a display-area
-  write) then fail at once with `TOBII_ERROR_CONNECTION_FAILED`, from when
-  the daemon has given the tracker up (a few seconds after the unplug); the
-  daemon logs once that no tracker is on the bus and opens it once it is
-  plugged back in, for a client still connected.
+  that need it live (a clock pair, a pause, starting, retrieving or applying
+  a calibration, a display-area write) then fail at once with
+  `TOBII_ERROR_CONNECTION_FAILED`, from when the daemon has given the tracker
+  up (a few seconds after the unplug); the daemon logs once that no tracker
+  is on the bus and opens it once it is plugged back in, for a client still
+  connected. A calibration session under way ends then, saving nothing,
+  unless its client is already stopping it, and the client's later calls in
+  it are `TOBII_ERROR_CALIBRATION_NOT_STARTED` (§8a).
 - **"It flies around."** You're talking to an **old daemon** (pre-rebuild) — it
   still has the previous code/units. Restart it (§5).
 - **"Rotations slide."** Tune `TOBII_PIVOT_DOWN` / `TOBII_PIVOT_BACK` (§7).

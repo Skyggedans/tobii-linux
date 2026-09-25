@@ -1,6 +1,6 @@
 //! `tobii_config.h` calibration: the session runs in the daemon (one owner at
-//! a time, the result saved as the user's calibration); parsing a blob is done
-//! here.
+//! a time; the result is saved as the user's calibration only when the owner
+//! stops the session); parsing a blob is done here.
 //!
 //! 2-D calibration of both eyes is what the Windows engine was captured doing;
 //! discarding a 2-D point uses the command the DLL sends for it. 3-D and
@@ -71,9 +71,14 @@ pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_ey
 }
 
 /// End the session, keeping the calibration it computed last (and the
-/// display area set during it). If nothing was computed, or the daemon
-/// could not save it (`TOBII_ERROR_OPERATION_FAILED`), the previous
-/// calibration and display area are restored.
+/// display area set during it). Only if nothing was computed, or the daemon
+/// could not save it (`TOBII_ERROR_OPERATION_FAILED`), are the previous
+/// calibration and display area restored. Once saved, both are kept even if
+/// the tracker then refuses the calibration or goes away before taking it
+/// (`TOBII_ERROR_OPERATION_FAILED` or `TOBII_ERROR_CONNECTION_FAILED` all
+/// the same): it loads them at its next init. A session the daemon already
+/// ended, because the tracker re-initialised or went away, saved nothing:
+/// its stop is `TOBII_ERROR_CALIBRATION_NOT_STARTED`.
 ///
 /// # Safety
 /// As `tobii_calibration_start`.

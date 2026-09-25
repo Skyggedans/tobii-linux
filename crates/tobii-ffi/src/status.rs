@@ -23,8 +23,10 @@ pub const TOBII_ERROR_NOT_SUPPORTED: Status = 3;
 /// No device is available.
 pub const TOBII_ERROR_NOT_AVAILABLE: Status = 4;
 /// Returned here: the daemon could not be reached (or spawned), the
-/// connection dropped, or the daemon has no tracker for a call that needs
-/// one live (a clock pair, a pause, a calibration, a display-area write).
+/// connection dropped, the daemon has no tracker for a call that needs one
+/// live (a clock pair, a pause, starting, retrieving or applying a
+/// calibration, a display-area write), or the tracker re-initialised or was
+/// lost while the call ran.
 pub const TOBII_ERROR_CONNECTION_FAILED: Status = 5;
 /// Returned here: no sample (or no daemon acknowledgement) arrived before the
 /// timeout.
@@ -35,7 +37,10 @@ pub const TOBII_ERROR_ALLOCATION_FAILED: Status = 7;
 pub const TOBII_ERROR_INVALID_PARAMETER: Status = 8;
 /// Calibration has already been started.
 pub const TOBII_ERROR_CALIBRATION_ALREADY_STARTED: Status = 9;
-/// Calibration has not been started.
+/// Calibration has not been started; the daemon ended the session without
+/// its owner (the tracker re-initialised or went away); or the tracker
+/// refused a collect, discard, clear or compute for having no session, and
+/// the daemon keeps its session for the owner to stop.
 pub const TOBII_ERROR_CALIBRATION_NOT_STARTED: Status = 10;
 /// The stream is already subscribed on this device.
 pub const TOBII_ERROR_ALREADY_SUBSCRIBED: Status = 11;

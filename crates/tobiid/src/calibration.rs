@@ -26,13 +26,14 @@
 //! ([`STOP_KEEP`], what `tobii_calibration_stop` sends): the last computed
 //! calibration is then saved as the user's, stays on the device and is
 //! uploaded at every later init. One that cannot be saved is not kept either
-//! (the stop is `OPERATION_FAILED`); with `TOBII_CALIBRATION=embedded` none
-//! is saved, and the one kept runs until the next init. Stopped with
-//! [`STOP_DISCARD`], by its owner going
-//! away, by the engine dying or by the device re-initialising (the engine
-//! re-opening it after a stall or a USB error), a session leaves nothing
-//! behind: the calibration it started from goes back on the device and
-//! nothing is saved.
+//! (the stop is `OPERATION_FAILED`). One saved is kept even if the device
+//! then refuses it or goes away before taking it: the stop answers that
+//! failure, and the next init uploads it. With `TOBII_CALIBRATION=embedded`
+//! none is saved, and the one kept runs until the next init. Stopped with
+//! [`STOP_DISCARD`], by its owner going away, by the engine dying or by the
+//! device re-initialising (the engine re-opening it after a stall or a USB
+//! error), a session leaves nothing behind: the calibration it started from
+//! goes back on the device and nothing is saved.
 //! A session stopped part way through would otherwise keep a calibration
 //! that mixes its points with the previous session's (the device keeps the
 //! last 14). A stop under way is left to finish by a device init, and by a
@@ -697,8 +698,10 @@ pub(crate) fn on_engine_lost(st: &mut State) {
 /// commands go through the engine's queue, which outlasts the re-open, to
 /// a device outside any session, so the start counts the inits from that
 /// answer. A stop that is running is left to finish: the engine keeps its
-/// command queue across the re-open, so the stop's own commands still
-/// reach the device.
+/// command queue across the re-open, so the stop's commands not yet sent
+/// still reach the device. The one on the device at the re-open fails, and
+/// the stop answers that failure, but an init after the stop's save uploads
+/// what it saved.
 ///
 /// Unverified on hardware: that a re-open takes the device out of its
 /// calibration session. The init replay sends no 1020, so a device that

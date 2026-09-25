@@ -10,12 +10,13 @@
 //!   display area and mounting (read and write), states, capabilities, the
 //!   gaze point, gaze origin, eye position, user position guide, presence,
 //!   head pose, gaze data, IR image and notification streams, 2-D
-//!   calibration (the result is saved as the user's calibration) and
-//!   discarding a 2-D point, the device/host clock pair (`tobii_timesync`),
-//!   the tracker's stream catalogue, device pause and resume, and the device
-//!   name (kept by the host, not the tracker). The hardware configuration is
-//!   implemented provisionally; the ET5 has reported none on Linux, so it
-//!   answers `TOBII_ERROR_NOT_SUPPORTED` there.
+//!   calibration (a session's result is saved as the user's calibration only
+//!   when its owner calls `tobii_calibration_stop`) and discarding a 2-D
+//!   point, the device/host clock pair (`tobii_timesync`), the tracker's
+//!   stream catalogue, device pause and resume, and the device name (kept by
+//!   the host, not the tracker). The hardware configuration is implemented
+//!   provisionally; the ET5 has reported none on Linux, so it answers
+//!   `TOBII_ERROR_NOT_SUPPORTED` there.
 //! - **Answered locally** — API version (4.1.0.3), system clock, output
 //!   frequency (33 Hz), enabled eye (both), feature group (consumer),
 //!   license validation (every key valid), display-area calculation,
