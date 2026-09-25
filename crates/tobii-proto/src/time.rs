@@ -1,4 +1,6 @@
-//! Wall-clock helper shared by the decoder, the packet log and the USB engine.
+//! Wall-clock helper shared by the decoder and the packet log. The USB engine
+//! stamps its reads with `tobii_ipc::host_clock_us` (`CLOCK_MONOTONIC`)
+//! instead.
 //!
 //! It lives on its own so the pure codec modules do not have to depend on the
 //! CLI's file sinks just to stamp a frame.

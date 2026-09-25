@@ -202,8 +202,11 @@ stays up, and clients that connect after it are not served until it exits.
 `tobiid` removes at shutdown only a socket file it bound itself, never
 systemd's, so clients reach the restarted daemon through the same socket.
 
-**Once, under 4c, when the running `tobiid` was built before 2026-09-25:**
-that daemon removes systemd's `$XDG_RUNTIME_DIR/tobiid.sock` at shutdown, and
+**Once, under 4c, when the running `tobiid` was built without the commit
+"daemon: leave the socket file to systemd under socket activation"** (any
+build before it, whatever its date; `strings "$(command -v tobiid)" | grep -q
+'did not bind'` fails for such a build): that daemon removes systemd's
+`$XDG_RUNTIME_DIR/tobiid.sock` at shutdown, and
 a restart runs its shutdown, so the first restart onto a newer build still
 loses the file. A client that then finds no socket spawns a `tobiid` of its own
 (as in 4a), which binds the path and may claim the tracker. For that one
@@ -214,9 +217,14 @@ systemctl --user stop tobiid.service tobiid.socket
 pkill -x tobiid                        # a daemon a client spawned meanwhile
 while pgrep -x tobiid >/dev/null; do sleep 0.2; done
 systemctl --user start tobiid.socket
+systemctl --user start tobii-gaze-keys.service   # if enabled: stopping tobiid.service stopped it
 ```
 
-`pgrep -a tobiid` should then list at most one daemon.
+`test -S "$XDG_RUNTIME_DIR/tobiid.sock"` should then succeed, and
+`pgrep -a tobiid` list at most one daemon (none until a client connects).
+Check the file this way rather than with a client: `ipc-probe` and the other
+clients spawn a daemon of their own when they find no socket, which hides a
+missing file.
 
 **Once, when moving to host-clock timestamps.** A `tobiid` built without the
 commit "daemon: send sample timestamps on the host clock" (any build before
@@ -227,6 +235,14 @@ a `libtobii.so` with that commit hands to its callbacks as
 tracker's. Nothing detects the mismatch: after installing the first build
 with that commit, restart the daemon, and restart the applications that read
 timestamps.
+
+**Once, when moving to a `libtobii.so` that reports a lost connection.** An
+application that loaded `libtobii.so` before `make install` keeps the old
+library in memory. A library built without the commit "ffi: report a lost
+daemon connection" never notices the daemon going away, so after the restart
+that application gets no samples and cannot recover by reconnecting. Restart
+every `libtobii.so` application after the first daemon restart onto such a
+build; in OpenTrack, stop and start tracking.
 
 **Running clients.** A restart, like a crash, closes every client's
 connection:
@@ -416,8 +432,10 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   `TOBII_ERROR_CONNECTION_FAILED`, calls `tobii_device_reconnect` at most
   once a second and keeps reporting the last pose meanwhile picks up again
   by itself once the daemon is back; that change to the plugin is a separate
-  patch. An unplugged tracker needs none of this: the pose holds, then
-  resumes once the tracker is back.
+  patch, the commit "tracker/tobii: reconnect when the connection is lost"
+  on the `tracker-tobii-linux` branch of the OpenTrack fork, which also
+  carries the Linux build change above. An unplugged tracker needs none of
+  this: the pose holds, then resumes once the tracker is back.
 - **`tobii-gaze-keys`** — subscribes to **gaze**. While you look at the left/right edge
   of the screen **and hold a Super/Meta key**, it taps the **Left**/**Right**
   arrow key once per second, via `/dev/uinput` (works under both X11 and Wayland).
