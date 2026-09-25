@@ -279,19 +279,25 @@ pub fn wait_for_response_seq(
 /// want; we then wait for the device to reappear (by presence, not a blind
 /// sleep) so the following init doesn't race a missing device.
 ///
-/// Set `TOBII_NO_RESET=1` to skip it: the engine resets only as an escalation
-/// once opens keep failing (see [`RESET_AFTER_FAILURES`]), and now that
-/// uvcvideo is kept off the device the reset may no longer be needed.
+/// The engine resets only as an escalation once opens keep failing (see
+/// [`RESET_AFTER_FAILURES`]), and not at all with `TOBII_NO_RESET=1` (see
+/// [`run_gaze_engine`]): now that uvcvideo is kept off the device the reset
+/// may no longer be needed. It logs what came of the reset, a skip when the
+/// tracker cannot be opened included: the escalation only says it tries one.
 fn reset_device_baseline(ctx: &UsbContext) {
-    if is_env_flag_set("TOBII_NO_RESET") {
-        return;
-    }
-    if let Ok(h) = open_tobii(ctx) {
-        match h.reset() {
-            Ok(()) => info!("reset Tobii to baseline before init"),
-            Err(e) => warn!(error = ?e, "best-effort reset failed"),
+    match open_tobii(ctx) {
+        Ok(h) => {
+            match h.reset() {
+                Ok(()) => info!("reset Tobii to baseline before init"),
+                Err(e) => warn!(error = ?e, "best-effort reset failed"),
+            }
+            drop(h); // device may re-enumerate; reopen fresh below
         }
-        drop(h); // device may re-enumerate; reopen fresh below
+        // Unplugged, no access (udev rule), or interface 0 held elsewhere.
+        Err(e) => warn!(
+            error = format_args!("{e:#}"),
+            "USB reset skipped: cannot open the tracker"
+        ),
     }
     // Poll for re-enumeration to finish (cap ~3s) instead of sleeping blindly.
     for _ in 0..30 {
@@ -335,8 +341,8 @@ fn is_tobii_present(ctx: &UsbContext) -> bool {
 /// within [`HEALTHY_STREAM`] — which is the signature of a device left hot by
 /// an unclean exit (`kill -9`, crash) that skipped the teardown. A stream that
 /// ran for [`HEALTHY_STREAM`] ends such a run, so the reset comes at most once
-/// per run of failures, not once per engine. `reset_device_baseline` still
-/// honors `TOBII_NO_RESET=1` (skip even the escalation).
+/// per run of failures, not once per engine. `TOBII_NO_RESET=1` skips even
+/// the escalation (see [`run_gaze_engine`]).
 const RESET_AFTER_FAILURES: usize = 2;
 
 /// How long a gaze stream must run after arming for its loss to count as a
@@ -463,13 +469,14 @@ impl FailedOpens {
 /// `shared.stop` is set, running the commands that arrive on `commands` in
 /// between. A stream that dies (a stall, a USB error) is re-opened in place,
 /// and only failures in a row count toward giving up, the prime aside (see
-/// [`run_opens`] and the note on the reset-escalation constant above).
+/// [`run_opens`] and the note on the reset-escalation constant above). Set
+/// `TOBII_NO_RESET=1` to leave out the USB reset of that escalation.
 ///
 /// # Errors
 ///
 /// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
-/// row are counted, as soon as an open fails after `shared.stop` is set, or at
-/// once when libusb cannot be initialised.
+/// row are counted, or at once when libusb cannot be initialised. A stop is
+/// not a failure, even one that cuts an open short.
 pub(crate) fn run_gaze_engine(
     shared: &Arc<Shared>,
     commands: &Receiver<QueuedCommand>,
@@ -491,10 +498,11 @@ pub(crate) fn run_gaze_engine(
         thread::spawn(move || pose_worker(&mailbox, &shared, &tx))
     });
 
+    let reset = (!is_env_flag_set("TOBII_NO_RESET")).then_some(|| reset_device_baseline(&ctx));
     let result = run_opens(
         stop,
         || gaze_engine_attempt(&ctx, shared, commands, tx, &mailbox),
-        || reset_device_baseline(&ctx),
+        reset,
         REOPEN_PAUSE,
     );
 
@@ -515,16 +523,22 @@ pub(crate) fn run_gaze_engine(
 /// [`OpenFailure`], which decides when `reset` runs (once
 /// [`RESET_AFTER_FAILURES`] are counted) and when to give up; the prime is
 /// not counted, and a failure whose [`StreamLost`] context says the stream
-/// ran for [`HEALTHY_STREAM`] ends the run instead of adding to it.
+/// ran for [`HEALTHY_STREAM`] ends the run instead of adding to it. With no
+/// `reset` (`TOBII_NO_RESET=1`) the escalation says it skipped the reset and
+/// the opens go on as they would after one.
+///
+/// A stop is not a failure: an open that fails once `stop` is set, as one
+/// whose arming wait the stop cut short does, ends the loop `Ok` and its
+/// error is logged at debug.
 ///
 /// # Errors
 ///
 /// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
-/// row are counted, or as soon as an open fails after `stop` is set.
+/// row are counted.
 fn run_opens(
     stop: &AtomicBool,
     mut open: impl FnMut() -> Result<()>,
-    mut reset: impl FnMut(),
+    mut reset: Option<impl FnMut()>,
     pause: Duration,
 ) -> Result<()> {
     let mut failed = FailedOpens::default();
@@ -536,19 +550,29 @@ fn run_opens(
         // A normal cold start or re-open arms on the open after its prime and
         // never gets here; opens that keep failing (the init fails, they do
         // not arm past the prime, or lose the stream within `HEALTHY_STREAM`)
-        // get a USB reset to recover.
+        // get a USB reset to recover, unless it is turned off.
         if reset_first {
-            warn!(
-                in_a_row = failed.in_a_row(),
-                "gaze: opens keep failing; USB-reset to recover"
-            );
-            reset();
+            let in_a_row = failed.in_a_row();
+            match reset.as_mut() {
+                Some(reset) => {
+                    warn!(in_a_row, "gaze: opens keep failing; trying a USB reset");
+                    reset();
+                }
+                None => warn!(
+                    in_a_row,
+                    "gaze: opens keep failing; USB reset skipped (TOBII_NO_RESET=1)"
+                ),
+            }
         }
         let Err(e) = open() else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
-            return Err(e);
+            debug!(
+                error = format_args!("{e:#}"),
+                "gaze: open ended by the stop"
+            );
+            return Ok(());
         }
         let failure = OpenFailure::of(&e);
         let after = failed.record(failure);
@@ -1419,6 +1443,8 @@ fn gaze_stream_loop(
         if image {
             let _ = stop_stream(h, pump.cmd_seq, STREAM_ID_IMAGE);
         }
+        // Also when a stop cut the wait short: `run_opens` ends cleanly on
+        // any failure after a stop.
         anyhow::bail!(StreamStartupTimeout);
     }
 
@@ -1803,6 +1829,12 @@ mod tests {
     /// Run `run_opens` with no pause, each open returning the next of
     /// `outcomes`, and say what it did and what it returned.
     fn drive(outcomes: Vec<Result<()>>) -> (Vec<Step>, Result<()>) {
+        drive_with(outcomes, true)
+    }
+
+    /// [`drive`], with no reset to run unless `can_reset` (as with
+    /// `TOBII_NO_RESET=1`).
+    fn drive_with(outcomes: Vec<Result<()>>, can_reset: bool) -> (Vec<Step>, Result<()>) {
         let stop = AtomicBool::new(false);
         let steps = RefCell::new(Vec::new());
         let mut outcomes = outcomes.into_iter();
@@ -1812,7 +1844,7 @@ mod tests {
                 steps.borrow_mut().push(Step::Open);
                 outcomes.next().expect("an open past the script")
             },
-            || steps.borrow_mut().push(Step::Reset),
+            can_reset.then_some(|| steps.borrow_mut().push(Step::Reset)),
             Duration::ZERO,
         );
         (steps.into_inner(), result)
@@ -1926,7 +1958,17 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_during_an_open_returns_its_error_without_another_open() {
+    fn the_open_loop_without_a_reset_skips_it_and_still_gives_up_after_the_fifth() {
+        let (steps, result) = drive_with(
+            (1..=5).map(|n| Err(anyhow::anyhow!("open {n}"))).collect(),
+            false,
+        );
+        assert_eq!(steps, [Open; 5], "no reset, nor an open in its place");
+        assert_eq!(result.expect_err("gave up").to_string(), "open 5");
+    }
+
+    #[test]
+    fn a_stop_during_an_open_ends_the_loop_ok_without_another_open() {
         let stop = AtomicBool::new(false);
         let (mut opens, mut resets) = (0, 0);
         let result = run_opens(
@@ -1939,15 +1981,31 @@ mod tests {
                 }
                 Err(anyhow::anyhow!("open {opens}"))
             },
-            || resets += 1,
+            Some(|| resets += 1),
             Duration::ZERO,
         );
-        assert_eq!(
-            result.expect_err("stopped").to_string(),
-            format!("open {RESET_AFTER_FAILURES}"),
-            "the stopped open's own error"
-        );
+        assert!(result.is_ok(), "a stop is not a failure: {result:?}");
         assert_eq!((opens, resets), (RESET_AFTER_FAILURES, 0));
+    }
+
+    #[test]
+    fn a_stop_that_cuts_the_arming_wait_short_ends_the_loop_ok() {
+        // The wait gives up on the stop, and the open fails as one that never
+        // armed.
+        let stop = AtomicBool::new(false);
+        let mut opens = 0;
+        let result = run_opens(
+            &stop,
+            || {
+                opens += 1;
+                stop.store(true, Ordering::Relaxed);
+                never_armed()
+            },
+            None::<fn()>,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok(), "a stop is not a failure: {result:?}");
+        assert_eq!(opens, 1);
     }
 
     #[test]
@@ -1960,7 +2018,7 @@ mod tests {
                 opens += 1;
                 Ok(())
             },
-            || {},
+            Some(|| {}),
             Duration::ZERO,
         );
         assert!(result.is_ok());
