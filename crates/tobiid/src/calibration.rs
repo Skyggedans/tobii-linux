@@ -24,15 +24,20 @@
 //!
 //! A session commits only when its owner stops it asking to keep the result
 //! ([`STOP_KEEP`], what `tobii_calibration_stop` sends): the last computed
-//! calibration then stays on the device and is saved as the user's, uploaded
-//! at every later init. Stopped with [`STOP_DISCARD`], by its owner going
+//! calibration is then saved as the user's, stays on the device and is
+//! uploaded at every later init. One that cannot be saved is not kept either
+//! (the stop is `OPERATION_FAILED`); with `TOBII_CALIBRATION=embedded` none
+//! is saved, and the one kept runs until the next init. Stopped with
+//! [`STOP_DISCARD`], by its owner going
 //! away, by the engine dying or by the device re-initialising (the engine
 //! re-opening it after a stall or a USB error), a session leaves nothing
 //! behind: the calibration it started from goes back on the device and
 //! nothing is saved.
 //! A session stopped part way through would otherwise keep a calibration
 //! that mixes its points with the previous session's (the device keeps the
-//! last 14).
+//! last 14). A stop under way is left to finish by a device init, and by a
+//! lost engine when it saves (see [`on_device_ready`] and
+//! [`on_engine_lost`]).
 //!
 //! A session belongs to the client that started it: others get
 //! `CALIBRATION_BUSY`. None starts while the device is paused or a pause is
@@ -163,9 +168,21 @@ struct Session {
     /// Until then a device init or a lost engine leaves the session to the
     /// start in flight (see [`on_device_ready`] and [`on_engine_lost`]).
     started: bool,
-    /// Its owner's stop is running: a device init leaves the session to it
-    /// (see [`on_device_ready`]).
-    stopping: bool,
+    /// Its owner's stop, once it runs: a device init leaves the session to
+    /// it, and so does a lost engine when it saves (see [`on_device_ready`]
+    /// and [`on_engine_lost`]).
+    stop: Option<Stopping>,
+}
+
+/// What a stop under way does with the session's calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopping {
+    /// Saves none: it discards, or keeps with none computed or none saved
+    /// (`TOBII_CALIBRATION=embedded`).
+    SavesNothing,
+    /// Saves the one the session computed, with the display area its owner
+    /// set.
+    Saves,
 }
 
 fn broadcast_state(st: &mut State, active: bool) {
@@ -263,9 +280,9 @@ fn prepare(state: &Mutex<State>, client: u64, access: &Access) -> Result<Prepare
 /// [`prepare`] under the state lock the caller holds, with what
 /// [`look_for_tracker`] found before it was taken. Checked again once the
 /// device is fetched, and before a missing one is `CONNECTION_FAILED`: a
-/// dead engine the fetch drops takes the session along (see
-/// [`on_engine_lost`]), whether or not another starts. A request refused
-/// before the fetch starts no engine.
+/// dead engine the fetch drops takes the session along unless its stop
+/// saves (see [`on_engine_lost`]), whether or not another starts. A request
+/// refused before the fetch starts no engine.
 fn prepare_locked(
     st: &mut State,
     client: u64,
@@ -368,7 +385,7 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
             display_before: None,
             unsaved_display: None,
             started: false,
-            stopping: false,
+            stop: None,
         });
         if st.calibration.orphaned == Some(client) {
             st.calibration.orphaned = None;
@@ -480,7 +497,8 @@ fn apply(state: &Mutex<State>, client: u64, payload: &[u8]) -> Result<Vec<u8>, u
 }
 
 /// End `client`'s session: commit what it computed when `keep` (and it
-/// computed something), else put back what it started from.
+/// computed something, and it could be saved), else put back what it
+/// started from.
 fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
     if lock_state(state).calibration.orphaned == Some(client) {
         // Its session ended without it (the engine lost, or the device
@@ -489,19 +507,44 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
         return Err(status::CALIBRATION_NOT_STARTED);
     }
     let on_bus = look_for_tracker(state);
-    let (device, session, location) = {
+    let (device, session, location, losses) = {
         let mut st = lock_state(state);
-        let prepared = prepare_locked(&mut st, client, &Access::Owner, on_bus)?;
+        let (device, session, location) = prepare_locked(&mut st, client, &Access::Owner, on_bus)?;
         // Under the same lock: a device init from now on leaves the session
-        // to this stop, whose commands still reach the device.
+        // to this stop, whose commands still reach the device; so does a
+        // lost engine when the stop saves, as the owner's display area then
+        // stays configured.
         if let Some(s) = st.calibration.session.as_mut() {
-            s.stopping = true;
+            let saves = keep && s.computed.is_some() && matches!(location, Location::File(_));
+            s.stop = Some(if saves {
+                Stopping::Saves
+            } else {
+                Stopping::SavesNothing
+            });
         }
-        prepared
+        (device, session, location, st.engine_losses)
     };
     let Some(session) = session else {
         return Err(status::CALIBRATION_NOT_STARTED);
     };
+    let commit = session.computed.clone().filter(|_| keep);
+    // Saved before the device gets it: an init from now on (the device
+    // re-opened, or an engine started in place of a lost one) uploads what
+    // this stop writes. The display area only goes to disk with the
+    // calibration made on it.
+    let saved = commit.as_ref().is_some_and(|blob| save(&location, blob));
+    if saved {
+        let file = lock_state(state).display_file.clone();
+        if let (Some(area), Some(path)) = (session.unsaved_display, file) {
+            crate::requests::save_display_area(&path, &area);
+        }
+    }
+    // One that could not be saved is not kept either: later inits would
+    // not upload it. With TOBII_CALIBRATION=embedded none is saved, and the
+    // one kept runs until the next init.
+    let unsaved = commit.is_some() && !saved && matches!(location, Location::File(_));
+    let kept = commit.filter(|_| !unsaved);
+    let active = kept.as_ref().unwrap_or(&session.previous);
     // What 1020 leaves the device running was never established; the write
     // that follows decides, so a refused 1020 alone does not fail the stop.
     if let Err(code) = run(device.as_ref(), cmd::STOP, Vec::new(), QUICK) {
@@ -510,40 +553,44 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
             "the device did not take the calibration stop"
         );
     }
-    let commit = session.computed.clone().filter(|_| keep);
-    let active = commit.as_ref().unwrap_or(&session.previous);
-    let written = run(device.as_ref(), cmd::WRITE, write_payload(active), SLOW);
+    let mut written = run(device.as_ref(), cmd::WRITE, write_payload(active), SLOW);
     if let Err(code) = written {
         warn!(
             status = code,
             "could not write the calibration after stopping; the device takes the saved one at its next start"
         );
     }
-    let mut outcome = written.map(|_| Vec::new());
-    match &commit {
-        Some(blob) => {
-            // The display area only goes to disk with the calibration made
-            // on it.
-            if save(&location, blob) {
-                let file = lock_state(state).display_file.clone();
-                if let (Some(area), Some(path)) = (session.unsaved_display, file) {
-                    crate::requests::save_display_area(&path, &area);
-                }
-            } else if matches!(location, Location::File(_)) {
-                outcome = Err(status::OPERATION_FAILED);
-            }
-        }
-        None => {
-            if let Some(before) = &session.display_before {
-                crate::requests::put_display_back(state, Some(device.as_ref()), before);
-            }
+    // An engine started in place of one lost during the stop may have read
+    // the calibration file before the save replaced it: it gets the saved
+    // one too, and its answer is the one that counts.
+    let successor = {
+        let st = lock_state(state);
+        st.commands()
+            .filter(|_| saved && st.engine_losses != losses)
+    };
+    if let Some(successor) = successor {
+        written = run(successor.as_ref(), cmd::WRITE, write_payload(active), SLOW);
+        if let Err(code) = written {
+            warn!(
+                status = code,
+                "could not write the saved calibration to the engine started in place of the lost one; it takes it at its next start"
+            );
         }
     }
+    if kept.is_none()
+        && let Some(before) = &session.display_before
+    {
+        crate::requests::put_display_back(state, before);
+    }
     let mut st = lock_state(state);
-    // Unknown when the write failed.
-    st.calibration.id = if outcome.is_ok() {
+    st.calibration.id = if st.engine_losses != losses && !saved {
+        // What this stop wrote went with the lost engine: the next init
+        // uploads the calibration the session started from.
+        tobii_calib::blob::calibration_id(&session.previous)
+    } else if written.is_ok() {
         tobii_calib::blob::calibration_id(active)
     } else {
+        // Unknown when the write failed.
         None
     };
     // A lost engine may have ended the session under this stop, and told
@@ -558,8 +605,11 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
     } else if st.calibration.orphaned == Some(client) {
         st.calibration.orphaned = None;
     }
-    info!(client, kept = commit.is_some(), "calibration stopped");
-    outcome
+    info!(client, kept = kept.is_some(), "calibration stopped");
+    if unsaved {
+        return Err(status::OPERATION_FAILED);
+    }
+    written.map(|_| Vec::new())
 }
 
 /// A client disconnected: a session it owned is discarded (it never said to
@@ -586,11 +636,23 @@ pub(crate) fn on_client_gone(state: &Mutex<State>, client: u64) {
 
 /// The engine went away: a started session died with it, uncommitted. The
 /// next init uploads the saved calibration, which is the one the session
-/// started from, and the display area it was made on is configured again.
-/// A start in flight is left to its own error path: its commands went to
-/// the lost engine.
+/// started from, and the display area it was made on is configured again,
+/// before a new engine starts and writes it. A start in flight is left to
+/// its own error path: its commands went to the lost engine. A stop that
+/// saves is left to finish, as by a device init, and settles the
+/// calibration id: the display area its owner set stays configured, for
+/// the next init to write with the calibration made on it. The stop saves
+/// that calibration before it writes it, writes it again to an engine
+/// started in place of this one (whose init may have read the file
+/// first), and puts the area back itself if the save fails. Any other stop
+/// is not waited for: the area the session replaced must be configured
+/// before a new engine starts.
 pub(crate) fn on_engine_lost(st: &mut State) {
-    let Some(session) = st.calibration.session.take_if(|s| s.started) else {
+    let Some(session) = st
+        .calibration
+        .session
+        .take_if(|s| s.started && s.stop != Some(Stopping::Saves))
+    else {
         return;
     };
     warn!(
@@ -618,7 +680,11 @@ pub(crate) fn on_engine_lost(st: &mut State) {
 /// calibration session. The init replay sends no 1020, so a device that
 /// stayed in it would be left in a session nobody owns.
 pub(crate) fn on_device_ready(st: &mut State) {
-    let Some(session) = st.calibration.session.take_if(|s| s.started && !s.stopping) else {
+    let Some(session) = st
+        .calibration
+        .session
+        .take_if(|s| s.started && s.stop.is_none())
+    else {
         return;
     };
     warn!(
@@ -667,6 +733,12 @@ mod tests {
         EngineLost,
         /// The engine is lost once the device has answered.
         EngineLostAfter,
+        /// The engine is lost once the device has answered, and another
+        /// client's request starts the next one.
+        EngineReplacedAfter,
+        /// The engine is lost, and the command with it, and none runs in
+        /// its place (the tracker was unplugged).
+        Unplugged,
     }
 
     /// Answers every command, remembers them, and hands back `blob` for a read.
@@ -690,6 +762,23 @@ mod tests {
         fn lose_engine(&self) {
             if let Some(state) = self.state.upgrade() {
                 lock_state(&state).drop_engine();
+            }
+        }
+
+        /// Lose the engine and start the next one, as a request that finds
+        /// it dead does (the stand-in stands for the new one).
+        fn replace_engine(&self) {
+            if let Some(state) = self.state.upgrade() {
+                lock_state(&state).ensure_engine(true);
+            }
+        }
+
+        /// Lose the engine with none in its place: the stand-in goes too.
+        fn unplug(&self) {
+            if let Some(state) = self.state.upgrade() {
+                let mut st = lock_state(&state);
+                st.drop_engine();
+                st.fake_device = None;
             }
         }
 
@@ -726,7 +815,11 @@ mod tests {
                     self.lose_engine();
                     return Err(CommandError::EngineGone);
                 }
-                Some(Mishap::EngineLostAfter) | None => {}
+                Some(Mishap::Unplugged) => {
+                    self.unplug();
+                    return Err(CommandError::EngineGone);
+                }
+                Some(Mishap::EngineLostAfter | Mishap::EngineReplacedAfter) | None => {}
             }
             self.log.lock().expect("log").push(cmd);
             self.payloads.lock().expect("payloads").push((cmd, payload));
@@ -747,8 +840,16 @@ mod tests {
             } else {
                 Vec::new()
             };
-            if let Some(Mishap::EngineLostAfter) = mishap {
-                self.lose_engine();
+            match mishap {
+                Some(Mishap::EngineLostAfter) => self.lose_engine(),
+                Some(Mishap::EngineReplacedAfter) => self.replace_engine(),
+                Some(
+                    Mishap::Reinit
+                    | Mishap::ReinitThenStart(_)
+                    | Mishap::EngineLost
+                    | Mishap::Unplugged,
+                )
+                | None => {}
             }
             Ok(CommandResponse::ok(payload))
         }
@@ -1545,21 +1646,74 @@ mod tests {
     }
 
     #[test]
-    fn the_display_area_is_saved_only_with_its_calibration() {
-        let (s, file, _) = display_setup("unsavable");
-        // The calibration cannot be written: its path is a directory.
-        std::fs::create_dir_all(s.dir.join("calibration.bin")).expect("dir");
-        assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
-            status::OK
-        );
+    fn a_calibration_that_cannot_be_saved_is_not_kept() {
+        // Without a lost engine, and with one lost once the device took the
+        // write and the next started before the stop ends.
+        for (tag, mishap, started) in [
+            ("unsavable", None, 0),
+            ("unsavable-lost", Some(Mishap::EngineReplacedAfter), 1),
+        ] {
+            let (s, file, old) = display_setup(tag);
+            // The calibration cannot be written: its path is a directory.
+            std::fs::create_dir_all(s.dir.join("calibration.bin")).expect("dir");
+            let new = area(597.0);
+            assert_eq!(set_area(&s, 1, &new), Reply::ok(Vec::new()), "{tag}");
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+                status::OK,
+                "{tag}"
+            );
+            if let Some(mishap) = mishap {
+                befall(&s, cmd::WRITE, mishap);
+            }
 
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP).status,
-            status::OPERATION_FAILED
-        );
-        assert!(!file.exists());
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP).status,
+                status::OPERATION_FAILED,
+                "{tag}"
+            );
+
+            assert!(!file.exists(), "{tag}: saved only with its calibration");
+            let built_in = tobii_usb::calibration::embedded_blob().expect("blob");
+            let last_write = s
+                .device
+                .payloads
+                .lock()
+                .expect("payloads")
+                .iter()
+                .rev()
+                .find(|(c, _)| *c == cmd::WRITE)
+                .map(|(_, p)| p.clone());
+            assert_eq!(
+                last_write,
+                Some(write_payload(&built_in)),
+                "{tag}: the device goes back to what the session started from"
+            );
+            assert_eq!(
+                last_display_write(&s),
+                Some(display_area_set_payload(&old, DEFAULT_DISPLAY_ID)),
+                "{tag}: and so does the area, on the engine running now"
+            );
+            let st = lock_state(&s.state);
+            assert_eq!(
+                st.engines_started,
+                vec![Some(new); started],
+                "{tag}: an engine started while the stop saved inits with the owner's area"
+            );
+            assert_eq!(st.display_override, Some(old), "{tag}");
+            assert_eq!(
+                st.facts.as_ref().and_then(|f| f.display_area),
+                Some(old),
+                "{tag}"
+            );
+            assert_eq!(st.calibration.id, built_in_id(), "{tag}");
+            assert!(!st.calibration.is_active(), "{tag}");
+            assert_eq!(
+                st.calibration.display_access(1),
+                Ok(()),
+                "{tag}: no orphan mark"
+            );
+        }
     }
 
     #[test]
@@ -1825,6 +1979,177 @@ mod tests {
             Ok(()),
             "its stop answered: no orphan mark"
         );
+    }
+
+    #[test]
+    fn an_engine_lost_during_a_kept_stop_leaves_the_session_to_it() {
+        // Lost once the device took the write, with the next engine started
+        // before the stop ends; lost with the write, with one running in its
+        // place by then (the stand-in); and lost with the write, with none.
+        // An engine running at the end gets the saved calibration from the
+        // stop: its init may have read the file before the save.
+        for (tag, mishap, answer, id, started, writes) in [
+            (
+                "lost-keep",
+                Mishap::EngineReplacedAfter,
+                status::OK,
+                Some(0x1234_5678),
+                1,
+                2,
+            ),
+            (
+                "lost-keep-write",
+                Mishap::EngineLost,
+                status::OK,
+                Some(0x1234_5678),
+                0,
+                1,
+            ),
+            (
+                "lost-keep-unplugged",
+                Mishap::Unplugged,
+                status::CONNECTION_FAILED,
+                None,
+                0,
+                0,
+            ),
+        ] {
+            let (s, file, _) = display_setup(tag);
+            lock_state(&s.state).clients[1].streams = STREAM_NOTIFICATIONS;
+            let new = area(597.0);
+            assert_eq!(set_area(&s, 1, &new), Reply::ok(Vec::new()), "{tag}");
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+                status::OK,
+                "{tag}"
+            );
+            befall(&s, cmd::WRITE, mishap);
+
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP).status,
+                answer,
+                "{tag}"
+            );
+
+            let (saved, _) = store::load(&s.dir.join("calibration.bin"))
+                .expect("load")
+                .expect("saved");
+            assert_eq!(saved, s.device.blob, "{tag}");
+            assert_eq!(
+                crate::display::load(&file).expect("load"),
+                Some(new),
+                "{tag}"
+            );
+            assert_eq!(
+                s.device
+                    .payloads
+                    .lock()
+                    .expect("payloads")
+                    .iter()
+                    .filter(|(c, p)| *c == cmd::WRITE && *p == write_payload(&saved))
+                    .count(),
+                writes,
+                "{tag}: written by the stop, and again to the engine running at its end"
+            );
+            {
+                let st = lock_state(&s.state);
+                assert_eq!(
+                    st.display_override,
+                    Some(new),
+                    "{tag}: what later inits write is what was saved"
+                );
+                assert_eq!(
+                    st.facts.as_ref().and_then(|f| f.display_area),
+                    Some(new),
+                    "{tag}"
+                );
+                assert_eq!(
+                    st.engines_started,
+                    vec![Some(new); started],
+                    "{tag}: the next engine's first init writes it too"
+                );
+                assert_eq!(st.calibration.id, id, "{tag}: unknown if unwritten");
+                assert!(!st.calibration.is_active(), "{tag}");
+                assert_eq!(
+                    st.calibration.display_access(1),
+                    Ok(()),
+                    "{tag}: no orphan mark"
+                );
+            }
+            assert_eq!(announced(&s, 2), [false], "{tag}");
+        }
+    }
+
+    #[test]
+    fn an_engine_lost_during_a_stop_that_saves_nothing_puts_the_area_back_before_the_next_starts() {
+        // A discard; a keep with nothing computed; a keep with
+        // TOBII_CALIBRATION=embedded, which saves nothing.
+        for (tag, payload, computes, location) in [
+            ("lost-discard", STOP_DISCARD, true, None),
+            ("lost-keep-none", STOP_KEEP, false, None),
+            (
+                "lost-keep-embedded",
+                STOP_KEEP,
+                true,
+                Some(Location::Embedded),
+            ),
+        ] {
+            let (s, file, old) = display_setup(tag);
+            lock_state(&s.state).clients[1].streams = STREAM_NOTIFICATIONS;
+            if let Some(location) = location {
+                lock_state(&s.state).calibration.location = location;
+            }
+            assert_eq!(
+                set_area(&s, 1, &area(597.0)),
+                Reply::ok(Vec::new()),
+                "{tag}"
+            );
+            if computes {
+                assert_eq!(
+                    ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+                    status::OK,
+                    "{tag}"
+                );
+            }
+            befall(&s, cmd::WRITE, Mishap::EngineReplacedAfter);
+
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_STOP, payload),
+                Reply::ok(Vec::new()),
+                "{tag}"
+            );
+
+            assert!(
+                !s.dir.join("calibration.bin").exists() && !file.exists(),
+                "{tag}"
+            );
+            {
+                let st = lock_state(&s.state);
+                assert_eq!(
+                    st.engines_started,
+                    [Some(old)],
+                    "{tag}: the next engine's first init writes the area the session replaced"
+                );
+                assert_eq!(st.display_override, Some(old), "{tag}");
+                assert_eq!(
+                    st.facts.as_ref().and_then(|f| f.display_area),
+                    Some(old),
+                    "{tag}"
+                );
+                assert_eq!(
+                    st.calibration.id,
+                    built_in_id(),
+                    "{tag}: the one the session started from, which that init uploads"
+                );
+                assert!(!st.calibration.is_active(), "{tag}");
+                assert_eq!(
+                    st.calibration.display_access(1),
+                    Ok(()),
+                    "{tag}: its stop answered: no orphan mark"
+                );
+            }
+            assert_eq!(announced(&s, 2), [false], "{tag}");
+        }
     }
 
     #[test]

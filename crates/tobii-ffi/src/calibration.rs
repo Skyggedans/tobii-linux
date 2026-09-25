@@ -71,8 +71,9 @@ pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_ey
 }
 
 /// End the session, keeping the calibration it computed last (and the
-/// display area set during it). If nothing was computed, the previous
-/// calibration is restored.
+/// display area set during it). If nothing was computed, or the daemon
+/// could not save it (`TOBII_ERROR_OPERATION_FAILED`), the previous
+/// calibration and display area are restored.
 ///
 /// # Safety
 /// As `tobii_calibration_start`.

@@ -331,22 +331,24 @@ pub(crate) fn save_display_area(path: &std::path::Path, area: &DisplayArea) {
 }
 
 /// Put the display area back as it was before a calibration session that
-/// did not commit changed it: on `device` (when there is one) and for later
-/// inits. The saved file never had the session's area.
-pub(crate) fn put_display_back(
-    state: &Mutex<State>,
-    device: Option<&dyn crate::device::DeviceCommands>,
-    before: &crate::calibration::DisplayBefore,
-) {
-    if let (Some(device), Some(area)) = (device, before.device) {
-        let display_id = lock_state(state)
+/// did not commit changed it: for later inits, then on the device of the
+/// engine running then, if one runs. Both under one lock, so an engine
+/// started in place of a lost one gets the area either from its init or
+/// from this write. The saved file never had the session's area.
+pub(crate) fn put_display_back(state: &Mutex<State>, before: &crate::calibration::DisplayBefore) {
+    let (device, display_id) = {
+        let mut st = lock_state(state);
+        put_display_configuration_back(&mut st, before);
+        let display_id = st
             .facts
             .as_ref()
             .and_then(|f| f.display_id)
             .unwrap_or(DEFAULT_DISPLAY_ID);
-        put_area_back_on(device, &area, display_id);
+        (st.commands(), display_id)
+    };
+    if let (Some(device), Some(area)) = (device, before.device) {
+        put_area_back_on(device.as_ref(), &area, display_id);
     }
-    put_display_configuration_back(&mut lock_state(state), before);
 }
 
 /// Write `area`, one that was put back, to `device`.

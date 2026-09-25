@@ -228,7 +228,9 @@ impl State {
     /// one once the tracker is plugged in while a client wants it. A dead
     /// engine is dropped either way, and the calibration session and the
     /// pause it took with it end before a new engine starts, so that its
-    /// first init writes the display area the session started from.
+    /// first init writes the display area the session started from; a
+    /// session whose stop saves is left to that stop, and the init writes
+    /// the area it saves (see [`crate::calibration::on_engine_lost`]).
     pub(crate) fn ensure_engine(&mut self, tracker_on_bus: bool) {
         if !self.drop_engine_unless_alive() {
             return;
@@ -278,8 +280,9 @@ impl State {
     }
 
     /// Drop the engine, with what lasts only as long as it runs: a started
-    /// calibration session (see [`crate::calibration::on_engine_lost`]), the
-    /// pause (see [`crate::pause::on_engine_lost`]) and the clock pair.
+    /// calibration session unless its stop saves (see
+    /// [`crate::calibration::on_engine_lost`]), the pause (see
+    /// [`crate::pause::on_engine_lost`]) and the clock pair.
     pub(crate) fn drop_engine(&mut self) {
         self.engine = None;
         self.clock = None;
