@@ -15,6 +15,7 @@ use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
 use crate::device::{Api, Device, device_mut, in_callback};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
+    TOBII_ERROR_OPERATION_FAILED,
 };
 use crate::stub::not_supported;
 use crate::types::{
@@ -219,13 +220,18 @@ fn point_status(word: u64) -> u32 {
     }
 }
 
-/// Hand each calibration point stored in `data` to `receiver`. The first
+/// Hand each calibration point stored in `data` to `receiver`. The checks run
+/// in the DLL's order: a null `api` or `data`, a `data_size` under 8 or a
+/// null `receiver` is `TOBII_ERROR_INVALID_PARAMETER`; then a call from inside
+/// a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`; then data that
+/// `tobii_calib::blob::points` refuses is not a valid calibration,
+/// `TOBII_ERROR_OPERATION_FAILED` with no point handed out. The DLL returns
+/// that only for a negative point count (0x18014783f, 13 at 0x1801478a7) and
+/// reads the rest as given: a status word above 2, its -1 included, is
+/// refused here where the DLL reports that eye as `FAILED_OR_INVALID`, and a
+/// blob shorter than a header where the DLL may succeed. The first
 /// measurement of each record is reported as the left eye, and each eye's
-/// status word is mapped as the DLL maps it; a word above 2, the DLL's -1
-/// included, makes the blob invalid here (`TOBII_ERROR_INVALID_PARAMETER`, no
-/// points), where the DLL reports that eye as `FAILED_OR_INVALID`. A call from
-/// inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS` once the arguments
-/// have been checked, before `data` is parsed, as in the DLL.
+/// status word is mapped as the DLL maps it.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `data` must be null or point to
@@ -239,19 +245,23 @@ pub unsafe extern "C" fn tobii_calibration_parse(
     receiver: Option<CalibrationPointReceiver>,
     user_data: *mut c_void,
 ) -> Status {
-    let Some(receiver) = receiver else {
-        return TOBII_ERROR_INVALID_PARAMETER;
-    };
     if api.is_null() || data.is_null() || data_size < 8 {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
+    let Some(receiver) = receiver else {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    };
     if in_callback() {
         return TOBII_ERROR_CALLBACK_IN_PROGRESS;
     }
     // SAFETY: non-null, and the caller guarantees `data_size` readable bytes.
     let blob = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), data_size) };
-    let Ok(points) = tobii_calib::blob::points(blob) else {
-        return TOBII_ERROR_INVALID_PARAMETER;
+    let points = match tobii_calib::blob::points(blob) {
+        Ok(points) => points,
+        Err(e) => {
+            tracing::debug!(error = %e, "tobii_calibration_parse: not a valid calibration");
+            return TOBII_ERROR_OPERATION_FAILED;
+        }
     };
     for p in points {
         let c = CalibrationPointData {
@@ -407,24 +417,8 @@ mod tests {
             let o = first + tobii_calib::blob::RECORD_LEN * i + offset;
             blob[o..o + 8].copy_from_slice(&word.to_le_bytes());
         }
-        let mut api: *mut Api = ptr::null_mut();
-        let mut points: Vec<CalibrationPointData> = Vec::new();
-        // SAFETY: live locals; `collect` matches the receiver contract.
-        unsafe {
-            assert_eq!(
-                crate::api::tobii_api_create(&raw mut api, ptr::null(), ptr::null()),
-                0
-            );
-            let status = tobii_calibration_parse(
-                api,
-                blob.as_ptr().cast(),
-                blob.len(),
-                Some(collect),
-                (&raw mut points).cast(),
-            );
-            assert_eq!(status, 0);
-            assert_eq!(crate::api::tobii_api_destroy(api), 0);
-        }
+        let (status, points) = parse(&blob);
+        assert_eq!(status, TOBII_ERROR_NO_ERROR);
         assert_eq!(points.len(), 14);
         for (i, (p, r)) in points.iter().zip(&records).enumerate() {
             let statuses = match i {
@@ -447,6 +441,103 @@ mod tests {
             assert_eq!(p.left_mapping_xy, r.a, "point {i}");
             assert_eq!(p.right_mapping_xy, r.b, "point {i}");
         }
+    }
+
+    /// The DLL's own invalid calibration (0x18014783f, 13 at 0x1801478a7) in
+    /// the fewest bytes the argument checks pass: a point list at offset 0
+    /// whose count, the next word, is negative. Here it is shorter than any
+    /// header, with the same answer.
+    static NEGATIVE_COUNT: [u8; 8] = [0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+
+    /// Parse `data` with a fresh API, as a client would: the status and the
+    /// points the receiver was handed.
+    fn parse(data: &[u8]) -> (Status, Vec<CalibrationPointData>) {
+        let mut api: *mut Api = ptr::null_mut();
+        let mut points: Vec<CalibrationPointData> = Vec::new();
+        // SAFETY: live locals; `data` points to `data.len()` readable bytes
+        // and `collect` matches the receiver contract.
+        let status = unsafe {
+            assert_eq!(
+                crate::api::tobii_api_create(&raw mut api, ptr::null(), ptr::null()),
+                0
+            );
+            let status = tobii_calibration_parse(
+                api,
+                data.as_ptr().cast(),
+                data.len(),
+                Some(collect),
+                (&raw mut points).cast(),
+            );
+            assert_eq!(crate::api::tobii_api_destroy(api), 0);
+            status
+        };
+        (status, points)
+    }
+
+    #[test]
+    fn parse_checks_its_arguments_before_the_data() {
+        let data = NEGATIVE_COUNT.as_ptr().cast();
+        let mut api: *mut Api = ptr::null_mut();
+        let mut points: Vec<CalibrationPointData> = Vec::new();
+        // SAFETY: live locals; `data` points to 8 readable bytes, null
+        // handles are allowed and `collect` matches the receiver contract.
+        let got = unsafe {
+            assert_eq!(
+                crate::api::tobii_api_create(&raw mut api, ptr::null(), ptr::null()),
+                0
+            );
+            let ud = (&raw mut points).cast();
+            let got = [
+                tobii_calibration_parse(ptr::null_mut(), data, 8, Some(collect), ud),
+                tobii_calibration_parse(api, ptr::null(), 8, Some(collect), ud),
+                tobii_calibration_parse(api, data, 7, Some(collect), ud),
+                tobii_calibration_parse(api, data, 0, Some(collect), ud),
+                tobii_calibration_parse(api, data, 8, None, ud),
+                tobii_calibration_parse(api, data, 8, Some(collect), ud),
+            ];
+            assert_eq!(crate::api::tobii_api_destroy(api), 0);
+            got
+        };
+        let invalid = TOBII_ERROR_INVALID_PARAMETER;
+        assert_eq!(
+            got,
+            [
+                invalid,
+                invalid,
+                invalid,
+                invalid,
+                invalid,
+                TOBII_ERROR_OPERATION_FAILED
+            ]
+        );
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn parse_refuses_data_that_is_not_a_calibration() {
+        let blob = embedded_blob();
+        let total =
+            usize::try_from(tobii_calib::blob::header(&blob).expect("header").total).expect("fits");
+        let mut negative = blob.clone();
+        negative[total + 4..total + 8].copy_from_slice(&(-1i32).to_le_bytes());
+        // Record 5's target x: the five records before it are sound, and
+        // still none is handed out.
+        let mut not_finite = blob.clone();
+        let o = total + 8 + tobii_calib::blob::RECORD_LEN * 5;
+        not_finite[o..o + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let long = [&blob[..], &[0]].concat();
+        for (name, data) in [
+            ("a negative count in 8 bytes", &NEGATIVE_COUNT[..]),
+            ("a negative count", &negative[..]),
+            ("a list past the end", &blob[..blob.len() - 1]),
+            ("bytes after the list", &long[..]),
+            ("a NaN target", &not_finite[..]),
+        ] {
+            let (status, points) = parse(data);
+            assert_eq!(status, TOBII_ERROR_OPERATION_FAILED, "{name}");
+            assert!(points.is_empty(), "{name}");
+        }
+        assert_eq!(parse(&blob).0, TOBII_ERROR_NO_ERROR);
     }
 
     #[test]

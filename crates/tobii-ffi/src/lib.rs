@@ -51,6 +51,16 @@
 //! `tobii_calibration_retrieve` and `tobii_enumerate_local_device_urls(_ex)`
 //! as callbacks, where here their `# Safety` sections forbid re-entry.
 //!
+//! `tobii_calibration_parse` checks in the DLL's order: a null `api` or
+//! `data`, a `data_size` under 8 or a null `receiver`
+//! (`TOBII_ERROR_INVALID_PARAMETER`), then the callback, then the whole blob
+//! before it hands out a point. Data that is not a valid calibration
+//! (whatever `tobii_calib::blob::points` refuses, a blob shorter than its
+//! 44-byte header included) is `TOBII_ERROR_OPERATION_FAILED`, as the 4.1
+//! docs say. The DLL returns that only for a negative point count and reads
+//! the rest as given, past `data_size` if the blob says so, with
+//! `TOBII_ERROR_NO_ERROR`.
+//!
 //! `tobii_device_create` connects to the daemon (auto-spawning it if needed),
 //! so several processes can use the device at once. Pump with
 //! `tobii_wait_for_callbacks` + `tobii_device_process_callbacks` exactly like

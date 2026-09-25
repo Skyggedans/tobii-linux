@@ -96,7 +96,8 @@ typedef struct tobii_calibration_point_data_t
 typedef void ( *tobii_calibration_point_data_receiver_t )(
     tobii_calibration_point_data_t const* point_data, void* user_data );
 
-/* The ET5 keeps 14 points: two rounds of the 7-point pattern. */
+/* The ET5 keeps 14 points: two rounds of the 7-point pattern. Data that is not a
+ * valid calibration is TOBII_ERROR_OPERATION_FAILED, before any point is passed. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_parse( tobii_api_t* api, void const* data,
     size_t data_size, tobii_calibration_point_data_receiver_t receiver, void* user_data );
 

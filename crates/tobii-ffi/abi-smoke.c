@@ -52,6 +52,12 @@ static void head_pose_callback( tobii_head_pose_t const* head_pose, void* user_d
     (void)user_data;
 }
 
+static void point_receiver( tobii_calibration_point_data_t const* point_data, void* user_data )
+{
+    (void)point_data;
+    ++*(int*)user_data;
+}
+
 /* How far the system clock reads behind the wall clock at least: 1e15 us,
  * some 31.7 years, where the wall clock is some 1.8e15 us past its epoch and
  * CLOCK_MONOTONIC counts from boot. */
@@ -124,6 +130,16 @@ int main( void )
     assert( fabsf( area.top_left_mm_xyz[ 0 ] + 297.49773f ) < 1e-3f );
     assert( fabsf( area.top_left_mm_xyz[ 1 ] - 326.00406f ) < 1e-3f );
     assert( fabsf( area.bottom_left_mm_xyz[ 2 ] + 3.10002f ) < 1e-3f );
+
+    /* The DLL's own invalid calibration, a negative point count, in the
+     * fewest bytes the argument checks pass: refused before any point. */
+    unsigned char const negative_count[ 8 ] = { 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+    int points = 0;
+    assert( tobii_calibration_parse( api, negative_count, sizeof( negative_count ), point_receiver, &points )
+        == TOBII_ERROR_OPERATION_FAILED );
+    assert( tobii_calibration_parse( api, negative_count, 7, point_receiver, &points )
+        == TOBII_ERROR_INVALID_PARAMETER );
+    assert( points == 0 );
 
     /* Unimplemented entry points answer, whatever they are given. */
     assert( tobii_license_key_store( NULL, NULL, 0 ) == TOBII_ERROR_NOT_SUPPORTED );
