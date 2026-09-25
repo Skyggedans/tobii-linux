@@ -392,8 +392,15 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
         }
         (device, st.engine_losses)
     };
+    // Inits count from the device's answer to 1010. One before the engine
+    // sends it (a cold engine inits twice before it runs a queued command)
+    // came before the session did; one while it is on the device fails it.
+    let mut inits = None;
     let seeded = run(device.as_ref(), cmd::START, Vec::new(), QUICK)
-        .and_then(|_| run(device.as_ref(), cmd::CLEAR, Vec::new(), QUICK))
+        .and_then(|_| {
+            inits = Some(lock_state(state).device_inits);
+            run(device.as_ref(), cmd::CLEAR, Vec::new(), QUICK)
+        })
         .and_then(|_| run(device.as_ref(), cmd::WRITE, write_payload(&previous), SLOW));
     let mut st = lock_state(state);
     let seeded = match seeded {
@@ -401,6 +408,18 @@ fn start(state: &Mutex<State>, client: u64, payload: &[u8]) -> Reply {
         // announced: its successor's device has no session.
         Ok(_) if st.engine_losses != losses => {
             warn!(client, "the engine was lost as the calibration started");
+            Err(status::CONNECTION_FAILED)
+        }
+        // The engine re-opened the device once it had answered the 1010
+        // (only the command in flight fails): the init ended the session,
+        // and what the start sent after it went to a device outside one.
+        // Answered as an init that cuts into a command is, whatever the
+        // device made of the rest.
+        _ if inits.is_some_and(|n| st.device_inits != n) => {
+            warn!(
+                client,
+                "the device re-initialised as the calibration started"
+            );
             Err(status::CONNECTION_FAILED)
         }
         seeded => seeded,
@@ -670,11 +689,16 @@ pub(crate) fn on_engine_lost(st: &mut State) {
 /// calibration, the one the session started from, so none is written; but
 /// it wrote the display area configured then, the session's own once its
 /// owner set one, so the area the session replaced goes back on the device
-/// too. A start still in flight is left to finish: a cold engine inits
-/// twice before it runs a queued command, and the command in flight when
-/// the engine re-opens the device fails. A stop that is running is left to
-/// finish too: the engine keeps its command queue across the re-open, so
-/// the stop's own commands still reach the device.
+/// too. A start still in flight is left to its own error path. An init
+/// before the engine sends the start's 1010 is harmless: a cold engine
+/// inits twice before it runs a queued command. One while the 1010 is on
+/// the device fails it, as a re-open fails any command in flight. One
+/// after the device answered it fails the start too: the start's later
+/// commands go through the engine's queue, which outlasts the re-open, to
+/// a device outside any session, so the start counts the inits from that
+/// answer. A stop that is running is left to finish: the engine keeps its
+/// command queue across the re-open, so the stop's own commands still
+/// reach the device.
 ///
 /// Unverified on hardware: that a re-open takes the device out of its
 /// calibration session. The init replay sends no 1020, so a device that
@@ -1838,6 +1862,70 @@ mod tests {
             "the session goes on"
         );
         assert_eq!(announced(&s, 1), [true]);
+    }
+
+    #[test]
+    fn a_device_init_after_the_device_took_the_start_fails_it() {
+        // The engine re-opens the device once 1010 is answered, before 1060
+        // leaves its queue, or once 1060 is answered, before 1110 does: the
+        // rest of the start reaches a device the init took out of the
+        // session.
+        for (tag, command) in [("reinit-clear", cmd::CLEAR), ("reinit-seed", cmd::WRITE)] {
+            let s = setup(tag);
+            lock_state(&s.state).clients[0].streams = STREAM_NOTIFICATIONS;
+            befall(&s, command, Mishap::Reinit);
+
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[2]).status,
+                status::CONNECTION_FAILED,
+                "{tag}"
+            );
+
+            assert_eq!(
+                *s.device.log.lock().expect("log"),
+                vec![cmd::START, cmd::CLEAR, cmd::WRITE, cmd::STOP, cmd::WRITE],
+                "{tag}: the calibration it started from goes back"
+            );
+            {
+                let st = lock_state(&s.state);
+                assert!(!st.calibration.is_active(), "{tag}");
+                assert_eq!(
+                    st.calibration.display_access(1),
+                    Ok(()),
+                    "{tag}: no orphan mark"
+                );
+            }
+            assert!(announced(&s, 1).is_empty(), "{tag}: nothing to announce");
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[2]),
+                Reply::ok(Vec::new()),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_after_a_device_init_fails_the_start_as_the_init_does() {
+        let s = setup("reinit-refused");
+        // The re-initialised device, outside any session, refuses the 1060.
+        befall(&s, cmd::CLEAR, Mishap::Reinit);
+        refuse_for_bad_state(&s, Some(cmd::CLEAR));
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]).status,
+            status::CONNECTION_FAILED
+        );
+        assert_eq!(
+            *s.device.log.lock().expect("log"),
+            vec![cmd::START, cmd::CLEAR, cmd::STOP, cmd::WRITE],
+            "the calibration it started from goes back"
+        );
+        assert!(!lock_state(&s.state).calibration.is_active());
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[2]).status,
+            status::OPERATION_FAILED,
+            "the same refusal with no init is the device's own"
+        );
     }
 
     #[test]

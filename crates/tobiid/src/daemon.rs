@@ -126,6 +126,10 @@ pub(crate) struct State {
     /// Likewise a calibration start: one the device took counts only if no
     /// loss came in between (see [`crate::calibration`]).
     pub(crate) engine_losses: u64,
+    /// How many times the device finished an init. A calibration start
+    /// counts only if none came after the device answered its 1010: the
+    /// init ended the session (see [`crate::calibration`]).
+    pub(crate) device_inits: u64,
     /// The log said the tracker is off the bus since an engine last
     /// started: it says so once per absence, not at every request.
     tracker_absence_logged: bool,
@@ -177,6 +181,7 @@ impl State {
             pausing: false,
             pause_lock: Arc::default(),
             engine_losses: 0,
+            device_inits: 0,
             tracker_absence_logged: false,
             #[cfg(test)]
             fake_device: None,
@@ -394,6 +399,7 @@ impl State {
                 self.facts = Some(Arc::new(facts));
                 // A pair from before the init may not hold after it.
                 self.clock = None;
+                self.device_inits = self.device_inits.wrapping_add(1);
                 crate::calibration::on_device_ready(self);
                 crate::requests::apply_display_request(self);
                 crate::pause::on_device_ready(self);
