@@ -15,9 +15,10 @@
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::net::Shutdown;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -492,10 +493,88 @@ fn is_prewarm_enabled() -> bool {
     )
 }
 
+/// A file's identity on disk: its device and inode numbers. While a daemon
+/// runs, its listening socket holds the file it bound, so no file made at the
+/// same path since can have the same numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    /// The file `path` names now (a symlink itself, not what it points to).
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// Who made the file of the socket the daemon listens on, which decides
+/// whether the daemon removes it at shutdown.
+#[derive(Debug)]
+enum SocketFile {
+    /// systemd, which passed the socket in (socket activation). The file is
+    /// the socket unit's and outlives the daemon: `systemctl --user restart
+    /// tobiid` hands the same socket to the next daemon, which clients reach
+    /// only through that file.
+    Systemd,
+    /// This daemon, which bound `path` and made the file `bound` there.
+    Bound { path: PathBuf, bound: FileId },
+}
+
+impl SocketFile {
+    /// Whether the daemon removes the socket file at shutdown, given the file
+    /// its path names by then (`None`: none). Only a file it bound itself, and
+    /// only while the path still names that file: a daemon started since has
+    /// replaced it (`bind_listener` replaces a file it finds there), and
+    /// removing that daemon's file would leave it where no client can connect.
+    fn is_ours_to_remove(&self, now: Option<FileId>) -> bool {
+        match self {
+            Self::Systemd => false,
+            Self::Bound { bound, .. } => now == Some(*bound),
+        }
+    }
+
+    /// Remove the socket file at shutdown if it is ours to remove. A file
+    /// that is not, or one that cannot be looked at, is left. (A daemon that
+    /// takes the path between the check and the removal still loses its
+    /// file; only a lock would close that window.)
+    fn remove_at_shutdown(&self) {
+        let Self::Bound { path, .. } = self else {
+            return;
+        };
+        let now = match FileId::of(path) {
+            Ok(now) => Some(now),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "could not check the socket file; leaving it");
+                return;
+            }
+        };
+        if self.is_ours_to_remove(now) {
+            if let Err(e) = std::fs::remove_file(path) {
+                warn!(path = %path.display(), error = %e, "failed to remove the socket file");
+            }
+        } else if now.is_some() {
+            // Someone re-bound the path while this daemon ran: a daemon a
+            // client spawned, or a socket unit started since.
+            warn!(
+                path = %path.display(),
+                "the socket path names a file this daemon did not bind; leaving it"
+            );
+        }
+    }
+}
+
 /// Use the socket passed by systemd socket activation (fd 3) if present,
-/// otherwise bind our own. The `sd_listen_fds(3)` protocol: `LISTEN_PID` must
-/// equal our pid and `LISTEN_FDS` >= 1, with the first socket at fd 3.
-fn obtain_listener() -> Result<UnixListener> {
+/// otherwise bind our own; say which, for the shutdown. The
+/// `sd_listen_fds(3)` protocol: `LISTEN_PID` must equal our pid and
+/// `LISTEN_FDS` >= 1, with the first socket at fd 3.
+fn obtain_listener() -> Result<(UnixListener, SocketFile)> {
     let activated = std::env::var("LISTEN_PID")
         .ok()
         .and_then(|p| p.parse::<u32>().ok())
@@ -512,16 +591,43 @@ fn obtain_listener() -> Result<UnixListener> {
         // sound.
         let listener = unsafe { UnixListener::from_raw_fd(3) };
         info!(fd = 3, "using systemd socket activation");
-        return Ok(listener);
+        return Ok((listener, SocketFile::Systemd));
     }
 
-    let path = tobii_ipc::socket_path();
-    // A stale socket file from a previous run is expected; a missing one is fine.
-    let _ = std::fs::remove_file(&path);
+    bind_listener(tobii_ipc::socket_path())
+}
+
+/// Bind a listening socket at `path` and note the file it makes there.
+///
+/// The socket is bound at `path` plus `.<pid>`, a name no other daemon uses,
+/// its file noted there and then renamed onto `path`. Noted at `path` itself,
+/// the file of a daemon that re-bound `path` in between would pass for ours.
+/// The rename replaces a stale file from a previous run (or a running
+/// daemon's, whose clients stay with it) in one step, so a client never finds
+/// the path missing, nor a file there that does not listen yet.
+fn bind_listener(path: PathBuf) -> Result<(UnixListener, SocketFile)> {
+    let mut own = path.clone().into_os_string();
+    own.push(format!(".{}", std::process::id()));
+    let own = PathBuf::from(own);
+    // Only a daemon that had this pid and died binding could have left one.
+    let _ = std::fs::remove_file(&own);
     let listener =
-        UnixListener::bind(&path).with_context(|| format!("failed to bind {}", path.display()))?;
+        UnixListener::bind(&own).with_context(|| format!("failed to bind {}", own.display()))?;
+    let placed = FileId::of(&own)
+        .with_context(|| format!("failed to read back {} after binding it", own.display()))
+        .and_then(|bound| {
+            std::fs::rename(&own, &path).with_context(|| {
+                format!("failed to move {} onto {}", own.display(), path.display())
+            })?;
+            Ok(bound)
+        });
+    if placed.is_err() {
+        // Nothing would ever remove it.
+        let _ = std::fs::remove_file(&own);
+    }
+    let bound = placed?;
     info!(path = %path.display(), "listening");
-    Ok(listener)
+    Ok((listener, SocketFile::Bound { path, bound }))
 }
 
 /// Run the daemon: bind (or adopt) the listening socket, install the signal
@@ -530,9 +636,10 @@ fn obtain_listener() -> Result<UnixListener> {
 ///
 /// # Errors
 ///
-/// Returns an error if the Unix socket cannot be bound.
+/// Returns an error if the Unix socket cannot be bound, or its file cannot be
+/// read back or moved onto the socket path right after binding.
 pub fn run() -> Result<()> {
-    let listener = obtain_listener()?;
+    let (listener, socket_file) = obtain_listener()?;
 
     let prewarm = is_prewarm_enabled();
     let state = Arc::new(Mutex::new(State::new(prewarm)));
@@ -585,14 +692,16 @@ pub fn run() -> Result<()> {
                 thread::sleep(Duration::from_millis(150));
                 if SHUTDOWN_SIGNAL.load(Ordering::Relaxed) {
                     // Drop the engine so its Drop runs the device teardown (stop the
-                    // 0x83 stream), then leave a clean socket and exit.
+                    // 0x83 stream), then exit.
                     let mut st = lock_state(&state);
                     st.prewarm = false; // don't let reconcile/watchdog respawn it
                     st.engine = None; // blocks until the engine thread + teardown finish
                     drop(st);
-                    // Under socket activation the file is systemd's; elsewhere it
-                    // may already be gone. Either way there is nothing to do.
-                    let _ = std::fs::remove_file(tobii_ipc::socket_path());
+                    // The socket file goes only if this daemon bound it, never
+                    // when it is systemd's (see `SocketFile`). It stays the
+                    // only file action here: `SocketFile` is tested, this
+                    // thread is not.
+                    socket_file.remove_at_shutdown();
                     info!("shutdown signal: device teardown done, exiting");
                     std::process::exit(0);
                 }
@@ -1127,5 +1236,143 @@ pub(crate) mod tests {
             }),
             "the presence from before the pause is kept"
         );
+    }
+
+    fn file_id(dev: u64, ino: u64) -> FileId {
+        FileId { dev, ino }
+    }
+
+    #[test]
+    fn a_socket_file_from_systemd_is_left_at_shutdown() {
+        let file = SocketFile::Systemd;
+
+        assert!(
+            !file.is_ours_to_remove(Some(file_id(1, 7))),
+            "the next daemon systemd starts is reached through it"
+        );
+        assert!(!file.is_ours_to_remove(None));
+    }
+
+    #[test]
+    fn a_bound_socket_file_is_removed_only_while_its_path_names_it() {
+        let file = SocketFile::Bound {
+            path: PathBuf::from("/run/user/1000/tobiid.sock"),
+            bound: file_id(1, 7),
+        };
+
+        assert!(file.is_ours_to_remove(Some(file_id(1, 7))));
+        assert!(
+            !file.is_ours_to_remove(Some(file_id(1, 8))),
+            "another daemon has bound the path since"
+        );
+        assert!(
+            !file.is_ours_to_remove(Some(file_id(2, 7))),
+            "the same inode on another file system is another file"
+        );
+        assert!(!file.is_ours_to_remove(None), "nothing left to remove");
+    }
+
+    /// A fresh directory for one test's sockets, removed on drop. Under
+    /// `/tmp` rather than `TMPDIR`, which can be too long for `sun_path`'s
+    /// 108 bytes.
+    struct SocketDir(PathBuf);
+
+    impl SocketDir {
+        fn new(test: &str) -> Self {
+            let root = Path::new("/tmp");
+            let root = if root.is_dir() {
+                root.to_path_buf()
+            } else {
+                std::env::temp_dir()
+            };
+            let dir = root.join(format!("tobiid-sock-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("socket dir");
+            Self(dir)
+        }
+
+        fn socket(&self) -> PathBuf {
+            self.0.join("tobiid.sock")
+        }
+
+        /// The names in the directory, sorted.
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .expect("read socket dir")
+                .map(|entry| {
+                    entry
+                        .expect("socket dir entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_daemon_removes_the_socket_file_it_bound_at_shutdown() {
+        let dir = SocketDir::new("own");
+        let path = dir.socket();
+        let (_listener, file) = bind_listener(path.clone()).expect("bind");
+
+        file.remove_at_shutdown();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_daemon_replaces_a_stale_socket_file_and_leaves_nothing_else() {
+        let dir = SocketDir::new("stale");
+        let path = dir.socket();
+        std::fs::write(&path, b"left by a previous run").expect("stale file");
+
+        let (_listener, file) = bind_listener(path.clone()).expect("bind");
+
+        assert_eq!(dir.names(), ["tobiid.sock"], "no file of its own is left");
+        assert!(file.is_ours_to_remove(FileId::of(&path).ok()));
+        UnixStream::connect(&path).expect("clients reach the daemon at the path");
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_take_the_socket_path_leaves_no_file_behind() {
+        let dir = SocketDir::new("taken");
+        let path = dir.socket();
+        // A directory full of files, which a rename does not replace.
+        std::fs::create_dir(&path).expect("directory at the path");
+        std::fs::write(path.join("keep"), b"").expect("file in it");
+
+        assert!(bind_listener(path.clone()).is_err());
+
+        assert_eq!(dir.names(), ["tobiid.sock"], "no file of its own is left");
+        assert!(path.join("keep").exists());
+    }
+
+    #[test]
+    fn a_daemon_leaves_the_socket_file_of_a_daemon_started_since() {
+        let dir = SocketDir::new("since");
+        let path = dir.socket();
+        let (_first_listener, first) = bind_listener(path.clone()).expect("bind");
+        // A second daemon (spawned by a client, say) replaces the file while
+        // the first still runs.
+        let (_second_listener, second) = bind_listener(path.clone()).expect("bind again");
+
+        first.remove_at_shutdown();
+
+        assert!(
+            second.is_ours_to_remove(FileId::of(&path).ok()),
+            "the path still names the second daemon's socket"
+        );
+        UnixStream::connect(&path).expect("clients still reach the second daemon");
+        second.remove_at_shutdown();
+        assert!(!path.exists());
     }
 }

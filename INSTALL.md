@@ -192,10 +192,31 @@ hold the device until a client subscribes.)
 
 ```bash
 cargo build --release --workspace
-systemctl --user restart tobiid        # 4b
-# or: systemctl --user restart tobiid.socket   # 4c
-# or: pkill -f release/tobiid                   # 4a (next client respawns it)
+systemctl --user restart tobiid        # 4b and 4c
+# or: pkill -f release/tobiid          # 4a (next client respawns it)
 ```
+
+Under socket activation (4c) restart the service, not `tobiid.socket`:
+restarting the socket does not restart a running daemon, so the old build
+stays up, and clients that connect after it are not served until it exits.
+`tobiid` removes at shutdown only a socket file it bound itself, never
+systemd's, so clients reach the restarted daemon through the same socket.
+
+**Once, under 4c, when the running `tobiid` was built before 2026-09-25:**
+that daemon removes systemd's `$XDG_RUNTIME_DIR/tobiid.sock` at shutdown, and
+a restart runs its shutdown, so the first restart onto a newer build still
+loses the file. A client that then finds no socket spawns a `tobiid` of its own
+(as in 4a), which binds the path and may claim the tracker. For that one
+upgrade, and whenever the file is missing, do this instead of the restart:
+
+```bash
+systemctl --user stop tobiid.service tobiid.socket
+pkill -x tobiid                        # a daemon a client spawned meanwhile
+while pgrep -x tobiid >/dev/null; do sleep 0.2; done
+systemctl --user start tobiid.socket
+```
+
+`pgrep -a tobiid` should then list at most one daemon.
 
 ## 6. Logs & debug
 
