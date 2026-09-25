@@ -20,8 +20,8 @@ use crate::types::{
     TOBII_STATE_BOOL_FALSE, TOBII_STATE_CALIBRATION_ACTIVE, TOBII_STATE_CALIBRATION_ID,
     TOBII_STATE_DEVICE_PAUSED, TOBII_STATE_FAULT, TOBII_STATE_WARNING,
     TOBII_STREAM_EYE_POSITION_NORMALIZED, TOBII_STREAM_GAZE_DATA, TOBII_STREAM_GAZE_ORIGIN,
-    TOBII_STREAM_GAZE_POINT, TOBII_STREAM_HEAD_POSE, TOBII_STREAM_USER_PRESENCE, TOBII_SUPPORTED,
-    TrackBox, Version, copy_c_string,
+    TOBII_STREAM_GAZE_POINT, TOBII_STREAM_HEAD_POSE, TOBII_STREAM_USER_POSITION_GUIDE,
+    TOBII_STREAM_USER_PRESENCE, TOBII_SUPPORTED, TrackBox, Version, copy_c_string,
 };
 
 /// The URL `tobii_enumerate_local_device_urls` reports. There is exactly one
@@ -608,7 +608,9 @@ const fn capability_supported(capability: u32) -> bool {
     )
 }
 
-/// Streams this library delivers.
+/// Streams this library delivers: the `tobii_stream_t` values whose subscribe
+/// is implemented. Digital syncport (6), diagnostics image (7) and the
+/// wearable streams (9..=11) have stub subscribes, so they are not listed.
 const fn stream_supported(stream: u32) -> bool {
     matches!(
         stream,
@@ -618,6 +620,7 @@ const fn stream_supported(stream: u32) -> bool {
             | TOBII_STREAM_USER_PRESENCE
             | TOBII_STREAM_HEAD_POSE
             | TOBII_STREAM_GAZE_DATA
+            | TOBII_STREAM_USER_POSITION_GUIDE
     )
 }
 
@@ -666,7 +669,16 @@ pub unsafe extern "C" fn tobii_capability_supported(
 }
 
 /// Whether a stream is available: gaze point, gaze origin, eye position,
-/// presence, head pose and gaze data.
+/// presence, head pose, gaze data and the user position guide.
+///
+/// This follows what libtobii delivers, not the DLL, which answers from what
+/// the device reports (its stream lists and capability flags): its TTP path
+/// never reports the user position guide, its PRP path does when the tracker
+/// lists the compound stream `USER_POSITION_GUIDE_XYZ`, and its answer for 6,
+/// 7 and 9..=11 depends on the device too. Here those are unsupported because
+/// their subscribes are stubs. As in the DLL, a value of 12 or more is
+/// reported unsupported, not an error, and a value above `i32::MAX` (a
+/// negative `tobii_stream_t`) is an invalid parameter.
 ///
 /// # Safety
 /// As `tobii_capability_supported`.
@@ -1038,13 +1050,29 @@ mod tests {
                 "unknown is not an error"
             );
             assert_eq!(s, TOBII_NOT_SUPPORTED);
+            // Literal values: the DLL's numbering, not the constants', is
+            // what a client compiled against Tobii's header sends.
+            for stream in (0..=12).chain([1000, 0x7fff_ffff]) {
+                s = 9;
+                assert_eq!(
+                    tobii_stream_supported(d, stream, &raw mut s),
+                    0,
+                    "stream {stream}: not an error"
+                );
+                let expected = if matches!(stream, 0..=5 | 8) {
+                    TOBII_SUPPORTED
+                } else {
+                    TOBII_NOT_SUPPORTED
+                };
+                assert_eq!(s, expected, "stream {stream}");
+            }
+            s = 9;
             assert_eq!(
-                tobii_stream_supported(d, TOBII_STREAM_GAZE_DATA, &raw mut s),
-                0
+                tobii_stream_supported(d, 0x8000_0000, &raw mut s),
+                TOBII_ERROR_INVALID_PARAMETER,
+                "a negative tobii_stream_t"
             );
-            assert_eq!(s, TOBII_SUPPORTED);
-            assert_eq!(tobii_stream_supported(d, 9, &raw mut s), 0);
-            assert_eq!(s, TOBII_NOT_SUPPORTED);
+            assert_eq!(s, 9, "nothing written");
             assert_eq!(tobii_device_destroy(d), 0);
         }
     }

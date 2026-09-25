@@ -76,6 +76,19 @@ pub const TOBII_CAPABILITY_COMPOUND_STREAM_USER_POSITION_GUIDE_Z: u32 = 8;
 pub const TOBII_CAPABILITY_MAX: u32 = 18;
 
 /// `tobii_stream_t`: gaze point.
+///
+/// The `tobii_stream_t` values are the 4.1 DLL's, not the pre-4.0 list its
+/// documentation still shows. `tobii_stream_supported` passes the value
+/// unchanged to the DLL's helper at 0x1801591b0, which the ten stream
+/// subscribes other than user presence and digital syncport call with their
+/// own number. Its map at 0x180153a50 sends 0, 1, 2, 4, 5, 7 and 11 to
+/// tracker streams the DLL names (4 `HEADPOSE`, 5 `ADVANCED_GAZE`,
+/// 7 `DIAGNOSTICS_IMAGE`, 11 `WEARABLE_FOVEATED`) and the rest to `INVALID`.
+/// 8 is identified by the compound stream `USER_POSITION_GUIDE_XYZ` the
+/// helper checks for it (0x1801592f4), and is the number the user position
+/// guide subscribe passes (0x18015111d); 3 and 6 by the checks the helper
+/// shares with the user presence and digital syncport subscribes (property
+/// 0xb, `[+0xa84c] != 2`).
 pub const TOBII_STREAM_GAZE_POINT: u32 = 0;
 /// `tobii_stream_t`: gaze origin.
 pub const TOBII_STREAM_GAZE_ORIGIN: u32 = 1;
@@ -86,7 +99,9 @@ pub const TOBII_STREAM_USER_PRESENCE: u32 = 3;
 /// `tobii_stream_t`: head pose.
 pub const TOBII_STREAM_HEAD_POSE: u32 = 4;
 /// `tobii_stream_t`: gaze data.
-pub const TOBII_STREAM_GAZE_DATA: u32 = 6;
+pub const TOBII_STREAM_GAZE_DATA: u32 = 5;
+/// `tobii_stream_t`: user position guide.
+pub const TOBII_STREAM_USER_POSITION_GUIDE: u32 = 8;
 
 /// `tobii_enabled_eye_t`: left.
 pub const TOBII_ENABLED_EYE_LEFT: u32 = 0;

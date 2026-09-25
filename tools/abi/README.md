@@ -46,6 +46,40 @@ prototype declares or a float/integer position disagrees.
   `tobii_send_custom_command` six.
 - `tobii_error_t` numbering 0..20 comes from the jump table in
   `tobii_error_message`.
+- `tobii_stream_t` numbering 0..11 comes from the DLL; the 4.1 docs still list
+  the pre-4.0 names, among them `WEARABLE` and `CUSTOM`, which have no value
+  in the DLL. `tobii_stream_supported` (0x180141820) passes the caller's value
+  unchanged to helper 0x1801591b0, which the ten stream subscribes other than
+  user presence and digital syncport call with their own number. The helper's
+  map at 0x180153a50 sends 0..2, 4, 5, 7 and 11 to tracker streams named in
+  the DLL's `PRP_STREAM_ENUM` table: 0..2 `GAZE_POINT`, `GAZE_ORIGIN`,
+  `EYE_POSITION_NORMALIZED`, 4 `HEADPOSE`, 5 `ADVANCED_GAZE` (gaze data),
+  7 `DIAGNOSTICS_IMAGE`, 11 `WEARABLE_FOVEATED`; the rest go to `INVALID`.
+  8..10 are checked against the compound streams `USER_POSITION_GUIDE_XYZ`,
+  `WEARABLE_CONSUMER` and `WEARABLE_ADVANCED` (from 0x1801592f4), and 9 and
+  10 against `WEARABLE` as well. 3 and 6 are identified by the checks the
+  helper shares with the user presence and digital syncport subscribes
+  (property 0xb `USER_PRESENCE`, `[+0xa84c] != 2`). A value of 12 or more is
+  not supported, without an error; a negative one is
+  `TOBII_ERROR_INVALID_PARAMETER`.
+- The other public enums agree with the DLL wherever it shows them. Matching:
+  capability 0..18 (range check at 0x180141b81), state 0..7 (state-to-property
+  map at 0x180142ba0), notification type and value type (dispatchers at
+  0x180153de0 and 0x18016c590), field of use (to-string at 0x1800314d0),
+  licence validation results 4..9 (`licensekey_validate_license`), lens
+  configuration writable (`tobii_lens_configuration_writable` writes 1 at
+  0x1801522a9 when the tracker lists property 0xa `LENS_CONFIGURATION`),
+  state bool and supported (`setne` gives 1 for true at 0x180153eaf and
+  0x180141972).
+  Consistent, with the names only from the docs: feature group (the mapping
+  at 0x18015026e in `tobii_get_feature_group`), enabled eye
+  (`tobii_set_enabled_eye` at 0x180149c40), calibration point status (the
+  mapping at 0x180147910 in `tobii_calibration_parse`), user presence status
+  (the presence notification at 0x180153f6e), log level (error paths pass 0,
+  and "Connected to platform module" passes 2, INFO, at 0x180153c19),
+  validity (the real DLL's Windows session output: 0 with position (-1,-1),
+  1 otherwise).
+  No DLL evidence: wearable foveated tracking state, device generation.
 
 Layouts, and where each comes from:
 

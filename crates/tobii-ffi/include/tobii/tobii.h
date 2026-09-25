@@ -194,18 +194,23 @@ typedef enum tobii_supported_t
     TOBII_SUPPORTED,
 } tobii_supported_t;
 
+/* Numbered as tobii_stream_engine.dll 4.1.0.3 numbers them (see
+ * tools/abi/README.md). The 4.1 documentation still lists the pre-4.0 names,
+ * among them WEARABLE and CUSTOM, which have no value in the DLL. */
 typedef enum tobii_stream_t
 {
-    TOBII_STREAM_GAZE_POINT,
-    TOBII_STREAM_GAZE_ORIGIN,
-    TOBII_STREAM_EYE_POSITION_NORMALIZED,
-    TOBII_STREAM_USER_PRESENCE,
-    TOBII_STREAM_HEAD_POSE,
-    TOBII_STREAM_WEARABLE,
-    TOBII_STREAM_GAZE_DATA,
-    TOBII_STREAM_DIGITAL_SYNCPORT,
-    TOBII_STREAM_DIAGNOSTICS_IMAGE,
-    TOBII_STREAM_CUSTOM,
+    TOBII_STREAM_GAZE_POINT = 0,
+    TOBII_STREAM_GAZE_ORIGIN = 1,
+    TOBII_STREAM_EYE_POSITION_NORMALIZED = 2,
+    TOBII_STREAM_USER_PRESENCE = 3,
+    TOBII_STREAM_HEAD_POSE = 4,
+    TOBII_STREAM_GAZE_DATA = 5,
+    TOBII_STREAM_DIGITAL_SYNCPORT = 6,
+    TOBII_STREAM_DIAGNOSTICS_IMAGE = 7,
+    TOBII_STREAM_USER_POSITION_GUIDE = 8,
+    TOBII_STREAM_WEARABLE_CONSUMER = 9,
+    TOBII_STREAM_WEARABLE_ADVANCED = 10,
+    TOBII_STREAM_WEARABLE_FOVEATED_GAZE = 11,
 } tobii_stream_t;
 
 /* Static, never NULL, valid for the lifetime of the process. */
@@ -271,7 +276,10 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_state_string( tobii_device_t* devic
 TOBII_API tobii_error_t TOBII_CALL tobii_capability_supported( tobii_device_t* device,
     tobii_capability_t capability, tobii_supported_t* supported );
 /* Supported: GAZE_POINT, GAZE_ORIGIN, EYE_POSITION_NORMALIZED, USER_PRESENCE,
- * HEAD_POSE, GAZE_DATA. */
+ * HEAD_POSE, GAZE_DATA, USER_POSITION_GUIDE: the streams libtobii.so
+ * delivers. Any other value, including one above WEARABLE_FOVEATED_GAZE, is
+ * reported unsupported, not an error; a negative value is
+ * TOBII_ERROR_INVALID_PARAMETER. */
 TOBII_API tobii_error_t TOBII_CALL tobii_stream_supported( tobii_device_t* device,
     tobii_stream_t stream, tobii_supported_t* supported );
 
