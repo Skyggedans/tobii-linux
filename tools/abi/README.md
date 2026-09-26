@@ -45,7 +45,26 @@ prototype declares or a float/integer position disagrees.
   stack); `tobii_calibration_collect_data_per_eye_2d` five;
   `tobii_send_custom_command` six.
 - `tobii_error_t` numbering 0..20 comes from the jump table in
-  `tobii_error_message`.
+  `tobii_error_message` (0x180144cb0, table 0x180144df4), and so do the texts
+  libtobii returns, verbatim. Each case is a `lea rax,[rip+d]` to a `.rdata`
+  string in 0x180220b90..0x180220f30; 2 and 19 share one case (0x180144dac),
+  "Insufficient permissions when using a restricted feature.". The compare at
+  0x180144cb4 is unsigned, so any other value, a negative one included, takes
+  the default case: `snprintf` of "Undefined error (0x%x). Please contact
+  support." (0x180220f60) into one process-global 64-byte buffer (0x18024ee60,
+  in `.bss`), which is returned. Nothing in the DLL calls the function, and
+  only it touches the buffer; the DLL's own log lines name an error from a
+  separate table of `TOBII_ERROR_*` names (file offset 0x21f070) or
+  "Undefined tobii error (0x%x).". To re-derive the texts,
+  `objdump -s --start-address=0x180144df4 --stop-address=0x180144e48` dumps
+  the table: 21 little-endian 32-bit RVAs in code order (`d44c1400` is
+  0x144cd4, so case 0 is at 0x180144cd4 once the image base 0x180000000 is
+  added). `objdump -d -M intel --start-address=0x180144cb0
+  --stop-address=0x180144df4` prints each case's `lea` with its target as a
+  comment (`# 0x180220b90`), and `strings -a -t x` finds that string at
+  file offset target minus the image base minus 0x1800 (`.rdata` is at RVA
+  0x1a8000, file offset 0x1a6800): 0x21f390..0x21f730, and the format at
+  0x21f760.
 - `tobii_stream_t` numbering 0..11 comes from the DLL; the 4.1 docs still list
   the pre-4.0 names, among them `WEARABLE` and `CUSTOM`, which have no value
   in the DLL. `tobii_stream_supported` (0x180141820) passes the caller's value

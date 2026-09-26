@@ -213,7 +213,10 @@ typedef enum tobii_stream_t
     TOBII_STREAM_WEARABLE_FOVEATED_GAZE = 11,
 } tobii_stream_t;
 
-/* Static, never NULL, valid for the lifetime of the process. */
+/* The 4.1 DLL's texts. Never NULL, never to be freed, valid for the lifetime
+ * of the process. An out-of-range code's text, a negative code's included, is
+ * formatted into one buffer the process shares, which the next out-of-range
+ * call, on any thread, rewrites, as in the DLL. */
 TOBII_API char const* TOBII_CALL tobii_error_message( tobii_error_t error );
 
 /* 4.1.0.3: the version this library imitates. */

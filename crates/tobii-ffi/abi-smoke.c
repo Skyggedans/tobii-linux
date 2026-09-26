@@ -172,8 +172,15 @@ int main( void )
     assert( tobii_device_destroy( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_api_destroy( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
 
-    assert( tobii_error_message( TOBII_ERROR_NO_ERROR ) != NULL );
-    assert( tobii_error_message( (tobii_error_t)9999 ) != NULL );
+    /* The DLL's texts; 2 and 19 share one. Out of range, a negative code
+     * included, is the DLL's generic text. */
+    assert( strcmp( tobii_error_message( TOBII_ERROR_NO_ERROR ), "No error." ) == 0 );
+    assert( strcmp( tobii_error_message( TOBII_ERROR_INSUFFICIENT_LICENSE ),
+        tobii_error_message( TOBII_ERROR_UNAUTHORIZED ) ) == 0 );
+    assert( strcmp( tobii_error_message( (tobii_error_t)9999 ),
+        "Undefined error (0x270f). Please contact support." ) == 0 );
+    assert( strcmp( tobii_error_message( (tobii_error_t)-1 ),
+        "Undefined error (0xffffffff). Please contact support." ) == 0 );
 
     /* Enum numbering is the Stream Engine's. */
     assert( TOBII_ERROR_CONNECTION_FAILED == 5 && TOBII_ERROR_INVALID_PARAMETER == 8 );
