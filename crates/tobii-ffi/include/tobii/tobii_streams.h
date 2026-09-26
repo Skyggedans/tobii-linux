@@ -151,9 +151,11 @@ typedef enum tobii_notification_value_type_t
 } tobii_notification_value_type_t;
 
 /* 520 bytes. Delivered: CALIBRATION_STATE_CHANGED, DISPLAY_AREA_CHANGED,
- * DEVICE_PAUSED_STATE_CHANGED and CALIBRATION_ID_CHANGED. The enabled-eye
- * value is a tobii_enabled_eye_t (tobii_config.h), carried here as its
- * underlying int. */
+ * DEVICE_PAUSED_STATE_CHANGED, CALIBRATION_ID_CHANGED, and FAULTS_CHANGED /
+ * WARNINGS_CHANGED (STRING: the new list, cut to 511 bytes, on every one the
+ * tracker announces, as the DLL). The other types are never sent for this
+ * tracker. The enabled-eye value is a tobii_enabled_eye_t (tobii_config.h),
+ * carried here as its underlying int. */
 typedef struct tobii_notification_t
 {
     tobii_notification_type_t type;

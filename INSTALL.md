@@ -373,14 +373,14 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   normalised), gaze data (per eye, tracker frame, with the pupil diameter),
   presence (on change), head pose (mm, radians about x/y/z), the IR
   image (280×280, `tobii_image_subscribe`), notifications (display area,
-  calibration, pause), device info, track box, display area (get and set —
-  kept across re-inits and, like the Stream Engine, across sessions),
-  mounting, states, capabilities, 2-D calibration (discarding a point too),
-  a device/host clock pair (`tobii_timesync`), the tracker's stream
-  catalogue (`tobii_enumerate_stream_types`), pause and resume, and the
-  device name. `tobii_hardware_configuration_get` is provisional: the ET5
-  has reported no hardware configuration on Linux, so it returns
-  `TOBII_ERROR_NOT_SUPPORTED`.
+  calibration, pause, faults and warnings), device info, track box, display
+  area (get and set — kept across re-inits and, like the Stream Engine,
+  across sessions), mounting, states, capabilities, 2-D calibration
+  (discarding a point too), a device/host clock pair (`tobii_timesync`), the
+  tracker's stream catalogue (`tobii_enumerate_stream_types`), pause and
+  resume, and the device name. `tobii_hardware_configuration_get` is
+  provisional: the ET5 has reported no hardware configuration on Linux, so
+  it returns `TOBII_ERROR_NOT_SUPPORTED`.
   Timestamps are the host clock `tobii_system_clock` reads (`CLOCK_MONOTONIC`),
   onto which the daemon maps the tracker's with an offset it estimates from
   the arrivals, afresh at every tracker init (README.md, Architecture,

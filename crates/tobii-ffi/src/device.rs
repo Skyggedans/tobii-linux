@@ -1202,6 +1202,56 @@ pub(crate) mod tests {
         assert_eq!(bytes[511], 0, "truncated and terminated");
     }
 
+    unsafe extern "C" fn keep_notification(p: *const Notification, ud: *mut c_void) {
+        // SAFETY: the test passes `&raw mut Vec<Notification>` as `ud`,
+        // which outlives the device; `p` is live for the call.
+        unsafe { (*ud.cast::<Vec<Notification>>()).push(*p) };
+    }
+
+    /// The tracker's fault and warning lists, as the daemon sends them,
+    /// reach the notifications callback through `process` as strings of
+    /// types 10 (`FAULTS_CHANGED`) and 11 (`WARNINGS_CHANGED`). A regression
+    /// check of the dispatch path, which passes any kind through unchanged;
+    /// the cut to 511 bytes is `notifications_fill_the_520_byte_union`'s.
+    #[test]
+    fn fault_and_warning_lists_reach_the_notifications_callback() {
+        let mut d = device_with(0, vec![]);
+        let mut seen: Vec<Notification> = Vec::new();
+        let ud = (&raw mut seen).cast::<c_void>();
+        assert_eq!(
+            d.subscribe(
+                |c| &mut c.notifications,
+                Some(keep_notification as NotificationsFn),
+                ud
+            ),
+            TOBII_ERROR_NO_ERROR
+        );
+        for (kind, text) in [
+            (tobii_ipc::notification::FAULTS_CHANGED, "FAULT_A"),
+            (tobii_ipc::notification::WARNINGS_CHANGED, "ok"),
+        ] {
+            let body = tobii_ipc::encode_notification(&tobii_ipc::Notification {
+                kind,
+                value: WireValue::String(text.to_owned()),
+            });
+            d.pending.push_back(decode_server(&body).expect("decodes"));
+        }
+
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+
+        let [faults, warnings] = &seen[..] else {
+            panic!("{} notifications", seen.len());
+        };
+        let string = crate::types::TOBII_NOTIFICATION_VALUE_TYPE_STRING;
+        assert_eq!((faults.type_, faults.value_type), (10, string));
+        assert_eq!((warnings.type_, warnings.value_type), (11, string));
+        // SAFETY: `value_type` says `string_` is the active field.
+        let (faults, warnings) = unsafe { (faults.value.string_, warnings.value.string_) };
+        assert_eq!(faults[..8], b"FAULT_A\0".map(c_char_of));
+        assert_eq!(warnings[..3], b"ok\0".map(c_char_of));
+    }
+
     fn c_char_of(b: u8) -> std::ffi::c_char {
         std::ffi::c_char::from_ne_bytes([b])
     }

@@ -129,7 +129,10 @@ pub(crate) fn presence_frame(p: &PresenceSample) -> Vec<u8> {
 }
 
 /// A device notification in the Stream Engine's terms; `None` for the ones it
-/// has no name for.
+/// has no name for. The fault and warning lists (3200, 3210) go out as
+/// strings on every one, changed or not, as the DLL's dispatcher passes
+/// each on (0x18016c9a3, 0x18016c9b7) without comparing it with the last;
+/// libtobii cuts them to 511 bytes, as the DLL does (0x18016c9ef).
 pub(crate) fn notification_of(n: &DeviceNotification) -> Option<Notification> {
     match n {
         DeviceNotification::DisplayAreaChanged(area) => Some(Notification {
@@ -139,6 +142,14 @@ pub(crate) fn notification_of(n: &DeviceNotification) -> Option<Notification> {
         DeviceNotification::CalibrationIdChanged(id) => Some(Notification {
             kind: notification::CALIBRATION_ID_CHANGED,
             value: NotificationValue::Uint(*id),
+        }),
+        DeviceNotification::FaultsChanged(list) => Some(Notification {
+            kind: notification::FAULTS_CHANGED,
+            value: NotificationValue::String(list.clone()),
+        }),
+        DeviceNotification::WarningsChanged(list) => Some(Notification {
+            kind: notification::WARNINGS_CHANGED,
+            value: NotificationValue::String(list.clone()),
         }),
         // The daemon reports the pause itself (see `pause`).
         DeviceNotification::DevicePausedChanged(_) => None,
@@ -442,5 +453,30 @@ mod tests {
             })
             .collect();
         assert_eq!(stamps, [HOST_US; 3], "head, presence and image");
+    }
+
+    /// The tracker's fault and warning lists reach notification subscribers
+    /// as strings, as `TOBII_NOTIFICATION_TYPE_FAULTS_CHANGED` (10) and
+    /// `_WARNINGS_CHANGED` (11).
+    #[test]
+    fn fault_and_warning_lists_reach_notification_subscribers() {
+        let string = |kind, text: &str| {
+            (
+                STREAM_NOTIFICATIONS,
+                ServerMsg::Notification(Notification {
+                    kind,
+                    value: NotificationValue::String(text.into()),
+                }),
+            )
+        };
+        let faults = Sample::Notification(DeviceNotification::FaultsChanged("FAULT_A".into()));
+        let warnings = Sample::Notification(DeviceNotification::WarningsChanged("ok".into()));
+
+        assert_eq!(
+            frames(&faults, STREAM_NOTIFICATIONS),
+            [string(10, "FAULT_A")]
+        );
+        assert_eq!(frames(&warnings, STREAM_NOTIFICATIONS), [string(11, "ok")]);
+        assert!(frames(&faults, 0).is_empty(), "nobody subscribed");
     }
 }

@@ -426,7 +426,37 @@ impl State {
             Sample::Notification(DeviceNotification::DevicePausedChanged(paused)) => {
                 crate::pause::on_notification(*paused);
             }
+            Sample::Notification(n @ DeviceNotification::FaultsChanged(text)) => {
+                self.note_status_list("faults", text, n);
+            }
+            Sample::Notification(n @ DeviceNotification::WarningsChanged(text)) => {
+                self.note_status_list("warnings", text, n);
+            }
             _ => {}
+        }
+    }
+
+    /// A fault or warning list the tracker announced (`n`, a 3200 or 3210
+    /// carrying `text` as the new `list`): it replaces the one the last init
+    /// reported, which the FAULT and WARNING states answer (see
+    /// [`DeviceFacts::apply_notification`]), as the DLL's handler updates its
+    /// cache (0x18016f0e9, 0x18016f108). A list that init left out stays left
+    /// out, and before the first init there is nothing to update; subscribers
+    /// are told either way (see [`crate::frames::notification_of`]). Unlike
+    /// the DLL, which takes messages strictly in arrival order, a list read
+    /// during an init arrives after its `DeviceReady` and replaces what that
+    /// init's 1490 said, even one the tracker sent before answering the 1490.
+    /// Logged, since neither was ever captured: at info, or at warn for
+    /// anything but "ok".
+    fn note_status_list(&mut self, list: &'static str, text: &str, n: &DeviceNotification) {
+        let state_updated = self
+            .facts
+            .as_mut()
+            .is_some_and(|facts| Arc::make_mut(facts).apply_notification(n));
+        if text == "ok" {
+            info!(list, text = ?text, state_updated, "tracker status list changed");
+        } else {
+            warn!(list, text = ?text, state_updated, "tracker status list changed");
         }
     }
 }
@@ -1302,6 +1332,52 @@ pub(crate) mod tests {
 
         assert_eq!(ask(state::FAULT), Reply::err(status::NOT_SUPPORTED));
         assert_eq!(ask(state::WARNING), Reply::err(status::NOT_SUPPORTED));
+    }
+
+    /// A fault list announced before the first init has no facts to go
+    /// into, and makes none (a guard: it held before lists were followed).
+    /// That subscribers still get it is the frames tests'.
+    #[test]
+    fn a_fault_list_before_the_first_init_makes_no_facts() {
+        let mut st = state_with_client(1);
+
+        st.observe(&Sample::Notification(DeviceNotification::FaultsChanged(
+            "FAULT_A".into(),
+        )));
+
+        assert_eq!(st.facts, None);
+    }
+
+    /// Samples are folded in in the order they are observed (the pump folds
+    /// a whole drained batch in before any of it goes out): a list observed
+    /// before an init's `DeviceReady` gives way to that init's 1490; one
+    /// observed after it replaces it, including one the tracker sent during
+    /// that init, which the engine delivers after its `DeviceReady`.
+    #[test]
+    fn a_fault_list_and_an_init_count_in_the_order_observed() {
+        use tobii_proto::facts::STATUS_FAULTS;
+        let faults = Sample::Notification(DeviceNotification::FaultsChanged("FAULT_A".into()));
+        let ready = Sample::DeviceReady(Arc::new(DeviceFacts {
+            status: vec![(STATUS_FAULTS, "ok".into())],
+            ..DeviceFacts::default()
+        }));
+        let fault_list = |batch: [&Sample; 2]| {
+            let mut st = state_with_client(1);
+            st.observe(&Sample::DeviceReady(Arc::new(DeviceFacts {
+                status: vec![(STATUS_FAULTS, "FAULT_OLD".into())],
+                ..DeviceFacts::default()
+            })));
+            for s in batch {
+                st.observe(s);
+            }
+            st.facts
+                .as_ref()
+                .and_then(|f| f.status_string(STATUS_FAULTS))
+                .map(str::to_owned)
+        };
+
+        assert_eq!(fault_list([&faults, &ready]).as_deref(), Some("ok"));
+        assert_eq!(fault_list([&ready, &faults]).as_deref(), Some("FAULT_A"));
     }
 
     #[test]

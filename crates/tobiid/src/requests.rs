@@ -122,8 +122,9 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
                 Reply::ok(vec![u8::from(active)])
             }
             Some(state::DEVICE_PAUSED) => Reply::ok(vec![u8::from(lock_state(state).paused)]),
-            // From the last init's 1490, as the DLL answers from the cache
-            // its create and reconnect fill: no 1490 per call.
+            // From the last init's 1490 and the 3200/3210 since, as the DLL
+            // answers from the cache its create and reconnect fill and those
+            // notifications update: no 1490 per call.
             Some(id @ (state::FAULT | state::WARNING)) => {
                 let index = if id == state::FAULT {
                     STATUS_FAULTS
@@ -652,6 +653,60 @@ pub(crate) mod tests {
             assert_eq!(ask(state::FAULT), Reply::err(status::NOT_SUPPORTED));
             assert_eq!(ask(state::WARNING), Reply::err(status::NOT_SUPPORTED));
         }
+    }
+
+    /// A list the tracker announces (3200, 3210) replaces the one its last
+    /// init reported, until the next init reports its own; a list that init
+    /// left out stays left out, as in the DLL.
+    #[test]
+    fn fault_and_warning_notifications_replace_the_reported_lists() {
+        use tobii_proto::facts::DeviceNotification::{FaultsChanged, WarningsChanged};
+        use tobii_usb::engine::Sample;
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        let state = Mutex::new(st);
+        let ask = |id| {
+            handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind: kind::STATE,
+                    payload: &encode_u32(id),
+                },
+            )
+        };
+        let facts = |status: &[(u32, &str)]| {
+            Arc::new(DeviceFacts {
+                status: status.iter().map(|(i, s)| (*i, (*s).to_owned())).collect(),
+                ..DeviceFacts::default()
+            })
+        };
+        let observe = |sample| lock_state(&state).observe(&sample);
+        observe(Sample::DeviceReady(facts(&[(5, "ok"), (6, "ok")])));
+
+        observe(Sample::Notification(FaultsChanged("FAULT_A".into())));
+
+        assert_eq!(ask(state::FAULT), Reply::ok(b"FAULT_A".to_vec()));
+        assert_eq!(ask(state::WARNING), Reply::ok(b"ok".to_vec()));
+
+        observe(Sample::Notification(WarningsChanged("WARNING_A".into())));
+        assert_eq!(ask(state::WARNING), Reply::ok(b"WARNING_A".to_vec()));
+        assert_eq!(ask(state::FAULT), Reply::ok(b"FAULT_A".to_vec()));
+
+        observe(Sample::DeviceReady(facts(&[(5, "ok"), (6, "WARNING_B")])));
+        assert_eq!(
+            ask(state::FAULT),
+            Reply::ok(b"ok".to_vec()),
+            "the new init's"
+        );
+        assert_eq!(ask(state::WARNING), Reply::ok(b"WARNING_B".to_vec()));
+
+        observe(Sample::DeviceReady(facts(&[(7, "1904654973")])));
+        observe(Sample::Notification(FaultsChanged("FAULT_A".into())));
+        observe(Sample::Notification(WarningsChanged("WARNING_A".into())));
+        assert_eq!(ask(state::FAULT), Reply::err(status::NOT_SUPPORTED));
+        assert_eq!(ask(state::WARNING), Reply::err(status::NOT_SUPPORTED));
     }
 
     #[test]

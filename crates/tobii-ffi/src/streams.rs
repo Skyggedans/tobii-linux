@@ -92,7 +92,8 @@ stream_pair! {
     /// Head pose from the tracker's IR camera: position in mm, rotation in
     /// radians about x (pitch), y (yaw) and z (roll).
     tobii_head_pose_subscribe / tobii_head_pose_unsubscribe: head, HeadPoseFn;
-    /// Device notifications: display-area and calibration changes.
+    /// Device notifications: display-area, calibration and pause changes,
+    /// and the tracker's fault and warning lists.
     tobii_notifications_subscribe / tobii_notifications_unsubscribe: notifications, NotificationsFn;
     /// The user position guide: the track-box-normalised eye positions.
     tobii_user_position_guide_subscribe / tobii_user_position_guide_unsubscribe: user_position_guide, EyePairFn;

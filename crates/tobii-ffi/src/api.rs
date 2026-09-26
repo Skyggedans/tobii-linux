@@ -674,22 +674,27 @@ pub unsafe extern "C" fn tobii_get_state_uint32(
 
 /// A string state: the tracker's fault or warning list ("ok" when there are
 /// none), as its last init reported them (status strings 5 and 6 of command
-/// 1490), from the daemon.
+/// 1490) or a notification 3200 or 3210 has replaced them since, from the
+/// daemon.
 ///
 /// The DLL (0x1801422c0) copies them from a cache that its create and
 /// reconnect fill from 1490 (0x18016db40, through `tracker_get_status` at
 /// 0x1801a0ac0), and that the tracker's notifications 3200 and 3210 update
-/// (0x18016efa0); those are not followed here, so a change shows at the next
-/// init. Up to the first NUL and at most 511 bytes are copied, and all 512
-/// written, as the DLL's `strncpy(value, .., 0x200)` and forced NUL at
-/// `[0x1ff]` do; the DLL's own copy of a 1490 string holds at most 119
-/// bytes (its TTP record, 0x18017c3a4, inferred to be the 1490 path), where
-/// a longer one is passed on here. `TOBII_ERROR_NOT_SUPPORTED` when the
-/// init reported no such list, as the DLL, and from a daemon too old to
-/// know these states. Unlike the DLL, which answers from its cache,
-/// `TOBII_ERROR_TIMED_OUT` if the daemon has not seen a tracker yet (the
-/// call waits for its first init) and `TOBII_ERROR_CONNECTION_FAILED` when
-/// the daemon is gone. On any error `value` is left untouched.
+/// (0x18016efa0); the daemon follows those the same way, and passes them on
+/// as `TOBII_NOTIFICATION_TYPE_FAULTS_CHANGED` and `_WARNINGS_CHANGED` (a
+/// daemon older than that answers the init's list and sends neither). Up
+/// to the first NUL and at most 511 bytes are copied, and all 512 written,
+/// as the DLL's `strncpy(value, .., 0x200)` and forced NUL at `[0x1ff]` do;
+/// the DLL's own copy of a 1490 string holds at most 119 bytes (its TTP
+/// record, 0x18017c3a4, inferred to be the 1490 path), where a longer one
+/// is passed on here. `TOBII_ERROR_NOT_SUPPORTED` when the init reported no
+/// such list, whatever notifications came since (they never set the DLL's
+/// "present" flag, which only a 1490 sets: 0x18016dce1, 0x18016dd8b), as
+/// the DLL, and from a daemon too old to know these states. Unlike the DLL,
+/// which answers from its cache, `TOBII_ERROR_TIMED_OUT` if the daemon has
+/// not seen a tracker yet (the call waits for its first init) and
+/// `TOBII_ERROR_CONNECTION_FAILED` when the daemon is gone. On any error
+/// `value` is left untouched.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `value` must be null or valid

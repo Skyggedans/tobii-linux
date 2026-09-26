@@ -113,9 +113,11 @@ pub mod notification {
     pub const CALIBRATION_ID_CHANGED: u8 = 8;
     /// The combined-gaze eye selection changed.
     pub const COMBINED_GAZE_EYE_SELECTION_CHANGED: u8 = 9;
-    /// The fault list changed.
+    /// The fault list changed ([`super::NotificationValue::String`], the new
+    /// list).
     pub const FAULTS_CHANGED: u8 = 10;
-    /// The warning list changed.
+    /// The warning list changed ([`super::NotificationValue::String`], the
+    /// new list).
     pub const WARNINGS_CHANGED: u8 = 11;
     /// The face type changed.
     pub const FACE_TYPE_CHANGED: u8 = 12;
