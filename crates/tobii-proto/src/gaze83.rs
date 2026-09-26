@@ -22,6 +22,15 @@
 //! do not shrink with the eye's distance, as a size in camera pixels would.
 //! Keys `0x25`/`0x27`'s third component, which decode.rs reports as
 //! `secondary_range_*`, is not the pupil: it tracks the eye's range.
+//!
+//! The Stream Engine's own record of a frame, which `process_gaze`
+//! (0x18018d9a0) fills and the raw gaze callback receives, takes keys
+//! `0x01`..`0x0d`, `0x1b` and `0x1c` and, each behind a flag set when the
+//! frame has it, keys `0x0e`, `0x11` and `0x14`..`0x18`; it reads no key
+//! above `0x1c`. A [`GazeFrame`] holds all of it: the keys its other fields
+//! reduce to a validity, or leave out, are kept as sent in
+//! [`EyeFrame::status`] and [`GazeFrame::record`]. The unfiltered combined
+//! gaze, [`GazeFrame::gaze_raw`] (key `0x20`), is not part of that record.
 
 use crate::protocol::{Message, STREAM_ID_GAZE, STREAM_ID_PRESENCE};
 use crate::tlv::{UNITS_PER_MM, keyed_fields};
@@ -40,6 +49,11 @@ pub mod key {
     pub const RAW_COMBINED_GAZE_VALID: u32 = 0x1f;
     /// Unfiltered combined gaze, `(left + right) / 2`.
     pub const RAW_COMBINED_GAZE: u32 = 0x20;
+    /// `u32` of unknown meaning, which the ET5 never sends; the Stream
+    /// Engine's gaze record keeps it.
+    pub const KEY_0E: u32 = 0x0e;
+    /// `u32` of unknown meaning; the ET5 sends 4 in every frame.
+    pub const KEY_11: u32 = 0x11;
 
     /// The keys of one eye.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +125,12 @@ pub struct Valued<T> {
 /// One eye of a [`GazeFrame`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct EyeFrame {
-    /// The device tracks this eye in this frame.
+    /// The device tracks this eye in this frame: its status is 0.
     pub tracked: bool,
+    /// Tracking status as sent: the ET5 sends 0 for a tracked eye, 4 for a
+    /// lost one. `None` when the frame lacks the key, which the Stream
+    /// Engine's zeroed record would read as 0.
+    pub status: Option<u32>,
     /// Cornea centre (gaze origin), tracker frame, mm.
     pub origin_tracker_mm: Valued<[f64; 3]>,
     /// Gaze origin, display frame, mm (the Stream Engine's `gazeOrigin`).
@@ -141,12 +159,50 @@ pub struct GazeFrame {
     /// Filtered combined gaze point, normalised display coordinates,
     /// unclamped (the Stream Engine's `gazePoint`).
     pub gaze: Valued<[f64; 2]>,
-    /// Unfiltered combined gaze point.
+    /// Unfiltered combined gaze point. Not part of the Stream Engine's gaze
+    /// record, which is what its raw gaze hands out.
     pub gaze_raw: Valued<[f64; 2]>,
     /// The user's left eye.
     pub left: EyeFrame,
     /// The user's right eye.
     pub right: EyeFrame,
+    /// The rest of what the Stream Engine's gaze record keeps of the frame.
+    pub record: RecordKeys,
+}
+
+/// Keys of a 0x500 message that the Stream Engine's gaze record keeps as
+/// sent and the rest of a [`GazeFrame`] does not: the combined gaze
+/// validity, and the keys the record flags as present or not. `None`, or
+/// `false`, for a key the frame lacks.
+///
+/// Where the record puts each (`process_gaze`, 0x18018d9a0, whose key
+/// switch jumps through the table at RVA 0x18f5a8; the flagged keys' cases
+/// span 0x18018dcf5..0x18018de01): the combined gaze point (key `0x1c`,
+/// [`GazeFrame::gaze`]) at `+0x70`, its validity at `+0x78`, then flag and
+/// value of `0x0e` at `+0x7c`, `0x11` at `+0x94`, `0x14` at `+0xac`, `0x16`
+/// at `+0xb4`, `0x15` at `+0xbc`, and the eyeball centres `0x17` at `+0xc4`
+/// and `0x18` at `+0xd4`, whose values are [`EyeFrame::eyeball_center_mm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecordKeys {
+    /// Key `0x1b`, the combined gaze validity; [`GazeFrame::gaze`] is valid
+    /// when it is 1. The record keeps it without a flag, 0 when absent.
+    pub combined_gaze_validity: Option<u32>,
+    /// Key `0x0e`, of unknown meaning; the ET5 never sends it.
+    pub key_0e: Option<u32>,
+    /// Key `0x11`, of unknown meaning; the ET5 sends 4.
+    pub key_11: Option<u32>,
+    /// Key `0x14`, the frame counter; [`GazeFrame::frame_counter`] is it,
+    /// or 0.
+    pub frame_counter: Option<u32>,
+    /// Key `0x16`, the left eye's gaze-origin validity;
+    /// [`EyeFrame::origin_tracker_mm`] is valid when it is 1.
+    pub left_origin_flag: Option<u32>,
+    /// Key `0x15`, the right eye's gaze-origin validity.
+    pub right_origin_flag: Option<u32>,
+    /// The frame has key `0x17`, the left eyeball centre, as a 3-D point.
+    pub left_eyeball_sent: bool,
+    /// The frame has key `0x18`, the right eyeball centre, as a 3-D point.
+    pub right_eyeball_sent: bool,
 }
 
 /// Wire value of an invalid component: exactly 0 or ±1024 (±1 mm-unit scale
@@ -164,11 +220,12 @@ pub fn decode_gaze_frame(msg: &Message<'_>) -> Option<GazeFrame> {
     }
     let fields = keyed_fields(msg.payload.get(2..)?);
     let device_ts_us = fields.scalar(key::TIMESTAMP)?;
-    let flag = |k: u32| fields.scalar(k) == Some(1);
+    let word = |k: u32| fields.scalar(k).and_then(|v| u32::try_from(v).ok());
+    let flag = |k: u32| word(k) == Some(1);
     let scaled = |v: [f64; 3]| v.map(|c| c / UNITS_PER_MM);
 
     let eye = |k: key::Eye| {
-        let status = fields.scalar(k.status);
+        let status = word(k.status);
         let tracked = status == Some(0);
         let point3 = |key: u32| fields.point::<3>(key);
         let flagged3 = |key: u32, valid: u32| {
@@ -187,6 +244,7 @@ pub fn decode_gaze_frame(msg: &Message<'_>) -> Option<GazeFrame> {
         };
         EyeFrame {
             tracked,
+            status,
             origin_tracker_mm: flagged3(k.origin_tracker, k.origin_tracker_valid),
             origin_display_mm: flagged3(k.origin_display, k.origin_display_valid),
             track_box: unflagged3(k.track_box),
@@ -221,16 +279,25 @@ pub fn decode_gaze_frame(msg: &Message<'_>) -> Option<GazeFrame> {
             })
     };
 
+    let record = RecordKeys {
+        combined_gaze_validity: word(key::COMBINED_GAZE_VALID),
+        key_0e: word(key::KEY_0E),
+        key_11: word(key::KEY_11),
+        frame_counter: word(key::FRAME_COUNTER),
+        left_origin_flag: word(key::LEFT.origin_tracker_valid),
+        right_origin_flag: word(key::RIGHT.origin_tracker_valid),
+        left_eyeball_sent: fields.point::<3>(key::LEFT.eyeball).is_some(),
+        right_eyeball_sent: fields.point::<3>(key::RIGHT.eyeball).is_some(),
+    };
+
     Some(GazeFrame {
         device_ts_us,
-        frame_counter: fields
-            .scalar(key::FRAME_COUNTER)
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0),
+        frame_counter: record.frame_counter.unwrap_or(0),
         gaze: gaze2(key::COMBINED_GAZE, key::COMBINED_GAZE_VALID),
         gaze_raw: gaze2(key::RAW_COMBINED_GAZE, key::RAW_COMBINED_GAZE_VALID),
         left: eye(key::LEFT),
         right: eye(key::RIGHT),
+        record,
     })
 }
 
@@ -378,6 +445,20 @@ mod tests {
         bytes
     }
 
+    /// `bytes` with keyed field `from` announced as key `to` instead.
+    fn renamed(mut bytes: Vec<u8>, from: u32, to: u32) -> Vec<u8> {
+        let at = key_at(&bytes, from);
+        bytes[at..at + 4].copy_from_slice(&to.to_be_bytes());
+        bytes
+    }
+
+    /// `bytes` without keyed field `key`: it is announced as `0x0f`, a key
+    /// the ET5 never sends and neither this decoder nor the Stream Engine's
+    /// record reads.
+    fn without(bytes: Vec<u8>, key: u32) -> Vec<u8> {
+        renamed(bytes, key, 0x0f)
+    }
+
     fn decode(bytes: &[u8]) -> GazeFrame {
         decode_gaze_frame(&parse_message(bytes).expect("message")).expect("gaze frame")
     }
@@ -427,16 +508,134 @@ mod tests {
     #[test]
     fn a_missing_status_or_pupil_gives_no_pupil() {
         for missing in [key::LEFT.status, key::LEFT.pupil] {
-            let mut bytes = session1();
-            let at = key_at(&bytes, missing);
-            // A key the ET5 never sends.
-            bytes[at..at + 4].copy_from_slice(&0x0fu32.to_be_bytes());
-
-            let frame = decode(&bytes);
+            let frame = decode(&without(session1(), missing));
 
             assert!(!frame.left.pupil_diameter_mm.valid, "{missing:#x}");
             assert!(frame.right.pupil_diameter_mm.valid);
         }
+    }
+
+    /// The Stream Engine's gaze record (`process_gaze`, 0x18018d9a0) takes
+    /// keys `0x02`..`0x07` for the left eye and `0x08`..`0x0d` for the
+    /// right, the combined gaze `0x1c`/`0x1b`, and flags `0x0e`, `0x11`,
+    /// `0x14`..`0x18`. A decoded frame holds every one of them as the record
+    /// does: points / 1024, the pupil as 16.16, the scalars as sent.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: the same wire values, scaled the same way
+    fn a_frame_holds_what_the_stream_engine_record_takes() {
+        let bytes = session1();
+        let msg = parse_message(&bytes).expect("message");
+        let keys = keyed_fields(msg.payload.get(2..).expect("keys"));
+        let point3 = |k: u32| {
+            keys.point::<3>(k)
+                .expect("the key")
+                .map(|c| c / UNITS_PER_MM)
+        };
+        let point2 = |k: u32| {
+            keys.point::<2>(k)
+                .expect("the key")
+                .map(|c| c / UNITS_PER_MM)
+        };
+
+        let frame = decode_gaze_frame(&msg).expect("gaze frame");
+
+        for (eye, first, eyeball) in [(frame.left, 0x02, 0x17), (frame.right, 0x08, 0x18)] {
+            assert_eq!(eye.origin_tracker_mm.value, point3(first));
+            assert_eq!(eye.track_box.value, point3(first + 1));
+            assert_eq!(eye.gaze_point_tracker_mm.value, point3(first + 2));
+            assert_eq!(eye.gaze_point_norm.value, point2(first + 3));
+            assert_eq!(Some(eye.pupil_diameter_mm.value), keys.fixed16(first + 4));
+            assert_eq!(eye.status.map(u64::from), keys.scalar(first + 5));
+            assert_eq!(eye.eyeball_center_mm.value, point3(eyeball));
+        }
+        assert_eq!(frame.gaze.value, point2(0x1c));
+        assert_eq!(
+            frame.record,
+            RecordKeys {
+                combined_gaze_validity: Some(1),
+                key_0e: None,
+                key_11: Some(4),
+                frame_counter: Some(43_780),
+                left_origin_flag: Some(1),
+                right_origin_flag: Some(1),
+                left_eyeball_sent: true,
+                right_eyeball_sent: true,
+            }
+        );
+    }
+
+    /// Each scalar the record keeps lands in its own field as sent: the
+    /// statuses `0x07`/`0x0d`, the combined gaze validity `0x1b`, `0x0e`
+    /// (on a frame that has it), `0x11`, the frame counter `0x14`, and the
+    /// origin flags `0x16` (left, record `+0xb8`) and `0x15` (right,
+    /// `+0xc0`). The fields derived from them follow.
+    #[test]
+    fn the_record_keeps_each_scalar_as_sent() {
+        // Key 0x2a, a u32 the ET5 always sends as 0, stands in for 0x0e.
+        let mut bytes = renamed(session1(), 0x2a, 0x0e);
+        for (k, value) in [
+            (0x07, 4),
+            (0x0d, 1),
+            (0x1b, 2),
+            (0x0e, 9),
+            (0x11, 5),
+            (0x14, 8),
+            (0x16, 7),
+            (0x15, 3),
+        ] {
+            bytes = with_scalar(bytes, k, value);
+        }
+
+        let frame = decode(&bytes);
+
+        assert_eq!((frame.left.status, frame.right.status), (Some(4), Some(1)));
+        assert!(!frame.left.tracked && !frame.right.tracked);
+        assert_eq!(
+            frame.record,
+            RecordKeys {
+                combined_gaze_validity: Some(2),
+                key_0e: Some(9),
+                key_11: Some(5),
+                frame_counter: Some(8),
+                left_origin_flag: Some(7),
+                right_origin_flag: Some(3),
+                left_eyeball_sent: true,
+                right_eyeball_sent: true,
+            }
+        );
+        assert_eq!(frame.frame_counter, 8);
+        assert!(!frame.gaze.valid);
+        assert!(!frame.left.origin_tracker_mm.valid && !frame.right.origin_tracker_mm.valid);
+    }
+
+    /// A key the frame lacks is `None` (or not sent), where the Stream
+    /// Engine's zeroed record would hold 0 and a clear flag; the other
+    /// eye's keys are untouched.
+    #[test]
+    fn keys_the_frame_lacks_are_none() {
+        let bytes = [0x07, 0x1b, 0x11, 0x14, 0x16, 0x17]
+            .into_iter()
+            .fold(session1(), without);
+
+        let frame = decode(&bytes);
+
+        assert_eq!((frame.left.status, frame.right.status), (None, Some(0)));
+        assert!(!frame.left.tracked && frame.right.tracked);
+        assert_eq!(
+            frame.record,
+            RecordKeys {
+                combined_gaze_validity: None,
+                key_0e: None,
+                key_11: None,
+                frame_counter: None,
+                left_origin_flag: None,
+                right_origin_flag: Some(1),
+                left_eyeball_sent: false,
+                right_eyeball_sent: true,
+            }
+        );
+        assert_eq!(frame.frame_counter, 0);
+        assert_eq!(frame.left.eyeball_center_mm, Valued::default());
     }
 
     #[test]
