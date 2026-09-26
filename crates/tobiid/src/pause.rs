@@ -8,8 +8,10 @@
 //! only from the device, a pause or resume the device accepts is reported at
 //! once (state [`state::DEVICE_PAUSED`](tobii_ipc::request::state) and a
 //! `DEVICE_PAUSED_STATE_CHANGED` notification when it changes). The device's
-//! own notification (3110, never captured) is only logged until the hardware
-//! shows what it carries.
+//! own notification (3110) is only logged: the ET5 sends it just before its
+//! answer when a 3100 changes its state (seen 2026-09-24), so the state
+//! already changes with that answer, and an init's resume of a device that
+//! was not paused brings none.
 //!
 //! A pause ends without a request in three ways. The client that paused
 //! last goes away: the device is resumed for it. The device re-initialises
@@ -239,9 +241,12 @@ pub(crate) fn on_engine_lost(st: &mut State) {
     record(st, false, None);
 }
 
-/// The device's own pause notification (3110): logged only. It was never
-/// captured, and one sent before an init would arrive with the init's other
-/// messages after `DeviceReady`.
+/// The device's own pause notification (3110): logged only. The ET5 sends it
+/// just before its answer when a 3100 changes its state (seen 2026-09-24),
+/// and that answer already changed the state here; an init's resume of a
+/// device that was not paused brings none. One sent during an init arrives
+/// with the init's other messages after `DeviceReady`, as one did that day
+/// from an init's resume of a device most likely left paused.
 pub(crate) fn on_notification(paused: bool) {
     info!(paused, "device pause notification (3110); not acted on");
 }

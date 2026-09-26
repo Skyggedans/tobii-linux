@@ -216,6 +216,122 @@ prototype declares or a float/integer position disagrees.
   service's, and nothing in the DLL produces or decimates the values.
   libtobii answers as the DLL does for a tracker it drives itself and does
   not re-publish its head pose.
+- Which notifications the DLL delivers for an ET5, and which libtobii
+  sends. On the DLL's own tracker module (`[device+0x4e8]`, above),
+  `tobii_notifications_subscribe` (0x180151440) stores the application's
+  callback twice: in the platmod's generic slot `+0xeb90` (0x18015175a; a
+  second subscribe is `TOBII_ERROR_ALREADY_SUBSCRIBED`, 0x1801516d4) and,
+  once it has subscribed the tracker's PRP properties but those in mask
+  0x66800 (0x18015179f), at `[device+0x15bd8]` (0x1801518f8). A tracker
+  notification is classified by its id (0x18017b7ad..0x18017babf), built
+  into a 520-byte record (0x180188100, table at RVA 0x1883c8) and handed to
+  0x18016efa0, which updates the platmod's caches and queues the record in
+  a 16-entry ring at `+0x32948`. `tobii_device_process_callbacks` drains
+  the ring (0x180143b30 → 0x1801593f0 → 0x180171400, which calls the TTP
+  dispatcher 0x18016c590 at 0x180172285; table at RVA 0x16ca2c), and
+  `tobii_device_clear_callback_buffers` flushes it (0x180143a8d →
+  0x180158a20, 0x18016e720 at 0x180158a47) before it runs the same drain
+  (0x180158ab2). The TTP dispatcher calls the generic slot itself for
+  types 2, 4, 5, 9, 10, 11 and 12, and the platmod's property slots for
+  the others, whose events reach the application through the PRP
+  dispatcher 0x180153de0 (table at RVA 0x15415c, by `PRP_PROPERTY` id).
+  That one has notification cases only for properties 1, 2, 4, 5, 6 and 7
+  and other callbacks for 11, 13, 14, 17 and 18; every other id (0, 3
+  `REMOTE_WAKE_ACTIVE`, 8 `DEVICE_NAME`, 9, 10 `LENS_CONFIGURATION`, 12,
+  15, 16 `ENABLED_EYE`, 19 and 20) goes to its exit at 0x180153f09. The
+  TTP dispatcher compares no value with the last one; the hop from a
+  property slot to the PRP dispatcher (the transport around 0x180043df0)
+  is not traced. By tracker id:
+  - 1040/1050: type 0 `CALIBRATION_STATE_CHANGED`, true/false (slot
+    `+0xea40`, property 7 at 0x180153f58);
+  - 1271/1272: type 1 `EXCLUSIVE_MODE_STATE_CHANGED`, true/false
+    (0x18018817f, 0x18018818c; slot `+0xea70`, property 5 at 0x180153f2e);
+  - 1410: type 2 `TRACK_BOX_CHANGED`, no value (0x18016c70e);
+  - 1450: type 3 `DISPLAY_AREA_CHANGED` (slot `+0xea30`, property 1 at
+    0x180153e2d);
+  - 1640 and 1680: type 4 `FRAMERATE_CHANGED`, a float (0x180188271,
+    0x180188240; 0x18016c7fd);
+  - 3020/3030: type 5 `POWER_SAVE_STATE_CHANGED`, true/false (0x18016c84d,
+    0x18016c897);
+  - 3110: type 6 `DEVICE_PAUSED_STATE_CHANGED` from a `u32` 0 or 1,
+    anything above 1 dropped (0x1801882b4; slot `+0xea20`, property 4 at
+    0x180153f21);
+  - 3220: type 8 `CALIBRATION_ID_CHANGED` (0x1801882ee; slot `+0xea50`,
+    property 6 at 0x180153f3c);
+  - 3180: type 9 `COMBINED_GAZE_EYE_SELECTION_CHANGED`, 1 left, 2 right,
+    anything else both (0x18018830b, 0x18016c933);
+  - 3200 and 3210: types 10 `FAULTS_CHANGED` and 11 `WARNINGS_CHANGED`,
+    the new list as a string of at most 511 bytes (0x180188339,
+    0x180188343; 0x18016c9a3, 0x18016c9b7), from one string parameter
+    (schema 0x1801810d2, 0x1801810bd) whose reader takes TLV type 0x14
+    only (0x180003be3);
+  - 3330: type 12 `FACE_TYPE_CHANGED`, a string (0x18016c9cb).
+
+  Nothing produces type 7 `CALIBRATION_ENABLED_EYE_CHANGED`. 3200 and 3210
+  also replace the text of the fault or warning cache (0x18016f0e9,
+  0x18016f108) but not its "present" flag, which only a 1490 that reported
+  the list sets (0x18016dce1, 0x18016dd8b) and `tobii_get_state_string`
+  checks (0x1801426fd, 0x180142563). 1271 also queues presence status 0,
+  `UNKNOWN` (0x18016f005..0x18016f034), which reaches the platmod's
+  presence slot `+0xeaf0` when it differs from the last
+  (0x1801720d8..0x1801720f2); the application's presence callback hangs
+  off PRP property 11 (0x180153f63), past the same untraced hop. The
+  platmod's subscribes for the six properties the PRP dispatcher turns
+  into notifications each call their slot once, straight away, with a
+  constant rather than the tracker's state: power save with 0 (0x180165012;
+  nothing else calls that slot), exclusive mode with 0 (0x180164a52),
+  display area with an all-zero area (0x18016601a..0x180166048),
+  calibration active and calibration id with 0 (0x180165972, 0x1801656e2)
+  and device paused with 1 (0x18016752f). So a new subscriber may get
+  initial notifications; whether they reach it is not traced either.
+
+  What the ET5 sends: the Windows captures hold 3180 (`u32 3`, once per
+  init, right after the tracker's answer to the init's 3160), 3220 (five in
+  the calibration) and 1450 (one in the display change), and nothing else.
+  On Linux it also sends, without a body and early in an open's init, 1271
+  when the open starts the sensor (a cold engine start, or a re-open after
+  the stream was lost; such an open has never armed) or 1272 when it finds
+  it running (the re-open that primes the stream about 10 s later, or an
+  engine start while the sensor still runs, which arms without a prime);
+  some opens bring neither, and opens after a USB reset have brought both.
+  It sends 3110 just before its answer when a 3100 changes its state (a
+  pause, or a resume of a paused tracker; seen 2026-09-24); an init's
+  resume of a tracker that was not paused brings none (one of 34 init
+  resumes in the Linux logs brought one, most likely for a tracker left
+  paused). 1040, 1050, 1410, 1640, 1680, 3020, 3030, 3200, 3210 and 3330
+  were never seen.
+
+  libtobii sends six types. `CALIBRATION_STATE_CHANGED` and
+  `DEVICE_PAUSED_STATE_CHANGED` come from the daemon itself, when a
+  calibration session starts or ends and when the tracker accepts a pause
+  or resume: the ET5 was never seen sending 1040/1050, not even in the
+  Windows calibration capture, and the daemon only logs 3110.
+  `DISPLAY_AREA_CHANGED` (1450), `CALIBRATION_ID_CHANGED` (3220),
+  `FAULTS_CHANGED` (3200) and `WARNINGS_CHANGED` (3210) come from the
+  tracker's, one for each, changed or not: as in the DLL for 3200 and
+  3210, and for 1450 and 3220 as far as traced, since the property hop
+  above is not. The rest are skipped:
+  - exclusive mode: 1271/1272 are a Linux cold-start artifact that no
+    Windows capture shows, and would turn it on whenever an open starts
+    the sensor and off again with the prime about 10 s later.
+    `TOBII_STATE_EXCLUSIVE_MODE` stays false, where the DLL answers it
+    from status string 2 of the 1490 and from 1271/1272 (`+0xe60a`,
+    0x1801648f3), and the presence side effect is not modelled either;
+  - the track box, power save and face type, which the ET5 never sent and
+    libtobii cannot change (`tobii_power_save_activate` / `_deactivate`
+    and the face-type exports are `TOBII_ERROR_NOT_SUPPORTED`), nor the
+    initial power-save value above;
+  - the frame rate, fixed at 33 Hz;
+  - the combined-gaze eye selection, always both. After
+    `tobii_device_create` or `tobii_device_reconnect` the DLL most likely
+    hands one `BOTH` to an application that subscribes before its next
+    `tobii_device_process_callbacks`, unless it clears the callback buffers
+    first: its create/reconnect routine flushes the ring at its start
+    (0x18016e720, called at 0x18016db7c), before the init's 3160, so the
+    3180 answering that 3160 stays queued until one of those two calls. The
+    value is constant, and the daemon's init is not tied to a client;
+  - type 7, which has no producer. There is no device-name notification
+    type.
 
 Layouts, and where each comes from:
 

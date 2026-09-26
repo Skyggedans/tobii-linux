@@ -21,7 +21,8 @@ from USB captures of the Windows Stream Engine.
 | User presence | on change | the `0x504` stream |
 | Head pose, 6 DOF | 33 Hz | face landmarks on the device's own IR frames |
 | IR camera image, 280×280 | 33 Hz | the `0x50e` stream |
-| Device info, track box, display area, notifications | on request / change | the device's own answers |
+| Device info, track box, display area | on request | the device's own answers |
+| Notifications: display area, calibration, pause, faults, warnings | on change | the device's own, and the daemon's for calibration and pause |
 | Calibration | on demand | `tobii-calibrate`, saved per user |
 
 Everything the Stream Engine reports is reproduced bit for bit: replaying a
@@ -91,7 +92,7 @@ the archived 4.1.0 reference. What stands behind the entry points:
 
 | | Entry points |
 |---|---|
-| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, IR image and notification streams; device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
+| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data and IR image streams; notifications (display area, calibration state and id, pause, faults and warnings); device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
 | Answered locally | API version, error texts (the DLL's), system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing, internal-stream support (the IR image only), internal-capability support (eyeball centres only), lens-configuration writability (never), the internal low-frequency head rotation and position, multiple faces position, wearable limited image and secondary camera image streams (never, as the DLL answers for a tracker it drives itself; behind Tobii's service, never captured) |
 | `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration, calibration stimulus points (as the DLL's in-process legacy TTP module answers for an ET5; behind Tobii's service, never captured) |
 
@@ -154,6 +155,29 @@ Where the answers come from, and where they differ from Windows:
   its init resumes it. Pausing during a calibration session is
   `TOBII_ERROR_CALIBRATION_BUSY`; starting one, or asking for
   `tobii_timesync`, while paused is `TOBII_ERROR_NOT_AVAILABLE`.
+- **Notifications.** Six of the thirteen types are delivered:
+  `CALIBRATION_STATE_CHANGED` and `DEVICE_PAUSED_STATE_CHANGED` from the
+  daemon itself, when a calibration session starts or ends and when the
+  tracker accepts a pause or resume (the Stream Engine waits for the
+  tracker's own messages, of which the ET5 was seen sending only the
+  pause's); `DISPLAY_AREA_CHANGED`, `CALIBRATION_ID_CHANGED`,
+  `FAULTS_CHANGED` and `WARNINGS_CHANGED` from the tracker's, one for each
+  (as the Stream Engine does for faults and warnings, and as far as traced
+  for the other two). The others never come: the output frequency is
+  fixed at 33 Hz, both eyes are always used, the ET5 was never seen changing
+  its track box, entering power save or reporting a face type, and the
+  Stream Engine has no source for `CALIBRATION_ENABLED_EYE_CHANGED`.
+  Exclusive mode is not reported either: the ET5 sends what the Stream
+  Engine reads as exclusive mode on and off only on Linux, whenever an open
+  starts the sensor (a cold engine start, or a re-open after the stream
+  was lost): on with that open, off with the re-open that primes the
+  stream about 10 s later. It never does so on Windows, so it says nothing
+  about another application; `TOBII_STATE_EXCLUSIVE_MODE` stays false. The
+  Stream Engine most likely also delivers one
+  `COMBINED_GAZE_EYE_SELECTION_CHANGED` (both eyes) after
+  `tobii_device_create` or `tobii_device_reconnect`, from the tracker's
+  answer to its init; libtobii does not. `tools/abi/README.md` has the
+  Stream Engine's side.
 - **Device name.** A name set with `tobii_set_device_name` is kept by the
   daemon in `~/.config/tobii/device-name`, for every client and later
   sessions; nothing is written to the tracker. Until one is set,

@@ -502,15 +502,25 @@ pub mod cmd {
     pub const DEVICE_PAUSE: u32 = 3100;
 }
 
-/// Notification ids seen in the Windows captures, unless noted as from the
-/// DLL only.
+/// Notification ids seen in the Windows captures, unless noted otherwise.
+/// Which ones the DLL delivers for an ET5, and which libtobii passes on:
+/// `tools/abi/README.md`.
 pub mod notify {
     /// The display area changed: three corners.
     pub const DISPLAY_AREA: u32 = 1450;
-    /// The device paused (`u32 1`) or resumed (`u32 0`). From the DLL's
-    /// decoder (0x1801882b4), which rejects anything above 1; never captured.
+    /// The device paused (`u32 1`) or resumed (`u32 0`); the DLL's decoder
+    /// (0x1801882b4) rejects anything above 1. Not in the Windows captures:
+    /// on Linux the ET5 sends it just before its answer when command 3100
+    /// changes its state (a pause, or a resume of a paused device; seen
+    /// 2026-09-24), and none for an init's resume of a device that was not
+    /// paused.
     pub const DEVICE_PAUSED: u32 = 3110;
-    /// Unknown; `u32 3` once at init, the value command 3170 also returns.
+    /// `u32 3`, once at init, right after the tracker's answer to the init
+    /// replay's command 3160; command 3170 returns the same value. The DLL
+    /// hands it to the application as
+    /// `TOBII_NOTIFICATION_TYPE_COMBINED_GAZE_EYE_SELECTION_CHANGED`
+    /// (builder 0x18018830b, dispatcher 0x18016c933): 1 left, 2 right,
+    /// anything else both.
     pub const STATE_3180: u32 = 3180;
     /// The tracker's fault list changed: one string, the new list, as
     /// status string 5 of command 1490 carries it. From the DLL only: its
