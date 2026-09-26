@@ -370,8 +370,8 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   Implemented: gaze point (the device's filtered combined gaze, unclamped —
   bit-identical to what the Windows Stream Engine delivers), gaze origin
   (display frame, mm), eye position and user position guide (track-box
-  normalised), gaze data (per eye, tracker frame; no pupil diameter on this
-  device), presence (on change), head pose (mm, radians about x/y/z), the IR
+  normalised), gaze data (per eye, tracker frame, with the pupil diameter),
+  presence (on change), head pose (mm, radians about x/y/z), the IR
   image (280×280, `tobii_image_subscribe`), notifications (display area,
   calibration, pause), device info, track box, display area (get and set —
   kept across re-inits and, like the Stream Engine, across sessions),

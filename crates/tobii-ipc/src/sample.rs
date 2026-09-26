@@ -187,8 +187,9 @@ pub enum ServerMsg {
         /// per axis, unclamped (the Stream Engine passes looks off-screen
         /// through).
         xy: [f32; 2],
-        /// Pupil diameter `[left, right]` in millimetres; `NaN` when the daemon
-        /// did not send the optional tail.
+        /// Pupil diameter `[left, right]` in millimetres; `NaN` for an eye
+        /// whose diameter is not valid, and for both when the daemon did not
+        /// send the optional tail.
         pupil_mm: [f32; 2],
     },
     /// User presence.

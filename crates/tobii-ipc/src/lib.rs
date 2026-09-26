@@ -81,7 +81,7 @@ pub const TAG_REPLY: u8 = 0x11;
 /// Daemon -> client: `i64 ts_us`, `3 x f32` position (mm), `3 x f32` rotation (rad).
 pub const TAG_HEAD: u8 = 0x20;
 /// Daemon -> client: `i64 ts_us`, `u8 valid`, `2 x f32` xy, then an optional
-/// `2 x f32` pupil-diameter tail (mm, left/right).
+/// `2 x f32` pupil-diameter tail (mm, left/right, `NaN` when not valid).
 pub const TAG_GAZE: u8 = 0x21;
 /// Daemon -> client: `i64 ts_us`, `u8 status` (`PRESENCE_*`).
 pub const TAG_PRESENCE: u8 = 0x22;

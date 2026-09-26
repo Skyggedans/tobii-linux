@@ -5,11 +5,13 @@
 //! goes out mirrors the Stream Engine: the gaze point is the device's
 //! filtered combined point, unclamped; gaze origins are in the display frame
 //! and gaze data in the tracker frame, both as the device sends them; values
-//! are passed through with their validity flags; every timestamp is the
-//! sample's host time (the engine's `host_us`, on
-//! [`tobii_ipc::host_clock_us`]), bar gaze data's tracker time, which stays
-//! the device clock. Gaze data's system time is that tracker time on the
-//! host clock, as in the Stream Engine, not the time the frame was read.
+//! are passed through with their validity flags (the GAZE frame's pupil
+//! tail, which has none, sends `NaN` for an eye whose diameter is not
+//! valid); every timestamp is the sample's host time (the engine's
+//! `host_us`, on [`tobii_ipc::host_clock_us`]), bar gaze data's tracker
+//! time, which stays the device clock. Gaze data's system time is that
+//! tracker time on the host clock, as in the Stream Engine, not the time the
+//! frame was read.
 
 use tobii_ipc::{
     EyePair, EyePoint, GazeData, GazeDataEye, Notification, NotificationValue, PRESENCE_AWAY,
@@ -42,8 +44,10 @@ fn point(v: Valued<[f64; 3]>) -> EyePoint {
 
 /// The per-eye fields of `tobii_gaze_data_t`. The device reports the 3-D
 /// points in the tracker frame, the Stream Engine's frame for them, so they
-/// pass through as they are, whatever the display area.
+/// pass through as they are, whatever the display area. The pupil diameter
+/// is valid while the eye's status is below 2, as in the Stream Engine.
 fn gaze_data_eye(eye: &EyeFrame) -> GazeDataEye {
+    let [pupil] = f32s([eye.pupil_diameter_mm.value]);
     GazeDataEye {
         gaze_origin_valid: eye.origin_tracker_mm.valid,
         gaze_origin_mm: f32s(eye.origin_tracker_mm.value),
@@ -53,10 +57,18 @@ fn gaze_data_eye(eye: &EyeFrame) -> GazeDataEye {
         gaze_point_on_display: f32s(eye.gaze_point_norm.value),
         eyeball_center_valid: eye.eyeball_center_mm.valid,
         eyeball_center_mm: f32s(eye.eyeball_center_mm.value),
-        // The ET5 wire carries no pupil diameter (see tobii_proto::gaze83).
-        pupil_valid: false,
-        pupil_diameter_mm: 0.0,
+        pupil_valid: eye.pupil_diameter_mm.valid,
+        pupil_diameter_mm: pupil,
     }
+}
+
+/// The GAZE frame's pupil tail: each eye's diameter, `NaN` when not valid.
+fn pupil_tail(frame: &GazeFrame) -> [f32; 2] {
+    let mm = |p: Valued<f64>| if p.valid { p.value } else { f64::NAN };
+    f32s([
+        mm(frame.left.pupil_diameter_mm),
+        mm(frame.right.pupil_diameter_mm),
+    ])
 }
 
 fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
@@ -68,7 +80,7 @@ fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
                 g.host_us,
                 frame.gaze.valid,
                 f32s(frame.gaze.value),
-                [f32::NAN; 2],
+                pupil_tail(frame),
             ),
         ));
     }
@@ -274,10 +286,66 @@ mod tests {
         match &all[3].1 {
             ServerMsg::GazeData(data) => {
                 assert!(data.left.gaze_point_valid && data.right.gaze_point_valid);
-                assert!(!data.left.pupil_valid);
+                assert!(data.left.pupil_valid && data.right.pupil_valid);
             }
             other => panic!("expected gaze data, got {other:?}"),
         }
+    }
+
+    /// The session1 frame's keys `0x06`/`0x0c`, 16.16, as the DLL's f32.
+    #[allow(clippy::cast_possible_truncation)] // reason: exact in f32
+    fn session1_pupils() -> [f32; 2] {
+        [0x0006_3f53, 0x0005_ff22].map(|raw: i32| (f64::from(raw) / 65_536.0) as f32)
+    }
+
+    /// Gaze data's pupil diameters are keys `0x06`/`0x0c` narrowed to f32, as
+    /// the Stream Engine hands them out, and the GAZE frame's pupil tail
+    /// carries the same values.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: 16.16 values narrow to f32 exactly
+    fn gaze_data_and_the_gaze_tail_carry_the_pupil_diameters() {
+        let wanted = STREAM_GAZE | STREAM_GAZE_DATA;
+        let [
+            (_, ServerMsg::Gaze { pupil_mm, .. }),
+            (_, ServerMsg::GazeData(data)),
+        ] = &frames(&session1_sample(), wanted)[..]
+        else {
+            panic!("the gaze sample did not give its gaze and gaze data");
+        };
+
+        let expected = session1_pupils();
+        assert_eq!(*pupil_mm, expected);
+        assert!(data.left.pupil_valid && data.right.pupil_valid);
+        assert_eq!(
+            [data.left.pupil_diameter_mm, data.right.pupil_diameter_mm],
+            expected
+        );
+    }
+
+    /// An eye whose pupil is not valid (its status 2 or more) keeps its
+    /// diameter in gaze data, marked invalid, as the Stream Engine passes it,
+    /// and is `NaN` in the GAZE frame's tail, which has no validity.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: 16.16 values narrow to f32 exactly
+    fn an_invalid_pupil_is_flagged_in_gaze_data_and_nan_in_the_gaze_tail() {
+        let bytes = fixture("session1-gaze-frame");
+        let mut frame = decode_gaze_frame(&parse_message(&bytes).expect("msg")).expect("frame");
+        frame.left.pupil_diameter_mm.valid = false;
+        let sample = Sample::Gaze(Box::new(GazeSample::new(frame, READ_US, HOST_US)));
+
+        let [
+            (_, ServerMsg::Gaze { pupil_mm, .. }),
+            (_, ServerMsg::GazeData(data)),
+        ] = &frames(&sample, STREAM_GAZE | STREAM_GAZE_DATA)[..]
+        else {
+            panic!("the gaze sample did not give its gaze and gaze data");
+        };
+
+        let [left, right] = session1_pupils();
+        assert!(pupil_mm[0].is_nan());
+        assert_eq!(pupil_mm[1], right);
+        assert!(!data.left.pupil_valid && data.right.pupil_valid);
+        assert_eq!(data.left.pupil_diameter_mm, left);
     }
 
     /// Gaze data's 3-D gaze point is keys `0x04`/`0x0a` as the device sends

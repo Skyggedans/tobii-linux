@@ -16,9 +16,12 @@
 //! The track-box position (`0x03`/`0x09`) and those 2-D points are
 //! normalised, not in mm.
 //!
-//! There is no pupil diameter on this wire. The fields that decode.rs labels
-//! `pupil_*` (keys `0x25`/`0x27`, third component) track the eye's range, not
-//! its pupil, and keys `0x06`/`0x0c` are an unidentified quantity.
+//! The pupil diameters, in mm, are keys `0x06`/`0x0c` (16.16): the Stream
+//! Engine hands them out as gaze data's `pupil_diameter_mm`, valid while the
+//! eye's status (`0x07`/`0x0d`) is below 2 (0x18017199a..0x1801719af). They
+//! do not shrink with the eye's distance, as a size in camera pixels would.
+//! The fields that decode.rs labels `pupil_*` (keys `0x25`/`0x27`, third
+//! component) are not the pupil: they track the eye's range.
 
 use crate::protocol::{Message, STREAM_ID_GAZE, STREAM_ID_PRESENCE};
 use crate::tlv::{UNITS_PER_MM, keyed_fields};
@@ -43,6 +46,8 @@ pub mod key {
     pub struct Eye {
         /// Tracking status: 0 tracked, 4 not tracked.
         pub status: u32,
+        /// Pupil diameter, mm, 16.16.
+        pub pupil: u32,
         /// Cornea centre (gaze origin), tracker frame.
         pub origin_tracker: u32,
         /// Validity of `origin_tracker`.
@@ -66,6 +71,7 @@ pub mod key {
     /// The user's left eye.
     pub const LEFT: Eye = Eye {
         status: 0x07,
+        pupil: 0x06,
         origin_tracker: 0x02,
         origin_tracker_valid: 0x16,
         origin_display: 0x22,
@@ -80,6 +86,7 @@ pub mod key {
     /// The user's right eye.
     pub const RIGHT: Eye = Eye {
         status: 0x0d,
+        pupil: 0x0c,
         origin_tracker: 0x08,
         origin_tracker_valid: 0x15,
         origin_display: 0x24,
@@ -118,6 +125,10 @@ pub struct EyeFrame {
     pub gaze_point_norm: Valued<[f64; 2]>,
     /// Eyeball rotation centre, tracker frame, mm.
     pub eyeball_center_mm: Valued<[f64; 3]>,
+    /// Pupil diameter, mm; valid, as the Stream Engine judges it, while the
+    /// eye's status is below 2. Unlike it, not valid when the frame lacks
+    /// either key (see [`decode_gaze_frame`]).
+    pub pupil_diameter_mm: Valued<f64>,
 }
 
 /// One decoded 0x500 message.
@@ -157,7 +168,8 @@ pub fn decode_gaze_frame(msg: &Message<'_>) -> Option<GazeFrame> {
     let scaled = |v: [f64; 3]| v.map(|c| c / UNITS_PER_MM);
 
     let eye = |k: key::Eye| {
-        let tracked = fields.scalar(k.status) == Some(0);
+        let status = fields.scalar(k.status);
+        let tracked = status == Some(0);
         let point3 = |key: u32| fields.point::<3>(key);
         let flagged3 = |key: u32, valid: u32| {
             point3(key).map_or_else(Valued::default, |v| Valued {
@@ -186,6 +198,17 @@ pub fn decode_gaze_frame(msg: &Message<'_>) -> Option<GazeFrame> {
                     value: v.map(|c| c / UNITS_PER_MM),
                 }),
             eyeball_center_mm: unflagged3(k.eyeball),
+            // The Stream Engine's test (0x180171818, 0x180171844). A frame
+            // without the status or the diameter, which the ET5 never sends,
+            // gives none. The Stream Engine, reading its zeroed record
+            // (0x18018dadd), would take a missing status as 0 and a missing
+            // diameter as a valid 0.0 mm; libtobii reports neither as valid.
+            pupil_diameter_mm: fields
+                .fixed16(k.pupil)
+                .map_or_else(Valued::default, |v| Valued {
+                    valid: status.is_some_and(|s| s < 2),
+                    value: v,
+                }),
         }
     };
 
@@ -238,6 +261,7 @@ pub fn decode_presence_frame(msg: &Message<'_>) -> Option<PresenceFrame> {
 mod tests {
     use super::*;
     use crate::protocol::parse_message;
+    use crate::tlv::{KEY_FIELD_ID, TYPE_FIELD_ID, TYPE_U32};
     use tobii_ipc::geometry::tracker_to_display;
 
     /// Frame 43780 of session1: what the Windows Stream Engine delivered for
@@ -323,6 +347,95 @@ mod tests {
             assert!(z.abs() < 1e-3, "{z} mm off the screen");
             assert!((x / width + 0.5 - u).abs() < 1e-4, "{x} vs {u}");
             assert!((0.5 - y / height - v).abs() < 1e-4, "{y} vs {v}");
+        }
+    }
+
+    /// The 0x500 fixture frame.
+    fn session1() -> Vec<u8> {
+        crate::fixture!("session1-gaze-frame")
+    }
+
+    /// Where the key word of keyed field `key` sits in a message, after
+    /// `05 KEY_FIELD_ID 02`; the field's value follows it.
+    fn key_at(bytes: &[u8], key: u32) -> usize {
+        let mut announce = vec![TYPE_FIELD_ID, 0, 0, 0, 4];
+        announce.extend_from_slice(&KEY_FIELD_ID.to_be_bytes());
+        announce.extend_from_slice(&[TYPE_U32, 0, 0, 0, 4]);
+        let start = announce.len();
+        announce.extend_from_slice(&key.to_be_bytes());
+        bytes
+            .windows(announce.len())
+            .position(|w| w == announce)
+            .expect("the key")
+            + start
+    }
+
+    /// `bytes` with the 4-byte scalar of keyed field `key` set to `value`.
+    fn with_scalar(mut bytes: Vec<u8>, key: u32, value: u32) -> Vec<u8> {
+        // The key word, then the value's type byte and u32 length.
+        let at = key_at(&bytes, key) + 4 + 5;
+        bytes[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> GazeFrame {
+        decode_gaze_frame(&parse_message(bytes).expect("message")).expect("gaze frame")
+    }
+
+    /// Keys `0x06`/`0x0c`, 16.16, are what the Stream Engine hands out as gaze
+    /// data's `pupil_diameter_mm`.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: 16.16 values decode exactly
+    fn the_pupil_diameters_are_keys_06_and_0c() {
+        let frame = decode(&session1());
+
+        assert_eq!(
+            frame.left.pupil_diameter_mm,
+            Valued {
+                valid: true,
+                value: 6.247_360_229_492_187_5
+            }
+        );
+        assert_eq!(
+            frame.right.pupil_diameter_mm,
+            Valued {
+                valid: true,
+                value: 5.996_612_548_828_125
+            }
+        );
+    }
+
+    /// The Stream Engine's pupil validity is the eye's status below 2
+    /// (0x180171818, 0x180171844): the ET5's 4 (not tracked) clears it. The
+    /// diameter is passed through either way, as the Stream Engine does.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: 16.16 values decode exactly
+    fn a_pupil_is_valid_while_the_eye_status_is_below_2() {
+        for (status, valid) in [(0, true), (1, true), (2, false), (4, false)] {
+            let frame = decode(&with_scalar(session1(), key::RIGHT.status, status));
+
+            assert_eq!(frame.right.pupil_diameter_mm.valid, valid, "{status}");
+            assert_eq!(frame.right.pupil_diameter_mm.value, 5.996_612_548_828_125);
+            assert!(frame.left.pupil_diameter_mm.valid, "the other eye");
+        }
+    }
+
+    /// A frame without the eye's status or pupil key reports no pupil for
+    /// that eye; the ET5 sends both in every frame. This departs from the
+    /// Stream Engine on purpose: its zeroed record would read a missing
+    /// status as 0 and a missing diameter as a valid 0.0 mm.
+    #[test]
+    fn a_missing_status_or_pupil_gives_no_pupil() {
+        for missing in [key::LEFT.status, key::LEFT.pupil] {
+            let mut bytes = session1();
+            let at = key_at(&bytes, missing);
+            // A key the ET5 never sends.
+            bytes[at..at + 4].copy_from_slice(&0x0fu32.to_be_bytes());
+
+            let frame = decode(&bytes);
+
+            assert!(!frame.left.pupil_diameter_mm.valid, "{missing:#x}");
+            assert!(frame.right.pupil_diameter_mm.valid);
         }
     }
 

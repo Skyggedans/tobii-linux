@@ -295,8 +295,6 @@ tools/abi/dll_abi.py headers                                 # headers vs tobii_
   per-eye calibration were never captured and are not supported. Discarding a
   2-D point and pausing the tracker send the commands the DLL sends for them
   (1080, and 3100 with 1), which were never captured.
-- The ET5 reports no pupil diameter; `tobii_gaze_data_t.pupil_validity` is
-  always invalid.
 
 ## License
 

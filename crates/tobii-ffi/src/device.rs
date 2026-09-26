@@ -1104,6 +1104,55 @@ pub(crate) mod tests {
         );
     }
 
+    unsafe extern "C" fn keep_gaze_data(p: *const GazeData, ud: *mut c_void) {
+        // SAFETY: the test passes `&raw mut Option<GazeData>` as `ud`, which
+        // outlives the device; `p` is a live sample for the call.
+        unsafe { *ud.cast::<Option<GazeData>>() = Some(*p) };
+    }
+
+    /// Gaze data's pupil diameters reach the application as the daemon sent
+    /// them: a valid one, and an invalid one still passed on, as the Stream
+    /// Engine does.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: the values go through unchanged
+    fn gaze_data_hands_on_the_pupil_diameters() {
+        let eye = |pupil_valid, pupil_diameter_mm| tobii_ipc::GazeDataEye {
+            pupil_valid,
+            pupil_diameter_mm,
+            ..tobii_ipc::GazeDataEye::default()
+        };
+        let frame = tobii_ipc::encode_gaze_data(&tobii_ipc::GazeData {
+            left: eye(true, 6.25),
+            right: eye(false, 6.0),
+            ..tobii_ipc::GazeData::default()
+        });
+        // Sent ahead of the ack, so that it waits for `process`.
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![frame.clone(), encode_subscribed(true)],
+            _ => vec![],
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut seen: Option<GazeData> = None;
+        let ud = (&raw mut seen).cast::<c_void>();
+
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_data, Some(keep_gaze_data as GazeDataFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+
+        let data = seen.expect("gaze data");
+        assert_eq!(
+            (data.left.pupil_validity, data.left.pupil_diameter_mm),
+            (TOBII_VALIDITY_VALID, 6.25)
+        );
+        assert_eq!(
+            (data.right.pupil_validity, data.right.pupil_diameter_mm),
+            (TOBII_VALIDITY_INVALID, 6.0)
+        );
+    }
+
     unsafe extern "C" fn reenter(_p: *const EyePair, ud: *mut c_void) {
         // SAFETY: the test passes `&raw mut Status` as `ud`.
         let out = unsafe { &mut *ud.cast::<Status>() };

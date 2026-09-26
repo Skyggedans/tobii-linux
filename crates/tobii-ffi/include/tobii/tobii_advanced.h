@@ -14,8 +14,10 @@
 extern "C" {
 #endif
 
-/* Tracker frame, mm (origin at the tracker, z towards the user). The ET5
- * reports no pupil diameter: pupil_validity is always INVALID. */
+/* Tracker frame, mm (origin at the tracker, z towards the user). The pupil
+ * diameter, in mm, is the tracker's own, as the DLL hands it out: valid
+ * while the eye's status is below 2, as in the DLL (the ET5 sends 0 for a
+ * tracked eye, 4 for a lost one), and passed on when it is not. */
 typedef struct tobii_gaze_data_eye_t
 {
     tobii_validity_t gaze_origin_validity;

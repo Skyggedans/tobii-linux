@@ -10,8 +10,9 @@ use crate::stub::not_supported;
 use crate::types::GazeDataFn;
 
 /// Per-eye gaze data: origins, gaze points and eyeball centres in the tracker
-/// frame, normalised positions and display gaze points. The ET5 reports no
-/// pupil diameter, so `pupil_validity` is always invalid.
+/// frame, normalised positions and display gaze points, and pupil diameters,
+/// valid while the eye's status is below 2, as in the Stream Engine (the ET5
+/// sends 0 for a tracked eye, 4 for a lost one).
 ///
 /// # Safety
 /// As the subscribe functions in `tobii_streams.h`.

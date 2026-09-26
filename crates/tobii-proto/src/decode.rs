@@ -4,8 +4,10 @@
 //!
 //! Field ids: `0x00021f40` carries 2-D gaze/eye points (occ1 = left eye,
 //! occ3 = right eye) in a 0..1024 screen space; `0x00031f41` carries 3-D head
-//! points in µm (occ4/occ9 = eyeball rotation centres, occ10/occ11 = pupil
-//! diameters). See the stream-0x83 field map for the full table.
+//! points in µm (occ4/occ9 = eyeball rotation centres; occ10/occ11 are keys
+//! `0x25`/`0x27`, whose third component, reported as `pupil_*`, tracks the
+//! eye's range, not its pupil, which is keys `0x06`/`0x0c`: see
+//! [`crate::gaze83`]). See the stream-0x83 field map for the full table.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -41,8 +43,10 @@ const FIXED_POINT_ONE: f64 = 4_294_967_296.0;
 /// ≈120–125 mm) — user/mounting dependent, hence a single tunable constant.
 pub const HEAD_ROLL_LEVER_UM: f64 = 137_000.0;
 
-/// Pupil diameter is reported in hundredths of a millimeter (raw 342 ≈ 3.42 mm;
-/// binocular readings track to r ≈ 1.0). occ10 comp2 = left, occ11 comp2 = right.
+/// Scale of the `pupil_*` columns: occ10 comp2 = left, occ11 comp2 = right
+/// (keys `0x25`/`0x27`), over 100 (raw 342 → 3.42). Despite the name these
+/// track the eye's range, not its pupil; the pupil diameter is
+/// [`crate::gaze83::EyeFrame::pupil_diameter_mm`] (keys `0x06`/`0x0c`).
 pub const PUPIL_RAW_PER_MM: f64 = 100.0;
 
 /// Raw stream fields written to the decoded CSV, in column order.
@@ -188,9 +192,10 @@ pub struct TrackingFrame {
     pub head_pitch: Option<f64>,
     /// Head roll (degrees) from the inter-eye line.
     pub head_roll: Option<f64>,
-    /// Left pupil diameter (mm).
+    /// Key `0x25`'s third component / 100: range-like, not the left pupil
+    /// (that is [`crate::gaze83::EyeFrame::pupil_diameter_mm`]).
     pub pupil_left: Option<f64>,
-    /// Right pupil diameter (mm).
+    /// Key `0x27`'s third component / 100: range-like, not the right pupil.
     pub pupil_right: Option<f64>,
 }
 
@@ -347,9 +352,9 @@ pub fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
     // None rather than a translation artifact dressed up as an angle.
     let head_yaw = None;
     let head_pitch = None;
-    // Pupil diameters (occ10 = left, occ11 = right; comp2), converted to mm.
-    // Gaze-invariant and binocular-correlated — a genuine attention/arousal
-    // and blink signal, independent of the head-pose channels above.
+    // The `pupil_*` columns: occ10 = left, occ11 = right (keys 0x25/0x27),
+    // comp2, / 100. Despite the name they track the eye's range, not its
+    // pupil; the pupil diameter is keys 0x06/0x0c (see crate::gaze83).
     let pupil_left =
         field_value(values, LiveField::new("", 0x00031f41, 10, 2)).map(|v| v / PUPIL_RAW_PER_MM);
     let pupil_right =
@@ -576,8 +581,8 @@ mod tests {
     #[test]
     fn pupil_diameters_scaled_to_mm() {
         let mut values = BTreeMap::new();
-        values.insert((0x00031f41, 10, 2), 342.0); // left pupil, hundredths of mm
-        values.insert((0x00031f41, 11, 2), 335.0); // right pupil
+        values.insert((0x00031f41, 10, 2), 342.0); // pupil_left: key 0x25 comp2
+        values.insert((0x00031f41, 11, 2), 335.0); // pupil_right: key 0x27 comp2
 
         let derived = derive_live_values(&values);
         assert!((derived[19].expect("pupil_left") - 3.42).abs() < 1e-9);
