@@ -1,5 +1,6 @@
 //! The API and device handles: a device is a connection to the `tobiid`
-//! daemon with a reader thread feeding decoded messages into a channel, the
+//! daemon with a reader thread sorting decoded messages into two channels
+//! (the answers to requests and subscription changes, and the samples), the
 //! registered callbacks, and a synchronous request/reply helper.
 //!
 //! Invariant: every stored callback was registered through the matching
@@ -118,34 +119,87 @@ enum LinkState {
     Reported,
 }
 
-/// One daemon connection and the thread reading it.
+/// What tobiid answers a request or a subscription change with: the
+/// messages a call waits for, as against the samples `process` delivers.
+#[derive(Debug)]
+enum Answer {
+    /// A subscription change's ack: whether the daemon took the streams.
+    Subscribed(bool),
+    /// A request's reply.
+    Reply {
+        /// The id the request carried.
+        request_id: u32,
+        /// A Stream Engine `tobii_error_t` value; `0` is success.
+        status: u8,
+        /// Kind-specific payload.
+        payload: Vec<u8>,
+    },
+}
+
+impl TryFrom<ServerMsg> for Answer {
+    /// Anything else: a sample, or a message kind a newer daemon may add.
+    type Error = ServerMsg;
+
+    fn try_from(msg: ServerMsg) -> Result<Self, ServerMsg> {
+        match msg {
+            ServerMsg::Subscribed { ok } => Ok(Self::Subscribed(ok)),
+            ServerMsg::Reply {
+                request_id,
+                status,
+                payload,
+            } => Ok(Self::Reply {
+                request_id,
+                status,
+                payload,
+            }),
+            other => Err(other),
+        }
+    }
+}
+
+/// One daemon connection and the thread reading it, which sorts what the
+/// daemon sends into two channels, each in the order it came: the answers,
+/// read only by a request or subscription change waiting for its own, and
+/// the samples, read only by `wait`, `process` and `clear_buffers`. A call
+/// waiting for its answer leaves the samples where they are, and an answer
+/// nobody waits for any more never wakes `wait`.
 struct Link {
     stream: UnixStream,
-    rx: Receiver<ServerMsg>,
+    answers: Receiver<Answer>,
+    samples: Receiver<ServerMsg>,
     reader: Option<JoinHandle<()>>,
     /// Kept with the link, so a new one (a reconnect) starts `Up` and a later
     /// loss is reported again.
     state: LinkState,
+    /// The acks still to come for subscription changes that gave up waiting.
+    /// tobiid acks every change on a connection, in order, so the next this
+    /// many acks are theirs, and a later change reads past them to its own
+    /// rather than take a late one for it. A reply needs no count: it names
+    /// its request. Kept with the link, so a new one owes none.
+    acks_owed: u32,
 }
 
 impl Link {
     fn open(connect: &mut Connector) -> io::Result<Self> {
         let stream = connect()?;
         let reader_stream = stream.try_clone()?;
-        let (tx, rx) = mpsc::channel();
+        let (answers_tx, answers) = mpsc::channel();
+        let (samples_tx, samples) = mpsc::channel();
         let reader = thread::Builder::new()
             .name("tobii-ffi-reader".into())
-            .spawn(move || reader_loop(reader_stream, &tx))?;
+            .spawn(move || reader_loop(reader_stream, &answers_tx, &samples_tx))?;
         Ok(Self {
             stream,
-            rx,
+            answers,
+            samples,
             reader: Some(reader),
             state: LinkState::Up,
+            acks_owed: 0,
         })
     }
 
     /// Close the connection and join the reader. Everything it read is then
-    /// in the channel, followed by a disconnect.
+    /// in the channels, each followed by a disconnect.
     fn close(&mut self) {
         // Shutting down the socket makes the reader's blocking read return, so
         // the join below cannot hang; a shutdown error only means it is already
@@ -183,10 +237,11 @@ impl Link {
         })
     }
 
-    /// Wait up to `timeout` for the next message.
-    fn recv(&mut self, timeout: Duration) -> Result<ServerMsg, Status> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(msg) => Ok(msg),
+    /// Wait up to `timeout` for the daemon's next answer. The samples that
+    /// arrive meanwhile stay queued for `process`.
+    fn recv_answer(&mut self, timeout: Duration) -> Result<Answer, Status> {
+        match self.answers.recv_timeout(timeout) {
+            Ok(answer) => Ok(answer),
             Err(RecvTimeoutError::Timeout) => Err(TOBII_ERROR_TIMED_OUT),
             Err(RecvTimeoutError::Disconnected) => {
                 self.lose();
@@ -195,21 +250,36 @@ impl Link {
         }
     }
 
+    /// Drop an ack that no subscription change waits for: the late one of a
+    /// change that gave up, which is then owed no more.
+    fn late_ack(&mut self) {
+        if let Some(owed) = self.acks_owed.checked_sub(1) {
+            self.acks_owed = owed;
+            tracing::debug!(owed, "late subscription ack dropped");
+        } else {
+            tracing::debug!("subscription ack nobody asked for dropped");
+        }
+    }
+
     /// Subscribe to the streams in `mask` and wait up to `timeout` for the
-    /// daemon's ack, queueing in `pending` any samples that arrive meanwhile.
-    /// Returns the ack's `ok` flag.
-    fn send_subscription(
-        &mut self,
-        mask: u32,
-        timeout: Duration,
-        pending: &mut VecDeque<ServerMsg>,
-    ) -> Result<bool, Status> {
+    /// daemon's ack, reading past the late ones still owed (see
+    /// [`Link::acks_owed`]). Returns the ack's `ok` flag. Giving up leaves
+    /// its ack owed.
+    fn send_subscription(&mut self, mask: u32, timeout: Duration) -> Result<bool, Status> {
         self.send(&encode_subscribe(mask))?;
         let deadline = Instant::now() + timeout;
         loop {
-            match self.recv(deadline.saturating_duration_since(Instant::now()))? {
-                ServerMsg::Subscribed { ok } => return Ok(ok),
-                other => pending.push_back(other),
+            match self.recv_answer(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Answer::Subscribed(ok)) if self.acks_owed == 0 => return Ok(ok),
+                Ok(Answer::Subscribed(_)) => self.late_ack(),
+                Ok(Answer::Reply { request_id, .. }) => {
+                    tracing::debug!(request_id, "stale reply dropped");
+                }
+                Err(TOBII_ERROR_TIMED_OUT) => {
+                    self.acks_owed = self.acks_owed.saturating_add(1);
+                    return Err(TOBII_ERROR_TIMED_OUT);
+                }
+                Err(status) => return Err(status),
             }
         }
     }
@@ -221,13 +291,19 @@ impl Drop for Link {
     }
 }
 
-/// Pump frames from the daemon into `tx` until EOF, a read error, or the
-/// receiving `Device` going away.
-fn reader_loop(mut stream: UnixStream, tx: &Sender<ServerMsg>) {
+/// Pump frames from the daemon until EOF, a read error, or the receiving
+/// `Link` going away: answers into `answers`, and everything else (the
+/// samples, and message kinds a newer daemon may add) into `samples`.
+fn reader_loop(mut stream: UnixStream, answers: &Sender<Answer>, samples: &Sender<ServerMsg>) {
     while let Ok(Some(body)) = read_frame(&mut stream) {
-        if let Some(msg) = decode_server(&body)
-            && tx.send(msg).is_err()
-        {
+        let Some(msg) = decode_server(&body) else {
+            continue;
+        };
+        let sent = match Answer::try_from(msg) {
+            Ok(answer) => answers.send(answer).is_ok(),
+            Err(sample) => samples.send(sample).is_ok(),
+        };
+        if !sent {
             break;
         }
     }
@@ -376,14 +452,11 @@ impl Device {
         self.link.send(body)
     }
 
-    /// Resend the subscription mask and wait for the daemon's ack, queueing
-    /// any samples that arrive meanwhile. Returns the ack's `ok` flag.
+    /// Resend the subscription mask and wait for the daemon's ack (see
+    /// [`Link::send_subscription`]). Returns the ack's `ok` flag.
     fn resend_subscription(&mut self) -> Result<bool, Status> {
-        self.link.send_subscription(
-            self.callbacks.mask(),
-            SUBSCRIBE_ACK_TIMEOUT,
-            &mut self.pending,
-        )
+        self.link
+            .send_subscription(self.callbacks.mask(), SUBSCRIBE_ACK_TIMEOUT)
     }
 
     /// Register `callback` in `slot` and subscribe its stream. The Stream
@@ -436,9 +509,12 @@ impl Device {
         }
     }
 
-    /// Send a request and wait up to `timeout` for its reply, queueing the
-    /// samples that arrive first. A reply with a non-zero status is that
-    /// status.
+    /// Send a request and wait up to `timeout` for its reply, dropping the
+    /// stale replies of requests that gave up, and the late acks it reads
+    /// past, which are then owed no more (see [`Link::acks_owed`]; no
+    /// subscription change waits at the same time). The samples that arrive
+    /// meanwhile stay queued for `process`. A reply with a non-zero status is
+    /// that status.
     pub(crate) fn request(
         &mut self,
         kind: u8,
@@ -452,9 +528,9 @@ impl Device {
         loop {
             match self
                 .link
-                .recv(deadline.saturating_duration_since(Instant::now()))?
+                .recv_answer(deadline.saturating_duration_since(Instant::now()))?
             {
-                ServerMsg::Reply {
+                Answer::Reply {
                     request_id,
                     status,
                     payload,
@@ -465,10 +541,10 @@ impl Device {
                         Err(Status::from(status))
                     };
                 }
-                ServerMsg::Reply { request_id, .. } => {
+                Answer::Reply { request_id, .. } => {
                     tracing::debug!(request_id, "stale reply dropped");
                 }
-                other => self.pending.push_back(other),
+                Answer::Subscribed(_) => self.link.late_ack(),
             }
         }
     }
@@ -488,9 +564,9 @@ impl Device {
     /// nothing to send first, so the daemon may still drop an engine that
     /// only the old connection's requests kept, until the next request.
     /// Samples queued from the old link are dropped. The new link starts up,
-    /// so its loss is reported again. The device info is fetched again: a
-    /// restarted daemon may serve another tracker. Each failure is logged at
-    /// ERROR, a success at INFO.
+    /// so its loss is reported again, and owes no acks. The device info is
+    /// fetched again: a restarted daemon may serve another tracker. Each
+    /// failure is logged at ERROR, a success at INFO.
     pub(crate) fn reconnect(&mut self) -> Status {
         let mut link = match Link::open(&mut self.connect) {
             Ok(link) => link,
@@ -502,10 +578,9 @@ impl Device {
                 return TOBII_ERROR_CONNECTION_FAILED;
             }
         };
-        let mut pending = VecDeque::new();
         let mask = self.callbacks.mask();
         if mask != 0 {
-            let why = match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT, &mut pending) {
+            let why = match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT) {
                 Ok(true) => None,
                 Ok(false) => Some("refused them"),
                 Err(TOBII_ERROR_TIMED_OUT) => Some("did not acknowledge them in time"),
@@ -523,16 +598,17 @@ impl Device {
             }
         }
         self.link = link;
-        self.pending = pending;
+        self.pending.clear();
         self.device_info = None;
         self.log(Level::Info, format_args!("reconnected to tobiid"));
         TOBII_ERROR_NO_ERROR
     }
 
     /// Drop every queued sample. A lost connection stays lost, and a loss not
-    /// reported yet is still reported.
+    /// reported yet is still reported. The answers are left alone: a late ack
+    /// dropped here would still be counted as owed.
     pub(crate) fn clear_buffers(&mut self) {
-        while self.link.rx.try_recv().is_ok() {}
+        while self.link.samples.try_recv().is_ok() {}
         self.pending.clear();
     }
 
@@ -540,13 +616,14 @@ impl Device {
     /// it: a queued sample, or a lost connection it has not reported yet.
     /// Once it has, nothing arrives until a reconnect, so this sleeps out
     /// `timeout` and says no, as for a quiet link; answering at once would
-    /// spin a wait-and-process loop.
+    /// spin a wait-and-process loop. An answer (a stale reply, a late ack)
+    /// is nothing to process and does not wake it.
     pub(crate) fn wait(&mut self, timeout: Duration) -> bool {
         if !self.pending.is_empty() {
             return true;
         }
         if self.link.state == LinkState::Up {
-            match self.link.rx.recv_timeout(timeout) {
+            match self.link.samples.recv_timeout(timeout) {
                 Ok(msg) => {
                     self.pending.push_back(msg);
                     return true;
@@ -570,7 +647,7 @@ impl Device {
     #[must_use]
     pub(crate) fn process(&mut self) -> Status {
         loop {
-            match self.link.rx.try_recv() {
+            match self.link.samples.try_recv() {
                 Ok(msg) => self.pending.push_back(msg),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -705,8 +782,8 @@ impl Device {
                     call(|| unsafe { f(&raw const c, ud) });
                 }
             }
-            // Acks and replies nobody waited for, and message kinds a newer
-            // daemon may add: nothing to deliver.
+            // Message kinds a newer daemon may add: nothing to deliver. The
+            // answers never get here, the reader sorts them out.
             _ => {}
         }
     }
@@ -873,6 +950,11 @@ pub(crate) mod tests {
         Device::new(connect, 1, 1).expect("device")
     }
 
+    /// The request reads past a stale reply to its own, and leaves the
+    /// sample that came first where it was, in the samples channel, for
+    /// `process` to deliver. What a caller sees, the sample delivered, held
+    /// when the request queued it in `pending` too; that the waiting call
+    /// moves no sample is a structural check.
     #[test]
     fn a_request_gets_its_reply_and_keeps_samples_that_came_first() {
         let connect = fake_daemon(|body| {
@@ -884,11 +966,203 @@ pub(crate) mod tests {
             ]
         });
         let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut stamps = Stamps::default();
+        d.callbacks.gaze = Some((stamp_gaze as GazePointFn, (&raw mut stamps).cast()));
 
         let got = d.request(1, &[], Duration::from_secs(2));
 
         assert_eq!(got, Ok(b"answer".to_vec()));
-        assert_eq!(d.pending.len(), 1, "the gaze sample waits for process()");
+        assert!(d.pending.is_empty(), "the request moved no sample");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+        assert_eq!(stamps.gaze, 1, "the gaze sample waited for process()");
+    }
+
+    /// A subscription change, too, leaves the samples that arrive ahead of
+    /// its ack for `process`. As above, the delivery held before; that the
+    /// change moves no sample is a structural check.
+    #[test]
+    fn a_subscription_change_keeps_samples_that_came_first() {
+        let connect = fake_daemon(|body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![
+                encode_gaze_origin(&tobii_ipc::EyePair::default()),
+                encode_subscribed(true),
+            ],
+            _ => vec![],
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut hits = 0u32;
+        let ud = (&raw mut hits).cast::<c_void>();
+
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+
+        assert!(d.pending.is_empty(), "the change moved no sample");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+        assert_eq!(hits, 1, "the sample waited for process()");
+    }
+
+    /// A subscription change that gave up waiting still has its ack coming:
+    /// the next change reads past that late ack to its own answer, here a
+    /// refusal, rather than take the late one for it.
+    #[test]
+    fn a_late_subscription_ack_is_not_taken_for_the_next_change() {
+        // Leaves the first change unacked, then acks it late, ahead of its
+        // refusal of the second.
+        let mut changes = 0u32;
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                changes += 1;
+                if changes == 1 {
+                    vec![]
+                } else {
+                    vec![encode_subscribed(true), encode_subscribed(false)]
+                }
+            }
+            _ => vec![],
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        assert_eq!(
+            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            Err(TOBII_ERROR_TIMED_OUT)
+        );
+        let mut hits = 0u32;
+        let ud = (&raw mut hits).cast::<c_void>();
+
+        assert_eq!(
+            d.subscribe(|c| &mut c.eye_position, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_CONFLICTING_API_INSTANCES
+        );
+
+        assert_eq!(d.callbacks.mask(), 0, "rolled back");
+    }
+
+    /// A daemon that leaves the first subscription change unacked and
+    /// refuses every later one. It answers a client frame tagged `late` with
+    /// the first change's ack, late, followed by what `late_frames` gives for
+    /// that frame.
+    fn late_acking_daemon(
+        late: u8,
+        mut late_frames: impl FnMut(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
+    ) -> Connector {
+        let mut changes = 0u32;
+        fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                changes += 1;
+                if changes == 1 {
+                    vec![]
+                } else {
+                    vec![encode_subscribed(false)]
+                }
+            }
+            Some(&tag) if tag == late => {
+                let mut frames = vec![encode_subscribed(true)];
+                frames.extend(late_frames(body));
+                frames
+            }
+            _ => vec![],
+        })
+    }
+
+    /// A late ack that a request reads past on its way to its reply is owed
+    /// no more: the next subscription change takes its own answer at once,
+    /// rather than read past it too and give up.
+    #[test]
+    fn a_late_ack_a_request_reads_past_is_owed_no_more() {
+        let connect = late_acking_daemon(tobii_ipc::TAG_REQUEST, |body| {
+            let req = tobii_ipc::request::decode_request(body).expect("request");
+            vec![encode_reply(req.id, 0, b"answer")]
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        assert_eq!(
+            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            Err(TOBII_ERROR_TIMED_OUT)
+        );
+        assert_eq!(d.request(1, &[], LONG_WAIT), Ok(b"answer".to_vec()));
+        let mut hits = 0u32;
+        let ud = (&raw mut hits).cast::<c_void>();
+
+        let t = Instant::now();
+        assert_eq!(
+            d.subscribe(|c| &mut c.eye_position, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_CONFLICTING_API_INSTANCES
+        );
+        assert!(t.elapsed() < PROMPT);
+    }
+
+    /// Clearing the buffers drops the samples and leaves the answers: a late
+    /// ack cleared away would still be counted as owed, and the next change
+    /// would read past its own answer and give up.
+    #[test]
+    fn clearing_the_buffers_leaves_a_late_ack_to_be_read_past() {
+        // The late ack comes when the client recenters, a sample behind it.
+        let connect = late_acking_daemon(tobii_ipc::TAG_RECENTER, |_| {
+            vec![encode_gaze_origin(&tobii_ipc::EyePair::default())]
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        assert_eq!(
+            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            Err(TOBII_ERROR_TIMED_OUT)
+        );
+        assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
+        assert!(
+            d.wait(LONG_WAIT),
+            "the sample, so the ack ahead of it is in"
+        );
+        // A callback for the sample's stream, so `process` would deliver it
+        // had the clear left it.
+        let mut hits = 0u32;
+        d.callbacks.gaze_origin = Some((count_pair as EyePairFn, (&raw mut hits).cast()));
+
+        d.clear_buffers();
+
+        let t = Instant::now();
+        assert_eq!(
+            d.subscribe(
+                |c| &mut c.eye_position,
+                Some(ignore_pair as EyePairFn),
+                std::ptr::null_mut()
+            ),
+            TOBII_ERROR_CONFLICTING_API_INSTANCES
+        );
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+        assert_eq!(hits, 0, "the sample was cleared");
+    }
+
+    /// Only a sample wakes `wait`: a reply that comes after its request gave
+    /// up is nothing to process. The next subscription change reads past
+    /// that reply to its own ack, which also shows the reply was read; that
+    /// half is a guard, as it held when the reply was queued for `process`.
+    #[test]
+    fn a_stale_reply_wakes_no_wait_and_a_change_reads_past_it() {
+        let (connect, daemons) = scripted_daemon(vec![vec![
+            encode_reply(7, 0, b"stale"),
+            encode_subscribed(true),
+        ]]);
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut daemon = daemons.recv().expect("daemon end");
+
+        let t = Instant::now();
+        assert!(!d.wait(SHORT_WAIT), "nothing to process");
+        assert!(t.elapsed() >= SHORT_WAIT, "slept out the timeout");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        let t = Instant::now();
+        assert_eq!(
+            d.subscribe(
+                |c| &mut c.gaze_origin,
+                Some(ignore_pair as EyePairFn),
+                std::ptr::null_mut()
+            ),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
     }
 
     #[test]
@@ -1319,7 +1593,7 @@ pub(crate) mod tests {
     }
 
     /// Wait for the reader to see the daemon hang up, so everything the
-    /// daemon sent is in the channel before the test looks.
+    /// daemon sent is in the channels before the test looks.
     fn hung_up(d: &mut Device) {
         if let Some(h) = d.link.reader.take() {
             h.join().expect("reader");
@@ -1645,6 +1919,29 @@ pub(crate) mod tests {
         );
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         drop(new);
+    }
+
+    /// The acks owed are the old connection's: a reconnect's new connection
+    /// owes none, and takes the first ack it gets for its own. A guard: the
+    /// count is kept with the link, so a new one starts at none by
+    /// construction, and this keeps it so should the count move off it.
+    #[test]
+    fn a_reconnect_owes_none_of_the_old_connections_acks() {
+        let (connect, daemons) = scripted_daemon(vec![vec![], ack_then_gaze_origin(0)]);
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let old = daemons.recv().expect("daemon end");
+        d.callbacks.gaze_origin = Some((ignore_pair as EyePairFn, std::ptr::null_mut()));
+        assert_eq!(
+            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            Err(TOBII_ERROR_TIMED_OUT),
+            "the old connection owes its ack"
+        );
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        let mut new = daemons.recv().expect("new daemon end");
+        assert_eq!(subscription(&mut new), Some(STREAM_GAZE_ORIGIN));
+        drop((old, new));
     }
 
     unsafe extern "C" fn ignore_pair(_p: *const EyePair, _ud: *mut c_void) {}
