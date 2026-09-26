@@ -7,18 +7,19 @@
 //! and gaze data in the tracker frame, both as the device sends them; values
 //! are passed through with their validity flags (the GAZE frame's pupil
 //! tail, which has none, sends `NaN` for an eye whose diameter is not
-//! valid); every timestamp is the sample's host time (the engine's
-//! `host_us`, on [`tobii_ipc::host_clock_us`]), bar gaze data's tracker
-//! time, which stays the device clock. Gaze data's system time is that
-//! tracker time on the host clock, as in the Stream Engine, not the time the
-//! frame was read.
+//! valid); raw gaze is the Stream Engine's own record of the gaze frame,
+//! every value as sent; every timestamp is the sample's host time (the
+//! engine's `host_us`, on [`tobii_ipc::host_clock_us`]), bar gaze data's
+//! tracker time and raw gaze's time, which stay the device clock. Gaze
+//! data's system time is that tracker time on the host clock, as in the
+//! Stream Engine, not the time the frame was read.
 
 use tobii_ipc::{
-    EyePair, EyePoint, GazeData, GazeDataEye, Notification, NotificationValue, PRESENCE_AWAY,
-    PRESENCE_PRESENT, STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN,
-    STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS, STREAM_PRESENCE, encode_eye_position,
-    encode_gaze, encode_gaze_data, encode_gaze_origin, encode_head, encode_image,
-    encode_notification, encode_presence, notification,
+    EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, Notification, NotificationValue,
+    PRESENCE_AWAY, PRESENCE_PRESENT, STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA,
+    STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS,
+    STREAM_PRESENCE, encode_eye_position, encode_gaze, encode_gaze_data, encode_gaze_origin,
+    encode_gaze_raw, encode_head, encode_image, encode_notification, encode_presence, notification,
 };
 use tobii_proto::facts::DeviceNotification;
 use tobii_proto::gaze83::{EyeFrame, GazeFrame, Valued};
@@ -59,6 +60,45 @@ fn gaze_data_eye(eye: &EyeFrame) -> GazeDataEye {
         eyeball_center_mm: f32s(eye.eyeball_center_mm.value),
         pupil_valid: eye.pupil_diameter_mm.valid,
         pupil_diameter_mm: pupil,
+    }
+}
+
+/// One eye's block of the raw gaze record: its values as sent, whatever
+/// their validity, and 0 for a key the frame lacks, as in the record's
+/// zeroed memory (0x18018dadd).
+fn gaze_raw_eye(eye: &EyeFrame) -> GazeRawEye {
+    let [pupil] = f32s([eye.pupil_diameter_mm.value]);
+    GazeRawEye {
+        gaze_origin_mm: f32s(eye.origin_tracker_mm.value),
+        gaze_origin_in_track_box: f32s(eye.track_box.value),
+        gaze_point_mm: f32s(eye.gaze_point_tracker_mm.value),
+        gaze_point_on_display: f32s(eye.gaze_point_norm.value),
+        pupil_diameter_mm: pupil,
+        status: eye.status.unwrap_or(0),
+    }
+}
+
+/// The Stream Engine's raw gaze record of `frame` (`tobii_gaze_raw_t`, which
+/// `process_gaze`, 0x18018d9a0, fills): both eyes, the combined gaze point
+/// and what [`GazeFrame::record`] keeps, each value as sent, stamped with
+/// the device clock, as the record is. An eyeball centre is there only when
+/// the frame sent it, as the record flags it.
+fn gaze_raw(frame: &GazeFrame) -> GazeRaw {
+    let record = &frame.record;
+    let eyeball = |sent: bool, eye: &EyeFrame| sent.then(|| f32s(eye.eyeball_center_mm.value));
+    GazeRaw {
+        timestamp_tracker_us: ts(frame.device_ts_us),
+        left: gaze_raw_eye(&frame.left),
+        right: gaze_raw_eye(&frame.right),
+        combined_gaze_point_on_display: f32s(frame.gaze.value),
+        combined_gaze_validity: record.combined_gaze_validity.unwrap_or(0),
+        key_0e: record.key_0e,
+        key_11: record.key_11,
+        frame_counter: record.frame_counter,
+        left_origin_flag: record.left_origin_flag,
+        right_origin_flag: record.right_origin_flag,
+        left_eyeball_center_mm: eyeball(record.left_eyeball_sent, &frame.left),
+        right_eyeball_center_mm: eyeball(record.right_eyeball_sent, &frame.right),
     }
 }
 
@@ -114,6 +154,9 @@ fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
                 right: gaze_data_eye(&frame.right),
             }),
         ));
+    }
+    if wanted & STREAM_GAZE_RAW != 0 {
+        out.push((STREAM_GAZE_RAW, encode_gaze_raw(&gaze_raw(frame))));
     }
 }
 
@@ -204,10 +247,10 @@ mod tests {
     use tobii_ipc::geometry::tracker_to_display;
     use tobii_ipc::{ServerMsg, decode_server};
     use tobii_proto::facts::parse_display_area;
-    use tobii_proto::gaze83::decode_gaze_frame;
+    use tobii_proto::gaze83::{RecordKeys, decode_gaze_frame};
     use tobii_proto::image83::ImageFrame;
     use tobii_proto::protocol::{hex_to_bytes, parse_message};
-    use tobii_proto::tlv::{UNITS_PER_MM, keyed_fields};
+    use tobii_proto::tlv::{KeyedFields, UNITS_PER_MM, keyed_fields};
     use tobii_usb::engine::{ImageSample, PoseSample};
 
     /// The session1 fixture frame's device timestamp.
@@ -227,10 +270,44 @@ mod tests {
         hex_to_bytes(&std::fs::read_to_string(path).expect("fixture")).expect("hex")
     }
 
-    fn session1_sample() -> Sample {
+    fn session1_frame() -> GazeFrame {
         let bytes = fixture("session1-gaze-frame");
-        let frame = decode_gaze_frame(&parse_message(&bytes).expect("msg")).expect("frame");
-        Sample::Gaze(Box::new(GazeSample::new(frame, READ_US, HOST_US)))
+        decode_gaze_frame(&parse_message(&bytes).expect("msg")).expect("frame")
+    }
+
+    fn session1_sample() -> Sample {
+        Sample::Gaze(Box::new(GazeSample::new(
+            session1_frame(),
+            READ_US,
+            HOST_US,
+        )))
+    }
+
+    /// The raw gaze of `frame`, the one frame its sample gives when raw gaze
+    /// alone is wanted.
+    fn raw_gaze_of(frame: GazeFrame) -> GazeRaw {
+        let sample = Sample::Gaze(Box::new(GazeSample::new(frame, READ_US, HOST_US)));
+        match &frames(&sample, STREAM_GAZE_RAW)[..] {
+            [(STREAM_GAZE_RAW, ServerMsg::GazeRaw(raw))] => **raw,
+            other => panic!("expected raw gaze alone, got {other:?}"),
+        }
+    }
+
+    /// The session1 frame's keyed fields, as sent.
+    fn session1_keys() -> KeyedFields {
+        let gaze = fixture("session1-gaze-frame");
+        keyed_fields(
+            parse_message(&gaze)
+                .expect("msg")
+                .payload
+                .get(2..)
+                .expect("keys"),
+        )
+    }
+
+    /// Keyed 3-D point `k` in mm, as the Stream Engine's f32.
+    fn key_point(keys: &KeyedFields, k: u32) -> [f32; 3] {
+        f32s(keys.point::<3>(k).expect("key").map(|c| c / UNITS_PER_MM))
     }
 
     fn frames(sample: &Sample, wanted: u32) -> Vec<(u32, ServerMsg)> {
@@ -272,6 +349,12 @@ mod tests {
     #[test]
     fn only_wanted_streams_are_encoded() {
         let sample = session1_sample();
+        let bits_of = |wanted| -> Vec<u32> {
+            frames(&sample, wanted)
+                .iter()
+                .map(|(bit, _)| *bit)
+                .collect()
+        };
         assert!(frames(&sample, STREAM_HEAD | STREAM_PRESENCE).is_empty());
         let all = frames(
             &sample,
@@ -287,6 +370,8 @@ mod tests {
                 STREAM_GAZE_DATA
             ]
         );
+        assert_eq!(bits_of(!STREAM_GAZE_RAW), bits, "raw gaze not wanted");
+        assert_eq!(bits_of(STREAM_GAZE_RAW), [STREAM_GAZE_RAW]);
         match &all[1].1 {
             ServerMsg::GazeOrigin(pair) => {
                 assert!(pair.left.valid && pair.right.valid);
@@ -339,8 +424,7 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)] // reason: 16.16 values narrow to f32 exactly
     fn an_invalid_pupil_is_flagged_in_gaze_data_and_nan_in_the_gaze_tail() {
-        let bytes = fixture("session1-gaze-frame");
-        let mut frame = decode_gaze_frame(&parse_message(&bytes).expect("msg")).expect("frame");
+        let mut frame = session1_frame();
         frame.left.pupil_diameter_mm.valid = false;
         let sample = Sample::Gaze(Box::new(GazeSample::new(frame, READ_US, HOST_US)));
 
@@ -367,15 +451,7 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)] // reason: the key's value is passed through, narrowed once
     fn gaze_data_sends_the_3d_gaze_point_as_the_device_does() {
-        let gaze = fixture("session1-gaze-frame");
-        let keys = keyed_fields(
-            parse_message(&gaze)
-                .expect("msg")
-                .payload
-                .get(2..)
-                .expect("keys"),
-        );
-        let key = |k: u32| f32s(keys.point::<3>(k).expect("key").map(|c| c / UNITS_PER_MM));
+        let keys = session1_keys();
         let (area, _) = parse_display_area(&parse_message(&fixture("init-rsp-1430")).expect("msg"))
             .expect("display area");
         let length = |a: [f64; 3], b: [f64; 3]| {
@@ -396,7 +472,7 @@ mod tests {
 
         for (eye, k) in [(data.left, 0x04), (data.right, 0x0a)] {
             assert!(eye.gaze_point_valid);
-            assert_eq!(eye.gaze_point_mm, key(k));
+            assert_eq!(eye.gaze_point_mm, key_point(&keys, k));
             let [x, y, z] = tracker_to_display(&area, eye.gaze_point_mm.map(f64::from));
             let [u, v] = eye.gaze_point_on_display.map(f64::from);
             assert!(z.abs() < 0.01, "{z} mm off the screen");
@@ -405,15 +481,146 @@ mod tests {
         }
     }
 
+    /// Raw gaze is the Stream Engine's record of the frame: each key the
+    /// record takes (`process_gaze`, 0x18018d9a0) as the session1 frame sent
+    /// it, narrowed to f32 once, in its own field. The 3-D points are in the
+    /// tracker frame, as sent, with no display area involved; the stamp is
+    /// the device time.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: each key's value is passed through, narrowed once
+    fn raw_gaze_is_the_stream_engines_record_of_the_frame() {
+        let keys = session1_keys();
+        let point = |k| key_point(&keys, k);
+        let point2 = |k| f32s(keys.point::<2>(k).expect("key").map(|c| c / UNITS_PER_MM));
+        let word = |k| keys.scalar(k).and_then(|v| u32::try_from(v).ok());
+        let raw_eye = |[origin, track_box, gaze_3d, gaze_2d, pupil, status]: [u32; 6]| {
+            let [pupil] = f32s([keys.fixed16(pupil).expect("pupil")]);
+            GazeRawEye {
+                gaze_origin_mm: point(origin),
+                gaze_origin_in_track_box: point(track_box),
+                gaze_point_mm: point(gaze_3d),
+                gaze_point_on_display: point2(gaze_2d),
+                pupil_diameter_mm: pupil,
+                status: word(status).expect("status"),
+            }
+        };
+
+        let raw = raw_gaze_of(session1_frame());
+
+        assert_eq!(raw.timestamp_tracker_us, DEVICE_US);
+        assert_eq!(raw.left, raw_eye([0x02, 0x03, 0x04, 0x05, 0x06, 0x07]));
+        assert_eq!(raw.right, raw_eye([0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d]));
+        assert_eq!(raw.combined_gaze_point_on_display, point2(0x1c));
+        assert_eq!(Some(raw.combined_gaze_validity), word(0x1b));
+        // The ET5 sends no 0x0e, and 4 for 0x11.
+        assert_eq!(
+            [
+                raw.key_0e,
+                raw.key_11,
+                raw.frame_counter,
+                raw.left_origin_flag,
+                raw.right_origin_flag,
+            ],
+            [0x0e, 0x11, 0x14, 0x16, 0x15].map(word)
+        );
+        assert_eq!([raw.key_0e, raw.key_11], [None, Some(4)]);
+        assert_eq!(
+            [raw.left_eyeball_center_mm, raw.right_eyeball_center_mm],
+            [Some(point(0x17)), Some(point(0x18))]
+        );
+    }
+
+    /// Raw gaze passes a value whatever its validity, a word as sent rather
+    /// than the validity derived from it, and a key the frame lacks as the
+    /// record holds it: 0 where the record has no flag for it, `None` where
+    /// it has one, told apart from a 0 that was sent. An eyeball centre is
+    /// there when the frame sent it, lost eye or not.
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: values are passed through, narrowed once
+    fn raw_gaze_passes_what_was_sent_and_zeroes_what_was_not() {
+        let mut frame = session1_frame();
+        // A lost left eye, whose values the device still sends.
+        frame.left.tracked = false;
+        frame.left.status = Some(4);
+        frame.left.origin_tracker_mm.valid = false;
+        frame.left.track_box.valid = false;
+        frame.left.gaze_point_tracker_mm.valid = false;
+        frame.left.gaze_point_norm.valid = false;
+        frame.left.eyeball_center_mm.valid = false;
+        frame.left.pupil_diameter_mm.valid = false;
+        frame.gaze.valid = false;
+        // The right eye's status and pupil, which the ET5 always sends,
+        // missing, and 0x0e, which it never sends, present.
+        frame.right.status = None;
+        frame.right.pupil_diameter_mm = Valued::default();
+        frame.record = RecordKeys {
+            // Not 1, so the point is not valid.
+            combined_gaze_validity: Some(2),
+            key_0e: Some(9),
+            key_11: None,
+            frame_counter: None,
+            // Told apart, so the eyes' flags (0x16 left, 0x15 right) cannot
+            // swap unseen.
+            left_origin_flag: Some(0),
+            right_origin_flag: Some(1),
+            left_eyeball_sent: true,
+            right_eyeball_sent: false,
+        };
+
+        let raw = raw_gaze_of(frame);
+
+        assert_eq!([raw.left.status, raw.right.status], [4, 0]);
+        assert_eq!(
+            [
+                raw.left.gaze_origin_mm,
+                raw.left.gaze_origin_in_track_box,
+                raw.left.gaze_point_mm,
+            ],
+            [
+                f32s(frame.left.origin_tracker_mm.value),
+                f32s(frame.left.track_box.value),
+                f32s(frame.left.gaze_point_tracker_mm.value),
+            ]
+        );
+        assert_eq!(
+            raw.left.gaze_point_on_display,
+            f32s(frame.left.gaze_point_norm.value)
+        );
+        assert_eq!(
+            [raw.left.pupil_diameter_mm, raw.right.pupil_diameter_mm],
+            [session1_pupils()[0], 0.0]
+        );
+        assert_eq!(raw.combined_gaze_point_on_display, f32s(frame.gaze.value));
+        assert_eq!(raw.combined_gaze_validity, 2);
+        assert_eq!(
+            [raw.key_0e, raw.key_11, raw.frame_counter],
+            [Some(9), None, None]
+        );
+        assert_eq!(
+            [raw.left_origin_flag, raw.right_origin_flag],
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            [raw.left_eyeball_center_mm, raw.right_eyeball_center_mm],
+            [Some(f32s(frame.left.eyeball_center_mm.value)), None]
+        );
+
+        frame.record.combined_gaze_validity = None;
+        assert_eq!(raw_gaze_of(frame).combined_gaze_validity, 0);
+    }
+
     /// Every sample frame carries the sample's host time, as the Stream
     /// Engine's callbacks do. Gaze data keeps the device time beside it, and
     /// its system time is that device time on the host clock, not the read.
+    /// Raw gaze, the exception, carries the device time alone, as the Stream
+    /// Engine's raw gaze record does.
     #[test]
-    fn every_sample_frame_carries_its_host_time() {
+    fn sample_frames_carry_their_host_time_bar_raw_gaze() {
         let wanted = STREAM_GAZE
             | STREAM_GAZE_ORIGIN
             | STREAM_EYE_POSITION
             | STREAM_GAZE_DATA
+            | STREAM_GAZE_RAW
             | STREAM_HEAD
             | STREAM_PRESENCE
             | STREAM_IMAGE;
@@ -422,15 +629,17 @@ mod tests {
             (_, ServerMsg::GazeOrigin(origin)),
             (_, ServerMsg::EyePosition(eyes)),
             (_, ServerMsg::GazeData(data)),
+            (_, ServerMsg::GazeRaw(raw)),
         ] = &frames(&session1_sample(), wanted)[..]
         else {
-            panic!("the gaze sample did not give its four frames");
+            panic!("the gaze sample did not give its five frames");
         };
         assert_eq!([*ts_us, origin.ts_us, eyes.ts_us], [HOST_US; 3]);
         assert_eq!(
             (data.timestamp_tracker_us, data.timestamp_system_us),
             (DEVICE_US, HOST_US)
         );
+        assert_eq!(raw.timestamp_tracker_us, DEVICE_US);
 
         let image = ImageFrame {
             device_ts_us: DEVICE_US.unsigned_abs(),
