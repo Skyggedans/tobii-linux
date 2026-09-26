@@ -265,12 +265,22 @@ impl TlvWriter {
         self.field_id(FIELD_POINT_3D).mm(p[0]).mm(p[1]).mm(p[2])
     }
 
-    /// A byte string (type 0x15).
-    pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
+    /// `typ` with a `u32` BE length + `b` as its value.
+    fn length_prefixed(&mut self, typ: u8, b: &[u8]) -> &mut Self {
         let mut value = Vec::with_capacity(4 + b.len());
         value.extend_from_slice(&u32::try_from(b.len()).unwrap_or(u32::MAX).to_be_bytes());
         value.extend_from_slice(b);
-        self.entry(TYPE_BYTES, &value)
+        self.entry(typ, &value)
+    }
+
+    /// A string (type 0x14), as the tracker writes each status string.
+    pub fn string(&mut self, s: &str) -> &mut Self {
+        self.length_prefixed(TYPE_STRING, s.as_bytes())
+    }
+
+    /// A byte string (type 0x15).
+    pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
+        self.length_prefixed(TYPE_BYTES, b)
     }
 
     /// The payload.
@@ -507,6 +517,22 @@ mod tests {
             .collect();
         assert_eq!(mm, vec![-1.5, 2.0, 0.25]);
         assert_eq!(entries[4].u32(), Some(12345));
+    }
+
+    #[test]
+    fn writer_writes_a_string_as_the_tracker_does() {
+        let ok = TlvWriter::new().string("ok").finish();
+        let empty = TlvWriter::new().string("").finish();
+
+        assert_eq!(ok, [0, 0, 0x14, 0, 0, 0, 6, 0, 0, 0, 2, b'o', b'k']);
+        // The captured 1490's fault and warning lists.
+        let status = crate::fixture!("init-rsp-1490");
+        assert!(status.windows(ok.len() - 2).any(|w| w == &ok[2..]));
+        assert_eq!(empty, [0, 0, 0x14, 0, 0, 0, 4, 0, 0, 0, 0]);
+        for (payload, text) in [(ok, "ok"), (empty, "")] {
+            let strings: Vec<_> = payload_tlvs(&payload).map(|t| t.string()).collect();
+            assert_eq!(strings, [Some(text.to_owned())]);
+        }
     }
 
     #[test]

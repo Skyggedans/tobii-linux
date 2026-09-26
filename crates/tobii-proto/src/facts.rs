@@ -33,9 +33,11 @@ const FIELD_DISPLAY_ID: u32 = 0x0001_0100;
 const FIELD_OUTPUT_RATE: u32 = 0x0002_2af8;
 /// Index of the fault list in the status strings (the DLL's
 /// `tracker_get_status`, 0x1801a0ac0, index table at RVA 0x1a1610); per the
-/// 4.1 docs comma-separated, "ok" when there are none.
+/// 4.1 docs comma-separated, "ok" when there are none. Notification 3200
+/// replaces it (see [`DeviceFacts::apply_notification`]).
 pub const STATUS_FAULTS: u32 = 5;
-/// Index of the warning list in the status strings, as [`STATUS_FAULTS`].
+/// Index of the warning list in the status strings, as [`STATUS_FAULTS`];
+/// notification 3210 replaces it.
 pub const STATUS_WARNINGS: u32 = 6;
 /// Index of the calibration id in the status strings.
 const STATUS_CALIBRATION_ID: u32 = 7;
@@ -67,7 +69,8 @@ pub struct DeviceFacts {
     /// Hardware configuration (command 2120); provisional, and never sent
     /// to Linux so far.
     pub hardware: Option<HardwareConfiguration>,
-    /// Status strings by index (the last command 1490).
+    /// Status strings by index (the last command 1490, with the fault and
+    /// warning lists that notifications replaced since).
     pub status: Vec<(u32, String)>,
     /// The active calibration id (status index 7).
     pub calibration_id: Option<u32>,
@@ -133,13 +136,38 @@ impl DeviceFacts {
     }
 
     /// Status string `index` of the last command 1490 (the first entry for
-    /// it); `None` when the tracker left it out or the 1490 was lost.
+    /// it), or the fault or warning list a 3200/3210 has replaced since (see
+    /// [`Self::apply_notification`]); `None` when the tracker left it out or
+    /// the 1490 was lost.
     #[must_use]
     pub fn status_string(&self, index: u32) -> Option<&str> {
         self.status
             .iter()
             .find(|(i, _)| *i == index)
             .map(|(_, s)| s.as_str())
+    }
+
+    /// Fold a fault or warning notification (3200, 3210) into the status
+    /// strings: its text replaces the [`STATUS_FAULTS`] or
+    /// [`STATUS_WARNINGS`] entry that [`Self::status_string`] reads, and this
+    /// returns `true`. The DLL's handler copies the text into its fault or
+    /// warning cache (0x18016f0e9, 0x18016f108) but never sets the cache's
+    /// "present" flag, which only a 1490 that reported the list sets
+    /// (0x18016dce1, 0x18016dd8b) and `tobii_get_state_string` checks
+    /// (0x1801426fd, 0x180142563). So a list the last 1490 left out stays
+    /// left out: nothing is added and this returns `false`, as it does for
+    /// any other notification.
+    pub fn apply_notification(&mut self, n: &DeviceNotification) -> bool {
+        let (index, text) = match n {
+            DeviceNotification::FaultsChanged(text) => (STATUS_FAULTS, text),
+            DeviceNotification::WarningsChanged(text) => (STATUS_WARNINGS, text),
+            _ => return false,
+        };
+        let Some((_, entry)) = self.status.iter_mut().find(|(i, _)| *i == index) else {
+            return false;
+        };
+        entry.clone_from(text);
+        true
     }
 
     /// What `tobii_get_device_info` reports: [`Self::info`] and the
@@ -470,6 +498,11 @@ pub enum DeviceNotification {
     CalibrationIdChanged(u32),
     /// The device paused (`true`) or resumed.
     DevicePausedChanged(bool),
+    /// The tracker's fault list changed (3200): the new list, as status
+    /// string 5 of a 1490 carries it.
+    FaultsChanged(String),
+    /// The tracker's warning list changed (3210), as status string 6.
+    WarningsChanged(String),
     /// Anything else: its id and first `u32`, if any.
     Other {
         /// Notification id.
@@ -510,11 +543,46 @@ pub fn decode_notification(msg: &Message<'_>) -> Option<DeviceNotification> {
             Some(v @ (0 | 1)) => DeviceNotification::DevicePausedChanged(v == 1),
             value => DeviceNotification::Other { id: msg.id, value },
         },
+        notify::FAULTS | notify::WARNINGS => match status_list(msg) {
+            Some(list) if msg.id == notify::FAULTS => DeviceNotification::FaultsChanged(list),
+            Some(list) => DeviceNotification::WarningsChanged(list),
+            None => {
+                warn!(
+                    id = msg.id,
+                    len = msg.payload.len(),
+                    "fault or warning notification in an unknown layout; ignored"
+                );
+                DeviceNotification::Other {
+                    id: msg.id,
+                    value: first_u32(),
+                }
+            }
+        },
         id => DeviceNotification::Other {
             id,
             value: first_u32(),
         },
     })
+}
+
+/// Notifications 3200 and 3210: one string (the DLL's schema, 0x1801810d2
+/// and 0x1801810bd), which must be the first TLV, as the DLL's reader fails
+/// any other type (0x180003be3); what follows it is not read. The text ends
+/// at its first NUL, where the DLL's `strncpy` copies end it (0x180188370,
+/// 0x18016f0fa). [`Tlv::string`] also holds the string to the TLV's own
+/// length word, which the DLL's reader reads and skips (0x180003c14),
+/// checking the string's length only against the rest of the message
+/// (0x180003c3e). Turning a body that fails here into `Other` with a warn
+/// is libtobii's own choice: the DLL ignores the failure (0x18017baae,
+/// 0x18017ba8c) and builds the notification anyway (0x180187b21) from
+/// whatever its string parameter holds (0x180188355), such as an earlier
+/// message's.
+fn status_list(msg: &Message<'_>) -> Option<String> {
+    let mut list = msg.tlvs().next()?.string()?;
+    if let Some(end) = list.find('\0') {
+        list.truncate(end);
+    }
+    Some(list)
 }
 
 #[cfg(test)]
@@ -936,21 +1004,18 @@ mod tests {
         );
     }
 
-    /// A 3110 carrying `payload`, laid out as the DLL decodes it (none was
-    /// ever captured).
-    fn paused_notification(payload: &[u8]) -> Vec<u8> {
-        let mut msg = chunk_command(notify::DEVICE_PAUSED, 0, payload).swap_remove(0);
+    /// Decode notification `id` carrying `payload`, laid out as the DLL
+    /// decodes it (for the ids never captured).
+    fn decode_synthetic(id: u32, payload: &[u8]) -> Option<DeviceNotification> {
+        let mut msg = chunk_command(id, 0, payload).swap_remove(0);
         msg[..4].copy_from_slice(&[1, 0, 0, 0]);
         msg[8..12].copy_from_slice(&MARKER_NOTIFICATION.to_be_bytes());
-        msg
+        decode_notification(&parse_message(&msg).expect("msg"))
     }
 
     #[test]
     fn decodes_a_synthetic_pause_notification() {
-        let decode = |payload: &[u8]| {
-            let msg = paused_notification(payload);
-            decode_notification(&parse_message(&msg).expect("msg"))
-        };
+        let decode = |payload: &[u8]| decode_synthetic(notify::DEVICE_PAUSED, payload);
         assert_eq!(
             decode(&device_pause_payload(true)),
             Some(DeviceNotification::DevicePausedChanged(true))
@@ -974,5 +1039,160 @@ mod tests {
                 value: None
             })
         );
+    }
+
+    #[test]
+    fn decodes_synthetic_fault_and_warning_notifications() {
+        let string = |text: &str| TlvWriter::new().string(text).finish();
+
+        assert_eq!(
+            decode_synthetic(notify::FAULTS, &string("FAULT_A,FAULT_B")),
+            Some(DeviceNotification::FaultsChanged("FAULT_A,FAULT_B".into()))
+        );
+        assert_eq!(
+            decode_synthetic(notify::WARNINGS, &string("ok")),
+            Some(DeviceNotification::WarningsChanged("ok".into()))
+        );
+        assert_eq!(
+            decode_synthetic(notify::WARNINGS, &string("")),
+            Some(DeviceNotification::WarningsChanged(String::new()))
+        );
+        assert_eq!(
+            decode_synthetic(notify::FAULTS, &string("FAULT_A\0FAULT_B")),
+            Some(DeviceNotification::FaultsChanged("FAULT_A".into())),
+            "the DLL's strncpy stops at the NUL"
+        );
+        assert_eq!(
+            decode_synthetic(
+                notify::FAULTS,
+                &TlvWriter::new().string("X").u32(5).finish()
+            ),
+            Some(DeviceNotification::FaultsChanged("X".into())),
+            "the DLL reads one parameter and nothing after it"
+        );
+    }
+
+    #[test]
+    fn a_fault_or_warning_notification_in_another_layout_is_other() {
+        let other = |id, value| Some(DeviceNotification::Other { id, value });
+
+        assert_eq!(
+            decode_synthetic(notify::FAULTS, &TlvWriter::new().u32(7).finish()),
+            other(3200, Some(7))
+        );
+        assert_eq!(
+            decode_synthetic(notify::WARNINGS, &TlvWriter::new().finish()),
+            other(3210, None)
+        );
+        assert_eq!(
+            decode_synthetic(
+                notify::FAULTS,
+                &TlvWriter::new().u32(7).string("X").finish()
+            ),
+            other(3200, Some(7)),
+            "the string must come first"
+        );
+        // Laid out as a 1490 entry, which the DLL's reader rejects too.
+        assert_eq!(
+            decode_synthetic(
+                notify::FAULTS,
+                &TlvWriter::new()
+                    .field_id(FIELD_INDEXED_STRING)
+                    .u32(STATUS_FAULTS)
+                    .string("X")
+                    .finish()
+            ),
+            other(3200, Some(STATUS_FAULTS))
+        );
+        assert_eq!(
+            decode_synthetic(notify::WARNINGS, &TlvWriter::new().bytes(b"ok").finish()),
+            other(3210, None),
+            "bytes are not a string"
+        );
+        // The string's own length runs past the payload.
+        let long = [0, 0, 0x14, 0, 0, 0, 5, 0, 0, 0, 9, b'X'];
+        assert_eq!(decode_synthetic(notify::FAULTS, &long), other(3200, None));
+    }
+
+    #[test]
+    fn a_fault_or_warning_notification_replaces_the_status_string() {
+        let mut facts = facts_from(&[crate::fixture!("init-rsp-1490")]);
+        let before = facts.clone();
+        let faults = decode_synthetic(notify::FAULTS, &TlvWriter::new().string("FAULT_A").finish())
+            .expect("decodes");
+
+        assert!(facts.apply_notification(&faults));
+        assert_eq!(facts.status_string(STATUS_FAULTS), Some("FAULT_A"));
+        assert_eq!(facts.status_string(STATUS_WARNINGS), Some("ok"));
+        assert_eq!(
+            facts.status_string(STATUS_CALIBRATION_ID),
+            Some("1904654973")
+        );
+        assert_eq!(facts.status.len(), before.status.len(), "nothing added");
+
+        assert!(facts.apply_notification(&DeviceNotification::WarningsChanged("WARN_A".into())));
+        assert_eq!(facts.status_string(STATUS_WARNINGS), Some("WARN_A"));
+        assert_eq!(facts.status_string(STATUS_FAULTS), Some("FAULT_A"));
+        assert_eq!(
+            DeviceFacts {
+                status: before.status.clone(),
+                ..facts.clone()
+            },
+            before,
+            "only the status strings change"
+        );
+    }
+
+    /// The DLL sets a list's "present" flag only from the 1490.
+    #[test]
+    fn a_list_the_last_status_left_out_stays_left_out() {
+        let mut facts = DeviceFacts {
+            status: vec![(STATUS_CALIBRATION_ID, "1".into())],
+            ..DeviceFacts::default()
+        };
+        let before = facts.clone();
+
+        assert!(!facts.apply_notification(&DeviceNotification::FaultsChanged("FAULT_A".into())));
+        assert!(!facts.apply_notification(&DeviceNotification::WarningsChanged("WARN_A".into())));
+        assert_eq!(facts.status_string(STATUS_FAULTS), None);
+        assert_eq!(facts.status_string(STATUS_WARNINGS), None);
+        assert_eq!(facts, before);
+
+        let mut none = DeviceFacts::default();
+        assert!(!none.apply_notification(&DeviceNotification::FaultsChanged("FAULT_A".into())));
+        assert_eq!(none, DeviceFacts::default());
+    }
+
+    #[test]
+    fn other_notifications_leave_the_status_strings_alone() {
+        let mut facts = facts_from(&[crate::fixture!("init-rsp-1490")]);
+        let before = facts.clone();
+
+        for n in [
+            DeviceNotification::DevicePausedChanged(true),
+            DeviceNotification::CalibrationIdChanged(7),
+            DeviceNotification::Other {
+                id: notify::FAULTS,
+                value: Some(5),
+            },
+        ] {
+            assert!(!facts.apply_notification(&n), "{n:?}");
+        }
+        assert_eq!(facts, before);
+    }
+
+    /// `status_string` reads the first entry for an index; the text goes
+    /// there.
+    #[test]
+    fn a_fault_notification_replaces_the_entry_status_string_reads() {
+        let mut facts = DeviceFacts {
+            status: vec![(STATUS_FAULTS, "ok".into()), (STATUS_FAULTS, "old".into())],
+            ..DeviceFacts::default()
+        };
+
+        assert!(facts.apply_notification(&DeviceNotification::FaultsChanged("FAULT_A".into())));
+
+        assert_eq!(facts.status_string(STATUS_FAULTS), Some("FAULT_A"));
+        assert_eq!(facts.status[1], (STATUS_FAULTS, "old".into()));
     }
 }

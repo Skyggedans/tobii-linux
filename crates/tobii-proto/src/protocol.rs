@@ -502,7 +502,8 @@ pub mod cmd {
     pub const DEVICE_PAUSE: u32 = 3100;
 }
 
-/// Notification ids seen in the Windows captures, unless noted.
+/// Notification ids seen in the Windows captures, unless noted as from the
+/// DLL only.
 pub mod notify {
     /// The display area changed: three corners.
     pub const DISPLAY_AREA: u32 = 1450;
@@ -511,6 +512,19 @@ pub mod notify {
     pub const DEVICE_PAUSED: u32 = 3110;
     /// Unknown; `u32 3` once at init, the value command 3170 also returns.
     pub const STATE_3180: u32 = 3180;
+    /// The tracker's fault list changed: one string, the new list, as
+    /// status string 5 of command 1490 carries it. From the DLL only: its
+    /// classifier (0x18017ba9e), record builder (0x180188339) and dispatcher
+    /// (0x18016c9a3) hand it to the application as
+    /// `TOBII_NOTIFICATION_TYPE_FAULTS_CHANGED`, and its schema (0x1801810d2)
+    /// reads one string, whose reader fails any TLV but type 0x14
+    /// (0x180003be3). Never captured.
+    pub const FAULTS: u32 = 3200;
+    /// The tracker's warning list changed, as [`FAULTS`] for status string
+    /// 6 and `TOBII_NOTIFICATION_TYPE_WARNINGS_CHANGED` (classifier
+    /// 0x18017ba7c, builder 0x180188343, dispatcher 0x18016c9b7, schema
+    /// 0x1801810bd). From the DLL only; never captured.
+    pub const WARNINGS: u32 = 3210;
     /// A new calibration is active: `u32` calibration id.
     pub const CALIBRATION_ID: u32 = 3220;
 }
