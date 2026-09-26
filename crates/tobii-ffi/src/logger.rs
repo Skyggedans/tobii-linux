@@ -165,6 +165,7 @@ pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::ffi::{CStr, c_char};
     use std::ptr;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::thread::{self, ThreadId};
 
     /// A logger calling `log_func` with `log_context`.
@@ -218,6 +219,48 @@ pub(crate) mod tests {
             text.to_string_lossy().into_owned(),
             thread::current().id(),
         ));
+    }
+
+    /// The lines a [`record_shared`] logger got, level and text, in the
+    /// order they came, from whichever threads logged them: for a device
+    /// that several threads use, where a [`Recorder`] would refuse the
+    /// lines that did not come from the test's own thread.
+    #[derive(Debug, Default)]
+    pub(crate) struct SyncRecorder(Mutex<Vec<(LogLevel, String)>>);
+
+    impl SyncRecorder {
+        /// A `tobii_custom_log_t` that records into this.
+        pub(crate) fn custom_log(&self) -> CustomLog {
+            CustomLog {
+                log_context: ptr::from_ref(self).cast_mut().cast(),
+                log_func: Some(record_shared),
+            }
+        }
+
+        /// The same, as a device's logger.
+        pub(crate) fn logger(&self) -> Option<Logger> {
+            logger(record_shared, ptr::from_ref(self).cast_mut().cast())
+        }
+
+        /// The levels and texts recorded so far.
+        pub(crate) fn lines(&self) -> Vec<(LogLevel, String)> {
+            self.recorded().clone()
+        }
+
+        /// The lines, locked, whole even if the lock is poisoned: a panic
+        /// cannot unwind out of a logger, and nothing else holds the lock
+        /// but to push or clone them.
+        fn recorded(&self) -> MutexGuard<'_, Vec<(LogLevel, String)>> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    unsafe extern "C" fn record_shared(context: *mut c_void, level: LogLevel, text: *const c_char) {
+        // SAFETY: the tests pass a live `SyncRecorder` as the context, which
+        // is `Sync`, and libtobii a NUL-terminated line valid for the call.
+        let (recorder, text) = unsafe { (&*context.cast::<SyncRecorder>(), CStr::from_ptr(text)) };
+        let line = (level, text.to_string_lossy().into_owned());
+        recorder.recorded().push(line);
     }
 
     #[test]
