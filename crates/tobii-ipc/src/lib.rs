@@ -244,7 +244,10 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)] // reason: encode/decode is a bit-exact round trip
     fn gaze_pupil_round_trips() {
-        let body = encode_gaze(123, true, [0.25, -0.5], [3.42, 3.35]);
+        // Plausible diameters (keys 0x06/0x0c; the session1 frame has
+        // 6.247/5.997 mm), exact in f32.
+        let pupil = [6.25, 6.0];
+        let body = encode_gaze(123, true, [0.25, -0.5], pupil);
         assert_eq!(body.len(), 26);
         match decode_server(&body) {
             Some(ServerMsg::Gaze {
@@ -256,7 +259,7 @@ mod tests {
                 assert_eq!(ts_us, 123);
                 assert!(valid);
                 assert_eq!(xy, [0.25, -0.5]);
-                assert_eq!(pupil_mm, [3.42, 3.35]);
+                assert_eq!(pupil_mm, pupil);
             }
             _ => panic!("expected Gaze"),
         }

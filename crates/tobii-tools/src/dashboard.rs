@@ -41,6 +41,17 @@ pub(crate) fn render_tracking_dashboard(
 ) -> Result<()> {
     // One buffered write per frame instead of ~30 line-buffered flushes.
     let mut out = BufWriter::new(io::stdout().lock());
+    write_tracking_dashboard(&mut out, frame, opentrack_pose)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// The dashboard of [`render_tracking_dashboard`], screen clear included.
+fn write_tracking_dashboard<W: Write>(
+    out: &mut W,
+    frame: &TrackingFrame,
+    opentrack_pose: Option<[f64; 6]>,
+) -> io::Result<()> {
     write!(out, "\x1b[2J\x1b[H")?;
     writeln!(out, "Tobii Eye Tracker 5 - TrackingFrame")?;
     writeln!(
@@ -57,34 +68,29 @@ pub(crate) fn render_tracking_dashboard(
     writeln!(out)?;
 
     writeln!(out, "Gaze")?;
-    dashboard_pair(&mut out, "  px", frame.gaze_x, frame.gaze_y)?;
-    dashboard_pair(&mut out, "  norm", frame.gaze_norm_x, frame.gaze_norm_y)?;
-    dashboard_bar(&mut out, "  x", frame.gaze_norm_x)?;
-    dashboard_bar(&mut out, "  y", frame.gaze_norm_y)?;
+    dashboard_pair(out, "  px", frame.gaze_x, frame.gaze_y)?;
+    dashboard_pair(out, "  norm", frame.gaze_norm_x, frame.gaze_norm_y)?;
+    dashboard_bar(out, "  x", frame.gaze_norm_x)?;
+    dashboard_bar(out, "  y", frame.gaze_norm_y)?;
     writeln!(out)?;
 
     writeln!(out, "Left Eye")?;
-    dashboard_pair(&mut out, "  px", frame.left_eye_x, frame.left_eye_y)?;
-    dashboard_pair(
-        &mut out,
-        "  norm",
-        frame.left_eye_norm_x,
-        frame.left_eye_norm_y,
-    )?;
-    dashboard_bar(&mut out, "  x", frame.left_eye_norm_x)?;
-    dashboard_bar(&mut out, "  y", frame.left_eye_norm_y)?;
+    dashboard_pair(out, "  px", frame.left_eye_x, frame.left_eye_y)?;
+    dashboard_pair(out, "  norm", frame.left_eye_norm_x, frame.left_eye_norm_y)?;
+    dashboard_bar(out, "  x", frame.left_eye_norm_x)?;
+    dashboard_bar(out, "  y", frame.left_eye_norm_y)?;
     writeln!(out)?;
 
     writeln!(out, "Right Eye")?;
-    dashboard_pair(&mut out, "  px", frame.right_eye_x, frame.right_eye_y)?;
+    dashboard_pair(out, "  px", frame.right_eye_x, frame.right_eye_y)?;
     dashboard_pair(
-        &mut out,
+        out,
         "  norm",
         frame.right_eye_norm_x,
         frame.right_eye_norm_y,
     )?;
-    dashboard_bar(&mut out, "  x", frame.right_eye_norm_x)?;
-    dashboard_bar(&mut out, "  y", frame.right_eye_norm_y)?;
+    dashboard_bar(out, "  x", frame.right_eye_norm_x)?;
+    dashboard_bar(out, "  y", frame.right_eye_norm_y)?;
     writeln!(out)?;
 
     writeln!(out, "Head")?;
@@ -105,8 +111,14 @@ pub(crate) fn render_tracking_dashboard(
     writeln!(
         out,
         "  pupil L/R mm{:>14} {:>14}",
-        fmt_frame_value(frame.pupil_left),
-        fmt_frame_value(frame.pupil_right)
+        fmt_frame_value(frame.pupil_diameter_left),
+        fmt_frame_value(frame.pupil_diameter_right)
+    )?;
+    writeln!(
+        out,
+        "  sec range L/R{:>13} {:>14}",
+        fmt_frame_value(frame.secondary_range_left),
+        fmt_frame_value(frame.secondary_range_right)
     )?;
     if let Some(pose) = opentrack_pose {
         writeln!(out)?;
@@ -127,10 +139,7 @@ pub(crate) fn render_tracking_dashboard(
         )?;
     }
     writeln!(out)?;
-    writeln!(out, "Press Ctrl+C to stop.")?;
-
-    out.flush()?;
-    Ok(())
+    writeln!(out, "Press Ctrl+C to stop.")
 }
 
 /// Clear the terminal and show the dashboard header with a single status
@@ -204,4 +213,40 @@ pub(crate) fn fmt_plain_value(value: f64) -> String {
 #[must_use]
 pub(crate) fn fmt_live(value: Option<f64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| format!("{value:.2}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tobii_proto::decode::decode_stream_payload;
+    use tobii_proto::gaze83::decode_gaze_frame;
+    use tobii_proto::protocol::{hex_to_bytes, parse_message};
+
+    /// The pupil row shows keys `0x06`/`0x0c`, and keys `0x25`/`0x27`'s
+    /// third component, which that row used to show, has a row of its own.
+    #[test]
+    fn the_pupil_row_shows_the_pupil_diameters() {
+        let bytes = hex_to_bytes(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tobii-proto/fixtures/session1-gaze-frame.hex"
+        )))
+        .expect("fixture is valid hex");
+        let values = decode_stream_payload(&bytes).expect("decodes");
+        let gaze = parse_message(&bytes).as_ref().and_then(decode_gaze_frame);
+        let frame = TrackingFrame::from_decoded(1, &values, gaze.as_ref());
+        let mut out = Vec::new();
+
+        write_tracking_dashboard(&mut out, &frame, None).expect("writes");
+
+        let screen = String::from_utf8(out).expect("utf-8");
+        let row = |label: &str| {
+            screen
+                .lines()
+                .find(|line| line.starts_with(label))
+                .map(str::split_whitespace)
+                .map(|words| words.rev().take(2).collect::<Vec<_>>())
+        };
+        assert_eq!(row("  pupil L/R mm"), Some(vec!["5.997", "6.247"]));
+        assert_eq!(row("  sec range L/R"), Some(vec!["430.605", "435.728"]));
+    }
 }

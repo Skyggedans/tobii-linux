@@ -851,7 +851,7 @@ pub(crate) fn print_angle_translation_fit(logs: &[LabelledFrames]) {
         let mut origin_angles = None::<[f64; 3]>;
 
         for (packet, values) in (0u64..).zip(frames) {
-            let frame = TrackingFrame::from_decoded(packet, values);
+            let frame = TrackingFrame::from_decoded(packet, values, None);
             let Some(head) = frame.head_xyz() else {
                 continue;
             };
@@ -923,7 +923,7 @@ pub(crate) fn print_rotation_translation_fit(logs: &[LabelledFrames]) {
         let mut origin_angles = None::<[f64; 3]>;
 
         for (packet, values) in (0u64..).zip(frames) {
-            let frame = TrackingFrame::from_decoded(packet, values);
+            let frame = TrackingFrame::from_decoded(packet, values, None);
             let Some(head) = frame.head_xyz() else {
                 continue;
             };
@@ -995,7 +995,7 @@ pub(crate) fn angle_ranges_with_comp(
     let mut count = 0usize;
 
     for (packet, values) in (0u64..).zip(frames) {
-        let frame = TrackingFrame::from_decoded(packet, values);
+        let frame = TrackingFrame::from_decoded(packet, values, None);
         let Some(head) = frame.head_xyz() else {
             continue;
         };

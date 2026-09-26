@@ -20,8 +20,8 @@
 //! Engine hands them out as gaze data's `pupil_diameter_mm`, valid while the
 //! eye's status (`0x07`/`0x0d`) is below 2 (0x18017199a..0x1801719af). They
 //! do not shrink with the eye's distance, as a size in camera pixels would.
-//! The fields that decode.rs labels `pupil_*` (keys `0x25`/`0x27`, third
-//! component) are not the pupil: they track the eye's range.
+//! Keys `0x25`/`0x27`'s third component, which decode.rs reports as
+//! `secondary_range_*`, is not the pupil: it tracks the eye's range.
 
 use crate::protocol::{Message, STREAM_ID_GAZE, STREAM_ID_PRESENCE};
 use crate::tlv::{UNITS_PER_MM, keyed_fields};

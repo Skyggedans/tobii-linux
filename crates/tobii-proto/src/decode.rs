@@ -5,14 +5,19 @@
 //! Field ids: `0x00021f40` carries 2-D gaze/eye points (occ1 = left eye,
 //! occ3 = right eye) in a 0..1024 screen space; `0x00031f41` carries 3-D head
 //! points in µm (occ4/occ9 = eyeball rotation centres; occ10/occ11 are keys
-//! `0x25`/`0x27`, whose third component, reported as `pupil_*`, tracks the
-//! eye's range, not its pupil, which is keys `0x06`/`0x0c`: see
-//! [`crate::gaze83`]). See the stream-0x83 field map for the full table.
+//! `0x25`/`0x27`, a secondary estimate of the eye positions, whose third
+//! component, reported as `secondary_range_*`, tracks the eye's range). See
+//! the stream-0x83 field map for the full table.
+//!
+//! The pupil diameters are keys `0x06`/`0x0c`, 16.16 scalars that the
+//! occurrence map does not hold; [`TrackingFrame`] takes them from the same
+//! message decoded by key ([`crate::gaze83`]).
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use crate::gaze83::{EyeFrame, GazeFrame};
 use crate::time::now_us;
 
 /// Key of a decoded stream value: `(field id, occurrence, component)`.
@@ -42,12 +47,6 @@ const FIXED_POINT_ONE: f64 = 4_294_967_296.0;
 /// `roll_only` captures (native ≈137 mm; the Windows replication set gives
 /// ≈120–125 mm) — user/mounting dependent, hence a single tunable constant.
 pub const HEAD_ROLL_LEVER_UM: f64 = 137_000.0;
-
-/// Scale of the `pupil_*` columns: occ10 comp2 = left, occ11 comp2 = right
-/// (keys `0x25`/`0x27`), over 100 (raw 342 → 3.42). Despite the name these
-/// track the eye's range, not its pupil; the pupil diameter is
-/// [`crate::gaze83::EyeFrame::pupil_diameter_mm`] (keys `0x06`/`0x0c`).
-pub const PUPIL_RAW_PER_MM: f64 = 100.0;
 
 /// Raw stream fields written to the decoded CSV, in column order.
 pub const LIVE_FIELDS: &[LiveField] = &[
@@ -100,8 +99,10 @@ pub const DERIVED_FIELDS: &[&str] = &[
     "head_yaw",
     "head_pitch",
     "head_roll",
-    "pupil_left",
-    "pupil_right",
+    "secondary_range_left",
+    "secondary_range_right",
+    "pupil_diameter_left",
+    "pupil_diameter_right",
 ];
 
 /// Address of one scalar in a decoded stream message, plus its CSV name.
@@ -192,18 +193,25 @@ pub struct TrackingFrame {
     pub head_pitch: Option<f64>,
     /// Head roll (degrees) from the inter-eye line.
     pub head_roll: Option<f64>,
-    /// Key `0x25`'s third component / 100: range-like, not the left pupil
-    /// (that is [`crate::gaze83::EyeFrame::pupil_diameter_mm`]).
-    pub pupil_left: Option<f64>,
-    /// Key `0x27`'s third component / 100: range-like, not the right pupil.
-    pub pupil_right: Option<f64>,
+    /// Left eye's secondary range: key `0x25`'s third component, in wire
+    /// units. It tracks the eye's range; it is neither a length nor the pupil.
+    pub secondary_range_left: Option<f64>,
+    /// Right eye's secondary range: key `0x27`'s third component.
+    pub secondary_range_right: Option<f64>,
+    /// Left pupil diameter (mm), key `0x06`; `None` when it is not valid
+    /// (see [`crate::gaze83::EyeFrame::pupil_diameter_mm`]) or no keyed frame
+    /// was given.
+    pub pupil_diameter_left: Option<f64>,
+    /// Right pupil diameter (mm), key `0x0c`.
+    pub pupil_diameter_right: Option<f64>,
 }
 
 impl TrackingFrame {
-    /// Build a frame from a decoded value map, stamping it with the host clock.
+    /// Build a frame from a decoded message, stamping it with the host clock;
+    /// `values` and `gaze` as for [`derive_live_values`].
     #[must_use]
-    pub fn from_decoded(packet: u64, values: &FieldValues) -> Self {
-        let derived = derive_live_values(values);
+    pub fn from_decoded(packet: u64, values: &FieldValues, gaze: Option<&GazeFrame>) -> Self {
+        let derived = derive_live_values(values, gaze);
 
         Self {
             ts_us: now_us(),
@@ -227,8 +235,10 @@ impl TrackingFrame {
             head_yaw: derived[16],
             head_pitch: derived[17],
             head_roll: derived[18],
-            pupil_left: derived[19],
-            pupil_right: derived[20],
+            secondary_range_left: derived[19],
+            secondary_range_right: derived[20],
+            pupil_diameter_left: derived[21],
+            pupil_diameter_right: derived[22],
         }
     }
 
@@ -266,9 +276,12 @@ impl TrackingFrame {
         write_json_number(out, "yaw", self.head_yaw, false)?;
         write_json_number(out, "pitch", self.head_pitch, false)?;
         write_json_number(out, "roll", self.head_roll, false)?;
-        write!(out, "}},\"pupil\":{{")?;
-        write_json_number(out, "left", self.pupil_left, true)?;
-        write_json_number(out, "right", self.pupil_right, false)?;
+        write!(out, "}},\"secondary_range\":{{")?;
+        write_json_number(out, "left", self.secondary_range_left, true)?;
+        write_json_number(out, "right", self.secondary_range_right, false)?;
+        write!(out, "}},\"pupil_diameter\":{{")?;
+        write_json_number(out, "left", self.pupil_diameter_left, true)?;
+        write_json_number(out, "right", self.pupil_diameter_right, false)?;
         write!(out, "}}}}")?;
         Ok(())
     }
@@ -304,9 +317,15 @@ pub fn write_json_number<W: Write>(
     Ok(())
 }
 
-/// Compute the [`DERIVED_FIELDS`] columns (same order) from a decoded message.
+/// Compute the [`DERIVED_FIELDS`] columns (same order) from a decoded message:
+/// `values` is its occurrence map, and `gaze` the same message decoded by key
+/// ([`crate::gaze83::decode_gaze_frame`]), which only the pupil diameters come
+/// from; `None` leaves them out.
 #[must_use]
-pub fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
+pub fn derive_live_values(
+    values: &FieldValues,
+    gaze: Option<&GazeFrame>,
+) -> [Option<f64>; DERIVED_FIELDS.len()] {
     let left_eye_x = field_value(values, LiveField::new("", 0x00021f40, 1, 0));
     let left_eye_y = field_value(values, LiveField::new("", 0x00021f40, 1, 1));
     let right_eye_x = field_value(values, LiveField::new("", 0x00021f40, 3, 0));
@@ -352,13 +371,13 @@ pub fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
     // None rather than a translation artifact dressed up as an angle.
     let head_yaw = None;
     let head_pitch = None;
-    // The `pupil_*` columns: occ10 = left, occ11 = right (keys 0x25/0x27),
-    // comp2, / 100. Despite the name they track the eye's range, not its
-    // pupil; the pupil diameter is keys 0x06/0x0c (see crate::gaze83).
-    let pupil_left =
-        field_value(values, LiveField::new("", 0x00031f41, 10, 2)).map(|v| v / PUPIL_RAW_PER_MM);
-    let pupil_right =
-        field_value(values, LiveField::new("", 0x00031f41, 11, 2)).map(|v| v / PUPIL_RAW_PER_MM);
+    // The secondary estimate's third component: occ10 = left, occ11 = right
+    // (keys 0x25/0x27), comp2, as it comes. It tracks the eye's range; it was
+    // once taken for the pupil, which is keys 0x06/0x0c.
+    let secondary_range_left = field_value(values, LiveField::new("", 0x00031f41, 10, 2));
+    let secondary_range_right = field_value(values, LiveField::new("", 0x00031f41, 11, 2));
+    let pupil_diameter_left = gaze.and_then(|gaze| valid_pupil(&gaze.left));
+    let pupil_diameter_right = gaze.and_then(|gaze| valid_pupil(&gaze.right));
     let gaze_valid = is_gaze_valid(gaze_x, gaze_y);
 
     [
@@ -381,9 +400,17 @@ pub fn derive_live_values(values: &FieldValues) -> [Option<f64>; 21] {
         head_yaw,
         head_pitch,
         head_roll,
-        pupil_left,
-        pupil_right,
+        secondary_range_left,
+        secondary_range_right,
+        pupil_diameter_left,
+        pupil_diameter_right,
     ]
+}
+
+/// An eye's pupil diameter (mm), when it is valid.
+fn valid_pupil(eye: &EyeFrame) -> Option<f64> {
+    let pupil = eye.pupil_diameter_mm;
+    pupil.valid.then_some(pupil.value)
 }
 
 /// Whether both gaze coordinates are present and within 25% beyond the
@@ -522,6 +549,8 @@ pub fn decode_stream_payload_with_status(payload: &[u8]) -> Result<(FieldValues,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gaze83::{Valued, decode_gaze_frame};
+    use crate::protocol::parse_message;
 
     fn eye(values: &mut FieldValues, occ: usize, p: [f64; 3]) {
         for (component, v) in p.into_iter().enumerate() {
@@ -561,7 +590,7 @@ mod tests {
         eye(&mut values, 4, [-35_000.0, -6_170.0, 600_000.0]);
         eye(&mut values, 9, [35_000.0, 6_170.0, 600_000.0]);
 
-        let derived = derive_live_values(&values);
+        let derived = derive_live_values(&values, None);
         let head_x = derived[13].expect("head_x");
         let head_z = derived[15].expect("head_z");
         let head_yaw = derived[16];
@@ -578,15 +607,87 @@ mod tests {
         assert!(head_pitch.is_none());
     }
 
-    #[test]
-    fn pupil_diameters_scaled_to_mm() {
-        let mut values = BTreeMap::new();
-        values.insert((0x00031f41, 10, 2), 342.0); // pupil_left: key 0x25 comp2
-        values.insert((0x00031f41, 11, 2), 335.0); // pupil_right: key 0x27 comp2
+    /// The session1 frame decoded both ways, as the tools' sinks do.
+    fn session1_frame() -> TrackingFrame {
+        let bytes = crate::fixture!("session1-gaze-frame");
+        let values = decode_stream_payload(&bytes).expect("decodes");
+        let gaze = parse_message(&bytes)
+            .as_ref()
+            .and_then(decode_gaze_frame)
+            .expect("gaze frame");
+        TrackingFrame::from_decoded(0, &values, Some(&gaze))
+    }
 
-        let derived = derive_live_values(&values);
-        assert!((derived[19].expect("pupil_left") - 3.42).abs() < 1e-9);
-        assert!((derived[20].expect("pupil_right") - 3.35).abs() < 1e-9);
+    /// The secondary range is keys `0x25`/`0x27`'s third component as it
+    /// comes, and the pupil is keys `0x06`/`0x0c`: on session1's frame the
+    /// Stream Engine's gaze data reports 6.247/5.997 mm, where the old
+    /// `pupil_*` columns showed 4.357/4.306.
+    #[test]
+    fn the_pupil_is_keys_06_and_0c_and_not_the_secondary_range() {
+        let frame = session1_frame();
+
+        // Exact: 32.32 and 16.16 values decode exactly.
+        assert_eq!(frame.secondary_range_left, Some(435.728_485_107_421_9));
+        assert_eq!(frame.secondary_range_right, Some(430.605_499_267_578_1));
+        assert_eq!(frame.pupil_diameter_left, Some(6.247_360_229_492_187_5));
+        assert_eq!(frame.pupil_diameter_right, Some(5.996_612_548_828_125));
+    }
+
+    #[test]
+    fn a_pupil_that_is_not_valid_or_not_given_is_none() {
+        let not_valid = Valued {
+            valid: false,
+            value: 5.0,
+        };
+        let gaze = GazeFrame {
+            left: EyeFrame {
+                pupil_diameter_mm: not_valid,
+                ..EyeFrame::default()
+            },
+            right: EyeFrame {
+                pupil_diameter_mm: Valued {
+                    valid: true,
+                    ..not_valid
+                },
+                ..EyeFrame::default()
+            },
+            ..GazeFrame::default()
+        };
+
+        let derived = derive_live_values(&FieldValues::new(), Some(&gaze));
+        assert_eq!(derived[21], None);
+        assert_eq!(derived[22], Some(5.0));
+        let derived = derive_live_values(&FieldValues::new(), None);
+        assert_eq!(derived[21..], [None, None]);
+    }
+
+    #[test]
+    fn the_columns_name_the_secondary_range_and_the_pupil() {
+        let at = |name: &str| DERIVED_FIELDS.iter().position(|field| *field == name);
+
+        assert_eq!(at("secondary_range_left"), Some(19));
+        assert_eq!(at("secondary_range_right"), Some(20));
+        assert_eq!(at("pupil_diameter_left"), Some(21));
+        assert_eq!(at("pupil_diameter_right"), Some(22));
+        // The mislabelled columns are gone rather than reused for the pupil.
+        assert_eq!(at("pupil_left"), None);
+        assert_eq!(at("pupil_right"), None);
+    }
+
+    #[test]
+    fn json_carries_the_secondary_range_and_the_pupil_diameter() {
+        let mut out = Vec::new();
+        session1_frame().write_json(&mut out).expect("writes");
+        let json = String::from_utf8(out).expect("utf-8");
+
+        assert!(
+            json.ends_with(
+                ",\"secondary_range\":{\"left\":435.728485,\"right\":430.605499},\
+                 \"pupil_diameter\":{\"left\":6.247360,\"right\":5.996613}}"
+            ),
+            "{json}"
+        );
+        assert!(!json.contains("\"pupil\":"), "{json}");
     }
 
     #[test]
@@ -595,7 +696,7 @@ mod tests {
         let mut values = BTreeMap::new();
         eye(&mut values, 4, [-35_000.0, 1_000.0, 600_000.0]);
 
-        let derived = derive_live_values(&values);
+        let derived = derive_live_values(&values, None);
         assert!(derived[13].is_none()); // head_x
         assert!(derived[14].is_none()); // head_y
         assert!(derived[15].is_none()); // head_z

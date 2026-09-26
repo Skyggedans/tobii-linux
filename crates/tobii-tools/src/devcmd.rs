@@ -590,7 +590,7 @@ pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
                 Some(STREAM_ID_GAZE) => {
                     let decoded = decode_stream_payload(msg)?;
                     if !decoded.is_empty() {
-                        last_gaze = Some(TrackingFrame::from_decoded(gaze_frames, &decoded));
+                        last_gaze = Some(TrackingFrame::from_decoded(gaze_frames, &decoded, None));
                         gaze_frames += 1;
                     }
                 }
@@ -779,7 +779,7 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
                             if let Ok(v) = decode_stream_payload(msg)
                                 && !v.is_empty()
                             {
-                                let f = TrackingFrame::from_decoded(gaze_frames, &v);
+                                let f = TrackingFrame::from_decoded(gaze_frames, &v, None);
                                 gaze_frames += 1;
                                 gaze_valid += u64::from(f.gaze_valid);
                                 eyes_valid += u64::from(f.head_xyz().is_some());
