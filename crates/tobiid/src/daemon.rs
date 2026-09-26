@@ -9,19 +9,28 @@
 //! client's outbox and sent ahead of the next samples, so a reply can never
 //! interleave with a sample frame.
 //!
+//! Each client has a reader thread, which handles its subscription changes
+//! and recenter requests, and from its first request on a request worker,
+//! which runs its requests one at a time in the order they came. A request can wait on the device for
+//! long (a cold engine takes ~12 s to arm, and a command queued meanwhile
+//! may wait 30 s for it), and the client's subscription changes do not wait
+//! behind it: libtobii gives up on a subscription's ack after 2 s.
+//!
 //! Log lines go through `tracing` (the `tobiid` binary installs the
 //! subscriber; under systemd stderr lands in the journal).
 
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
+use std::io;
 use std::net::Shutdown;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -819,11 +828,109 @@ fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<State>>) {
     }
 }
 
-/// One per connection: handle SUBSCRIBE, RECENTER and REQUEST frames and
-/// detect disconnect. Replies go through the client's outbox.
-fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
-    // Loop ends on EOF or a read error.
-    while let Ok(Some(body)) = read_frame(&mut stream) {
+/// How many of a client's requests may wait behind the one its worker runs.
+/// A client with that many waiting is read no further until the worker
+/// takes the next: its frames wait in the socket, SUBSCRIBEs included.
+/// libtobii has one request in flight per device and gives up on one after
+/// 3 s at the soonest, so even a request that holds the worker for a minute
+/// leaves no more than about twenty behind it.
+const REQUEST_QUEUE: usize = 32;
+
+/// A client's request worker: a thread that runs the client's requests one
+/// at a time, in the order its reader queued them.
+struct RequestWorker {
+    /// REQUEST frame bodies, as read.
+    queue: SyncSender<Vec<u8>>,
+    thread: JoinHandle<()>,
+}
+
+impl RequestWorker {
+    /// Start the worker for client `id`, connected over `stream`.
+    fn spawn(state: &Arc<Mutex<State>>, id: u64, stream: &UnixStream) -> io::Result<Self> {
+        let hang_up = HangUpOnPanic(stream.try_clone()?);
+        let (queue, requests) = mpsc::sync_channel(REQUEST_QUEUE);
+        let state = Arc::clone(state);
+        let thread = thread::Builder::new()
+            // At most 15 bytes are kept (the kernel's limit).
+            .name(format!("tobiid-rq-{id}"))
+            .spawn(move || {
+                let _hang_up = hang_up;
+                run_requests(&state, id, &requests);
+            })?;
+        Ok(Self { queue, thread })
+    }
+
+    /// Take no more requests, and wait for those queued to run.
+    fn finish(self, id: u64) {
+        let Self { queue, thread } = self;
+        drop(queue);
+        if thread.join().is_err() {
+            warn!(client = id, "a request worker panicked");
+        }
+    }
+}
+
+/// Hangs up on a client when its request worker panics: nothing would
+/// answer its requests any more. Its reader then stops at once, and the
+/// client learns the connection is lost before it is cleaned up after, not
+/// at its next request.
+struct HangUpOnPanic(UnixStream);
+
+impl Drop for HangUpOnPanic {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let _ = self.0.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Run client `id`'s requests as they come, one at a time and in order,
+/// until its reader drops the queue; those queued by then still run. Each
+/// reply goes to the client's outbox.
+fn run_requests(state: &Mutex<State>, id: u64, requests: &Receiver<Vec<u8>>) {
+    for body in requests {
+        if let Some(request) = decode_request(&body) {
+            // Runs without the state lock held while the device works.
+            let reply = crate::requests::handle(state, id, &request);
+            lock_state(state).send_to(id, encode_reply(request.id, reply.status, &reply.payload));
+        }
+    }
+}
+
+/// One per connection: handle SUBSCRIBE and RECENTER frames, hand REQUEST
+/// frames to the client's request worker, and detect disconnect. Replies go
+/// through the client's outbox. The requests a client sent before it hung
+/// up still run (a calibration stop that keeps the result, sent without
+/// waiting for the answer, still keeps it); only then is the client
+/// cleaned up after. A subscription change takes effect at once, ahead of
+/// the client's requests still to run: an unsubscribe before one of them
+/// pins the device (see [`State::device_for`]) may stop an engine that it
+/// then starts again.
+fn client_reader(state: &Arc<Mutex<State>>, id: u64, mut stream: UnixStream) {
+    if let Some(worker) = read_frames(state, id, &mut stream) {
+        worker.finish(id);
+    }
+    // No request of the client's runs any more: its worker has returned or
+    // panicked (see `pause::release`). Resumed before the engine may stop
+    // below.
+    crate::pause::release(state, id);
+    crate::calibration::on_client_gone(state, id);
+    let mut st = lock_state(state);
+    st.clients.retain(|c| c.id != id);
+    st.reconcile();
+}
+
+/// Read client `id`'s frames until it hangs up (EOF or a read error), or
+/// its request worker dies, which hangs up on it. The worker starts at the
+/// client's first request (a client that only streams needs none) and is
+/// handed back to be waited for.
+fn read_frames(
+    state: &Arc<Mutex<State>>,
+    id: u64,
+    stream: &mut UnixStream,
+) -> Option<RequestWorker> {
+    let mut worker: Option<RequestWorker> = None;
+    while let Ok(Some(body)) = read_frame(stream) {
         match body.first().copied() {
             Some(tobii_ipc::TAG_SUBSCRIBE) => {
                 if let Some(streams) = decode_subscribe(&body) {
@@ -836,22 +943,30 @@ fn client_reader(state: &Mutex<State>, id: u64, mut stream: UnixStream) {
                 }
             }
             Some(tobii_ipc::TAG_REQUEST) => {
-                if let Some(request) = decode_request(&body) {
-                    // Runs without the state lock held while the device works.
-                    let reply = crate::requests::handle(state, id, &request);
-                    lock_state(state)
-                        .send_to(id, encode_reply(request.id, reply.status, &reply.payload));
+                if worker.is_none() {
+                    match RequestWorker::spawn(state, id, stream) {
+                        Ok(started) => worker = Some(started),
+                        Err(e) => {
+                            warn!(client = id, error = %e, "could not start a request worker; closing the connection");
+                            break;
+                        }
+                    }
+                }
+                // Waits while the queue is full (see `REQUEST_QUEUE`).
+                if !worker.as_ref().is_some_and(|w| w.queue.send(body).is_ok()) {
+                    // It panicked, and has hung up on the client; frames
+                    // the client sent before that may still be read.
+                    warn!(
+                        client = id,
+                        "the request worker stopped; closing the connection"
+                    );
+                    break;
                 }
             }
             _ => {}
         }
     }
-    // Resumed before the engine may stop below.
-    crate::pause::release(state, id);
-    crate::calibration::on_client_gone(state, id);
-    let mut st = lock_state(state);
-    st.clients.retain(|c| c.id != id);
-    st.reconcile();
+    worker
 }
 
 /// Register the client's streams, starting the engine if it isn't running
@@ -950,6 +1065,7 @@ fn pump(state: &Mutex<State>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::calibration::tests::device_blob;
 
     /// A state with one connected client (its socket's peer is dropped; the
     /// pump never runs in these tests).
@@ -1434,6 +1550,466 @@ pub(crate) mod tests {
                 status: tobii_ipc::PRESENCE_PRESENT
             }),
             "the presence from before the pause is kept"
+        );
+    }
+
+    /// How long a test waits for what must happen.
+    const WAIT: Duration = Duration::from_secs(5);
+    /// How long a test gives what must not happen the time to.
+    const GRACE: Duration = Duration::from_millis(100);
+
+    /// Holds the first command it gets (the first `held`, when set) until
+    /// the test lets it go (or drops its keys), answers the rest at once,
+    /// and logs every command. A calibration read gets the calibration the
+    /// device computes (see [`device_blob`]).
+    struct Gate {
+        log: Mutex<Vec<(u32, Vec<u8>)>>,
+        held: Option<u32>,
+        armed: AtomicBool,
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    /// The test's side of a [`Gate`].
+    struct GateKeys {
+        /// Rung once the command is held.
+        entered: Receiver<()>,
+        /// Lets it go.
+        release: mpsc::Sender<()>,
+    }
+
+    fn gate() -> (Arc<Gate>, GateKeys) {
+        gate_holding(None)
+    }
+
+    /// A [`Gate`] that holds the first `held` command (`None`: whichever
+    /// comes first).
+    fn gate_holding(held: Option<u32>) -> (Arc<Gate>, GateKeys) {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let gate = Gate {
+            log: Mutex::new(Vec::new()),
+            held,
+            armed: AtomicBool::new(true),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        };
+        (Arc::new(gate), GateKeys { entered, release })
+    }
+
+    impl Gate {
+        fn log(&self) -> Vec<(u32, Vec<u8>)> {
+            self.log.lock().expect("log").clone()
+        }
+    }
+
+    impl DeviceCommands for Gate {
+        fn run(
+            &self,
+            cmd: u32,
+            payload: Vec<u8>,
+            _timeout: Duration,
+        ) -> Result<tobii_usb::engine::CommandResponse, tobii_usb::engine::CommandError> {
+            self.log.lock().expect("log").push((cmd, payload));
+            if self.held.is_none_or(|held| held == cmd) && self.armed.swap(false, Ordering::Relaxed)
+            {
+                let _ = self.entered.lock().expect("entered").send(());
+                // Bounded, should a test forget to let it go.
+                let _ = self
+                    .release
+                    .lock()
+                    .expect("release")
+                    .recv_timeout(Duration::from_secs(10));
+            }
+            let answer = if cmd == tobii_proto::calibration::cmd::READ {
+                tobii_proto::calibration::write_payload(&device_blob())
+            } else {
+                Vec::new()
+            };
+            Ok(tobii_usb::engine::CommandResponse::ok(answer))
+        }
+    }
+
+    /// Client 1's connection, served by [`client_reader`] as the accept
+    /// loop serves one, with `device` standing in for the engine. The pump
+    /// does not run: what the daemon sends the client stays in its outbox.
+    struct Connection {
+        state: Arc<Mutex<State>>,
+        /// The client's end, until it hangs up.
+        peer: Option<UnixStream>,
+        /// Hung up once the reader has returned.
+        served: Receiver<()>,
+    }
+
+    impl Connection {
+        fn open(device: Arc<dyn DeviceCommands>) -> Self {
+            let mut st = state_with_client(1);
+            st.fake_device = Some(device);
+            // No calibration file is read or saved.
+            st.calibration.location = tobii_calib::store::Location::Embedded;
+            let state = Arc::new(Mutex::new(st));
+            let (peer, stream) = UnixStream::pair().expect("socket pair");
+            let (served_tx, served) = mpsc::channel::<()>();
+            let reader_state = Arc::clone(&state);
+            thread::spawn(move || {
+                client_reader(&reader_state, 1, stream);
+                drop(served_tx);
+            });
+            Self {
+                state,
+                peer: Some(peer),
+                served,
+            }
+        }
+
+        fn send(&mut self, body: &[u8]) {
+            let peer = self.peer.as_mut().expect("still connected");
+            write_frame(peer, body).expect("frame written");
+        }
+
+        fn request(&mut self, id: u32, kind: u8, payload: &[u8]) {
+            self.send(&tobii_ipc::request::encode_request(id, kind, payload));
+        }
+
+        fn hang_up(&mut self) {
+            self.peer = None;
+        }
+
+        /// What the daemon has sent the client so far, decoded.
+        fn sent(&self) -> Vec<tobii_ipc::ServerMsg> {
+            outbox(&lock_state(&self.state), 1)
+                .iter()
+                .map(|body| tobii_ipc::decode_server(body).expect("a server frame"))
+                .collect()
+        }
+
+        /// Wait until the daemon has sent the client `n` frames.
+        fn wait_for_frames(&self, n: usize) -> Vec<tobii_ipc::ServerMsg> {
+            let deadline = std::time::Instant::now() + WAIT;
+            loop {
+                let sent = self.sent();
+                if sent.len() >= n {
+                    return sent;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{n} frames expected, {} sent: {sent:?}",
+                    sent.len()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Wait until the reader has returned, having cleaned up after the
+        /// client.
+        fn wait_until_served(&self) {
+            assert_eq!(
+                self.served.recv_timeout(WAIT),
+                Err(mpsc::RecvTimeoutError::Disconnected),
+                "the reader returned in time"
+            );
+        }
+    }
+
+    fn reply(request_id: u32, status: u8, payload: &[u8]) -> tobii_ipc::ServerMsg {
+        tobii_ipc::ServerMsg::Reply {
+            request_id,
+            status,
+            payload: payload.to_vec(),
+        }
+    }
+
+    const ACK: tobii_ipc::ServerMsg = tobii_ipc::ServerMsg::Subscribed { ok: true };
+
+    /// Found on hardware: a calibration retrieve waiting for a cold engine
+    /// held the client's subscribe up past libtobii's 2 s. Neither do the
+    /// requests behind it (libtobii's that timed out meanwhile), as many as
+    /// the queue holds.
+    #[test]
+    fn a_request_on_the_device_holds_no_subscription_ack_up() {
+        use tobii_ipc::request::{encode_display_area, encode_u32, kind, state, status};
+        let (device, keys) = gate();
+        let mut c = Connection::open(device);
+        c.request(
+            1,
+            kind::DISPLAY_AREA_SET,
+            &encode_display_area(&area(600.0)),
+        );
+        keys.entered
+            .recv_timeout(WAIT)
+            .expect("the request is held");
+        let paused = encode_u32(state::DEVICE_PAUSED);
+        // A full queue.
+        let last = u32::try_from(REQUEST_QUEUE).expect("queue length") + 1;
+        for id in 2..=last {
+            c.request(id, kind::STATE, &paused);
+        }
+
+        c.send(&tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE));
+
+        assert_eq!(c.wait_for_frames(1), [ACK], "acked while the requests wait");
+        keys.release.send(()).expect("let go");
+        let mut expected = vec![ACK, reply(1, status::OK, &[])];
+        expected.extend((2..=last).map(|id| reply(id, status::OK, &[0])));
+        assert_eq!(c.wait_for_frames(expected.len()), expected);
+        c.hang_up();
+        c.wait_until_served();
+        assert!(lock_state(&c.state).clients.is_empty());
+    }
+
+    #[test]
+    fn a_clients_requests_run_one_at_a_time_in_order() {
+        use tobii_ipc::request::{encode_display_area, kind, status};
+        let (device, keys) = gate();
+        let mut c = Connection::open(device);
+        c.request(
+            1,
+            kind::DISPLAY_AREA_SET,
+            &encode_display_area(&area(600.0)),
+        );
+        keys.entered
+            .recv_timeout(WAIT)
+            .expect("the request is held");
+        c.request(2, kind::DEVICE_NAME_SET, b"desk");
+        // Answers the name only if it runs after the set.
+        c.request(3, kind::DEVICE_NAME_GET, &[]);
+
+        thread::sleep(GRACE);
+        assert!(c.sent().is_empty(), "none overtakes the one on the device");
+        keys.release.send(()).expect("let go");
+
+        assert_eq!(
+            c.wait_for_frames(3),
+            [
+                reply(1, status::OK, &[]),
+                reply(2, status::OK, &[]),
+                reply(3, status::OK, b"desk"),
+            ]
+        );
+    }
+
+    /// The pause the client asked for is taken before its hang-up is acted
+    /// on, and then resumed once: cleaning up before the request ran would
+    /// leave the device paused for a client that is gone.
+    #[test]
+    fn a_client_that_hangs_up_during_a_request_is_cleaned_up_after_it_once() {
+        use tobii_ipc::request::kind;
+        use tobii_proto::facts::device_pause_payload;
+        use tobii_proto::protocol::cmd;
+        let (device, keys) = gate();
+        let mut c = Connection::open(Arc::clone(&device) as Arc<dyn DeviceCommands>);
+        c.request(1, kind::DEVICE_PAUSE, &[1]);
+        keys.entered.recv_timeout(WAIT).expect("the pause is held");
+        c.request(2, kind::DEVICE_NAME_SET, b"desk");
+
+        c.hang_up();
+
+        thread::sleep(GRACE);
+        assert_eq!(
+            lock_state(&c.state).clients.len(),
+            1,
+            "not cleaned up while its request runs"
+        );
+        keys.release.send(()).expect("let go");
+        c.wait_until_served();
+        assert_eq!(
+            device.log(),
+            [
+                (cmd::DEVICE_PAUSE, device_pause_payload(true)),
+                (cmd::DEVICE_PAUSE, device_pause_payload(false)),
+            ],
+            "paused, then resumed once"
+        );
+        let st = lock_state(&c.state);
+        // No pause landed after the cleanup. The log above shows the
+        // resume: the engine dropped once the client went clears these
+        // either way.
+        assert!(!st.paused);
+        assert_eq!(st.pause_holder, None);
+        assert_eq!(
+            st.device_name.as_deref(),
+            Some(&b"desk"[..]),
+            "a request sent before the hang-up still ran"
+        );
+        assert!(st.clients.is_empty());
+    }
+
+    /// A connection whose client started a calibration session and
+    /// computed a calibration, and whose collect (request 3) is held on the
+    /// device.
+    fn calibrating_with_a_collect_held() -> (Arc<Gate>, GateKeys, Connection) {
+        use tobii_ipc::request::{encode_point_2d, encode_u32, kind, status};
+        use tobii_proto::calibration::cmd;
+        let (device, keys) = gate_holding(Some(cmd::COLLECT_2D));
+        let mut c = Connection::open(Arc::clone(&device) as Arc<dyn DeviceCommands>);
+        // Both eyes.
+        c.request(1, kind::CALIBRATION_START, &[2]);
+        c.request(2, kind::CALIBRATION_COMPUTE, &[]);
+        let computed = tobii_calib::blob::calibration_id(&device_blob()).expect("an id");
+        assert_eq!(
+            c.wait_for_frames(2),
+            [
+                reply(1, status::OK, &[]),
+                reply(2, status::OK, &encode_u32(computed)),
+            ]
+        );
+        c.request(3, kind::CALIBRATION_COLLECT_2D, &encode_point_2d(0.5, 0.1));
+        keys.entered
+            .recv_timeout(WAIT)
+            .expect("the collect is held");
+        (device, keys, c)
+    }
+
+    /// What the device got after the collect.
+    fn after_the_collect(device: &Gate) -> Vec<(u32, Vec<u8>)> {
+        let log = device.log();
+        let collect = log
+            .iter()
+            .position(|(command, _)| *command == tobii_proto::calibration::cmd::COLLECT_2D)
+            .expect("the collect");
+        log[collect + 1..].to_vec()
+    }
+
+    /// A stop that keeps the session, sent without waiting for the answer
+    /// just before the hang-up, commits once the request before it has run;
+    /// the cleanup then finds no session to discard.
+    #[test]
+    fn a_kept_stop_sent_before_a_hang_up_during_a_request_keeps_the_session() {
+        use tobii_ipc::request::{STOP_KEEP, kind};
+        use tobii_proto::calibration::{cmd, write_payload};
+        let (device, keys, mut c) = calibrating_with_a_collect_held();
+        c.request(4, kind::CALIBRATION_STOP, STOP_KEEP);
+
+        c.hang_up();
+
+        thread::sleep(GRACE);
+        assert_eq!(
+            after_the_collect(&device),
+            [],
+            "nothing overtakes the collect"
+        );
+        keys.release.send(()).expect("let go");
+        c.wait_until_served();
+        assert_eq!(
+            after_the_collect(&device),
+            [
+                (cmd::STOP, Vec::new()),
+                (cmd::WRITE, write_payload(&device_blob())),
+            ],
+            "stopped once, keeping what the session computed"
+        );
+        let st = lock_state(&c.state);
+        assert!(!st.calibration.is_active());
+        assert_eq!(
+            st.calibration.id,
+            tobii_calib::blob::calibration_id(&device_blob())
+        );
+        assert!(st.clients.is_empty());
+    }
+
+    /// The session of a client that hangs up during a request of it is
+    /// discarded once the request has run, and once.
+    #[test]
+    fn a_calibrating_client_that_hangs_up_during_a_request_has_its_session_discarded_after_it() {
+        use tobii_proto::calibration::{cmd, write_payload};
+        let (device, keys, mut c) = calibrating_with_a_collect_held();
+
+        c.hang_up();
+
+        thread::sleep(GRACE);
+        assert_eq!(
+            after_the_collect(&device),
+            [],
+            "not discarded while the collect runs"
+        );
+        keys.release.send(()).expect("let go");
+        c.wait_until_served();
+        let previous = tobii_usb::calibration::embedded_blob().expect("blob");
+        assert_eq!(
+            after_the_collect(&device),
+            [
+                (cmd::STOP, Vec::new()),
+                (cmd::WRITE, write_payload(&previous))
+            ],
+            "stopped once, putting back the calibration it started from"
+        );
+        let st = lock_state(&c.state);
+        assert!(!st.calibration.is_active());
+        assert_eq!(
+            st.calibration.id,
+            tobii_calib::blob::calibration_id(&previous)
+        );
+        assert!(st.clients.is_empty());
+    }
+
+    #[test]
+    fn a_client_with_a_full_request_queue_is_read_no_further() {
+        use tobii_ipc::request::{encode_display_area, encode_u32, kind, state, status};
+        let (device, keys) = gate();
+        let mut c = Connection::open(device);
+        c.request(
+            1,
+            kind::DISPLAY_AREA_SET,
+            &encode_display_area(&area(600.0)),
+        );
+        keys.entered
+            .recv_timeout(WAIT)
+            .expect("the request is held");
+        let paused = encode_u32(state::DEVICE_PAUSED);
+        // A full queue, and one more that the reader waits to queue.
+        let last = u32::try_from(REQUEST_QUEUE).expect("queue length") + 2;
+        for id in 2..=last {
+            c.request(id, kind::STATE, &paused);
+        }
+
+        c.send(&tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE));
+
+        thread::sleep(GRACE);
+        assert!(c.sent().is_empty(), "the subscription waits in the socket");
+        keys.release.send(()).expect("let go");
+        let count = usize::try_from(last).expect("frame count") + 1;
+        let sent = c.wait_for_frames(count);
+        let replies: Vec<_> = sent.iter().filter(|m| **m != ACK).cloned().collect();
+        let mut expected = vec![reply(1, status::OK, &[])];
+        expected.extend((2..=last).map(|id| reply(id, status::OK, &[0])));
+        assert_eq!(replies, expected, "every request answered, in order");
+        assert_eq!(sent.len() - replies.len(), 1, "and the subscription acked");
+    }
+
+    /// Answers nothing: panics.
+    struct Panicking;
+
+    impl DeviceCommands for Panicking {
+        fn run(
+            &self,
+            _cmd: u32,
+            _payload: Vec<u8>,
+            _timeout: Duration,
+        ) -> Result<tobii_usb::engine::CommandResponse, tobii_usb::engine::CommandError> {
+            panic!("the stand-in device panics");
+        }
+    }
+
+    /// Nothing answers the client's requests once its worker panicked: the
+    /// connection is closed then, not at the client's next request.
+    #[test]
+    fn a_connection_whose_request_worker_panicked_is_closed() {
+        use tobii_ipc::request::{encode_display_area, kind};
+        let mut c = Connection::open(Arc::new(Panicking));
+
+        c.request(
+            1,
+            kind::DISPLAY_AREA_SET,
+            &encode_display_area(&area(600.0)),
+        );
+
+        c.wait_until_served();
+        assert!(lock_state(&c.state).clients.is_empty());
+        let peer = c.peer.as_mut().expect("still connected");
+        peer.set_read_timeout(Some(WAIT)).expect("read timeout");
+        assert!(
+            matches!(read_frame(peer), Ok(None)),
+            "the connection is closed"
         );
     }
 

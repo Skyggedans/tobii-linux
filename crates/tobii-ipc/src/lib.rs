@@ -12,6 +12,12 @@
 //! | `0x11` REPLY | daemon -> client | `u32 id`, `u8 status`, payload |
 //! | `0x20` HEAD .. `0x27` NOTIFICATION | daemon -> client | samples ([`ServerMsg`]) |
 //!
+//! The daemon runs a connection's REQUESTs one at a time, in the order they
+//! came, and answers a SUBSCRIBE without waiting for the requests before it
+//! to finish (only a backlog of dozens of them holds it up): a SUBSCRIBED
+//! may arrive ahead of the REPLYs to earlier requests, so a client matches
+//! a REPLY to its REQUEST by id.
+//!
 //! Sample timestamps are the host clock, [`host_clock_us`] in microseconds,
 //! which is also what `tobii_system_clock` returns: the daemon maps the
 //! device time each sample was taken at onto it. Its USB engine estimates

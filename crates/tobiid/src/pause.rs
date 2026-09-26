@@ -181,8 +181,9 @@ fn resume(state: &Mutex<State>, client: u64) -> Reply {
 /// dropped the client too. Only the running engine is asked; none is
 /// started for this.
 pub(crate) fn release(state: &Mutex<State>, client: u64) {
-    // The client's own requests ran on the thread calling this, so the
-    // holder cannot become `client` after this check.
+    // No request of the client's runs any more (its reader waits for its
+    // request worker before calling this), so the holder cannot become
+    // `client` after this check.
     if lock_state(state).pause_holder != Some(client) {
         return;
     }
