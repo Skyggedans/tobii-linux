@@ -126,6 +126,19 @@ Where the answers come from, and where they differ from Windows:
   calibration it has saved stays saved even if the stop then fails
   (`TOBII_ERROR_CONNECTION_FAILED` when the tracker went away); the tracker
   loads it at its next init.
+- **Waiting for the daemon.** A call that asks the daemon (any but a
+  subscription change or a reconnect, which wait 2 s and ~500 ms for their
+  acknowledgement) waits for the answer longer than the daemon's own
+  deadlines let it take, so `TOBII_ERROR_TIMED_OUT` is the daemon's answer
+  (or a daemon held up past them), not libtobii giving up on a call the
+  daemon then carries out (a calibration started, a display area set). A
+  call answered from the facts waits at most ~12 s, for the tracker's first
+  init. One that needs the tracker live waits for it to stream (~12 s from
+  cold) and answer, and at worst for the daemon's own deadlines: 30 s for
+  the tracker to take each command, plus the command's, which comes to 35 s
+  for `tobii_calibration_retrieve` and about 3 min for a
+  `tobii_calibration_start` that fails and puts the calibration back (the
+  table in `crates/tobii-ffi/src/timeouts.rs` has every call).
 - **Lost daemon.** When the connection to `tobiid` is lost (the daemon
   stopped, crashed or was restarted), `tobii_device_process_callbacks`
   delivers what had arrived and then returns `TOBII_ERROR_CONNECTION_FAILED`
@@ -233,16 +246,17 @@ Where the answers come from, and where they differ from Windows:
   from several threads at once, on one device too: a device's state is
   locked by concern, as the DLL's is. Its requests, subscription changes and
   reconnects run one at a time, in the order they are called, each for its
-  whole round trip to tobiid (a pause may take up to a minute), so one
-  thread's calls made back to back hold another thread's up for one of them
-  at most. They do not hold up its callbacks, processing or waiting, but for
-  a reconnect's round trip (~500 ms at most), and a recenter, a write with
-  no reply, waits for those under way or called before it; a reconnect's
-  ~500 ms counts from when the calls ahead of it, and then a process call
-  another thread is making, have finished. Its callbacks run one at a time,
-  on whichever thread processes it, and a subscribe, an unsubscribe, a clear
-  or a reconnect waits for one running on another thread; once an
-  unsubscribe returns, its callback is not running and never runs again.
+  whole round trip to tobiid (a calibration start may take ~3 min at worst,
+  a pause a minute: *Waiting for the daemon*), so one thread's calls made
+  back to back hold another thread's up for one of them at most. They do not
+  hold up its callbacks, processing or waiting, but for a reconnect's round
+  trip (~500 ms at most), and a recenter, a write with no reply, waits for
+  those under way or called before it; a reconnect's ~500 ms counts from
+  when the calls ahead of it, and then a process call another thread is
+  making, have finished. Its callbacks run one at a time, on whichever
+  thread processes it, and a subscribe, an unsubscribe, a clear or a
+  reconnect waits for one running on another thread; once an unsubscribe
+  returns, its callback is not running and never runs again.
   `tobii_device_destroy` and `tobii_api_destroy` take no lock, as in the
   Stream Engine (whose documentation says so for `tobii_device_destroy`): no
   other thread may be inside a call on the handle, or use it afterwards.
@@ -301,7 +315,7 @@ rather than 20 MB).
 | `tobii-proto` | wire formats: framing, TLV, commands, the gaze/presence/image streams, device facts, the capture log | none |
 | `tobii-pose` | face landmarks and the head-pose fit; owns the model | `ort` |
 | `tobii-usb` | USB transport and the live `0x83` engine; owns the init capture | `rusb` |
-| `tobii-ipc` | the daemon protocol, the display geometry and the host clock | none (`libc` only) |
+| `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
 | `tobii-log` | shared `tracing` setup | — |
 | `tobiid` | the daemon | — |

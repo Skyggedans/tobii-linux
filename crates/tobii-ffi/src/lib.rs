@@ -154,6 +154,17 @@
 //! lost, so that call reports the loss, while after a daemon's answer that it
 //! has no tracker it returns `TOBII_ERROR_NO_ERROR`.
 //!
+//! A request waits for tobiid's answer longer than tobiid's own deadlines
+//! let it take (see `timeouts`), so that `TOBII_ERROR_TIMED_OUT` from one is
+//! tobiid's answer (or a tobiid held up past them), not libtobii giving up
+//! on a request tobiid then carries out. A call answered from what the
+//! tracker reported waits at most ~12 s, for its first init. One that needs
+//! the tracker live waits for it to stream (~12 s from cold) and answer, and
+//! at worst for tobiid's own deadlines: 30 s for the tracker to take each
+//! command, plus the command's (up to 35 s for `tobii_calibration_retrieve`,
+//! about 3 min for a `tobii_calibration_start` that fails and puts the
+//! calibration back).
+//!
 //! libtobii prints nothing, and nothing outside it can subscribe to its
 //! `tracing` events (it is a cdylib with its own copy of `tracing`): the
 //! `tobii_custom_log_t` an application hands `tobii_api_create` is the only
@@ -187,6 +198,7 @@ mod logger;
 mod status;
 mod streams;
 mod stub;
+mod timeouts;
 mod types;
 mod wearable;
 

@@ -8,13 +8,12 @@
 //! DLL refuses only compare theirs with null.
 
 use std::ffi::c_void;
-use std::time::Duration;
 
 use tobii_ipc::request::{
     self, decode_hardware_configuration, decode_stream_types, decode_timesync, kind,
 };
 
-use crate::api::{FACTS_TIMEOUT, write_supported};
+use crate::api::write_supported;
 use crate::calibration::request;
 use crate::device::{Device, device_ref, in_callback};
 use crate::status::{
@@ -23,6 +22,7 @@ use crate::status::{
 };
 use crate::streams::{subscribe, unsubscribe};
 use crate::stub::not_supported;
+use crate::timeouts;
 use crate::types::{
     FieldOfUse, FieldOfUseFn, HardwareConfiguration, HardwareConfigurationEntry, ImageFn,
     StreamType, StreamTypeReceiver, TimesyncData, copy_c_string,
@@ -291,10 +291,6 @@ pub unsafe extern "C" fn tobii_internal_capability_supported(
     unsafe { write_supported(device, capability, supported, internal_capability_supported) }
 }
 
-/// The daemon waits up to 25 s for a gaze frame: a cold tracker streams
-/// gaze only after its second init.
-const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(27);
-
 /// A fresh tracker/host clock pair: the tracker clock read `tracker_us` at
 /// some host time between `system_start_us` and `system_end_us`.
 ///
@@ -331,7 +327,7 @@ pub unsafe extern "C" fn tobii_timesync(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     match d
-        .request(kind::TIMESYNC, &[], TIMESYNC_TIMEOUT)
+        .request(kind::TIMESYNC, &[], timeouts::TIMESYNC)
         .map(|p| decode_timesync(&p))
     {
         Ok(Some(t)) => {
@@ -423,7 +419,7 @@ pub unsafe extern "C" fn tobii_enumerate_stream_types(
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     let entries: Vec<StreamType> = match d
-        .request(kind::STREAM_TYPES, &[], FACTS_TIMEOUT)
+        .request(kind::STREAM_TYPES, &[], timeouts::FACTS)
         .map(|p| decode_stream_types(&p))
     {
         Ok(Some(types)) => types.iter().map(stream_type_c).collect(),
@@ -437,10 +433,6 @@ pub unsafe extern "C" fn tobii_enumerate_stream_types(
     }
     TOBII_ERROR_NO_ERROR
 }
-
-/// The daemon may wait 20 s for another pause or resume to finish, then
-/// 6 s for the device's answer, plus the 30 s a command may wait queued.
-const PAUSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Pause the tracker: it stops sending data until resumed.
 ///
@@ -458,7 +450,7 @@ const PAUSE_TIMEOUT: Duration = Duration::from_secs(60);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_pause_device(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::DEVICE_PAUSE, &[1], PAUSE_TIMEOUT) }
+    unsafe { request(device, kind::DEVICE_PAUSE, &[1], timeouts::DEVICE_PAUSE) }
 }
 
 /// Resume the tracker, whichever client paused it. A resume the tracker does
@@ -470,7 +462,7 @@ pub unsafe extern "C" fn tobii_pause_device(device: *mut Device) -> Status {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_resume_device(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::DEVICE_PAUSE, &[0], PAUSE_TIMEOUT) }
+    unsafe { request(device, kind::DEVICE_PAUSE, &[0], timeouts::DEVICE_PAUSE) }
 }
 
 /// A hardware configuration entry with nothing set.
@@ -562,7 +554,7 @@ pub unsafe extern "C" fn tobii_hardware_configuration_get(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     match d
-        .request(kind::HARDWARE_CONFIGURATION, &[], FACTS_TIMEOUT)
+        .request(kind::HARDWARE_CONFIGURATION, &[], timeouts::FACTS)
         .map(|p| decode_hardware_configuration(&p))
     {
         Ok(Some(h)) => {

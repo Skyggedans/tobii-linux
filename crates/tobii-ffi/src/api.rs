@@ -13,6 +13,7 @@ use crate::status::{
     TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
     TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_TIMED_OUT,
 };
+use crate::timeouts;
 use crate::types::{
     CustomAlloc, CustomLog, DeviceInfo, DeviceUrlReceiver, FieldOfUse, StateString,
     TOBII_CAPABILITY_CALIBRATION_2D, TOBII_CAPABILITY_COMPOUND_STREAM_USER_POSITION_GUIDE_XY,
@@ -37,12 +38,6 @@ const API_VERSION: Version = Version {
     revision: 0,
     build: 3,
 };
-
-/// Device facts are ready once the daemon's engine has initialised the
-/// tracker, which a cold start can take most of 10 s to do.
-pub(crate) const FACTS_TIMEOUT: Duration = Duration::from_secs(12);
-/// How long a state query may take.
-const STATE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `tobii_get_api_version`: 4.1.0.3.
 ///
@@ -604,7 +599,7 @@ pub unsafe extern "C" fn tobii_get_track_box(
     if track_box.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    let b = match d.request(kind::TRACK_BOX, &[], FACTS_TIMEOUT) {
+    let b = match d.request(kind::TRACK_BOX, &[], timeouts::FACTS) {
         Ok(p) => match decode_track_box(&p) {
             Some(b) => b,
             None => return d.malformed("track box"),
@@ -629,7 +624,7 @@ pub unsafe extern "C" fn tobii_get_track_box(
 
 /// Ask the daemon for a state value.
 fn query_state(d: &Device, state: u32) -> Result<Vec<u8>, Status> {
-    d.request(kind::STATE, &request::encode_u32(state), STATE_TIMEOUT)
+    d.request(kind::STATE, &request::encode_u32(state), timeouts::STATE)
 }
 
 /// A boolean state. Power save, remote wake, exclusive mode and the
@@ -755,7 +750,7 @@ pub unsafe extern "C" fn tobii_get_state_string(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     // The daemon may wait for the tracker's first init: the facts timeout.
-    let bytes = match d.request(kind::STATE, &request::encode_u32(state), FACTS_TIMEOUT) {
+    let bytes = match d.request(kind::STATE, &request::encode_u32(state), timeouts::FACTS) {
         Ok(bytes) => bytes,
         Err(status) => return status,
     };

@@ -2,18 +2,17 @@
 //! mounting geometry, device name and output frequency.
 
 use std::ffi::{c_char, c_void};
-use std::time::Duration;
 
 use tobii_ipc::geometry::{self, GeometryMounting as WireMounting};
 use tobii_ipc::request::{
     DEVICE_NAME_MAX, decode_display_area, decode_geometry_mounting, encode_display_area, kind,
 };
 
-use crate::api::FACTS_TIMEOUT;
 use crate::device::{Api, Device, device_ref};
 use crate::status::{
     Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUPPORTED,
 };
+use crate::timeouts;
 use crate::types::{
     DeviceName, DisplayArea, GeometryMounting, OutputFrequencyReceiver, TOBII_ENABLED_EYE_BOTH,
     copy_c_bytes,
@@ -21,8 +20,6 @@ use crate::types::{
 
 /// The ET5's output frequency, Hz (what command 1650 reports).
 const OUTPUT_FREQUENCY_HZ: f32 = 33.0;
-/// How long the device may take to acknowledge a display area.
-const DISPLAY_AREA_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Only both eyes: per-eye tracking was never captured.
 ///
@@ -115,7 +112,7 @@ pub unsafe extern "C" fn tobii_get_geometry_mounting(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     match d
-        .request(kind::GEOMETRY_MOUNTING, &[], FACTS_TIMEOUT)
+        .request(kind::GEOMETRY_MOUNTING, &[], timeouts::FACTS)
         .map(|p| decode_geometry_mounting(&p))
     {
         Ok(Some(m)) => {
@@ -148,7 +145,7 @@ pub unsafe extern "C" fn tobii_get_display_area(
         return TOBII_ERROR_INVALID_PARAMETER;
     }
     match d
-        .request(kind::DISPLAY_AREA_GET, &[], FACTS_TIMEOUT)
+        .request(kind::DISPLAY_AREA_GET, &[], timeouts::FACTS)
         .map(|p| decode_display_area(&p))
     {
         Ok(Some(a)) => {
@@ -183,7 +180,7 @@ pub unsafe extern "C" fn tobii_set_display_area(
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     let payload = encode_display_area(&display_area_wire(area));
-    match d.request(kind::DISPLAY_AREA_SET, &payload, DISPLAY_AREA_TIMEOUT) {
+    match d.request(kind::DISPLAY_AREA_SET, &payload, timeouts::DISPLAY_AREA_SET) {
         Ok(_) => TOBII_ERROR_NO_ERROR,
         Err(status) => status,
     }
@@ -246,7 +243,7 @@ pub unsafe extern "C" fn tobii_get_device_name(
     if device_name.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    let bytes = match d.request(kind::DEVICE_NAME_GET, &[], FACTS_TIMEOUT) {
+    let bytes = match d.request(kind::DEVICE_NAME_GET, &[], timeouts::FACTS) {
         Ok(bytes) => bytes,
         Err(TOBII_ERROR_NOT_SUPPORTED) => match d.device_info() {
             Ok(info) => info.model.into_bytes(),
@@ -285,7 +282,7 @@ pub unsafe extern "C" fn tobii_set_device_name(
     }
     // SAFETY: non-null, and the caller guarantees it is readable that far.
     let name = unsafe { name_bytes(device_name) };
-    match d.request(kind::DEVICE_NAME_SET, &name, FACTS_TIMEOUT) {
+    match d.request(kind::DEVICE_NAME_SET, &name, timeouts::FACTS) {
         Ok(_) => TOBII_ERROR_NO_ERROR,
         Err(status) => status,
     }

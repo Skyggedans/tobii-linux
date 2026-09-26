@@ -48,6 +48,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use tobii_ipc::deadline;
 use tobii_ipc::geometry::DisplayArea;
 use tobii_proto::facts::{DeviceFacts, DeviceNotification};
 use tobii_proto::gaze83::GazeFrame;
@@ -244,12 +245,6 @@ pub(crate) struct QueuedCommand {
     pub(crate) reply: Sender<Result<CommandResponse, CommandError>>,
 }
 
-/// How long a command may wait for the USB thread to reach it (queued behind
-/// others, or the device still initialising) and to write it (a tracker
-/// starting its sensor refuses writes for up to about 3 s; its sensor start
-/// takes 3.6 s) before its own deadline starts.
-const QUEUE_ALLOWANCE: Duration = Duration::from_secs(30);
-
 /// Runs commands on the engine's device; cheap to clone and usable from any
 /// thread.
 #[derive(Debug, Clone)]
@@ -261,12 +256,12 @@ impl Commands {
     /// # Errors
     ///
     /// [`CommandError::Timeout`] when no answer arrives within the command's
-    /// timeout (plus the time spent queued and writing it) or the device
-    /// refuses the write past its deadline, [`CommandError::EngineGone`] when
-    /// the engine stops first, [`CommandError::Usb`] when the write fails
-    /// otherwise.
+    /// timeout, plus up to [`deadline::QUEUE_ALLOWANCE`] spent queued and
+    /// writing it (see [`deadline::command`]), or the device refuses the write
+    /// past its deadline, [`CommandError::EngineGone`] when the engine stops
+    /// first, [`CommandError::Usb`] when the write fails otherwise.
     pub fn run(&self, command: DeviceCommand) -> Result<CommandResponse, CommandError> {
-        let deadline = command.timeout + QUEUE_ALLOWANCE;
+        let deadline = deadline::command(command.timeout);
         let (reply, answer) = mpsc::channel();
         self.0
             .send(QueuedCommand { command, reply })

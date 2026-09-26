@@ -831,9 +831,10 @@ fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<State>>) {
 /// How many of a client's requests may wait behind the one its worker runs.
 /// A client with that many waiting is read no further until the worker
 /// takes the next: its frames wait in the socket, SUBSCRIBEs included.
-/// libtobii has one request in flight per device and gives up on one after
-/// 3 s at the soonest, so even a request that holds the worker for a minute
-/// leaves no more than about twenty behind it.
+/// libtobii has one request in flight per device and waits for its answer
+/// longer than the daemon may take over it (see [`tobii_ipc::deadline`]), so
+/// it leaves none waiting; only a client that gives up sooner and asks again
+/// fills the queue.
 const REQUEST_QUEUE: usize = 32;
 
 /// A client's request worker: a thread that runs the client's requests one

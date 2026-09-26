@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tobii_ipc::deadline;
 use tobii_ipc::geometry::{DisplayArea, display_area_basic};
 use tobii_ipc::request::{
     self, Request, Timesync, decode_display_area, encode_device_info, encode_display_area,
@@ -56,17 +57,16 @@ impl From<Result<Vec<u8>, u8>> for Reply {
 }
 
 /// How long a request waits for the device's init to report its facts.
-const FACTS_TIMEOUT: Duration = Duration::from_secs(10);
+const FACTS_TIMEOUT: Duration = deadline::FACTS;
 /// How long the device may take to acknowledge a display area.
-const DISPLAY_AREA_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPLAY_AREA_TIMEOUT: Duration = deadline::DISPLAY_AREA;
 /// Host-side latency bound between the device stamping a gaze frame and the
 /// daemon reading it: the lower edge of the TIMESYNC window.
 const FRAME_LATENCY_US: i64 = 30_000;
-/// How long a TIMESYNC waits for a gaze frame newer than the request. A cold
-/// engine reports its facts within seconds but streams gaze only after its
-/// second init (about 12 s on the ET5); this also covers a third.
+/// How long a TIMESYNC waits for a gaze frame newer than the request (see
+/// [`deadline::TIMESYNC`]).
 #[cfg(not(test))]
-const TIMESYNC_TIMEOUT: Duration = Duration::from_secs(25);
+const TIMESYNC_TIMEOUT: Duration = deadline::TIMESYNC;
 #[cfg(test)]
 const TIMESYNC_TIMEOUT: Duration = Duration::from_millis(300);
 /// How often a TIMESYNC looks for that frame (the tracker sends ~33 a second).

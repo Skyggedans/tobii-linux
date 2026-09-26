@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tobii_ipc::deadline;
 use tobii_ipc::request::status;
 use tobii_ipc::{
     Notification, NotificationValue, STREAM_NOTIFICATIONS, encode_notification, notification,
@@ -46,10 +47,10 @@ use crate::requests::Reply;
 
 /// How long the device may take to answer 3100. The DLL allows 3 s; the
 /// init's resume has taken 3.5 s on Linux.
-const PAUSE_TIMEOUT: Duration = Duration::from_secs(6);
+const PAUSE_TIMEOUT: Duration = deadline::PAUSE;
 /// How long a request waits for another pause or resume to finish.
 #[cfg(not(test))]
-const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
+const LOCK_TIMEOUT: Duration = deadline::PAUSE_LOCK;
 #[cfg(test)]
 const LOCK_TIMEOUT: Duration = Duration::from_millis(300);
 /// How often a waiting request tries the lock.
@@ -280,6 +281,8 @@ mod tests {
     /// Records every command and answers each with `answer`.
     struct Recording {
         sent: Mutex<Vec<(u32, Vec<u8>)>>,
+        /// Every command's deadline.
+        deadlines: Mutex<Vec<Duration>>,
         answer: Mutex<Result<CommandResponse, CommandError>>,
     }
 
@@ -288,9 +291,10 @@ mod tests {
             &self,
             cmd: u32,
             payload: Vec<u8>,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<CommandResponse, CommandError> {
             self.sent.lock().expect("sent").push((cmd, payload));
+            self.deadlines.lock().expect("deadlines").push(timeout);
             self.answer.lock().expect("answer").clone()
         }
     }
@@ -305,6 +309,7 @@ mod tests {
     fn setup() -> Setup {
         let device = Arc::new(Recording {
             sent: Mutex::new(Vec::new()),
+            deadlines: Mutex::new(Vec::new()),
             answer: Mutex::new(Ok(CommandResponse::ok(Vec::new()))),
         });
         let mut st = state_with_client(1);
@@ -397,6 +402,27 @@ mod tests {
         assert_eq!(st.pause_holder, Some(2));
         assert!(!st.pausing);
         assert!(st.clients[1].holds_device, "the device stays up for it");
+    }
+
+    #[test]
+    fn a_pause_or_resume_waits_on_the_device_within_its_budget() {
+        let s = setup();
+        for payload in [[1], [0]] {
+            s.device.deadlines.lock().expect("deadlines").clear();
+
+            assert_eq!(
+                ask(&s, 1, kind::DEVICE_PAUSE, &payload),
+                Reply::ok(Vec::new())
+            );
+
+            let sent = s.device.deadlines.lock().expect("deadlines").clone();
+            // After waiting for another pause or resume to finish.
+            let waited = deadline::PAUSE_LOCK + deadline::commands(&sent);
+            assert!(
+                !sent.is_empty() && waited <= deadline::worst::DEVICE_PAUSE,
+                "{payload:?}: {waited:?}"
+            );
+        }
     }
 
     #[test]

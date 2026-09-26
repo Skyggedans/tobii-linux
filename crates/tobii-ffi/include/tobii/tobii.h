@@ -18,13 +18,14 @@
  * - its requests (device info, states, calibration, pause and the other
  *   calls answered by tobiid), subscribes, unsubscribes and
  *   tobii_device_reconnect run one at a time, in the order they are called,
- *   each for its whole round trip to tobiid, so a slow one (a pause may take
- *   up to a minute) delays the others on that device, and one thread's
- *   calls made back to back hold another thread's up for one of them at
- *   most; of them only a reconnect holds back its callbacks,
- *   tobii_device_process_callbacks and tobii_wait_for_callbacks, for its own
- *   round trip (~500 ms at most); tobii_recenter, a write with no reply,
- *   waits for those under way or called before it;
+ *   each for its whole round trip to tobiid, so a slow one (a calibration
+ *   start may take ~3 min at worst, a pause a minute) delays the others on
+ *   that device, and one thread's calls made back to back hold another
+ *   thread's up for one of them at most; of them only a reconnect holds
+ *   back its callbacks, tobii_device_process_callbacks and
+ *   tobii_wait_for_callbacks, for its own round trip (~500 ms at most);
+ *   tobii_recenter, a write with no reply, waits for those under way or
+ *   called before it;
  * - its callbacks run one at a time, on whichever thread calls
  *   tobii_device_process_callbacks, and such a call made while another
  *   thread processes the device returns at once;

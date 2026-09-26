@@ -52,6 +52,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use tobii_calib::store::{self, Location};
+use tobii_ipc::deadline;
 use tobii_ipc::geometry::DisplayArea;
 use tobii_ipc::request::{STOP_DISCARD, STOP_KEEP, decode_point_2d, encode_u32, kind, status};
 use tobii_ipc::{
@@ -67,9 +68,9 @@ use crate::device::{DeviceCommands, run, run_in_session};
 use crate::requests::Reply;
 
 /// Commands the device answers at once (and collect, which takes ~0.9 s).
-const QUICK: Duration = Duration::from_secs(5);
+const QUICK: Duration = deadline::CALIBRATION_QUICK;
 /// Compute (~2 s) and uploading a ~660 KB calibration.
-const SLOW: Duration = Duration::from_secs(10);
+const SLOW: Duration = deadline::CALIBRATION_SLOW;
 
 /// `tobii_enabled_eye_t`: both eyes.
 const ENABLED_EYE_BOTH: u8 = 2;
@@ -739,8 +740,9 @@ fn orphan(st: &mut State, session: &Session) {
 pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Weak};
-    use std::thread;
+    use std::thread::{self, ThreadId};
     use std::time::Instant;
+    use tobii_ipc::deadline::worst;
     use tobii_ipc::request::decode_u32;
     use tobii_proto::facts::{DEFAULT_DISPLAY_ID, DeviceFacts, display_area_set_payload};
     use tobii_proto::protocol::cmd::DISPLAY_AREA_SET;
@@ -774,6 +776,9 @@ pub(crate) mod tests {
         log: Mutex<Vec<u32>>,
         /// Every command with its payload.
         payloads: Mutex<Vec<(u32, Vec<u8>)>>,
+        /// Every command's deadline, lost ones too, with the thread that
+        /// sent it.
+        deadlines: Mutex<Vec<(ThreadId, Duration)>>,
         /// A command the device refuses.
         refuse: Mutex<Option<u32>>,
         /// A command the device refuses for a bad state (TTP `BAD_STATE`).
@@ -822,8 +827,12 @@ pub(crate) mod tests {
             &self,
             cmd: u32,
             payload: Vec<u8>,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<CommandResponse, CommandError> {
+            self.deadlines
+                .lock()
+                .expect("deadlines")
+                .push((thread::current().id(), timeout));
             let mishap = self
                 .mishap
                 .lock()
@@ -920,6 +929,7 @@ pub(crate) mod tests {
                 blob,
                 log: Mutex::new(Vec::new()),
                 payloads: Mutex::new(Vec::new()),
+                deadlines: Mutex::new(Vec::new()),
                 refuse: Mutex::new(None),
                 bad_state: Mutex::new(None),
                 mishap: Mutex::new(None),
@@ -1030,6 +1040,22 @@ pub(crate) mod tests {
         handle(&s.state, client, k, payload)
     }
 
+    /// Make `request` on this thread; its reply, and the longest its device
+    /// commands may keep it waiting in the daemon (see
+    /// [`deadline::commands`]). The commands other threads send meanwhile,
+    /// such as an init's own write, are not the request's.
+    fn timed(s: &Setup, request: impl FnOnce() -> Reply) -> (Reply, Duration) {
+        let before = s.device.deadlines.lock().expect("deadlines").len();
+        let reply = request();
+        let me = thread::current().id();
+        let sent: Vec<Duration> = s.device.deadlines.lock().expect("deadlines")[before..]
+            .iter()
+            .filter(|(sender, _)| *sender == me)
+            .map(|(_, deadline)| *deadline)
+            .collect();
+        (reply, deadline::commands(&sent))
+    }
+
     /// Have the device refuse `command` for a bad state from now on (`None`:
     /// no command).
     fn refuse_for_bad_state(s: &Setup, command: Option<u32>) {
@@ -1073,6 +1099,43 @@ pub(crate) mod tests {
         assert_eq!((info.id, saved), (0x1234_5678, s.device.blob.clone()));
         assert_eq!(lock_state(&s.state).calibration.id, Some(0x1234_5678));
         assert!(!lock_state(&s.state).calibration.is_active());
+    }
+
+    #[test]
+    fn a_session_waits_on_the_device_within_each_requests_budget() {
+        let s = setup("budgets");
+        let point = tobii_ipc::request::encode_point_2d(0.5, 0.1);
+        let blob = s.device.blob.clone();
+        for (k, payload, budget) in [
+            (
+                kind::CALIBRATION_START,
+                &[ENABLED_EYE_BOTH][..],
+                worst::CALIBRATION_START,
+            ),
+            (
+                kind::CALIBRATION_COLLECT_2D,
+                &point,
+                worst::CALIBRATION_COLLECT_2D,
+            ),
+            (
+                kind::CALIBRATION_DISCARD_2D,
+                &point,
+                worst::CALIBRATION_DISCARD_2D,
+            ),
+            (kind::CALIBRATION_CLEAR, &[], worst::CALIBRATION_CLEAR),
+            (kind::CALIBRATION_COMPUTE, &[], worst::CALIBRATION_COMPUTE),
+            (kind::CALIBRATION_RETRIEVE, &[], worst::CALIBRATION_RETRIEVE),
+            (kind::CALIBRATION_APPLY, &blob, worst::CALIBRATION_APPLY),
+            (kind::CALIBRATION_STOP, STOP_KEEP, worst::CALIBRATION_STOP),
+        ] {
+            let (reply, waited) = timed(&s, || ask(&s, 1, k, payload));
+
+            assert_eq!(reply.status, status::OK, "request {k}");
+            assert!(
+                waited > Duration::ZERO && waited <= budget,
+                "request {k}: {waited:?} in a budget of {budget:?}"
+            );
+        }
     }
 
     #[test]
@@ -1528,11 +1591,13 @@ pub(crate) mod tests {
         assert_eq!(set_area(&s, 1, &area(597.0)), Reply::ok(Vec::new()));
         assert!(!file.exists(), "saved only with a calibration made on it");
 
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, &[]),
-            Reply::ok(Vec::new())
-        );
+        let (reply, waited) = timed(&s, || ask(&s, 1, kind::CALIBRATION_STOP, &[]));
 
+        assert_eq!(reply, Reply::ok(Vec::new()));
+        assert!(
+            waited <= worst::CALIBRATION_STOP,
+            "{waited:?}, the put-back included"
+        );
         assert_eq!(display_writes(&s), 2, "set, then put back");
         let st = lock_state(&s.state);
         assert_eq!(st.display_override, Some(old));
@@ -1929,16 +1994,17 @@ pub(crate) mod tests {
             lock_state(&s.state).clients[0].streams = STREAM_NOTIFICATIONS;
             befall(&s, command, Mishap::Reinit);
 
-            assert_eq!(
-                ask(&s, 1, kind::CALIBRATION_START, &[2]).status,
-                status::CONNECTION_FAILED,
-                "{tag}"
-            );
+            let (reply, waited) = timed(&s, || ask(&s, 1, kind::CALIBRATION_START, &[2]));
 
+            assert_eq!(reply.status, status::CONNECTION_FAILED, "{tag}");
             assert_eq!(
                 *s.device.log.lock().expect("log"),
                 vec![cmd::START, cmd::CLEAR, cmd::WRITE, cmd::STOP, cmd::WRITE],
                 "{tag}: the calibration it started from goes back"
+            );
+            assert!(
+                waited <= worst::CALIBRATION_START,
+                "{tag}: {waited:?}, its longest path"
             );
             {
                 let st = lock_state(&s.state);
@@ -2041,9 +2107,12 @@ pub(crate) mod tests {
         let (s, file, old) = display_setup("reinit-area");
         befall(&s, DISPLAY_AREA_SET, Mishap::Reinit);
 
-        assert_eq!(
-            set_area(&s, 1, &area(597.0)).status,
-            status::CALIBRATION_NOT_STARTED
+        let (reply, waited) = timed(&s, || set_area(&s, 1, &area(597.0)));
+
+        assert_eq!(reply.status, status::CALIBRATION_NOT_STARTED);
+        assert!(
+            waited <= worst::DISPLAY_AREA_SET,
+            "{waited:?}, its own put-back included"
         );
 
         {
@@ -2167,10 +2236,12 @@ pub(crate) mod tests {
             );
             befall(&s, cmd::WRITE, mishap);
 
-            assert_eq!(
-                ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP).status,
-                answer,
-                "{tag}"
+            let (reply, waited) = timed(&s, || ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP));
+
+            assert_eq!(reply.status, answer, "{tag}");
+            assert!(
+                waited <= worst::CALIBRATION_STOP,
+                "{tag}: {waited:?}, the successor's write included"
             );
 
             let (saved, _) = store::load(&s.dir.join("calibration.bin"))

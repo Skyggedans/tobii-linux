@@ -33,7 +33,6 @@ use tobii_ipc::{
     ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
 };
 
-use crate::api::FACTS_TIMEOUT;
 use crate::logger::{self, Level, Logger, SharedLogger};
 use crate::status::{
     Status, TOBII_ERROR_ALREADY_SUBSCRIBED, TOBII_ERROR_CALLBACK_IN_PROGRESS,
@@ -41,6 +40,7 @@ use crate::status::{
     TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUBSCRIBED,
     TOBII_ERROR_TIMED_OUT,
 };
+use crate::timeouts;
 use crate::types::{
     DisplayArea, EyePair, EyePairFn, FieldOfUse, FieldOfUseFn, GazeData, GazeDataEye, GazeDataFn,
     GazePoint, GazePointFn, HeadPose, HeadPoseFn, Image, ImageFn, Notification, NotificationValue,
@@ -622,6 +622,8 @@ impl Command {
     /// lock). The samples that arrive meanwhile stay queued for `process`. A
     /// reply with a non-zero status is that status.
     fn request(&mut self, kind: u8, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, Status> {
+        #[cfg(test)]
+        tests::note_request(timeout);
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let id = self.next_request_id;
         self.link.send(&encode_request(id, kind, payload))?;
@@ -1060,7 +1062,7 @@ impl Device {
         if let Some(info) = &command.device_info {
             return Ok(info.clone());
         }
-        let payload = command.request(kind::DEVICE_INFO, &[], FACTS_TIMEOUT)?;
+        let payload = command.request(kind::DEVICE_INFO, &[], timeouts::FACTS)?;
         let Some(info) = decode_device_info(&payload) else {
             drop(command);
             return Err(self.malformed("device info"));
@@ -1531,6 +1533,7 @@ pub(crate) mod tests {
     use crate::types::{
         LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO, TOBII_STATE_CALIBRATION_ACTIVE,
     };
+    use std::cell::RefCell;
     use std::ffi::c_char;
     use std::io::Write as _;
     use std::ptr;
@@ -1584,6 +1587,20 @@ pub(crate) mod tests {
         /// connects to, taken by the test build of `Device::connect_daemon`;
         /// with none there, the constructor fails to connect.
         pub(crate) static DAEMON: Cell<Option<Connector>> = const { Cell::new(None) };
+
+        /// The timeout of each request made on this thread, noted by the
+        /// test build of `Command::request`.
+        static REQUEST_TIMEOUTS: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Note that a request on this thread waits up to `timeout`.
+    pub(super) fn note_request(timeout: Duration) {
+        REQUEST_TIMEOUTS.with_borrow_mut(|timeouts| timeouts.push(timeout));
+    }
+
+    /// The timeouts of the requests made on this thread since the last take.
+    pub(crate) fn take_request_timeouts() -> Vec<Duration> {
+        REQUEST_TIMEOUTS.take()
     }
 
     /// A daemon stand-in: answers each client frame with whatever `handler`

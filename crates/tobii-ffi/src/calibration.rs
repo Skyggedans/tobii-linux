@@ -20,23 +20,13 @@ use crate::status::{
     TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_OPERATION_FAILED,
 };
 use crate::stub::not_supported;
+use crate::timeouts;
 use crate::types::{
     CalibrationPointData, CalibrationPointReceiver, CalibrationStimulusPoints, DataReceiver,
     TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
     TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
     TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
 };
-
-// Client-side timeouts cover the daemon's own device timeouts plus queueing.
-const START_TIMEOUT: Duration = Duration::from_secs(25);
-const STOP_TIMEOUT: Duration = Duration::from_secs(20);
-const COLLECT_TIMEOUT: Duration = Duration::from_secs(8);
-/// The daemon's 5 s command timeout plus the 30 s a command may wait queued.
-const DISCARD_TIMEOUT: Duration = Duration::from_secs(40);
-const COMPUTE_TIMEOUT: Duration = Duration::from_secs(20);
-const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(8);
-const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
-const CLEAR_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Run a request on `device`, discarding the reply payload.
 ///
@@ -72,7 +62,14 @@ pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_ey
         return TOBII_ERROR_INVALID_PARAMETER;
     };
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::CALIBRATION_START, &[eye], START_TIMEOUT) }
+    unsafe {
+        request(
+            device,
+            kind::CALIBRATION_START,
+            &[eye],
+            timeouts::CALIBRATION_START,
+        )
+    }
 }
 
 /// End the session, keeping the calibration it computed last (and the
@@ -90,7 +87,14 @@ pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_ey
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_stop(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::CALIBRATION_STOP, STOP_KEEP, STOP_TIMEOUT) }
+    unsafe {
+        request(
+            device,
+            kind::CALIBRATION_STOP,
+            STOP_KEEP,
+            timeouts::CALIBRATION_STOP,
+        )
+    }
 }
 
 /// Collect the user's gaze at `(x, y)` (normalised display coordinates)
@@ -110,7 +114,7 @@ pub unsafe extern "C" fn tobii_calibration_collect_data_2d(
             device,
             kind::CALIBRATION_COLLECT_2D,
             &encode_point_2d(x, y),
-            COLLECT_TIMEOUT,
+            timeouts::CALIBRATION_COLLECT_2D,
         )
     }
 }
@@ -132,7 +136,7 @@ pub unsafe extern "C" fn tobii_calibration_discard_data_2d(
             device,
             kind::CALIBRATION_DISCARD_2D,
             &encode_point_2d(x, y),
-            DISCARD_TIMEOUT,
+            timeouts::CALIBRATION_DISCARD_2D,
         )
     }
 }
@@ -144,7 +148,14 @@ pub unsafe extern "C" fn tobii_calibration_discard_data_2d(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_clear(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::CALIBRATION_CLEAR, &[], CLEAR_TIMEOUT) }
+    unsafe {
+        request(
+            device,
+            kind::CALIBRATION_CLEAR,
+            &[],
+            timeouts::CALIBRATION_CLEAR,
+        )
+    }
 }
 
 /// Compute a calibration from the collected points and make it active. The
@@ -156,7 +167,14 @@ pub unsafe extern "C" fn tobii_calibration_clear(device: *mut Device) -> Status 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_compute_and_apply(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::CALIBRATION_COMPUTE, &[], COMPUTE_TIMEOUT) }
+    unsafe {
+        request(
+            device,
+            kind::CALIBRATION_COMPUTE,
+            &[],
+            timeouts::CALIBRATION_COMPUTE,
+        )
+    }
 }
 
 /// Read the active calibration and hand it to `receiver`, on this thread.
@@ -191,7 +209,11 @@ pub unsafe extern "C" fn tobii_calibration_retrieve(
     let Some(receiver) = receiver else {
         return TOBII_ERROR_INVALID_PARAMETER;
     };
-    match d.request(kind::CALIBRATION_RETRIEVE, &[], RETRIEVE_TIMEOUT) {
+    match d.request(
+        kind::CALIBRATION_RETRIEVE,
+        &[],
+        timeouts::CALIBRATION_RETRIEVE,
+    ) {
         Ok(blob) => {
             // The request has let the command lock go, so no lock is held.
             // `call` leaves the guard as it found it, down (a call from
@@ -224,7 +246,14 @@ pub unsafe extern "C" fn tobii_calibration_apply(
     // SAFETY: non-null, and the caller guarantees `size` readable bytes.
     let blob = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) };
     // SAFETY: forwarded under the same contract.
-    unsafe { request(device, kind::CALIBRATION_APPLY, blob, APPLY_TIMEOUT) }
+    unsafe {
+        request(
+            device,
+            kind::CALIBRATION_APPLY,
+            blob,
+            timeouts::CALIBRATION_APPLY,
+        )
+    }
 }
 
 /// A record's status word as a `tobii_calibration_point_status_t`, mapped as
