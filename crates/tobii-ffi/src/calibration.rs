@@ -211,7 +211,8 @@ pub unsafe extern "C" fn tobii_calibration_apply(
 /// the DLL maps it (0x180147910): only the low 32 bits count; 1 was used in
 /// the calibration, 0 is valid but was not used, and anything else (the DLL
 /// tests for -1 explicitly) failed or is invalid. The mask only mirrors the
-/// DLL: `tobii_calib::blob::points` passes no word above 2.
+/// DLL: `tobii_calib::blob::points` passes an upper half only as the sign of
+/// a -1.
 fn point_status(word: u64) -> u32 {
     match word & 0xffff_ffff {
         1 => TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
@@ -227,11 +228,16 @@ fn point_status(word: u64) -> u32 {
 /// `tobii_calib::blob::points` refuses is not a valid calibration,
 /// `TOBII_ERROR_OPERATION_FAILED` with no point handed out. The DLL returns
 /// that only for a negative point count (0x18014783f, 13 at 0x1801478a7) and
-/// reads the rest as given: a status word above 2, its -1 included, is
-/// refused here where the DLL reports that eye as `FAILED_OR_INVALID`, and a
-/// blob shorter than a header where the DLL may succeed. The first
-/// measurement of each record is reported as the left eye, and each eye's
-/// status word is mapped as the DLL maps it.
+/// reads the rest as given. Here a status word whose low 32 bits are outside
+/// -1..=2 is refused where the DLL reports that eye as `FAILED_OR_INVALID`,
+/// and one with a non-zero upper half, unless it is a -1's sign, where the
+/// DLL ignores that half and maps the low word as usual; so are a target, or
+/// the measurement of an eye not marked failed (-1), that is not finite or
+/// lies outside the display by more than half its size, and a blob shorter
+/// than a header or with bytes past its point list, where the DLL may
+/// succeed. The first measurement of each record is reported as the left
+/// eye, and each eye's status word is mapped as the DLL maps it; a failed
+/// eye's mapping is passed on as the blob holds it.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `data` must be null or point to
@@ -383,11 +389,12 @@ mod tests {
                 0,
                 TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
             ),
-            // -1 as the DLL reads it, a 32-bit int.
+            // -1 as the DLL reads it, a 32-bit int, and a 64-bit -1.
             (
                 0xffff_ffff,
                 TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
             ),
+            (u64::MAX, TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID),
             (2, TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID),
             // The upper half is never read.
             (
@@ -411,8 +418,8 @@ mod tests {
         let total =
             usize::try_from(tobii_calib::blob::header(&blob).expect("header").total).expect("fits");
         let first = total + 8;
-        // The first measurement's word is at +16, the second's at +32. 2 is
-        // the one word besides 0 and 1 that the blob check lets through.
+        // The first measurement's word is at +16, the second's at +32. The
+        // blob check lets 2 through, which the DLL reports as failed.
         for (i, offset, word) in [(2, 16, 0u64), (2, 32, 2), (4, 16, 2), (4, 32, 0)] {
             let o = first + tobii_calib::blob::RECORD_LEN * i + offset;
             blob[o..o + 8].copy_from_slice(&word.to_le_bytes());
@@ -441,6 +448,45 @@ mod tests {
             assert_eq!(p.left_mapping_xy, r.a, "point {i}");
             assert_eq!(p.right_mapping_xy, r.b, "point {i}");
         }
+    }
+
+    #[test]
+    fn parse_reports_a_failed_eye_and_passes_its_mapping_on() {
+        let mut blob = embedded_blob();
+        let total =
+            usize::try_from(tobii_calib::blob::header(&blob).expect("header").total).expect("fits");
+        let first = total + 8;
+        // -1 in either encoding the tracker may write: a 32-bit int (record
+        // 3's first eye) and a 64-bit one (record 6's second); the failed
+        // eye's mapping is not a number, or off the display.
+        let failed_32 = 0xffff_ffffu64.to_le_bytes();
+        let failed_64 = u64::MAX.to_le_bytes();
+        let nan = f32::NAN.to_le_bytes();
+        let off = (-7.5f32).to_le_bytes();
+        for (i, offset, bytes) in [
+            (3, 16, &failed_32[..]),
+            (3, 8, &nan[..]),
+            (6, 32, &failed_64[..]),
+            (6, 28, &off[..]),
+        ] {
+            let o = first + tobii_calib::blob::RECORD_LEN * i + offset;
+            blob[o..o + bytes.len()].copy_from_slice(bytes);
+        }
+        let (status, points) = parse(&blob);
+        assert_eq!(status, TOBII_ERROR_NO_ERROR);
+        assert_eq!(points.len(), 14);
+        let used = TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION;
+        let failed = TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID;
+        for (i, p) in points.iter().enumerate() {
+            let statuses = match i {
+                3 => (failed, used),
+                6 => (used, failed),
+                _ => (used, used),
+            };
+            assert_eq!((p.left_status, p.right_status), statuses, "point {i}");
+        }
+        assert!(points[3].left_mapping_xy[0].is_nan());
+        assert_eq!(points[6].right_mapping_xy[1].to_bits(), (-7.5f32).to_bits());
     }
 
     /// The DLL's own invalid calibration (0x18014783f, 13 at 0x1801478a7) in
@@ -525,6 +571,9 @@ mod tests {
         let mut not_finite = blob.clone();
         let o = total + 8 + tobii_calib::blob::RECORD_LEN * 5;
         not_finite[o..o + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        // Record 5's first status word: 3 means nothing to the DLL.
+        let mut status_3 = blob.clone();
+        status_3[o + 16..o + 24].copy_from_slice(&3u64.to_le_bytes());
         let long = [&blob[..], &[0]].concat();
         for (name, data) in [
             ("a negative count in 8 bytes", &NEGATIVE_COUNT[..]),
@@ -532,6 +581,7 @@ mod tests {
             ("a list past the end", &blob[..blob.len() - 1]),
             ("bytes after the list", &long[..]),
             ("a NaN target", &not_finite[..]),
+            ("a status word of 3", &status_3[..]),
         ] {
             let (status, points) = parse(data);
             assert_eq!(status, TOBII_ERROR_OPERATION_FAILED, "{name}");

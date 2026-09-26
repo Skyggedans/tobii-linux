@@ -97,7 +97,12 @@ typedef void ( *tobii_calibration_point_data_receiver_t )(
     tobii_calibration_point_data_t const* point_data, void* user_data );
 
 /* The ET5 keeps 14 points: two rounds of the 7-point pattern. Data that is not a
- * valid calibration is TOBII_ERROR_OPERATION_FAILED, before any point is passed. */
+ * valid calibration is TOBII_ERROR_OPERATION_FAILED, before any point is passed.
+ * The DLL refuses only a negative point count and parses everything else; this
+ * library also refuses a short blob, bytes after the point list, a status word
+ * other than -1, 0, 1 or 2 (its upper 32 bits 0, or all ones with -1), and a
+ * value that is not finite or lies outside the display by more than half its
+ * size, unless it is the mapping of an eye marked failed (-1). */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_parse( tobii_api_t* api, void const* data,
     size_t data_size, tobii_calibration_point_data_receiver_t receiver, void* user_data );
 

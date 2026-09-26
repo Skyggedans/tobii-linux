@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tobii_calib::STIMULUS_POINTS;
+use tobii_calib::{PointRecord, STIMULUS_POINTS};
 use tobii_ipc::geometry::{DisplayArea, GeometryMounting, display_area_basic};
 use tobii_ipc::request::{
     STOP_DISCARD, STOP_KEEP, decode_display_area, decode_geometry_mounting, encode_display_area,
@@ -278,13 +278,24 @@ fn expect_ok((code, payload): Reply, what: &str) -> Result<Vec<u8>> {
 
 /// Mean target error of a calibration, as a fraction of the display.
 fn mean_error(blob: &[u8]) -> Option<f32> {
-    let points = tobii_calib::blob::points(blob).ok()?;
+    mean_offset(&tobii_calib::blob::points(blob).ok()?)
+}
+
+/// Mean distance between each target and the eyes' mean measured point. An
+/// eye that failed at a point may hold anything there: the other eye stands
+/// alone, and a point where both failed does not count.
+fn mean_offset(points: &[PointRecord]) -> Option<f32> {
     let errors: Vec<f32> = points
         .iter()
-        .map(|p| {
-            let mx = (p.a[0] + p.b[0]) / 2.0 - p.target[0];
-            let my = (p.a[1] + p.b[1]) / 2.0 - p.target[1];
-            (mx * mx + my * my).sqrt()
+        .filter_map(|p| {
+            let [x, y] = match (p.a_failed(), p.b_failed()) {
+                (false, false) => [(p.a[0] + p.b[0]) / 2.0, (p.a[1] + p.b[1]) / 2.0],
+                (false, true) => p.a,
+                (true, false) => p.b,
+                (true, true) => return None,
+            };
+            let (mx, my) = (x - p.target[0], y - p.target[1]);
+            Some((mx * mx + my * my).sqrt())
         })
         .collect();
     #[allow(clippy::cast_precision_loss)] // reason: a handful of points
@@ -469,6 +480,32 @@ mod tests {
         assert_eq!(sizes, vec![1, 3, 3, 1, 3, 3]);
         assert_eq!(p[0][0], [0.5, 0.5]);
         assert_eq!(p[1], vec![[0.5, 0.1], [0.9, 0.9], [0.1, 0.9]]);
+    }
+
+    #[test]
+    fn the_mean_offset_leaves_out_a_failed_eye() {
+        let point = |a, a_status, b, b_status| PointRecord {
+            target: [0.5, 0.5],
+            a,
+            a_status,
+            b,
+            b_status,
+        };
+        // -1 as a 32-bit and as a 64-bit int.
+        let (failed_32, failed_64) = (0xffff_ffff, u64::MAX);
+        let offsets = [
+            // Both eyes 0.1 off.
+            point([0.6, 0.5], 1, [0.6, 0.5], 1),
+            // The eye that did not fail alone: 0.3 off.
+            point([f32::NAN, 0.5], failed_32, [0.5, 0.8], 1),
+            // Neither counts.
+            point([f32::NAN; 2], failed_64, [9.0, -9.0], failed_32),
+        ];
+
+        let permille = |points: &[PointRecord]| mean_offset(points).map(|e| (e * 1000.0).round());
+
+        assert_eq!(permille(&offsets), Some(200.0));
+        assert_eq!(permille(&offsets[2..]), None);
     }
 
     /// Records requests; answers every one with `status`.

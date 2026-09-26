@@ -162,11 +162,15 @@ Where the answers come from, and where they differ from Windows:
   `TOBII_ERROR_OPERATION_FAILED`, as the Stream Engine documentation says.
   That is a blob shorter than its 44-byte header or over 4 MiB, a point list
   that lies outside the blob, holds more than 256 points or does not end
-  exactly at `data_size`, a value that is not finite or lies more than half
-  a display off it, and a status word above 2. The Stream Engine returns
-  that only for a negative point count; it reads everything else as given,
-  past `data_size` if the blob says so, and returns
-  `TOBII_ERROR_NO_ERROR` (8 zero bytes are an empty calibration there).
+  exactly at `data_size`, a status word other than -1, 0, 1 or 2 (its low
+  32 bits read as a signed int, as the Stream Engine reads them, with the
+  upper 32 zero, or all ones with -1), and a value that is not finite or
+  lies more than half a display off it, but for the mapping of an eye
+  marked failed (-1). The Stream Engine returns that only for a negative
+  point count; it reads everything else as given, past `data_size` if the
+  blob says so, and returns `TOBII_ERROR_NO_ERROR` (8 zero bytes are an
+  empty calibration there). Both report an eye whose status word is -1 as
+  `FAILED_OR_INVALID` and pass its mapping on as the blob holds it.
 - **Timestamps.** Every callback timestamp is on `tobii_system_clock`'s
   clock, as in the Stream Engine; the tracker's clock is left only in gaze
   data's `timestamp_tracker_us` and `tobii_timesync`'s `tracker_us`. A head

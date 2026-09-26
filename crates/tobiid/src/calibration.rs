@@ -895,10 +895,21 @@ mod tests {
     }
 
     fn setup(tag: &str) -> Setup {
-        let dir = std::env::temp_dir().join(format!("tobiid-calib-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        setup_with(tag, device_blob())
+    }
+
+    /// The calibration the device computes: the one built into the init
+    /// replay, with an id of its own.
+    fn device_blob() -> Vec<u8> {
         let mut blob = tobii_usb::calibration::embedded_blob().expect("blob");
         blob[20..24].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        blob
+    }
+
+    /// As [`setup`], with the device computing `blob`.
+    fn setup_with(tag: &str, blob: Vec<u8>) -> Setup {
+        let dir = std::env::temp_dir().join(format!("tobiid-calib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let mut st = crate::daemon::tests::state_with_client(1);
         st.clients
             .append(&mut crate::daemon::tests::state_with_client(2).clients);
@@ -1062,6 +1073,46 @@ mod tests {
         assert_eq!((info.id, saved), (0x1234_5678, s.device.blob.clone()));
         assert_eq!(lock_state(&s.state).calibration.id, Some(0x1234_5678));
         assert!(!lock_state(&s.state).calibration.is_active());
+    }
+
+    #[test]
+    fn a_computed_calibration_with_a_failed_eye_is_kept_and_saved() {
+        // The tracker lost the first eye at record 3: its status -1, as a
+        // 32-bit int, and a mapping that is not a number.
+        let mut blob = device_blob();
+        let total =
+            usize::try_from(tobii_calib::blob::header(&blob).expect("header").total).expect("fits");
+        let record = total + 8 + 3 * tobii_calib::blob::RECORD_LEN;
+        blob[record + 8..record + 12].copy_from_slice(&f32::NAN.to_le_bytes());
+        blob[record + 16..record + 24].copy_from_slice(&0xffff_ffffu64.to_le_bytes());
+        let s = setup_with("failed-eye", blob.clone());
+        let path = s.dir.join("calibration.bin");
+
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_START, &[ENABLED_EYE_BOTH]),
+            Reply::ok(vec![])
+        );
+        let computed = ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]);
+        assert_eq!(decode_u32(&computed.payload), Some(0x1234_5678));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::ok(vec![])
+        );
+
+        // What the device computed is written back, not the calibration the
+        // session started from, and saved.
+        assert_eq!(
+            s.device.payloads.lock().expect("payloads").last(),
+            Some(&(cmd::WRITE, write_payload(&blob)))
+        );
+        let (saved, _) = store::load(&path).expect("load").expect("saved");
+        assert_eq!(saved, blob);
+        assert_eq!(lock_state(&s.state).calibration.id, Some(0x1234_5678));
+        // And it may be applied again.
+        assert_eq!(
+            ask(&s, 2, kind::CALIBRATION_APPLY, &blob).status,
+            status::OK
+        );
     }
 
     #[test]

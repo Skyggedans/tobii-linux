@@ -19,9 +19,11 @@
 //! u64 b_status`, all little-endian: the stimulus point, then where each eye
 //! was measured looking. `a` is the measurement the Stream Engine reports as
 //! the left eye and `b` the one it reports as the right
-//! (`tobii_calibration_parse`, 0x1801478f4 and 0x180147937). The device keeps
-//! a ring of 14 records (two per target of the 7-point pattern); a new session
-//! pushes the oldest out.
+//! (`tobii_calibration_parse`, 0x1801478f4 and 0x180147937). The Stream
+//! Engine reads only the low 32 bits of a status word, as an `i32`: -1 the
+//! eye failed at that point, 0 valid but not used, 1 used (0x180147910 and
+//! 0x180147950). The device keeps a ring of 14 records (two per target of the
+//! 7-point pattern); a new session pushes the oldest out.
 
 use std::fmt;
 
@@ -71,17 +73,37 @@ pub struct PointRecord {
     /// Where the stimulus was, normalised display coordinates.
     pub target: [f32; 2],
     /// The measurement the Stream Engine reports as the left eye
-    /// (`tobii_calibration_parse`, 0x1801478f4).
+    /// (`tobii_calibration_parse`, 0x1801478f4). Anything, not a number
+    /// included, when the eye failed ([`Self::a_failed`]).
     pub a: [f32; 2],
     /// Status word of `a` (1 on every captured record). The Stream Engine
-    /// reads its low 32 bits: 1 used in the calibration, 0 valid but not
-    /// used, anything else failed. [`points`] accepts only `0..=2`.
+    /// reads its low 32 bits as an `i32`: 1 used in the calibration, 0 valid
+    /// but not used, -1 failed, and it reports any other value as failed
+    /// too. [`points`] accepts `-1..=2` there, with the upper 32 bits 0, or
+    /// all ones with -1.
     pub a_status: u64,
     /// The measurement the Stream Engine reports as the right eye
-    /// (0x180147937).
+    /// (0x180147937). Anything when the eye failed ([`Self::b_failed`]).
     pub b: [f32; 2],
     /// Status word of `b`, read as `a_status` is.
     pub b_status: u64,
+}
+
+impl PointRecord {
+    /// Whether the Stream Engine reads `a_status` as -1 (its low 32 bits, the
+    /// upper half unchecked), the eye failed at this point: `a` may then hold
+    /// anything.
+    #[must_use]
+    pub const fn a_failed(&self) -> bool {
+        status(self.a_status) == STATUS_FAILED
+    }
+
+    /// Whether the Stream Engine reads `b_status` as -1, as
+    /// [`Self::a_failed`] for `a`.
+    #[must_use]
+    pub const fn b_failed(&self) -> bool {
+        status(self.b_status) == STATUS_FAILED
+    }
 }
 
 /// What [`validate`] learned about a blob.
@@ -115,7 +137,9 @@ pub enum BlobError {
         /// Where the blob ends.
         actual: usize,
     },
-    /// A record holds non-finite or out-of-range values.
+    /// A record holds a status word other than `-1..=2` (see
+    /// [`PointRecord::a_status`]), or a non-finite or out-of-range value that
+    /// is not a failed eye's.
     Record(usize),
 }
 
@@ -150,6 +174,30 @@ fn u64_at(blob: &[u8], offset: usize) -> Option<u64> {
 
 fn f32_at(blob: &[u8], offset: usize) -> Option<f32> {
     u32_at(blob, offset).map(f32::from_bits)
+}
+
+/// The status the Stream Engine gives an eye that failed at a point.
+const STATUS_FAILED: i32 = -1;
+
+/// A status word as the Stream Engine reads it: its low 32 bits, as an `i32`
+/// (`tobii_calibration_parse`, 0x1801478eb and 0x180147941).
+#[allow(clippy::cast_possible_truncation)] // reason: the upper half is never read
+const fn status(word: u64) -> i32 {
+    (word as u32).cast_signed()
+}
+
+/// Whether [`points`] lets `word` through: -1, 0 and 1, the statuses the
+/// Stream Engine names, and 2, which it reports as failed and this check has
+/// always let through, with the upper 32 bits 0. A -1 may also be a 64-bit
+/// one, the upper half all ones: no captured record holds a failed eye, so
+/// how the tracker writes one is inferred, and both are let through.
+fn status_plausible(word: u64) -> bool {
+    let upper = word >> 32;
+    match status(word) {
+        STATUS_FAILED => upper == 0 || upper == 0xffff_ffff,
+        0..=2 => upper == 0,
+        _ => false,
+    }
 }
 
 /// The header words.
@@ -190,8 +238,11 @@ pub fn calibration_id(blob: &[u8]) -> Option<u32> {
 /// # Errors
 ///
 /// Any [`BlobError`]: the list must sit where the header says and end
-/// exactly at the end of the blob, every value must be finite and within a
-/// margin of the display, and each status word at most 2.
+/// exactly at the end of the blob, each status word must read as `-1..=2`
+/// with its upper half 0, or all ones with -1 (see [`PointRecord::a_status`]),
+/// and every value must be finite and in `-0.5..=1.5`, no more than half a
+/// display past its edges, but for the measurement of an eye whose status is
+/// -1, failed, which may hold anything.
 pub fn points(blob: &[u8]) -> Result<Vec<PointRecord>, BlobError> {
     let h = header(blob)?;
     let list = usize::try_from(h.total).map_err(|_| BlobError::PointList)?;
@@ -209,6 +260,7 @@ pub fn points(blob: &[u8]) -> Result<Vec<PointRecord>, BlobError> {
             actual: blob.len(),
         });
     }
+    let on_display = |xy: &[f32; 2]| xy.iter().all(|v| v.is_finite() && (-0.5..=1.5).contains(v));
     (0..count)
         .map(|i| {
             let o = first + RECORD_LEN * i;
@@ -223,13 +275,11 @@ pub fn points(blob: &[u8]) -> Result<Vec<PointRecord>, BlobError> {
                 ],
                 b_status: u64_at(blob, o + 32).ok_or(BlobError::Record(i))?,
             };
-            let values = [record.target, record.a, record.b];
-            let plausible = values
-                .iter()
-                .flatten()
-                .all(|v| v.is_finite() && (-0.5..=1.5).contains(v))
-                && record.a_status <= 2
-                && record.b_status <= 2;
+            let plausible = status_plausible(record.a_status)
+                && status_plausible(record.b_status)
+                && on_display(&record.target)
+                && (record.a_failed() || on_display(&record.a))
+                && (record.b_failed() || on_display(&record.b));
             if plausible {
                 Ok(record)
             } else {
@@ -317,5 +367,104 @@ pub(crate) mod tests {
         let record3 = total + 8 + 3 * RECORD_LEN;
         bad[record3..record3 + 4].copy_from_slice(&5.0f32.to_le_bytes());
         assert_eq!(validate(&bad), Err(BlobError::Record(3)));
+    }
+
+    /// Offsets in a record: the first eye's values and status word, then the
+    /// second's.
+    const A: usize = 8;
+    const A_STATUS: usize = 16;
+    const B: usize = 24;
+    const B_STATUS: usize = 32;
+
+    /// The embedded blob with `bytes` written at each offset into record `i`.
+    fn edited(i: usize, edits: &[(usize, &[u8])]) -> Vec<u8> {
+        let mut blob = embedded_blob();
+        let total = usize::try_from(header(&blob).expect("header").total).expect("fits");
+        let record = total + 8 + i * RECORD_LEN;
+        for (offset, bytes) in edits {
+            let o = record + offset;
+            blob[o..o + bytes.len()].copy_from_slice(bytes);
+        }
+        blob
+    }
+
+    #[test]
+    fn a_failed_eye_passes_in_either_encoding_whatever_its_values() {
+        let nan = f32::NAN.to_le_bytes();
+        let off = 5.0f32.to_le_bytes();
+        // -1 as a 32-bit int with a zero upper half, and as a 64-bit one.
+        for failed in [0xffff_ffff, u64::MAX] {
+            let word = failed.to_le_bytes();
+            let first = edited(3, &[(A_STATUS, &word), (A, &nan), (A + 4, &off)]);
+            let second = edited(5, &[(B_STATUS, &word), (B, &off)]);
+
+            assert_eq!(validate(&first).map(|info| info.points), Ok(14));
+            assert_eq!(validate(&second).map(|info| info.points), Ok(14));
+            let record = points(&first).expect("first")[3];
+            assert_eq!((record.a_status, record.b_status), (failed, 1));
+            assert!(record.a[0].is_nan());
+            let record = points(&second).expect("second")[5];
+            assert_eq!((record.a_status, record.b_status), (1, failed));
+        }
+    }
+
+    #[test]
+    fn a_value_off_the_display_passes_only_for_a_failed_eye() {
+        let nan = f32::NAN.to_le_bytes();
+        let failed = u64::MAX.to_le_bytes();
+        for (name, blob) in [
+            ("a used eye", edited(3, &[(A, &nan)])),
+            (
+                "an eye valid but not used",
+                edited(3, &[(A_STATUS, &0u64.to_le_bytes()), (A, &nan)]),
+            ),
+            (
+                "an eye with status 2",
+                edited(3, &[(B_STATUS, &2u64.to_le_bytes()), (B, &nan)]),
+            ),
+            (
+                "the eye that did not fail",
+                edited(3, &[(A_STATUS, &failed), (B, &nan)]),
+            ),
+            (
+                "the target of two failed eyes",
+                edited(3, &[(A_STATUS, &failed), (B_STATUS, &failed), (0, &nan)]),
+            ),
+        ] {
+            assert_eq!(validate(&blob), Err(BlobError::Record(3)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_status_word_passes_only_as_minus_one_to_two() {
+        for (word, passes) in [
+            (0u64, true),
+            (1, true),
+            (2, true),
+            (0xffff_ffff, true),
+            (u64::MAX, true),
+            (3, false),
+            (0xffff_fffe, false),
+            (0x8000_0000, false),
+            // An upper half only as the sign of a -1.
+            (0x1_0000_0001, false),
+            (0xffff_ffff_0000_0000, false),
+            (0xffff_ffff_0000_0001, false),
+            (0x1_ffff_ffff, false),
+        ] {
+            for at in [A_STATUS, B_STATUS] {
+                let blob = edited(3, &[(at, &word.to_le_bytes())]);
+                let expected = if passes {
+                    Ok(14)
+                } else {
+                    Err(BlobError::Record(3))
+                };
+                assert_eq!(
+                    validate(&blob).map(|info| info.points),
+                    expected,
+                    "{word:#x} at +{at}"
+                );
+            }
+        }
     }
 }
