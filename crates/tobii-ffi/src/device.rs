@@ -1,6 +1,7 @@
 //! The API and device handles: a device is a connection to the `tobiid`
 //! daemon with a reader thread sorting decoded messages into two channels
-//! (the answers to requests and subscription changes, and the samples), the
+//! (the answers to requests and subscription changes, and the samples) and
+//! ringing the device's doorbell for `wait` after each sample, the
 //! registered callbacks, and a synchronous request/reply helper.
 //!
 //! Invariant: every stored callback was registered through the matching
@@ -16,6 +17,7 @@ use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -157,12 +159,92 @@ impl TryFrom<ServerMsg> for Answer {
     }
 }
 
+/// Lock `m`, taking a poisoned lock's data as it is. A lock is poisoned
+/// only by a panic while it is held. On an application's thread that never
+/// goes on to use the data: the panic cannot unwind out of an `extern "C"`
+/// entry point, which aborts the process instead. A lock another thread
+/// takes (the reader's) must keep its data whole through a panic itself
+/// (see [`Doorbell`]).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What `wait` sleeps on between its looks in the samples channel, rather
+/// than blocking on the channel itself: the number of times it has rung,
+/// and a condvar to sleep on until that moves. The reader rings it after
+/// each sample it queues and once when it stops, having hung up its
+/// channels first; an answer rings nothing, as it is nothing to process.
+/// A reconnect rings it once it has put its new link in place. The reader
+/// holds the lock only to bump the count, which cannot panic, so the count
+/// is whole even if the lock is poisoned.
+///
+/// One per device, kept across reconnects and rung by every link's reader,
+/// a failed reconnect's included: while a reconnect runs, the old link's
+/// reader and the new one's both ring it, and the old one rings last as
+/// the old link goes. Once a device may be shared between threads, that is
+/// what lets a wait sleeping on a lost link wake for the samples of the
+/// link a reconnect puts in its place; while a call borrows the device
+/// `&mut`, no reconnect runs during a wait, and it is structural.
+#[derive(Debug, Default)]
+struct Doorbell {
+    rings: Mutex<u64>,
+    rung: Condvar,
+}
+
+impl Doorbell {
+    /// Count a ring and wake every waiter.
+    fn ring(&self) {
+        let mut rings = lock(&self.rings);
+        *rings = rings.wrapping_add(1);
+        drop(rings);
+        self.rung.notify_all();
+    }
+
+    /// How many times it has rung.
+    fn rings(&self) -> u64 {
+        *lock(&self.rings)
+    }
+
+    /// Look with `look` until it finds something, sleeping between looks
+    /// until a ring, for up to `timeout` in all; whether it found something.
+    /// The count is read before each look, so a ring that comes after a
+    /// look, however soon, ends the sleep that follows it. A ring that
+    /// brings nothing (for a sample an earlier look took already) sends it
+    /// back to sleep until the same deadline.
+    fn wait_for(&self, timeout: Duration, mut look: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = self.rings();
+            if look() {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !self.wait_past(seen, left) {
+                return false;
+            }
+        }
+    }
+
+    /// Wait up to `timeout` for it to ring past `seen`, a count read
+    /// earlier; whether it has. A ring since `seen` answers at once.
+    fn wait_past(&self, seen: u64, timeout: Duration) -> bool {
+        let rings = lock(&self.rings);
+        let (rings, _) = self
+            .rung
+            .wait_timeout_while(rings, timeout, |rings| *rings == seen)
+            .unwrap_or_else(PoisonError::into_inner);
+        *rings != seen
+    }
+}
+
 /// One daemon connection and the thread reading it, which sorts what the
 /// daemon sends into two channels, each in the order it came: the answers,
 /// read only by a request or subscription change waiting for its own, and
 /// the samples, read only by `wait`, `process` and `clear_buffers`. A call
 /// waiting for its answer leaves the samples where they are, and an answer
-/// nobody waits for any more never wakes `wait`.
+/// nobody waits for any more never wakes `wait`. The reader rings the
+/// device's doorbell after each sample, and when it stops shuts the
+/// connection down and rings once more (see [`ReaderEnd`]).
 struct Link {
     stream: UnixStream,
     answers: Receiver<Answer>,
@@ -180,14 +262,19 @@ struct Link {
 }
 
 impl Link {
-    fn open(connect: &mut Connector) -> io::Result<Self> {
+    /// Connect through `connect` and start the reader, which rings `bell`.
+    fn open(connect: &mut Connector, bell: &Arc<Doorbell>) -> io::Result<Self> {
         let stream = connect()?;
-        let reader_stream = stream.try_clone()?;
         let (answers_tx, answers) = mpsc::channel();
         let (samples_tx, samples) = mpsc::channel();
+        let end = ReaderEnd {
+            stream: stream.try_clone()?,
+            channels: Some((answers_tx, samples_tx)),
+            bell: Arc::clone(bell),
+        };
         let reader = thread::Builder::new()
             .name("tobii-ffi-reader".into())
-            .spawn(move || reader_loop(reader_stream, &answers_tx, &samples_tx))?;
+            .spawn(move || end.run())?;
         Ok(Self {
             stream,
             answers,
@@ -291,21 +378,59 @@ impl Drop for Link {
     }
 }
 
-/// Pump frames from the daemon until EOF, a read error, or the receiving
-/// `Link` going away: answers into `answers`, and everything else (the
-/// samples, and message kinds a newer daemon may add) into `samples`.
-fn reader_loop(mut stream: UnixStream, answers: &Sender<Answer>, samples: &Sender<ServerMsg>) {
-    while let Ok(Some(body)) = read_frame(&mut stream) {
-        let Some(msg) = decode_server(&body) else {
-            continue;
+/// What the reader thread owns: its clone of the connection, the senders of
+/// both channels, and the device's doorbell. However the reader stops (the
+/// daemon hangs up, a read fails, the `Link` goes away, or a panic unwinds),
+/// dropping this shuts the connection down, hangs up both channels and only
+/// then rings, so the wait that ring wakes finds the loss.
+struct ReaderEnd {
+    stream: UnixStream,
+    /// `Some` until dropped, when taking them hangs up before the ring.
+    channels: Option<(Sender<Answer>, Sender<ServerMsg>)>,
+    bell: Arc<Doorbell>,
+}
+
+impl ReaderEnd {
+    /// Pump frames from the daemon until EOF, a read error, or the receiving
+    /// `Link` going away: answers into the answers channel, and everything
+    /// else (the samples, and message kinds a newer daemon may add) into the
+    /// samples channel, ringing the doorbell after each of those.
+    fn run(mut self) {
+        let Some((answers, samples)) = &self.channels else {
+            return;
         };
-        let sent = match Answer::try_from(msg) {
-            Ok(answer) => answers.send(answer).is_ok(),
-            Err(sample) => samples.send(sample).is_ok(),
-        };
-        if !sent {
-            break;
+        while let Ok(Some(body)) = read_frame(&mut self.stream) {
+            let Some(msg) = decode_server(&body) else {
+                continue;
+            };
+            let sent = match Answer::try_from(msg) {
+                Ok(answer) => answers.send(answer).is_ok(),
+                Err(sample) => {
+                    let sent = samples.send(sample).is_ok();
+                    if sent {
+                        self.bell.ring();
+                    }
+                    sent
+                }
+            };
+            if !sent {
+                break;
+            }
         }
+    }
+}
+
+impl Drop for ReaderEnd {
+    fn drop(&mut self) {
+        // The connection closes however its loss is found, not only once a
+        // `process` or `wait` notices it; a shutdown error only means it is
+        // closed already.
+        let _ = self.stream.shutdown(Shutdown::Both);
+        // Hang up before ringing: a wait woken by a ring made with the
+        // channels still up would find the samples channel empty rather
+        // than disconnected, and sleep again with nothing left to ring.
+        self.channels = None;
+        self.bell.ring();
     }
 }
 
@@ -358,6 +483,8 @@ pub struct Device {
     link: Link,
     connect: Connector,
     pending: VecDeque<ServerMsg>,
+    /// Rung by every link's reader, kept across reconnects.
+    doorbell: Arc<Doorbell>,
     pub(crate) callbacks: Callbacks,
     pub(crate) field_of_use: FieldOfUse,
     /// Address of the API handle this device was created from.
@@ -389,11 +516,13 @@ impl Device {
         api: usize,
         field_of_use: FieldOfUse,
     ) -> io::Result<Self> {
-        let link = Link::open(&mut connect)?;
+        let doorbell = Arc::new(Doorbell::default());
+        let link = Link::open(&mut connect, &doorbell)?;
         Ok(Self {
             link,
             connect,
             pending: VecDeque::new(),
+            doorbell,
             callbacks: Callbacks::default(),
             field_of_use,
             api,
@@ -564,11 +693,15 @@ impl Device {
     /// nothing to send first, so the daemon may still drop an engine that
     /// only the old connection's requests kept, until the next request.
     /// Samples queued from the old link are dropped. The new link starts up,
-    /// so its loss is reported again, and owes no acks. The device info is
-    /// fetched again: a restarted daemon may serve another tracker. Each
-    /// failure is logged at ERROR, a success at INFO.
+    /// so its loss is reported again, and owes no acks. Once it is in place
+    /// this rings the device's doorbell (see [`Doorbell`]): the new link's
+    /// reader rings it too, but its first samples may come while this still
+    /// waits for the ack, and a wait they woke then (once a device may be
+    /// shared between threads) looked at the old link and slept again. The
+    /// device info is fetched again: a restarted daemon may serve another
+    /// tracker. Each failure is logged at ERROR, a success at INFO.
     pub(crate) fn reconnect(&mut self) -> Status {
-        let mut link = match Link::open(&mut self.connect) {
+        let mut link = match Link::open(&mut self.connect, &self.doorbell) {
             Ok(link) => link,
             Err(e) => {
                 self.log(
@@ -599,6 +732,7 @@ impl Device {
         }
         self.link = link;
         self.pending.clear();
+        self.doorbell.ring();
         self.device_info = None;
         self.log(Level::Info, format_args!("reconnected to tobiid"));
         TOBII_ERROR_NO_ERROR
@@ -614,29 +748,40 @@ impl Device {
 
     /// Whether `process` has something to do, waiting up to `timeout` for
     /// it: a queued sample, or a lost connection it has not reported yet.
-    /// Once it has, nothing arrives until a reconnect, so this sleeps out
-    /// `timeout` and says no, as for a quiet link; answering at once would
-    /// spin a wait-and-process loop. An answer (a stale reply, a late ack)
-    /// is nothing to process and does not wake it.
+    /// Between looks it sleeps on the doorbell (see [`Doorbell::wait_for`]),
+    /// which the reader rings after each sample and when it stops, so either
+    /// wakes it at once. An answer (a stale reply, a late ack) is nothing to
+    /// process and rings nothing. Once the loss is reported, the lost link
+    /// rings no more, so this sleeps out `timeout` and says no, as for a
+    /// quiet link; answering at once would spin a wait-and-process loop. A
+    /// ring that brings nothing (from an old or a failed link, or for a
+    /// sample an earlier look took) sends it back to sleep until the same
+    /// deadline. No reconnect runs during it while it borrows the device
+    /// `&mut`; once a device may be shared between threads, one on another
+    /// thread wakes it (see [`Device::reconnect`]).
     pub(crate) fn wait(&mut self, timeout: Duration) -> bool {
+        // A handle of its own, so that the looks may borrow the device.
+        let bell = Arc::clone(&self.doorbell);
+        bell.wait_for(timeout, || self.anything_to_process())
+    }
+
+    /// Whether `process` has something to do now: a sample, which this
+    /// moves into `pending`, or a loss it has not reported yet.
+    fn anything_to_process(&mut self) -> bool {
         if !self.pending.is_empty() {
             return true;
         }
         if self.link.state == LinkState::Up {
-            match self.link.samples.recv_timeout(timeout) {
+            match self.link.samples.try_recv() {
                 Ok(msg) => {
                     self.pending.push_back(msg);
                     return true;
                 }
-                Err(RecvTimeoutError::Timeout) => return false,
-                Err(RecvTimeoutError::Disconnected) => self.link.lose(),
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => self.link.lose(),
             }
         }
-        if self.link.state == LinkState::Reported {
-            thread::sleep(timeout);
-            return false;
-        }
-        true
+        self.link.state == LinkState::Lost
     }
 
     /// Deliver every queued sample to its callbacks, on this thread, then
@@ -1778,6 +1923,320 @@ pub(crate) mod tests {
         assert!(d.wait(LONG_WAIT), "the new loss is something to process");
         assert!(t.elapsed() < PROMPT);
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+    }
+
+    /// A ring that comes after the waiter read the count, but before it
+    /// sleeps, still wakes it: the count has moved past what it read. A
+    /// condvar waited on bare would have missed that notify and slept out
+    /// its timeout.
+    #[test]
+    fn a_ring_before_the_sleep_is_not_missed() {
+        let bell = Doorbell::default();
+        let seen = bell.rings();
+        bell.ring();
+
+        let t = Instant::now();
+        assert!(bell.wait_past(seen, LONG_WAIT));
+        assert!(t.elapsed() < PROMPT);
+        let t = Instant::now();
+        assert!(!bell.wait_past(bell.rings(), SHORT_WAIT), "no ring since");
+        assert!(t.elapsed() >= SHORT_WAIT);
+    }
+
+    /// A sample queued right after a look found nothing ends the sleep that
+    /// follows at once: the count is read before each look, not after. Here
+    /// the first look rings, as the reader would just after it; were the
+    /// count read after the look, that ring would be slept through.
+    #[test]
+    fn a_ring_right_after_a_look_ends_the_sleep_that_follows() {
+        let bell = Doorbell::default();
+        let mut looks = 0u32;
+
+        let t = Instant::now();
+        let found = bell.wait_for(LONG_WAIT, || {
+            looks += 1;
+            if looks == 1 {
+                bell.ring();
+            }
+            looks > 1
+        });
+
+        assert!(found);
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(looks, 2);
+    }
+
+    /// Long enough for a wait to have gone to sleep.
+    const ASLEEP: Duration = Duration::from_millis(100);
+
+    /// A device subscribed to gaze origin, `ud` counting the deliveries, and
+    /// its daemon's end, which has read the subscription and sent nothing
+    /// since the ack.
+    fn subscribed_device(ud: *mut c_void) -> (Device, UnixStream) {
+        let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(0)]);
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let mut daemon = daemons.recv().expect("daemon end");
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        (d, daemon)
+    }
+
+    /// Hand the daemon's end to a thread that, for each delay sent to it,
+    /// sleeps that long and writes one gaze-origin sample. It gives the end
+    /// back once the sender is dropped.
+    fn sampler(mut daemon: UnixStream) -> (Sender<Duration>, JoinHandle<UnixStream>) {
+        let (go, delays) = mpsc::channel();
+        let sampler = thread::spawn(move || {
+            let sample = encode_gaze_origin(&tobii_ipc::EyePair::default());
+            for delay in delays {
+                thread::sleep(delay);
+                write_frame(&mut daemon, &sample).expect("sample");
+            }
+            daemon
+        });
+        (go, sampler)
+    }
+
+    /// A sample that comes while a wait sleeps wakes it at once, and
+    /// process delivers it. A guard: the wait blocked on the samples channel
+    /// before, which woke it as promptly.
+    #[test]
+    fn a_sample_wakes_a_wait_asleep() {
+        let mut hits = 0u32;
+        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let (go, sampler) = sampler(daemon);
+        go.send(ASLEEP).expect("go");
+
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT));
+        assert!(t.elapsed() < PROMPT);
+
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(go);
+        let daemon = sampler.join().expect("sampler");
+        drop((d, daemon));
+        assert_eq!(hits, 1);
+    }
+
+    /// However soon after the wait starts a sample comes (before its look,
+    /// between the look and the sleep, or during the sleep), the wait wakes
+    /// for it: no ring is lost. A guard, a thousand rounds with the delay
+    /// varied, from the reader's ring to the wait's wake; the window a wrong
+    /// order of reading the count and looking would open is too narrow for
+    /// it, and `a_ring_right_after_a_look_ends_the_sleep_that_follows` pins
+    /// that order.
+    #[test]
+    fn no_sample_is_slept_through_whenever_it_comes() {
+        const ROUNDS: u32 = 1000;
+        let delays = [0, 0, 20, 50, 100, 200, 400].map(Duration::from_micros);
+        let mut hits = 0u32;
+        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let (go, sampler) = sampler(daemon);
+
+        for (round, delay) in (0..ROUNDS).zip(delays.iter().cycle()) {
+            go.send(*delay).expect("go");
+            let t = Instant::now();
+            assert!(d.wait(LONG_WAIT), "round {round}");
+            assert!(t.elapsed() < PROMPT, "round {round}");
+            assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        }
+
+        drop(go);
+        let daemon = sampler.join().expect("sampler");
+        drop((d, daemon));
+        assert_eq!(hits, ROUNDS, "one sample a round");
+    }
+
+    /// A daemon that hangs up while a wait sleeps wakes it at once: the
+    /// reader hangs up its channels, then rings. Every wait answers at once
+    /// until process reports the loss, and then one sleeps out its timeout,
+    /// so a wait-and-process loop wakes once. A guard: the wait blocked on
+    /// the samples channel before, whose disconnect woke it as promptly.
+    #[test]
+    fn a_loss_wakes_a_wait_asleep_once() {
+        let mut hits = 0u32;
+        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let hang_up = thread::spawn(move || {
+            thread::sleep(ASLEEP);
+            drop(daemon);
+        });
+
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT), "woken by the loss");
+        assert!(d.wait(LONG_WAIT), "until process has reported it");
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+
+        let t = Instant::now();
+        assert!(!d.wait(SHORT_WAIT), "reported: nothing left to process");
+        assert!(t.elapsed() >= SHORT_WAIT, "slept out the timeout");
+        hang_up.join().expect("daemon");
+    }
+
+    /// Rings that bring nothing to process (rung here by hand, as the ring
+    /// of a sample an earlier look took already would be) neither end a
+    /// wait nor stretch it: it looks, sleeps again, and gives up at its own
+    /// deadline. So too on a reported loss, where answering at once would
+    /// spin a wait-and-process loop.
+    #[test]
+    fn a_wait_keeps_its_deadline_through_rings_that_bring_nothing() {
+        let mut hits = 0u32;
+        let quiet = Device::new(fake_daemon(|_| vec![]), 1, 1).expect("device");
+        let (mut lost, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        assert_eq!(lost.process(), TOBII_ERROR_CONNECTION_FAILED);
+
+        for mut d in [quiet, lost] {
+            // Rings every few ms until told to stop, or for `LONG_WAIT`
+            // should the wait never end.
+            let bell = Arc::clone(&d.doorbell);
+            let (stop, stopped) = mpsc::channel::<()>();
+            let ringer = thread::spawn(move || {
+                let until = Instant::now() + LONG_WAIT;
+                while Instant::now() < until
+                    && stopped.recv_timeout(Duration::from_millis(5))
+                        == Err(RecvTimeoutError::Timeout)
+                {
+                    bell.ring();
+                }
+            });
+
+            let t = Instant::now();
+            let woke = d.wait(SHORT_WAIT);
+            let took = t.elapsed();
+
+            drop(stop);
+            ringer.join().expect("ringer");
+            assert!(!woke, "{d:?}");
+            assert!((SHORT_WAIT..PROMPT).contains(&took), "{d:?} {took:?}");
+        }
+    }
+
+    /// A reconnect's new link rings the device's own doorbell, the one a
+    /// wait on the reported loss sleeps on: once another thread may
+    /// reconnect, that ring is what wakes such a wait for the new link's
+    /// samples. The count moves by two, the sample's ring and the one the
+    /// reconnect makes once the link is in place. Structural while a call
+    /// borrows the device `&mut`: it fails should a link ring a doorbell of
+    /// its own, which would leave the reconnect's ring alone on the device's.
+    #[test]
+    fn a_reconnects_samples_ring_the_doorbell_a_lost_wait_sleeps_on() {
+        let mut hits = 0u32;
+        let (mut d, daemons) =
+            lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        let bell = Arc::clone(&d.doorbell);
+        let seen = bell.rings();
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        let t = Instant::now();
+        assert!(bell.wait_past(seen + 1, LONG_WAIT), "the new link's sample");
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(bell.rings(), seen + 2, "the sample's ring and the swap's");
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert!(d.wait(LONG_WAIT));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop((d, daemon));
+        assert_eq!(hits, 1);
+    }
+
+    /// A reconnect rings the doorbell once it has put its new link in place,
+    /// though that link brings no sample: once a device may be shared, a
+    /// wait on another thread that the new link's first samples woke while
+    /// the reconnect still waited for its ack looked at the old link and
+    /// slept again, and this ring sends it back to look at the new one. The
+    /// greeting here is the ack alone, and the old link's reader stopped
+    /// before the count was read, so the reconnect's ring is the only one.
+    #[test]
+    fn a_reconnect_rings_the_doorbell_once_its_new_link_is_in_place() {
+        let mut hits = 0u32;
+        let (mut d, daemons) =
+            lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        let seen = d.doorbell.rings();
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        assert_eq!(d.doorbell.rings(), seen + 1);
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        drop((d, daemon));
+    }
+
+    /// The reader hangs up its channels before its last ring, so the wait
+    /// that ring wakes finds the samples channel disconnected, not empty.
+    /// The test holds the doorbell's lock, so once the daemon hangs up the
+    /// reader blocks in that ring, and the channel is disconnected all the
+    /// same. Were the ring first, the reader would block in it with its
+    /// senders still up, and the channel would stay open until the lock is
+    /// let go.
+    #[test]
+    fn the_reader_hangs_up_before_its_last_ring() {
+        let mut hits = 0u32;
+        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let held = lock(&d.doorbell.rings);
+
+        drop(daemon);
+
+        assert_eq!(
+            d.link.samples.recv_timeout(PROMPT).err(),
+            Some(RecvTimeoutError::Disconnected),
+            "hung up while the ring waits for the lock"
+        );
+        drop(held);
+        let t = Instant::now();
+        assert!(d.wait(LONG_WAIT), "the loss");
+        assert!(t.elapsed() < PROMPT);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+    }
+
+    /// The reader shuts the connection down when it stops, so it closes
+    /// however its loss is found: here the daemon only half-closes, and no
+    /// process or wait comes to notice, yet the daemon's read ends.
+    #[test]
+    fn the_reader_closes_the_connection_when_it_stops() {
+        let mut hits = 0u32;
+        let (d, mut daemon) = subscribed_device((&raw mut hits).cast());
+        daemon.set_read_timeout(Some(PROMPT)).expect("read timeout");
+
+        daemon.shutdown(Shutdown::Write).expect("half-close");
+
+        assert!(
+            matches!(read_frame(&mut daemon), Ok(None)),
+            "the client closed its end"
+        );
+        drop(d);
+    }
+
+    /// Only samples ring: an answer is nothing for `wait`, and a ring for
+    /// one would only wake it to look and sleep again. The reader handles
+    /// frames in order, so the ack's ring, the sample's and the stale
+    /// reply's would all come before the reply the request returns with.
+    #[test]
+    fn answers_ring_no_doorbell() {
+        let connect = fake_daemon(|body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![encode_subscribed(true)],
+            Some(&tobii_ipc::TAG_REQUEST) => {
+                let req = tobii_ipc::request::decode_request(body).expect("request");
+                vec![
+                    encode_gaze(1, true, [0.5; 2], [f32::NAN; 2]),
+                    encode_reply(req.id.wrapping_add(7), 0, b"stale"),
+                    encode_reply(req.id, 0, b"answer"),
+                ]
+            }
+            _ => vec![],
+        });
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        let before = d.doorbell.rings();
+
+        assert_eq!(d.link.send_subscription(STREAM_GAZE, LONG_WAIT), Ok(true));
+        assert_eq!(d.request(1, &[], LONG_WAIT), Ok(b"answer".to_vec()));
+
+        assert_eq!(d.doorbell.rings(), before + 1, "the sample's ring alone");
     }
 
     /// Wait out `SHORT_WAIT` and say no, as for a loss already reported, then

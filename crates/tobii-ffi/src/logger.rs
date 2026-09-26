@@ -16,8 +16,8 @@
 //! The logger is called synchronously, on the thread inside the `tobii_*` call
 //! that has something to say, and never from the reader thread: a [`Logger`]
 //! holds the application's context pointer, so it is not `Send`. libtobii
-//! holds no lock while it runs (it has none), and does not serialise calls
-//! across threads, so devices used on two threads may log at once. It runs
+//! holds no lock while it runs, and does not serialise calls across
+//! threads, so devices used on two threads may log at once. It runs
 //! under the callback guard (see [`crate::device::call`]), because the device
 //! that logs may be borrowed: a call from inside it that a stream callback
 //! could not make either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`. The guard is
