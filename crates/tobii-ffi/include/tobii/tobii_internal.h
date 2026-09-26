@@ -3,10 +3,10 @@
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
  * argument types are best guesses. Only the field-of-use, image,
- * internal-stream, timesync, stream-type, pause and hardware-configuration
- * functions are implemented; every other entry point here returns
- * TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the guessed
- * types cannot matter at runtime.
+ * internal-stream, internal-capability, timesync, stream-type, pause and
+ * hardware-configuration functions are implemented; every other entry point
+ * here returns TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so
+ * the guessed types cannot matter at runtime.
  * Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
@@ -60,6 +60,17 @@ TOBII_API tobii_error_t TOBII_CALL tobii_image_unsubscribe( tobii_device_t* devi
  * TOBII_ERROR_INVALID_PARAMETER. */
 TOBII_API tobii_error_t TOBII_CALL tobii_internal_stream_supported( tobii_device_t* device,
     uint32_t stream, tobii_supported_t* supported );
+
+/* Internal capability ids (only the name of 0 is the DLL's): 0 eyeball
+ * center, 1 diagnostic images, 2 remote wake, 3 power save, 4 face id,
+ * 5 logs. Supported: 0 only, since tobii_gaze_data_t carries each eye's
+ * eyeball centre. For 0 that is what the DLL would answer on its TTP path
+ * (inferred); on its PRP path, behind the Tobii service, 0 is
+ * TOBII_ERROR_NOT_SUPPORTED. The DLL answers 1..5 from device lists never
+ * captured for an ET5. An unknown id is reported unsupported, not an error;
+ * a negative id is TOBII_ERROR_INVALID_PARAMETER. */
+TOBII_API tobii_error_t TOBII_CALL tobii_internal_capability_supported( tobii_device_t* device,
+    int32_t capability, tobii_supported_t* supported );
 
 /* One tracker/host clock pair: the tracker clock (the clock of gaze data's
  * timestamp_tracker_us) read tracker_us at some host time between
@@ -217,7 +228,6 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_gaze_hid_enabled( tobii_device_t* d
 TOBII_API tobii_error_t TOBII_CALL tobii_get_illumination_mode( tobii_device_t* device, void* mode );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_collection_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_collection_unsubscribe( tobii_device_t* device );
-TOBII_API tobii_error_t TOBII_CALL tobii_internal_capability_supported( tobii_device_t* device, uint32_t capability, void* supported );
 TOBII_API tobii_error_t TOBII_CALL tobii_logs_retrieve( tobii_device_t* device, void const* receiver, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_low_frequency_head_position_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_low_frequency_head_position_unsubscribe( tobii_device_t* device );

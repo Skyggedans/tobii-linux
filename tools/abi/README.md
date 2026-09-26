@@ -152,8 +152,8 @@ Layouts, and where each comes from:
 | everything else in `tobii_streams.h` / `tobii_wearable.h` | — | 4.1 docs, unchanged since 1.x |
 
 Undocumented exports are declared in `tobii_internal.h` with the arity the DLL
-shows. The 11 implemented ones (field of use, IR image, internal-stream
-support, timesync, the stream catalogue, pause and resume, hardware
-configuration) have real types; the other 62 return
+shows. The 12 implemented ones (field of use, IR image, internal-stream
+and internal-capability support, timesync, the stream catalogue, pause and
+resume, hardware configuration) have real types; the other 61 return
 `TOBII_ERROR_NOT_SUPPORTED` without reading their arguments, so their
 best-effort parameter types cannot matter at runtime.

@@ -2,8 +2,9 @@
 //! does not cover (all but `tobii_calibration_stimulus_points_get`, which
 //! lives with calibration). Their argument counts come from the DLL (see
 //! `tools/abi`); their types are best-effort, which is safe because only the
-//! field-of-use, image, internal-stream, timesync, stream-type, pause and
-//! hardware-configuration functions below read their arguments.
+//! field-of-use, image, internal-stream, internal-capability, timesync,
+//! stream-type, pause and hardware-configuration functions below read their
+//! arguments.
 
 use std::ffi::c_void;
 use std::time::Duration;
@@ -129,6 +130,46 @@ pub unsafe extern "C" fn tobii_internal_stream_supported(
 ) -> Status {
     // SAFETY: forwarded under the same contract.
     unsafe { write_supported(device, stream, supported, internal_stream_supported) }
+}
+
+/// Internal capabilities this library provides: eyeball centres (id 0) only.
+///
+/// The DLL's ids, from what its jump table at 0x18014d268 leads to: 0
+/// eyeball center, 1 diagnostic images (command 0x15), 2 remote wake
+/// (settable property 3), 3 power save (settable property 2), 4 face id
+/// (properties 13 and 14, commands 0x1a and 0x1b) and 5 logs (command
+/// 0x19). The name of 0 is the DLL's; those of 1..5 are inferred from what
+/// they look for.
+const fn internal_capability_supported(capability: u32) -> bool {
+    capability == 0
+}
+
+/// Whether an internal capability is available: eyeball centres only.
+///
+/// This matches what libtobii delivers (`tobii_gaze_data_t` carries each
+/// eye's eyeball centre; diagnostic images, remote wake, power save, face id
+/// and logs are stubs), not the DLL. For an ET5 the DLL would support 0 on
+/// its TTP path (inferred: it asks for gaze columns 0x17 and 0x18, the keys
+/// of the eyeball centres in every ET5 gaze frame) and answer
+/// `TOBII_ERROR_NOT_SUPPORTED` for 0 on its PRP path, the one behind the
+/// Tobii service; it answers 1..5 from device lists never captured for an
+/// ET5. As in the DLL, an id above 5 is reported unsupported, not an error,
+/// and a negative id is an invalid parameter.
+///
+/// # Safety
+/// `device` as `tobii_device_process_callbacks`; `supported` must be null or
+/// valid for writing one `tobii_supported_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tobii_internal_capability_supported(
+    device: *mut Device,
+    capability: i32,
+    supported: *mut u32,
+) -> Status {
+    // A negative id is one above `i32::MAX` here, which `write_supported`
+    // refuses once the device checks out.
+    let capability = capability.cast_unsigned();
+    // SAFETY: forwarded under the same contract.
+    unsafe { write_supported(device, capability, supported, internal_capability_supported) }
 }
 
 /// The daemon waits up to 25 s for a gaze frame: a cold tracker streams
@@ -453,7 +494,6 @@ not_supported! {
     fn tobii_get_illumination_mode(device: P, mode: P);
     fn tobii_image_collection_subscribe(device: P, callback: C, user_data: P);
     fn tobii_image_collection_unsubscribe(device: P);
-    fn tobii_internal_capability_supported(device: P, capability: u32, supported: P);
     fn tobii_logs_retrieve(device: P, receiver: C, user_data: P);
     fn tobii_low_frequency_head_position_subscribe(device: P, callback: C, user_data: P);
     fn tobii_low_frequency_head_position_unsubscribe(device: P);
@@ -484,7 +524,8 @@ mod tests {
     use super::*;
     use crate::api::tobii_device_destroy;
     use crate::status::{
-        TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL, TOBII_ERROR_NOT_AVAILABLE,
+        TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL,
+        TOBII_ERROR_NOT_AVAILABLE,
     };
     use crate::types::{TOBII_NOT_SUPPORTED, TOBII_SUPPORTED};
     use std::ffi::CStr;
@@ -526,6 +567,80 @@ mod tests {
             assert_eq!(s, 9, "nothing written");
             assert_eq!(tobii_device_destroy(d), 0);
         }
+    }
+
+    /// The daemon fails every request, as with no tracker plugged in: the
+    /// answer is local.
+    #[test]
+    fn only_eyeball_centres_are_a_supported_internal_capability() {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(
+            status::CONNECTION_FAILED,
+            vec![],
+        )));
+        let mut s = 9u32;
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once
+        // below; `s` is a live local.
+        unsafe {
+            assert_eq!(tobii_internal_capability_supported(d, 0, &raw mut s), 0);
+            assert_eq!(s, TOBII_SUPPORTED);
+            for capability in (1..=5).chain([6, 1000, i32::MAX]) {
+                s = 9;
+                assert_eq!(
+                    tobii_internal_capability_supported(d, capability, &raw mut s),
+                    0,
+                    "{capability}: unknown is not an error"
+                );
+                assert_eq!(s, TOBII_NOT_SUPPORTED, "{capability}");
+            }
+            for capability in [-1, i32::MIN] {
+                s = 9;
+                assert_eq!(
+                    tobii_internal_capability_supported(d, capability, &raw mut s),
+                    TOBII_ERROR_INVALID_PARAMETER,
+                    "{capability}"
+                );
+                assert_eq!(s, 9, "{capability}: nothing written");
+            }
+            assert_eq!(
+                tobii_internal_capability_supported(d, 0, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_internal_capability_supported(d, -1, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_internal_capability_supported(ptr::null_mut(), 0, &raw mut s),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(s, 9, "nothing written");
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+    }
+
+    /// From inside a callback the query is refused before its arguments are
+    /// read, as wherever a device handle is taken, and writes nothing.
+    #[test]
+    fn internal_capability_support_is_refused_inside_a_callback() {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        let mut s = 9u32;
+        let mut got = [0; 4];
+        crate::device::call(|| {
+            // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed
+            // once below; `s` is a live local.
+            got = unsafe {
+                [
+                    tobii_internal_capability_supported(d, 0, &raw mut s),
+                    tobii_internal_capability_supported(ptr::null_mut(), 0, &raw mut s),
+                    tobii_internal_capability_supported(d, 0, ptr::null_mut()),
+                    tobii_internal_capability_supported(d, -1, &raw mut s),
+                ]
+            };
+        });
+        assert_eq!(got, [TOBII_ERROR_CALLBACK_IN_PROGRESS; 4]);
+        assert_eq!(s, 9, "nothing written");
+        // SAFETY: as above; the callback guard is down again.
+        unsafe { assert_eq!(tobii_device_destroy(d), 0) };
     }
 
     /// Ask a daemon answering `status`/`payload` for a clock pair, into a

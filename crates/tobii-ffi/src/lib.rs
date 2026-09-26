@@ -20,8 +20,9 @@
 //! - **Answered locally** — API version (4.1.0.3), system clock, output
 //!   frequency (33 Hz), enabled eye (both), feature group (consumer),
 //!   license validation (every key valid), display-area calculation,
-//!   calibration parsing, internal-stream support (the IR image only), lens
-//!   configuration writability (never).
+//!   calibration parsing, internal-stream support (the IR image only),
+//!   internal-capability support (eyeball centres only), lens configuration
+//!   writability (never).
 //! - **`TOBII_ERROR_NOT_SUPPORTED`** — everything the ET5 was never observed
 //!   doing: wearable, face id, illumination, power control, firmware,
 //!   diagnostics, extensions, custom streams, 3-D and per-eye calibration.
