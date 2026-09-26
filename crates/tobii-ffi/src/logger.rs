@@ -20,8 +20,12 @@
 //! across threads, so devices used on two threads may log at once. It runs
 //! under the callback guard (see [`crate::device::call`]), because the device
 //! that logs may be borrowed: a call from inside it that a stream callback
-//! could not make either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`. These are
-//! libtobii's guarantees, not the DLL's.
+//! could not make either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`. The guard is
+//! the logging thread's own, so it does not stop another thread the logger
+//! hands the line to from using that device meanwhile; what forbids that is
+//! the rule every entry point's `# Safety` states, that no other thread uses
+//! the device during the call. These are libtobii's guarantees, not the
+//! DLL's.
 //!
 //! The 4.1 DLL, for comparison: its error lines go through one helper,
 //! 0x18015e360(api, level, fmt, ...), which takes no lock and calls

@@ -12,6 +12,14 @@
  * tobii_config.h, tobii_licensing.h, tobii_advanced.h, tobii_wearable.h, and
  * tobii_internal.h for the exports the Stream Engine never documented.
  *
+ * Threads: the Stream Engine promises thread safety across all its
+ * functions; libtobii.so holds no lock. One device must not be used from two
+ * threads at once, a tobii_wait_for_callbacks waiting on it included: an
+ * application that shares a device between threads serialises its calls on
+ * it. Different devices, and the API handle, may be used from several
+ * threads at once. TOBII_ERROR_CALLBACK_IN_PROGRESS guards only the thread
+ * a callback or the logger runs on.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -101,10 +109,12 @@ typedef enum tobii_log_level_t
  * It is called synchronously, on the thread inside the tobii_* call that
  * logs, never on a thread of libtobii's own, with no lock of libtobii's held,
  * and not serialised across threads. A call from inside it that a stream
- * callback could not make either returns TOBII_ERROR_CALLBACK_IN_PROGRESS.
- * text is valid only during the call. log_func and log_context must stay
- * valid until the API and every device created from it are destroyed: a
- * device keeps logging after tobii_api_destroy. */
+ * callback could not make either returns TOBII_ERROR_CALLBACK_IN_PROGRESS,
+ * on that thread only: another thread it hands the line to is not refused,
+ * and must not use the logging device while the call that logs runs (see
+ * Threads at the top). text is valid only during the call. log_func and
+ * log_context must stay valid until the API and every device created from
+ * it are destroyed: a device keeps logging after tobii_api_destroy. */
 typedef void ( *tobii_log_func_t )( void* log_context, tobii_log_level_t level, char const* text );
 
 typedef struct tobii_custom_log_t

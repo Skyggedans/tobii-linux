@@ -92,7 +92,7 @@ the archived 4.1.0 reference. What stands behind the entry points:
 | | Entry points |
 |---|---|
 | Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, IR image and notification streams; device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
-| Answered locally | API version, system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing, internal-stream support (the IR image only), internal-capability support (eyeball centres only), lens-configuration writability (never) |
+| Answered locally | API version, error texts (the DLL's), system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing, internal-stream support (the IR image only), internal-capability support (eyeball centres only), lens-configuration writability (never) |
 | `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration |
 
 Where the answers come from, and where they differ from Windows:
@@ -204,6 +204,24 @@ Where the answers come from, and where they differ from Windows:
   answered its command (2120) with no data, so
   `tobii_hardware_configuration_get` is `TOBII_ERROR_NOT_SUPPORTED` until it
   reports one.
+- **Threads.** The Stream Engine promises thread safety across all its
+  functions; libtobii has no lock, so one device must not be used from two
+  threads at once, a `tobii_wait_for_callbacks` waiting on it included. An
+  application that shares a device between threads serialises its calls on
+  it; different devices, and the API handle, may be used from several
+  threads at once. `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the
+  thread a callback or the logger runs on, not another thread it hands
+  work to.
+- **Logging and allocation.** The `tobii_custom_log_t` logger gets
+  libtobii's own few lines (a refused `field_of_use`, a failed connect or
+  reconnect, a lost daemon connection once per loss, a daemon reply that
+  does not decode, each connect and reconnect), not the line per failing
+  call the Stream Engine writes: the returned status says that. It is
+  called on the thread inside the call that logs, and a device keeps
+  logging through it after `tobii_api_destroy`. A `tobii_custom_alloc_t` is
+  checked as in the Stream Engine and never called: libtobii allocates with
+  Rust's allocator, where the DLL allocates the API handle, each device and
+  long log lines through it (INSTALL.md §8).
 
 The headers are in `crates/tobii-ffi/include/tobii/` (installed to
 `/usr/local/include/tobii/`); OpenTrack's `tracker-tobii` plugin builds against

@@ -11,32 +11,32 @@ pub type Status = i32;
 // The numbering below is the Stream Engine's own, recovered from the jump table
 // of `tobii_error_message` in `tobii_stream_engine.dll`, and so are the texts
 // that function returns. A client that switches on these values has to see
-// the same numbers this library returns, so keep them as they are. Only the
-// codes marked "returned here" ever leave this library; the rest exist so the
-// shared header can name them.
+// the same numbers this library returns, so keep them as they are. Codes 2,
+// 7 and 17 to 20 never leave this library; they exist so the shared header
+// can name them.
 
 /// The call succeeded.
 pub const TOBII_ERROR_NO_ERROR: Status = 0;
-/// Unrecoverable internal failure.
+/// Unrecoverable internal failure; here, a reply from tobiid that does not
+/// decode, which is logged too.
 pub const TOBII_ERROR_INTERNAL: Status = 1;
 /// A restricted feature was used without the permission to do so.
 pub const TOBII_ERROR_INSUFFICIENT_LICENSE: Status = 2;
 /// The device does not support the feature.
 pub const TOBII_ERROR_NOT_SUPPORTED: Status = 3;
-/// No device is available.
+/// No device is available; here, the tracker is paused (a clock pair, a
+/// calibration start) or tobiid knows no calibration id yet.
 pub const TOBII_ERROR_NOT_AVAILABLE: Status = 4;
-/// Returned here: the daemon could not be reached (or spawned), the
-/// connection dropped, the daemon has no tracker for a call that needs one
-/// live (a clock pair, a pause, starting, retrieving or applying a
-/// calibration, a display-area write), or the tracker re-initialised or was
-/// lost while the call ran.
+/// The daemon could not be reached (or spawned), the connection dropped, the
+/// daemon has no tracker for a call that needs one live (a clock pair, a
+/// pause, starting, retrieving or applying a calibration, a display-area
+/// write), or the tracker re-initialised or was lost while the call ran.
 pub const TOBII_ERROR_CONNECTION_FAILED: Status = 5;
-/// Returned here: no sample (or no daemon acknowledgement) arrived before the
-/// timeout.
+/// No sample (or no daemon acknowledgement) arrived before the timeout.
 pub const TOBII_ERROR_TIMED_OUT: Status = 6;
 /// Memory could not be allocated.
 pub const TOBII_ERROR_ALLOCATION_FAILED: Status = 7;
-/// Returned here: a null or otherwise unusable argument was passed.
+/// A null or otherwise unusable argument was passed.
 pub const TOBII_ERROR_INVALID_PARAMETER: Status = 8;
 /// Calibration has already been started.
 pub const TOBII_ERROR_CALIBRATION_ALREADY_STARTED: Status = 9;
@@ -49,14 +49,17 @@ pub const TOBII_ERROR_CALIBRATION_NOT_STARTED: Status = 10;
 pub const TOBII_ERROR_ALREADY_SUBSCRIBED: Status = 11;
 /// The stream is not subscribed on this device.
 pub const TOBII_ERROR_NOT_SUBSCRIBED: Status = 12;
-/// The operation failed.
+/// The operation failed: the tracker refused a request or tobiid could not
+/// complete it, or `tobii_calibration_parse` refused the blob.
 pub const TOBII_ERROR_OPERATION_FAILED: Status = 13;
-/// Returned here: the daemon refused the subscription. Kept for ABI
-/// compatibility; the current daemon never refuses.
+/// `tobii_wait_for_callbacks` was given devices from different API handles,
+/// as in the DLL, or the daemon refused a subscription, which the current
+/// daemon never does.
 pub const TOBII_ERROR_CONFLICTING_API_INSTANCES: Status = 14;
 /// Another client is calibrating the device.
 pub const TOBII_ERROR_CALIBRATION_BUSY: Status = 15;
-/// An API function was called from inside an API callback.
+/// An API function was called from inside an API callback, or from inside
+/// the logger, on the thread that runs it.
 pub const TOBII_ERROR_CALLBACK_IN_PROGRESS: Status = 16;
 /// The stream already has as many subscribers as it accepts.
 pub const TOBII_ERROR_TOO_MANY_SUBSCRIBERS: Status = 17;

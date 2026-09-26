@@ -1788,10 +1788,13 @@ fn gaze_stream_loop(
     if let Some(area) = display_override {
         facts.display_area = Some(area);
     }
+    // This init's own 1330 answer, so empty after one that lost it; tobiid
+    // then keeps the previous init's properties, if there was one, and tells
+    // its clients those (`keep_unreported`).
     info!(
         model = %facts.info.model,
         firmware = %facts.info.firmware_version,
-        integration_type = %facts.device_info().integration_type,
+        init_integration_type = %facts.device_info().integration_type,
         calibration_id = ?facts.calibration_id,
         faults = ?facts.status_string(STATUS_FAULTS),
         warnings = ?facts.status_string(STATUS_WARNINGS),

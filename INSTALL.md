@@ -421,9 +421,12 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   reports it (once per loss) or a daemon reply that does not decode, and
   `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
   The logger is called on the thread inside the `tobii_*` call that logs,
-  with no lock of libtobii's held; a call from inside it that a callback could
-  not make either returns `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A
-  `tobii_custom_alloc_t` is checked as in the Stream Engine and never called.
+  with no lock of libtobii's held; a call from inside it, on that thread,
+  that a callback could not make either returns
+  `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A `tobii_custom_alloc_t` is checked as
+  in the Stream Engine and never called. Unlike the Stream Engine, libtobii
+  does not serialise calls on a device: one device must not be used from
+  two threads at once (README.md, Architecture, "Threads").
 
   #### OpenTrack's `tracker-tobii` plugin
 

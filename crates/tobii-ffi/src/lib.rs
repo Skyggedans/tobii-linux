@@ -17,12 +17,12 @@
 //!   the host, not the tracker). The hardware configuration is implemented
 //!   provisionally; the ET5 has reported none on Linux, so it answers
 //!   `TOBII_ERROR_NOT_SUPPORTED` there.
-//! - **Answered locally** — API version (4.1.0.3), system clock, output
-//!   frequency (33 Hz), enabled eye (both), feature group (consumer),
-//!   license validation (every key valid), display-area calculation,
-//!   calibration parsing, internal-stream support (the IR image only),
-//!   internal-capability support (eyeball centres only), lens configuration
-//!   writability (never).
+//! - **Answered locally** — API version (4.1.0.3), error texts (the DLL's),
+//!   system clock, output frequency (33 Hz), enabled eye (both), feature
+//!   group (consumer), license validation (every key valid), display-area
+//!   calculation, calibration parsing, internal-stream support (the IR image
+//!   only), internal-capability support (eyeball centres only), lens
+//!   configuration writability (never).
 //! - **`TOBII_ERROR_NOT_SUPPORTED`** — everything the ET5 was never observed
 //!   doing: wearable, face id, illumination, power control, firmware,
 //!   diagnostics, extensions, custom streams, 3-D and per-eye calibration.
@@ -40,6 +40,13 @@
 //! callback flag in the API instance), `tobii_device_create` and
 //! `tobii_device_create_ex` (a callback could not destroy what they make) and
 //! `tobii_calibration_parse`.
+//!
+//! That refusal covers only the thread the callback runs on (the flag is
+//! thread-local), and nothing else stands between two threads: the Stream
+//! Engine promises thread safety across all its functions, but libtobii has
+//! no lock, so a device must not be used from two threads at once, as each
+//! entry point's `# Safety` section says. Different devices may be, and so
+//! may the API handle.
 //!
 //! An entry point that takes a device handle checks the callback first, then
 //! a null device, then its other arguments (`TOBII_ERROR_INVALID_PARAMETER`
@@ -109,9 +116,10 @@
 //! way to see its diagnostics. They are its own, and few: ERROR for a refused
 //! `field_of_use`, a failed connect or reconnect, a lost connection when
 //! `tobii_device_process_callbacks` reports it (once per loss) and a daemon
-//! reply that does not decode, INFO for each connect and reconnect. The logger is called on the thread inside the `tobii_*` call
-//! that logs, with no lock held and under the callback guard, so a call from
-//! inside it that a callback could not make either is
+//! reply that does not decode, INFO for each connect and reconnect. The
+//! logger is called on the thread inside the `tobii_*` call that logs, with
+//! no lock held and under the callback guard, so a call from inside it, on
+//! that thread, that a callback could not make either is
 //! `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A `tobii_custom_alloc_t` is checked as
 //! in the DLL and never called (see `logger` and `tobii_api_create`).
 //!
