@@ -22,7 +22,11 @@
 //!   group (consumer), license validation (every key valid), display-area
 //!   calculation, calibration parsing, internal-stream support (the IR image
 //!   only), internal-capability support (eyeball centres only), lens
-//!   configuration writability (never).
+//!   configuration writability (never), and the subscribes and unsubscribes
+//!   of internal streams 3, 4, 5, 7 and 8: low-frequency head rotation and
+//!   position, multiple faces position, wearable limited image and secondary
+//!   camera image (never, as the DLL answers for a tracker it drives itself;
+//!   see `internal`).
 //! - **`TOBII_ERROR_NOT_SUPPORTED`** — everything the ET5 was never observed
 //!   doing: wearable, face id, illumination, power control, firmware,
 //!   diagnostics, extensions, custom streams, 3-D and per-eye calibration,
@@ -38,9 +42,10 @@
 //! A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, as in
 //! the Stream Engine, from every implemented entry point that takes a device
 //! handle, `tobii_device_destroy` included, and from
-//! `tobii_calibration_stimulus_points_get`. Four more refuse it once their
-//! arguments check out, as in the DLL: `tobii_api_destroy` (the DLL keeps its
-//! callback flag in the API instance), `tobii_device_create` and
+//! `tobii_calibration_stimulus_points_get` and the refused internal streams'
+//! subscribes and unsubscribes. Four more refuse it once their arguments
+//! check out, as in the DLL: `tobii_api_destroy` (the DLL keeps its callback
+//! flag in the API instance), `tobii_device_create` and
 //! `tobii_device_create_ex` (a callback could not destroy what they make) and
 //! `tobii_calibration_parse`.
 //!
@@ -131,8 +136,8 @@
 //! inside are kept to the single pointer operation that needs them. Entry
 //! points without an implementation are safe functions: the stubs read none
 //! of their arguments (see `stub`), and
-//! `tobii_calibration_stimulus_points_get` only compares its pointers with
-//! null.
+//! `tobii_calibration_stimulus_points_get` and the refused internal streams'
+//! subscribes and unsubscribes only compare their pointers with null.
 
 mod advanced;
 mod api;

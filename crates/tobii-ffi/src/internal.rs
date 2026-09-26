@@ -4,7 +4,8 @@
 //! `tools/abi`); their types are best-effort, which is safe because only the
 //! field-of-use, image, internal-stream, internal-capability, timesync,
 //! stream-type, pause and hardware-configuration functions below read their
-//! arguments.
+//! arguments, and the subscribes and unsubscribes of the internal streams the
+//! DLL refuses only compare theirs with null.
 
 use std::ffi::c_void;
 use std::time::Duration;
@@ -15,8 +16,11 @@ use tobii_ipc::request::{
 
 use crate::api::{FACTS_TIMEOUT, write_supported};
 use crate::calibration::request;
-use crate::device::{Device, device_mut};
-use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
+use crate::device::{Device, device_mut, in_callback};
+use crate::status::{
+    Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
+    TOBII_ERROR_NOT_SUPPORTED,
+};
 use crate::streams::{subscribe, unsubscribe};
 use crate::stub::not_supported;
 use crate::types::{
@@ -114,10 +118,16 @@ const fn internal_stream_supported(stream: u32) -> bool {
 /// Whether an internal stream is available: the IR image only.
 ///
 /// This matches what libtobii delivers (`tobii_image_subscribe` works; the
-/// clean IR, custom and image-collection streams are stubs), not the DLL.
-/// For an ET5 the DLL would support 0, 2 and 6 on its TTP path and none on
-/// its PRP path. As in the DLL, an unknown id is reported unsupported, not
-/// an error, and an id above `i32::MAX` is an invalid parameter.
+/// clean IR, custom and image-collection streams are stubs). For 3, 4, 5, 7
+/// and 8 it is also the DLL's answer on its TTP path, for any tracker it
+/// drives itself: its check (0x180157860, called at 0x18014cc59) has no case
+/// for them, and their subscribes refuse them the same way (see
+/// `refused_internal_subscribe`). For an ET5 the DLL would support 0, 2 and 6
+/// on that path. On its PRP path, behind the Tobii service, it never
+/// supports 0 or 1 and answers 2..8 from the streams the service lists,
+/// never captured for an ET5. As in the DLL, an unknown id is reported
+/// unsupported, not an error, and an id above `i32::MAX` is an invalid
+/// parameter.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `supported` must be null or
@@ -130,6 +140,114 @@ pub unsafe extern "C" fn tobii_internal_stream_supported(
 ) -> Status {
     // SAFETY: forwarded under the same contract.
     unsafe { write_supported(device, stream, supported, internal_stream_supported) }
+}
+
+/// A subscribe to an internal stream the DLL refuses for a tracker it drives
+/// itself: 3 and 4 low-frequency head rotation and position, 5 multiple
+/// faces position, 7 wearable limited image and 8 secondary camera image.
+///
+/// Each such export passes its stream's id to one helper of the DLL
+/// (0x18015bbf0, `tobii_internal_stream_subscribe` in its log). Its support
+/// check (0x180157860) has no case for these ids when the DLL runs its own
+/// tracker module, as it does for any URL but `tobii-prp://` and
+/// `tprp-tcp://`, so the helper answers `TOBII_ERROR_NOT_SUPPORTED` before it
+/// registers anything (0x18015bd29); the module's own subscribes for them
+/// answer `PLATMOD_ERROR_NOT_SUPPORTED` whatever they are given. Behind the
+/// Tobii service the answer depends on the streams the service lists, never
+/// captured for an ET5. So nothing is sent to the daemon, and libtobii's head
+/// pose is not re-published as the low-frequency streams, whose units, frame
+/// and rate would all be invented.
+///
+/// A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, then a
+/// null device or callback is `TOBII_ERROR_INVALID_PARAMETER`, in that order:
+/// the DLL checks both nulls before the callback. Unlike the DLL, which logs
+/// every refusal but a null device's at ERROR, nothing reaches the
+/// application's logger. The device is only compared with null, never
+/// borrowed.
+fn refused_internal_subscribe(
+    export: &'static str,
+    stream: u32,
+    device: *mut Device,
+    callback: *const c_void,
+) -> Status {
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
+    }
+    if device.is_null() || callback.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    tracing::trace!(export, stream, "internal stream not supported");
+    TOBII_ERROR_NOT_SUPPORTED
+}
+
+/// The unsubscribe of an internal stream [`refused_internal_subscribe`]
+/// refuses. The DLL's helper (0x18015bee0) runs the same support check before
+/// it looks for a subscription (0x18015bf2d), so the answer is
+/// `TOBII_ERROR_NOT_SUPPORTED`, never `TOBII_ERROR_NOT_SUBSCRIBED`; the
+/// checks before it are the subscribe's, less the callback.
+fn refused_internal_unsubscribe(export: &'static str, stream: u32, device: *mut Device) -> Status {
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
+    }
+    if device.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    tracing::trace!(export, stream, "internal stream not supported");
+    TOBII_ERROR_NOT_SUPPORTED
+}
+
+/// Define the subscribe and unsubscribe of internal streams the DLL refuses
+/// for a tracker it drives itself (see `refused_internal_subscribe`).
+macro_rules! refused_internal_streams {
+    ($(
+        $(#[$doc:meta])*
+        $sub:ident / $unsub:ident: $stream:literal;
+    )+) => { $(
+        $(#[$doc])*
+        ///
+        /// `TOBII_ERROR_NOT_SUPPORTED` once the device and callback check out,
+        /// as the DLL answers for a tracker it drives itself, with nothing sent
+        /// to the daemon (see `refused_internal_subscribe`). The pointers are
+        /// only compared with null, so the function is safe.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $sub(
+            device: *mut Device,
+            callback: *const c_void,
+            _user_data: *mut c_void,
+        ) -> Status {
+            refused_internal_subscribe(stringify!($sub), $stream, device, callback)
+        }
+
+        #[doc = concat!(
+            "The unsubscribe of `", stringify!($sub), "`: `TOBII_ERROR_NOT_SUPPORTED` ",
+            "once the device checks out, as in the DLL, whose support check comes ",
+            "before its subscription lookup (see `refused_internal_unsubscribe`)."
+        )]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $unsub(device: *mut Device) -> Status {
+            refused_internal_unsubscribe(stringify!($unsub), $stream, device)
+        }
+    )+ };
+}
+
+refused_internal_streams! {
+    /// Internal stream 3, low-frequency head rotation (the DLL's PRP stream 9,
+    /// `LOW_FREQUENCY_HEAD_ROTATION`). What the DLL would deliver behind the
+    /// Tobii service is described in `tobii_internal.h`.
+    tobii_low_frequency_head_rotation_subscribe / tobii_low_frequency_head_rotation_unsubscribe: 3;
+    /// Internal stream 4, low-frequency head position (the DLL's PRP stream 8,
+    /// `LOW_FREQUENCY_HEAD_POSITION`). What the DLL would deliver behind the
+    /// Tobii service is described in `tobii_internal.h`.
+    tobii_low_frequency_head_position_subscribe / tobii_low_frequency_head_position_unsubscribe: 4;
+    /// Internal stream 5, multiple faces position (the DLL's PRP stream 10,
+    /// `MULTIPLE_FACES_POSITION`).
+    tobii_multiple_faces_position_subscribe / tobii_multiple_faces_position_unsubscribe: 5;
+    /// Internal stream 7, wearable limited image (the DLL's PRP stream 11,
+    /// `WEARABLE_LIMITED_IMAGE`).
+    tobii_wearable_limited_image_subscribe / tobii_wearable_limited_image_unsubscribe: 7;
+    /// Internal stream 8, secondary camera image (the DLL's PRP stream 0x17,
+    /// `SECONDARY_CAMERA_IMAGE`).
+    tobii_secondary_camera_image_subscribe / tobii_secondary_camera_image_unsubscribe: 8;
 }
 
 /// Internal capabilities this library provides: eyeball centres (id 0) only.
@@ -495,19 +613,11 @@ not_supported! {
     fn tobii_image_collection_subscribe(device: P, callback: C, user_data: P);
     fn tobii_image_collection_unsubscribe(device: P);
     fn tobii_logs_retrieve(device: P, receiver: C, user_data: P);
-    fn tobii_low_frequency_head_position_subscribe(device: P, callback: C, user_data: P);
-    fn tobii_low_frequency_head_position_unsubscribe(device: P);
-    fn tobii_low_frequency_head_rotation_subscribe(device: P, callback: C, user_data: P);
-    fn tobii_low_frequency_head_rotation_unsubscribe(device: P);
-    fn tobii_multiple_faces_position_subscribe(device: P, callback: C, user_data: P);
-    fn tobii_multiple_faces_position_unsubscribe(device: P);
     fn tobii_open_realm(device: P, realm: u32, key: C, key_size: u32);
     fn tobii_power_save_activate(device: P);
     fn tobii_power_save_deactivate(device: P);
     fn tobii_remote_wake_activate(device: P);
     fn tobii_remote_wake_deactivate(device: P);
-    fn tobii_secondary_camera_image_subscribe(device: P, callback: C, user_data: P);
-    fn tobii_secondary_camera_image_unsubscribe(device: P);
     fn tobii_send_custom_command(device: P, command: u32, data: C, size: usize, receiver: C, user_data: P);
     fn tobii_send_statistics(device: P, data: C, size: usize);
     fn tobii_set_display_id(device: P, display_id: u32);
@@ -515,8 +625,6 @@ not_supported! {
     fn tobii_set_face_id_parameters(device: P, parameters: C);
     fn tobii_set_fw_upgrade_allowed(device: P, allowed: u32);
     fn tobii_set_illumination_mode(device: P, mode: C);
-    fn tobii_wearable_limited_image_subscribe(device: P, callback: C, user_data: P);
-    fn tobii_wearable_limited_image_unsubscribe(device: P);
 }
 
 #[cfg(test)]
@@ -524,8 +632,7 @@ mod tests {
     use super::*;
     use crate::api::tobii_device_destroy;
     use crate::status::{
-        TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL,
-        TOBII_ERROR_NOT_AVAILABLE,
+        TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL, TOBII_ERROR_NOT_AVAILABLE,
     };
     use crate::types::{TOBII_NOT_SUPPORTED, TOBII_SUPPORTED};
     use std::ffi::CStr;
@@ -541,6 +648,8 @@ mod tests {
         unsafe {
             assert_eq!(tobii_internal_stream_supported(d, 0, &raw mut s), 0);
             assert_eq!(s, TOBII_SUPPORTED);
+            // For 3, 4, 5, 7 and 8 this is the DLL's own answer for a tracker
+            // it drives itself.
             for stream in (1..=8).chain([9, 1000, 0x7fff_ffff]) {
                 s = 9;
                 assert_eq!(
@@ -567,6 +676,128 @@ mod tests {
             assert_eq!(s, 9, "nothing written");
             assert_eq!(tobii_device_destroy(d), 0);
         }
+    }
+
+    type RefusedSubscribe = extern "C" fn(*mut Device, *const c_void, *mut c_void) -> Status;
+    type RefusedUnsubscribe = extern "C" fn(*mut Device) -> Status;
+
+    /// The subscribe and unsubscribe of each internal stream the DLL refuses
+    /// for a tracker it drives itself.
+    const REFUSED: [(u32, RefusedSubscribe, RefusedUnsubscribe); 5] = [
+        (
+            3,
+            tobii_low_frequency_head_rotation_subscribe,
+            tobii_low_frequency_head_rotation_unsubscribe,
+        ),
+        (
+            4,
+            tobii_low_frequency_head_position_subscribe,
+            tobii_low_frequency_head_position_unsubscribe,
+        ),
+        (
+            5,
+            tobii_multiple_faces_position_subscribe,
+            tobii_multiple_faces_position_unsubscribe,
+        ),
+        (
+            7,
+            tobii_wearable_limited_image_subscribe,
+            tobii_wearable_limited_image_unsubscribe,
+        ),
+        (
+            8,
+            tobii_secondary_camera_image_subscribe,
+            tobii_secondary_camera_image_unsubscribe,
+        ),
+    ];
+
+    /// A callback the refused subscribes are given and never call.
+    fn never_called() -> *const c_void {
+        ptr::NonNull::<c_void>::dangling().as_ptr().cast_const()
+    }
+
+    unsafe extern "C" fn ignore_head_pose(_: *const crate::types::HeadPose, _: *mut c_void) {}
+
+    /// The daemon fails every request, as with no tracker plugged in, and
+    /// counts every frame: only the head-pose subscribe at the end reaches
+    /// it. An unsubscribe is refused, not `TOBII_ERROR_NOT_SUBSCRIBED`, as in
+    /// the DLL, whose support check comes first.
+    #[test]
+    fn refused_internal_streams_are_not_supported_without_asking_the_daemon() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tobii_ipc::request::decode_request;
+        use tobii_ipc::{encode_reply, encode_subscribed};
+        let frames = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&frames);
+        let connect = crate::device::tests::fake_daemon(move |body| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            match body.first() {
+                Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![encode_subscribed(true)],
+                Some(&tobii_ipc::TAG_REQUEST) => {
+                    let req = decode_request(body).expect("request");
+                    vec![encode_reply(req.id, status::CONNECTION_FAILED, &[])]
+                }
+                _ => vec![],
+            }
+        });
+        let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        let (refused, invalid) = (TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_INVALID_PARAMETER);
+        let n = ptr::null_mut();
+        for (stream, subscribe, unsubscribe) in REFUSED {
+            let got = [
+                unsubscribe(d),
+                subscribe(d, never_called(), n),
+                subscribe(d, ptr::null(), n),
+                subscribe(n.cast(), never_called(), n),
+                subscribe(n.cast(), ptr::null(), n),
+                unsubscribe(d),
+                unsubscribe(n.cast()),
+            ];
+            let want = [
+                refused, refused, invalid, invalid, invalid, refused, invalid,
+            ];
+            assert_eq!(got, want, "internal stream {stream}");
+        }
+        assert_eq!(frames.load(Ordering::Relaxed), 0, "nothing sent");
+        // The daemon handles frames in order, so once the head-pose subscribe
+        // is acked, a frame the calls sent without waiting would have been
+        // counted too. The refused subscribes left head pose's slot free.
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once.
+        unsafe {
+            assert_eq!(
+                crate::streams::tobii_head_pose_subscribe(d, Some(ignore_head_pose), n),
+                TOBII_ERROR_NO_ERROR
+            );
+            assert_eq!(frames.load(Ordering::Relaxed), 1, "only the head pose");
+            assert_eq!(tobii_device_destroy(d), 0);
+        }
+    }
+
+    /// Inside a callback every call is refused before its arguments are
+    /// read, as wherever a device handle is taken. The DLL checks the nulls
+    /// first, so for those it would answer `TOBII_ERROR_INVALID_PARAMETER`.
+    #[test]
+    fn refused_internal_streams_are_refused_inside_a_callback() {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        let n = ptr::null_mut();
+        let mut got = Vec::new();
+        crate::device::call(|| {
+            for (_, subscribe, unsubscribe) in REFUSED {
+                got.extend([
+                    subscribe(d, never_called(), n),
+                    subscribe(n.cast(), never_called(), n),
+                    subscribe(d, ptr::null(), n),
+                    subscribe(n.cast(), ptr::null(), n),
+                    unsubscribe(d),
+                    unsubscribe(n.cast()),
+                ]);
+            }
+        });
+        assert_eq!(got, [TOBII_ERROR_CALLBACK_IN_PROGRESS; 30]);
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once;
+        // the callback guard is down again.
+        unsafe { assert_eq!(tobii_device_destroy(d), 0) };
     }
 
     /// The daemon fails every request, as with no tracker plugged in: the

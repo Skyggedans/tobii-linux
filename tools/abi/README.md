@@ -165,6 +165,57 @@ prototype declares or a float/integer position disagrees.
   (`tobii_get_combined_gaze_hid_track_box`, 0x180149fd2) and 0x12
   (`tobii_get_display_id`, 0x1801467b9); their module ids would be 10, 12, 13,
   1 and 16.
+- What the subscribes and unsubscribes of internal streams 3, 4, 5, 7 and 8
+  answer, streams the DLL never serves for a tracker it drives itself. Each
+  export passes an internal stream id in `edx` to one helper, 0x18015bbf0 to
+  subscribe (`tobii_internal_stream_subscribe` in its log, `internal.cpp`)
+  and 0x18015bee0 to unsubscribe: 3 low-frequency head
+  rotation (0x18014b7ad, 0x18014b707), 4 low-frequency head position
+  (0x18014b8ed, 0x18014b847), 5 multiple faces position (0x18014b66d,
+  0x18014b5c7), 7 wearable limited image (0x18014b24d, 0x18014b1a7) and 8
+  secondary camera image (0x180150fdd, 0x180150f37). The subscribe helper
+  answers `TOBII_ERROR_INVALID_PARAMETER` for a null device (unlogged) or
+  callback, `TOBII_ERROR_CALLBACK_IN_PROGRESS` inside a callback, then
+  `TOBII_ERROR_NOT_SUPPORTED` (0x18015bd29) when its support check
+  0x180157860 fails; the unsubscribe helper checks for a null device, the
+  callback flag and then the same support check (0x18015bf2d) before it
+  looks for a subscription, so it never answers `NOT_SUBSCRIBED` for them.
+  The check has two paths. When the DLL runs its own tracker module
+  (`[device+0x4e8]`, set for any URL but `tobii-prp://` and `tprp-tcp://`,
+  0x180157d47..0x180157fee), only ids 0, 1, 2 and 6 have a case, each asking
+  the module's TTP stream list for its stream (2, 3, 7 and 0xb through
+  0x180170260); 3, 4, 5, 7 and 8 fall through to `false` (0x1801578c0), and
+  so does every id above 8. Otherwise the id goes through the map at
+  0x180153b60 (2 to 1, 3 to 9, 4 to 8, 5 to 10, 6 to 7, 7 to 11, 8 to 0x17; 0
+  and 1 to 0, never supported) to the service's stream list (`+0x8854`,
+  count `+0x88bc`), never captured for an ET5. The map's targets are
+  `PRP_STREAM_ENUM` values, named by the to-string switch at 0x1800232a3
+  (table at RVA 0x237d8): 1 `CUSTOM`, 7 `IMAGE_COLLECTION`, 8
+  `LOW_FREQUENCY_HEAD_POSITION`, 9 `LOW_FREQUENCY_HEAD_ROTATION`, 10
+  `MULTIPLE_FACES_POSITION`, 11 `WEARABLE_LIMITED_IMAGE`, 0x17
+  `SECONDARY_CAMERA_IMAGE`. `tobii_internal_stream_supported` calls the same
+  check (0x18014cc59), so it reports 3, 4, 5, 7 and 8 unsupported on that
+  path, as libtobii does. Below the check, the legacy TTP module
+  (`platmod_legacy_ttp.cpp`) refuses them again: its unsubscribe and
+  subscribe for each (rotation 0x180163150 and 0x1801631e0, position
+  0x180163270 and 0x180163300, multiple faces 0x18015feb0 and 0x18015ff40,
+  wearable limited image 0x18015fc70 and 0x18015fd00, secondary camera image
+  0x18015fa30 and 0x18015fac0) log `PLATMOD_ERROR_NOT_SUPPORTED`
+  (0x180222bd8, format 0x180220b60) and return 3 whatever they are given.
+  Behind the service the DLL calls a low-frequency head callback with a
+  24-byte record (dispatch at 0x180154bdc for PRP stream 8 and 0x180154c5d
+  for 9, again at 0x180156d70 and 0x180156cc0; callback slots `+0x15de8` and
+  `+0x15e00`, from the registration at 0x1801536d0): an `int64` at +0, the
+  service's package timestamp plus `[device+0x15bd0]`, which the DLL only
+  ever sets to 0 (0x180153c7c); an `int32` validity at +8, the package's
+  flag tested for non-zero; and three `float`s at +0xc, copied unchanged.
+  The platform side's `low_frequency_head_position_callback` (0x1800279f0)
+  and `_rotation_callback` (0x180027c50) pack what a tracker module hands
+  them unchanged too (the timestamp, validity 1 as the flag, the three
+  words at 0x180027acd..0x180027adc), so the units, frame and rate are the
+  service's, and nothing in the DLL produces or decimates the values.
+  libtobii answers as the DLL does for a tracker it drives itself and does
+  not re-publish its head pose.
 
 Layouts, and where each comes from:
 
@@ -192,6 +243,9 @@ and internal-capability support, timesync, the stream catalogue, pause and
 resume, hardware configuration) have real types, and so does
 `tobii_calibration_stimulus_points_get`, which checks its arguments and then
 answers `TOBII_ERROR_NOT_SUPPORTED` as the DLL's in-process tracker module
-does for an ET5; the other 60 return `TOBII_ERROR_NOT_SUPPORTED` without
-reading their arguments, so their best-effort parameter types cannot matter
-at runtime.
+does for an ET5. The 10 subscribes and unsubscribes of internal streams 3,
+4, 5, 7 and 8 answer the same way, as the DLL does for a tracker it drives
+itself; they only compare their device and callback with null, so the
+callback's `void const*` cannot matter. The other 50 return
+`TOBII_ERROR_NOT_SUPPORTED` without reading their arguments, so their
+best-effort parameter types cannot matter at runtime.

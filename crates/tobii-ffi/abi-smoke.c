@@ -207,6 +207,18 @@ int main( void )
     tobii_supported_t supported = TOBII_SUPPORTED;
     assert( tobii_internal_stream_supported( NULL, 0, &supported ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_internal_capability_supported( NULL, 0, &supported ) == TOBII_ERROR_INVALID_PARAMETER );
+    /* Refused internal streams: any non-null callback, as it is never called. */
+    assert( tobii_low_frequency_head_rotation_subscribe( NULL, &supported, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_low_frequency_head_rotation_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_low_frequency_head_position_subscribe( NULL, &supported, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_low_frequency_head_position_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_multiple_faces_position_subscribe( NULL, &supported, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_multiple_faces_position_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_wearable_limited_image_subscribe( NULL, &supported, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_wearable_limited_image_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_secondary_camera_image_subscribe( NULL, &supported, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_secondary_camera_image_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_low_frequency_head_position_subscribe( NULL, NULL, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     tobii_lens_configuration_writable_t writable = TOBII_LENS_CONFIGURATION_WRITABLE;
     assert( tobii_lens_configuration_writable( NULL, &writable ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( supported == TOBII_SUPPORTED && writable == TOBII_LENS_CONFIGURATION_WRITABLE );
