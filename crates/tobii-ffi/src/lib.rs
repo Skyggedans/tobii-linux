@@ -25,7 +25,9 @@
 //!   configuration writability (never).
 //! - **`TOBII_ERROR_NOT_SUPPORTED`** — everything the ET5 was never observed
 //!   doing: wearable, face id, illumination, power control, firmware,
-//!   diagnostics, extensions, custom streams, 3-D and per-eye calibration.
+//!   diagnostics, extensions, custom streams, 3-D and per-eye calibration,
+//!   and the calibration stimulus points, as the DLL's in-process tracker
+//!   module answers for an ET5 (see `tobii_calibration_stimulus_points_get`).
 //!
 //! Nothing is gated by a licence. What the Stream Engine reserves for a
 //! higher feature group or an extra licence (gaze data, timesync,
@@ -35,7 +37,8 @@
 //!
 //! A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, as in
 //! the Stream Engine, from every implemented entry point that takes a device
-//! handle, `tobii_device_destroy` included. Four more refuse it once their
+//! handle, `tobii_device_destroy` included, and from
+//! `tobii_calibration_stimulus_points_get`. Four more refuse it once their
 //! arguments check out, as in the DLL: `tobii_api_destroy` (the DLL keeps its
 //! callback flag in the API instance), `tobii_device_create` and
 //! `tobii_device_create_ex` (a callback could not destroy what they make) and
@@ -126,8 +129,10 @@
 //! Every entry point takes raw handles from C, so each is an `unsafe fn` whose
 //! `# Safety` section states what the caller must uphold; the `unsafe` blocks
 //! inside are kept to the single pointer operation that needs them. Entry
-//! points without an implementation read none of their arguments and are safe
-//! functions (see `stub`).
+//! points without an implementation are safe functions: the stubs read none
+//! of their arguments (see `stub`), and
+//! `tobii_calibration_stimulus_points_get` only compares its pointers with
+//! null.
 
 mod advanced;
 mod api;
@@ -180,10 +185,6 @@ mod tests {
             (
                 "collect_data_3d",
                 crate::calibration::tobii_calibration_collect_data_3d(n, 0.5, 0.5, 0.5),
-            ),
-            (
-                "stimulus_points_get",
-                crate::calibration::tobii_calibration_stimulus_points_get(n, n),
             ),
             ("open_realm", crate::internal::tobii_open_realm(n, 0, c, 0)),
             (

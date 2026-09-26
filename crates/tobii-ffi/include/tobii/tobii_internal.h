@@ -4,9 +4,11 @@
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
  * argument types are best guesses. Only the field-of-use, image,
  * internal-stream, internal-capability, timesync, stream-type, pause and
- * hardware-configuration functions are implemented; every other entry point
- * here returns TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so
- * the guessed types cannot matter at runtime.
+ * hardware-configuration functions are implemented, and
+ * tobii_calibration_stimulus_points_get checks its arguments before it
+ * answers TOBII_ERROR_NOT_SUPPORTED; every other entry point here returns
+ * TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the guessed
+ * types cannot matter at runtime.
  * Companion to tobii/tobii.h.
  *
  * SPDX-License-Identifier: MIT
@@ -184,10 +186,34 @@ typedef struct tobii_hardware_configuration_t
 TOBII_API tobii_error_t TOBII_CALL tobii_hardware_configuration_get( tobii_device_t* device,
     tobii_hardware_configuration_t* configuration );
 
-/* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED. Its point type is
- * unknown. */
+/* The calibration's stimulus points as the DLL lays them out: a count, then
+ * at most 32 records of 36 bytes (1156 bytes; its copier at 0x180001800 and
+ * its fixed 0x488-byte PRP body, a size word and then this, at 0x180042517
+ * and 0x18004563e). The DLL copies each record as nine 32-bit words and never
+ * reads one, so what they hold is not known; the names are ours. The
+ * prototype took void* before: the ABI is the same, but a caller passing
+ * another pointer type now gets an incompatible-pointer-types diagnostic (an
+ * error by default since GCC 14 in C, and always an error in C++). */
+typedef struct tobii_calibration_stimulus_point_t
+{
+    uint32_t words[ 9 ];
+} tobii_calibration_stimulus_point_t;
+
+typedef struct tobii_calibration_stimulus_points_t
+{
+    int point_count;
+    tobii_calibration_stimulus_point_t points[ 32 ];
+} tobii_calibration_stimulus_points_t;
+
+/* TOBII_ERROR_CALLBACK_IN_PROGRESS from inside a callback, then
+ * TOBII_ERROR_INVALID_PARAMETER for a null device or points (the DLL checks
+ * both before the callback), and otherwise always TOBII_ERROR_NOT_SUPPORTED,
+ * with nothing written and no request to the daemon. That is the answer of
+ * the DLL's in-process tracker module (legacy TTP) for an ET5, whose property
+ * list never holds the stimulus points (PRP property 0x13); behind Tobii's
+ * service (tobii-prp://) the answer was never captured. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_stimulus_points_get( tobii_device_t* device,
-    void* points );
+    tobii_calibration_stimulus_points_t* points );
 
 /* Everything below: NOT IMPLEMENTED, returns TOBII_ERROR_NOT_SUPPORTED. */
 

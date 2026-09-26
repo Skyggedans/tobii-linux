@@ -93,7 +93,7 @@ the archived 4.1.0 reference. What stands behind the entry points:
 |---|---|
 | Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, IR image and notification streams; device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
 | Answered locally | API version, error texts (the DLL's), system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing, internal-stream support (the IR image only), internal-capability support (eyeball centres only), lens-configuration writability (never) |
-| `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration |
+| `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration, calibration stimulus points (as the DLL's in-process legacy TTP module answers for an ET5; behind Tobii's service, never captured) |
 
 Where the answers come from, and where they differ from Windows:
 

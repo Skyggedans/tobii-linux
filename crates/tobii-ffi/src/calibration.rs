@@ -5,7 +5,9 @@
 //! 2-D calibration of both eyes is what the Windows engine was captured doing;
 //! discarding a 2-D point uses the command the DLL sends for it. 3-D and
 //! per-eye variants were never observed and return
-//! `TOBII_ERROR_NOT_SUPPORTED`.
+//! `TOBII_ERROR_NOT_SUPPORTED`. So do the undocumented stimulus points, once
+//! their arguments check out, as the DLL's in-process tracker module answers
+//! for an ET5.
 
 use std::ffi::c_void;
 use std::time::Duration;
@@ -15,11 +17,11 @@ use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
 use crate::device::{Api, Device, device_mut, in_callback};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
-    TOBII_ERROR_OPERATION_FAILED,
+    TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_OPERATION_FAILED,
 };
 use crate::stub::not_supported;
 use crate::types::{
-    CalibrationPointData, CalibrationPointReceiver, DataReceiver,
+    CalibrationPointData, CalibrationPointReceiver, CalibrationStimulusPoints, DataReceiver,
     TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID,
     TOBII_CALIBRATION_POINT_STATUS_VALID_AND_USED_IN_CALIBRATION,
     TOBII_CALIBRATION_POINT_STATUS_VALID_BUT_NOT_USED_IN_CALIBRATION,
@@ -284,6 +286,40 @@ pub unsafe extern "C" fn tobii_calibration_parse(
     TOBII_ERROR_NO_ERROR
 }
 
+/// The calibration's stimulus points (undocumented): always
+/// `TOBII_ERROR_NOT_SUPPORTED` once the arguments check out, with nothing
+/// written. That is the answer of the DLL's in-process tracker module
+/// (legacy TTP) for an ET5; behind Tobii's service (`tobii-prp://`) the
+/// answer was never captured.
+///
+/// The DLL (0x180149d10) reads PRP property 0x13, which its id-to-name
+/// switch calls `CALIBRATION_STIMULUS_POINTS` (0x18002e8b0, table
+/// 0x18002ea00, case 19 at 0x18002e9b8), through its `tobii_property_get`
+/// (0x18015d300). That answers `TOBII_ERROR_NOT_SUPPORTED` without a request
+/// when the device's property list lacks the id (0x18015d450), and on the
+/// DLL's own path the list is what the legacy TTP module reported at
+/// connect, which never holds 0x13 (0x18016b536..0x18016b8d2). No capture
+/// has a tracker command for the points either, so the answer is given here,
+/// without asking the daemon. A call from inside a callback is
+/// `TOBII_ERROR_CALLBACK_IN_PROGRESS`, then a null device or `points` is
+/// `TOBII_ERROR_INVALID_PARAMETER`, in that order: the DLL checks the two
+/// nulls before the callback. The device is only compared with null, never
+/// borrowed, and `points` is never written, so the function is safe.
+#[unsafe(no_mangle)]
+pub extern "C" fn tobii_calibration_stimulus_points_get(
+    device: *mut Device,
+    points: *mut CalibrationStimulusPoints,
+) -> Status {
+    if in_callback() {
+        return TOBII_ERROR_CALLBACK_IN_PROGRESS;
+    }
+    if device.is_null() || points.is_null() {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    tracing::trace!("tobii_calibration_stimulus_points_get: not supported");
+    TOBII_ERROR_NOT_SUPPORTED
+}
+
 not_supported! {
     /// 3-D calibration was never captured.
     fn tobii_calibration_collect_data_3d(device: *mut c_void, x: f32, y: f32, z: f32);
@@ -295,13 +331,12 @@ not_supported! {
     fn tobii_calibration_discard_data_per_eye_2d(device: *mut c_void, x: f32, y: f32, eyes: u32);
     /// Per-eye calibration was never captured.
     fn tobii_calibration_compute_and_apply_per_eye(device: *mut c_void, calibrated_eyes: *mut c_void);
-    /// Undocumented; its point type is unknown.
-    fn tobii_calibration_stimulus_points_get(device: *mut c_void, points: *mut c_void);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CalibrationStimulusPoint;
     use std::ptr;
 
     unsafe extern "C" fn collect(p: *const CalibrationPointData, ud: *mut c_void) {
@@ -634,5 +669,76 @@ mod tests {
             );
             assert_eq!(crate::api::tobii_device_destroy(d), 0);
         }
+    }
+
+    /// Stimulus points no call may write.
+    fn stimulus_sentinel() -> CalibrationStimulusPoints {
+        CalibrationStimulusPoints {
+            point_count: -7,
+            points: [CalibrationStimulusPoint {
+                words: [0xdead_beef; 9],
+            }; 32],
+        }
+    }
+
+    #[test]
+    fn stimulus_points_are_not_supported_without_asking_the_daemon() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tobii_ipc::encode_reply;
+        use tobii_ipc::request::decode_request;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let connect = crate::device::tests::fake_daemon(move |body| {
+            if body.first() != Some(&tobii_ipc::TAG_REQUEST) {
+                return vec![];
+            }
+            seen.fetch_add(1, Ordering::Relaxed);
+            let req = decode_request(body).expect("request");
+            vec![encode_reply(req.id, 0, &[])]
+        });
+        let d = Box::into_raw(Box::new(Device::new(connect, 1, 1).expect("device")));
+        let mut out = stimulus_sentinel();
+        let got = [
+            tobii_calibration_stimulus_points_get(d, &raw mut out),
+            tobii_calibration_stimulus_points_get(d, ptr::null_mut()),
+            tobii_calibration_stimulus_points_get(ptr::null_mut(), &raw mut out),
+            tobii_calibration_stimulus_points_get(ptr::null_mut(), ptr::null_mut()),
+        ];
+        let invalid = TOBII_ERROR_INVALID_PARAMETER;
+        assert_eq!(got, [TOBII_ERROR_NOT_SUPPORTED, invalid, invalid, invalid]);
+        assert_eq!(out, stimulus_sentinel(), "nothing written");
+        assert_eq!(requests.load(Ordering::Relaxed), 0, "no request");
+        // The daemon handles frames in order, so once a request of the
+        // test's own is answered, one the calls sent without waiting would
+        // have been counted too.
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once.
+        unsafe {
+            assert_eq!(tobii_calibration_clear(d), 0);
+            assert_eq!(crate::api::tobii_device_destroy(d), 0);
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 1, "only the clear");
+    }
+
+    /// Inside a callback every call is refused before its arguments are
+    /// read, as wherever a device handle is taken, and writes nothing.
+    #[test]
+    fn stimulus_points_are_refused_inside_a_callback() {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, vec![])));
+        let mut out = stimulus_sentinel();
+        let mut got = [0; 4];
+        crate::device::call(|| {
+            got = [
+                tobii_calibration_stimulus_points_get(d, &raw mut out),
+                tobii_calibration_stimulus_points_get(ptr::null_mut(), &raw mut out),
+                tobii_calibration_stimulus_points_get(d, ptr::null_mut()),
+                tobii_calibration_stimulus_points_get(ptr::null_mut(), ptr::null_mut()),
+            ];
+        });
+        assert_eq!(got, [TOBII_ERROR_CALLBACK_IN_PROGRESS; 4]);
+        assert_eq!(out, stimulus_sentinel(), "nothing written");
+        // SAFETY: `d` is a live handle from `Box::into_raw`, destroyed once;
+        // the callback guard is down again.
+        unsafe { assert_eq!(crate::api::tobii_device_destroy(d), 0) };
     }
 }

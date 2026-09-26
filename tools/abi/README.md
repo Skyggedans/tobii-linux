@@ -131,6 +131,40 @@ prototype declares or a float/integer position disagrees.
   reads properties 3 and 4 (0x18014ffe2..0x18015003d). Not traced: only the
   transport between the in-process server and the host's deserialiser
   (0x180043df0).
+- What `tobii_calibration_stimulus_points_get` (0x180149d10) answers. It is
+  an internal API (its source file, 0x180149d22, is
+  `src\api\tobii_internal.cpp`) that only reads a property: it calls the
+  DLL's `tobii_property_get` (0x18015d300, `core\internal.cpp`) with PRP
+  property 0x13 and a copier (0x180001800). 0x13 is
+  `PRP_PROPERTY_ENUM_CALIBRATION_STIMULUS_POINTS` by the DLL's id-to-name
+  switch (0x18002e8b0, table 0x18002ea00; case 19 is at 0x18002e9b8). Only
+  the switch names an id: the names in `.rdata` are not in enum order (the
+  switch gives 13 `FACE_ID_STATE` and 14 `FACE_ID_PARAMETERS`, the ids
+  `tobii_get_face_id_state` and `tobii_get_face_id_parameters` pass at
+  0x18014a639 and 0x18014a589, and the strings stand the other way round).
+  `tobii_property_get` answers `TOBII_ERROR_INVALID_PARAMETER` for a null
+  device (unlogged) or output, then `TOBII_ERROR_CALLBACK_IN_PROGRESS` inside
+  a callback, then `TOBII_ERROR_NOT_SUPPORTED` (0x18015d450), before any
+  request, when the device's property list (host device +0x8704, count
+  +0x8754) lacks the id; nothing checks for a calibration session. That list
+  is what the tracker module reported at connect. The legacy TTP
+  `platmod_start` fills its readable list with module ids 9, 0, 2, 3, 5, 6,
+  7, 8, 0xe, 4 and 0xb only (0x18016b536..0x18016b8d2); the server maps them
+  through the table at 0x18001f9b4 to PRP ids 9, 1, 4, 8, 7, 6, 3, 2, 5, 0xa
+  and 0x10 (module id 17 would be 0x13, 0x18001f288) and adds field of use,
+  0x11 (0x18001f2bc). So on the DLL's own path an ET5 always gets
+  `TOBII_ERROR_NOT_SUPPORTED`, which libtobii answers too; behind Tobii's
+  service the answer is the service's, never captured, and no capture has a
+  tracker command for the points. The copier writes an `int` count and that
+  many 36-byte records, nine 32-bit words each, with no bound; the PRP body is
+  a fixed 0x488 bytes (serialiser 0x180042517, deserialiser 0x18004563e): a
+  size word, the count and 32 records. Nothing in the DLL reads a record's
+  fields. Other exports reach `tobii_property_get` with PRP ids that mapped
+  list does not hold either: 0xc (`tobii_hardware_configuration_get`,
+  0x18014ab79), 0xd and 0xe (the face id state and parameters, above), 0xf
+  (`tobii_get_combined_gaze_hid_track_box`, 0x180149fd2) and 0x12
+  (`tobii_get_display_id`, 0x1801467b9); their module ids would be 10, 12, 13,
+  1 and 16.
 
 Layouts, and where each comes from:
 
@@ -149,11 +183,15 @@ Layouts, and where each comes from:
 | `tobii_timesync_data_t` | 24 | DLL (`tobii_timesync` writes three qwords at +0/+8/+16); which field is which, and the names, inferred |
 | `tobii_stream_type_t` | 136 | DLL (offsets 0/4/8/72 in `tobii_enumerate_stream_types`); size inferred, field names ours |
 | `tobii_hardware_configuration_t` | 2472, align 8 | DLL (its copy at 0x18014abe0 and the PRP deserialiser at 0x180045056); **provisional**: the values decoded from one Windows 2120 answer, field names and units ours |
+| `tobii_calibration_stimulus_points_t` | 1156, align 4 | DLL (the copier at 0x180001800, the PRP serialiser at 0x180042517 and deserialiser at 0x18004563e, the property cache copy at 0x180031c44); record contents unknown, names ours |
 | everything else in `tobii_streams.h` / `tobii_wearable.h` | — | 4.1 docs, unchanged since 1.x |
 
 Undocumented exports are declared in `tobii_internal.h` with the arity the DLL
 shows. The 12 implemented ones (field of use, IR image, internal-stream
 and internal-capability support, timesync, the stream catalogue, pause and
-resume, hardware configuration) have real types; the other 61 return
-`TOBII_ERROR_NOT_SUPPORTED` without reading their arguments, so their
-best-effort parameter types cannot matter at runtime.
+resume, hardware configuration) have real types, and so does
+`tobii_calibration_stimulus_points_get`, which checks its arguments and then
+answers `TOBII_ERROR_NOT_SUPPORTED` as the DLL's in-process tracker module
+does for an ET5; the other 60 return `TOBII_ERROR_NOT_SUPPORTED` without
+reading their arguments, so their best-effort parameter types cannot matter
+at runtime.

@@ -482,6 +482,28 @@ pub struct CalibrationPointData {
     pub right_mapping_xy: [f32; 2],
 }
 
+/// `tobii_calibration_stimulus_point_t` (undocumented; the name is ours):
+/// 36 bytes that the DLL copies as nine 32-bit words (0x180001800) and never
+/// reads, so what they hold is not known.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalibrationStimulusPoint {
+    /// The record, word by word, as the DLL copies it.
+    pub words: [u32; 9],
+}
+
+/// `tobii_calibration_stimulus_points_t` (undocumented: 1156 bytes, from the
+/// DLL's copier at 0x180001800 and its fixed 0x488-byte PRP body, a size
+/// word and then this, at 0x180042517 and 0x18004563e; the names are ours).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalibrationStimulusPoints {
+    /// How many of `points` are set; the DLL's copier takes it unbounded.
+    pub point_count: i32,
+    /// At most 32 points; the first `point_count` are set.
+    pub points: [CalibrationStimulusPoint; 32],
+}
+
 /// `tobii_license_key_t`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -650,6 +672,13 @@ mod tests {
 
         assert_eq!(size_of::<CalibrationPointData>(), 32);
         assert_eq!(offset_of!(CalibrationPointData, right_status), 20);
+        // The copier's 36-byte stride (0x180001872) and the PRP body's
+        // 0x488 bytes, less its size word.
+        assert_eq!(size_of::<CalibrationStimulusPoint>(), 36);
+        assert_eq!(align_of::<CalibrationStimulusPoint>(), 4);
+        assert_eq!(size_of::<CalibrationStimulusPoints>(), 1156);
+        assert_eq!(align_of::<CalibrationStimulusPoints>(), 4);
+        assert_eq!(offset_of!(CalibrationStimulusPoints, points), 4);
         assert_eq!(size_of::<LicenseKey>(), 16);
         // `tobii_api_create` checks +8 and +0x10 of the one and +8 of the
         // other (0x180144ac7..0x180144ae2), and copies 24 and 16 bytes

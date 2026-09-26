@@ -218,6 +218,10 @@ int main( void )
     tobii_hardware_configuration_t hardware = { .entry_count = 7, .mode = 7 };
     assert( tobii_hardware_configuration_get( NULL, &hardware ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( hardware.entry_count == 7 && hardware.mode == 7 );
+    tobii_calibration_stimulus_points_t stimulus = { .point_count = 7, .points = { { .words = { 7 } } } };
+    assert( tobii_calibration_stimulus_points_get( NULL, &stimulus ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_calibration_stimulus_points_get( NULL, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( stimulus.point_count == 7 && stimulus.points[ 0 ].words[ 0 ] == 7 );
     assert( tobii_resume_device( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     tobii_device_name_t name = "unchanged";
     assert( tobii_set_device_name( NULL, name ) == TOBII_ERROR_INVALID_PARAMETER );
@@ -297,6 +301,10 @@ int main( void )
     assert( offsetof( tobii_hardware_configuration_t, points_xyz ) == 0x5e0 );
     assert( offsetof( tobii_hardware_configuration_t, mode ) == 0x9a0 );
     assert( sizeof( tobii_calibration_point_data_t ) == 32 );
+    assert( sizeof( tobii_calibration_stimulus_point_t ) == 36 );
+    assert( sizeof( tobii_calibration_stimulus_points_t ) == 1156 );
+    assert( _Alignof( tobii_calibration_stimulus_points_t ) == 4 );
+    assert( offsetof( tobii_calibration_stimulus_points_t, points ) == 4 );
     assert( sizeof( tobii_license_key_t ) == 16 );
     assert( sizeof( tobii_custom_alloc_t ) == 24 );
     assert( offsetof( tobii_custom_alloc_t, malloc_func ) == 8 );
