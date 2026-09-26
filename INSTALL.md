@@ -436,7 +436,8 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   from several threads at once are safe. Its requests, subscription changes
   and reconnects run one at a time (a slow one, such as a pause, delays the
   others), its callbacks run one at a time on whichever thread processes it,
-  and a process call made while another thread processes it returns at once.
+  and a process call made while another thread processes or reconnects it
+  returns at once.
   `tobii_device_destroy` and `tobii_api_destroy` must not overlap any other
   call on the handle, and nothing may use it afterwards: join the thread
   that processes a device before destroying it. Threads that create devices

@@ -131,11 +131,13 @@
 //! `TOBII_ERROR_CONNECTION_FAILED` within ~500 ms (at once when nothing
 //! listens). On a device shared between threads that counts from when a
 //! request, subscription change or other reconnect under way on another
-//! thread, and then a callback another thread is running, have finished: the
-//! reconnect waits for them before its round trip, and for that thread's
-//! whole dispatch before it swaps connections. It restores the
-//! subscriptions, not a calibration session or pause the lost connection
-//! held.
+//! thread, and then another thread's dispatch, have finished: the reconnect
+//! waits for them before its round trip, and until it has swapped
+//! connections or failed a process call on another thread returns at once,
+//! delivering nothing, so no sample tobiid sends both connections is
+//! delivered twice.
+//! It restores the subscriptions, not a calibration session or pause the
+//! lost connection held.
 //!
 //! `TOBII_ERROR_CONNECTION_FAILED` has a second source: a request that needs
 //! the tracker live (a clock pair, a pause, a calibration, a display-area

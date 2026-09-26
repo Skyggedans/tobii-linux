@@ -234,13 +234,14 @@ Where the answers come from, and where they differ from Windows:
   locked by concern, as the DLL's is. Its requests, subscription changes and
   reconnects run one at a time, each for its whole round trip to tobiid (a
   pause may take up to a minute), without holding up its callbacks,
-  processing or waiting, and a recenter, a write with no reply, waits for
-  any of them under way; a reconnect's ~500 ms counts from when the call
-  ahead of it, and then a callback another thread is running, have
-  finished. Its callbacks run one at a time, on whichever thread processes
-  it, and a subscribe, an unsubscribe, a clear or a reconnect waits for one
-  running on another thread; once an unsubscribe returns, its callback is
-  not running and never runs again. `tobii_device_destroy` and
+  processing or waiting, but for a reconnect's round trip (~500 ms at
+  most), and a recenter, a write with no reply, waits for any of them under
+  way; a reconnect's ~500 ms counts from when the call ahead of it, and
+  then a process call another thread is making, have finished. Its
+  callbacks run one at a time, on whichever thread processes it, and a
+  subscribe, an unsubscribe, a clear or a reconnect waits for one running
+  on another thread; once an unsubscribe returns, its callback is not
+  running and never runs again. `tobii_device_destroy` and
   `tobii_api_destroy` take no lock, as in the Stream Engine (whose
   documentation says so for `tobii_device_destroy`): no other thread may be
   inside a call on the handle, or use it afterwards. Threads that create
@@ -264,7 +265,8 @@ Where the answers come from, and where they differ from Windows:
   returns at once, as there, but with `TOBII_ERROR_CONNECTION_FAILED` once
   the loss has been reported, and delivers nothing (the DLL first delivers
   the device's queued notifications); a clear waits for another thread's
-  processing, never for a request; `tobii_calibration_retrieve` calls its
+  processing, never for a request (both wait for a reconnect's round
+  trip); `tobii_calibration_retrieve` calls its
   receiver with no lock held, where the DLL holds the device's API mutex;
   and the logger is never called under a lock of the call that logs.
 - **Logging and allocation.** The `tobii_custom_log_t` logger gets

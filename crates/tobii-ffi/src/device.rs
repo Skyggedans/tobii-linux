@@ -695,7 +695,8 @@ impl fmt::Display for ReconnectError {
 ///   which process only try-enters, 0x18000e9d9, and the notification
 ///   queue's dev+0x9818): held by one `process` while it drains the samples
 ///   and runs the callbacks, by `clear_buffers`, by each look of a `wait`,
-///   and by a reconnect while it swaps the samples channel.
+///   and by a reconnect from before its new link asks for the streams until
+///   it has swapped the samples channel (see `Device::reconnect`).
 /// - `callbacks` (`Callbacks`; dev+0x4d8, held around each user callback,
 ///   0x1801546a0..0x180155091): held around each callback, and while a
 ///   subscription change reads or sets a slot.
@@ -718,11 +719,12 @@ impl fmt::Display for ReconnectError {
 /// blocks on another thread's call into any device (or on a thread that
 /// waits for one). Of the calls that take a lock, only `process` and `wait`
 /// return promptly while a callback runs. A subscribe, an unsubscribe, a
-/// clear or a reconnect waits for it, on `callbacks` or `dispatch`, and a
+/// clear or a reconnect waits for it, on `callbacks` or `dispatch`; a
 /// request or a recenter may wait, on `command`, behind a subscription
-/// change or reconnect under way. Across devices the same makes a cycle:
-/// X's callback waits for an unsubscribe of Y, which waits for Y's
-/// callback, which waits for an unsubscribe of X, which waits for X's.
+/// change or reconnect under way, and a clear, on `dispatch`, behind a
+/// reconnect's round trip. Across devices the same makes a cycle: X's
+/// callback waits for an unsubscribe of Y, which waits for Y's callback,
+/// which waits for an unsubscribe of X, which waits for X's.
 ///
 /// Destroying the device takes no lock, as in the DLL: no other thread may
 /// be inside a call on it, or use it afterwards.
@@ -978,21 +980,30 @@ impl Device {
     /// start the tracker cold again. A device with no subscription has
     /// nothing to send first, so the daemon may still drop an engine that
     /// only the old connection's requests kept, until the next request.
-    /// Samples queued from the old link are dropped. The new link starts up,
-    /// so its loss is reported again, and owes no acks. Once it is in place
-    /// this rings the device's doorbell (see [`Doorbell`]): the new link's
-    /// reader rings it too, but its first samples may come while this still
-    /// waits for the ack, and a wait they woke then looked at the old link
-    /// and slept again. The device info is fetched again: a restarted daemon
-    /// may serve another tracker.
+    /// Samples queued from the old link are dropped, and nothing the old
+    /// link brings once the new one has asked for the streams is delivered:
+    /// tobiid writes each tick to every connection subscribed to its
+    /// streams, so from the tick that acks the new link on, the old one
+    /// brings what the new one does, and delivering from both would repeat
+    /// samples, their stamps stepping back. The new link starts up, so its
+    /// loss is reported again, and owes no acks. Once it is in place this
+    /// rings the device's doorbell (see [`Doorbell`]): the new link's reader
+    /// rings it too, but its first samples may come while this still waits
+    /// for the ack, and a wait they woke then was turned away by the
+    /// dispatch lock and slept again. The device info is fetched again: a
+    /// restarted daemon may serve another tracker.
     ///
     /// It runs under the command lock, after any round trip another thread
-    /// has under way. It reads the subscriptions under the callbacks lock,
-    /// so before its own round trip it waits for a callback another thread
-    /// is running, and it swaps the samples channel under the dispatch
-    /// lock, once a process another thread runs has finished its callbacks,
-    /// as the DLL's waits for its process mutex (0x18000eb88). Each failure
-    /// is logged at ERROR, a success at INFO, once the locks are let go.
+    /// has under way. Before it asks for the subscriptions back it takes the
+    /// dispatch lock, once a process another thread runs has finished its
+    /// callbacks, as the DLL's waits for its process mutex (0x18000eb88),
+    /// and it holds that lock until it has swapped the samples channel, or
+    /// failed: for up to [`RECONNECT_ACK_TIMEOUT`], a process on another
+    /// thread returns at once, delivering nothing, a wait sleeps until this
+    /// rings or its own timeout ends, and a clear waits. It reads the
+    /// subscriptions under the callbacks lock, which is free by then. Each
+    /// failure is logged at ERROR, a success at INFO, once the locks are let
+    /// go.
     pub(crate) fn reconnect(&self) -> Status {
         match self.replace_link() {
             Ok(()) => {
@@ -1014,6 +1025,11 @@ impl Device {
         let mut command = lock(&self.command);
         let (mut link, samples) =
             Link::open(&mut command.connect, &self.doorbell).map_err(ReconnectError::Connect)?;
+        // Taken before the new link asks for anything, and held until the
+        // swap: what the old link brings from then on, the new one may bring
+        // too, and no process may deliver it from the old one meanwhile.
+        let mut dispatch = lock(&self.dispatch);
+        let seen = self.doorbell.rings();
         let mask = lock(&self.callbacks).mask();
         if mask != 0 {
             let why = match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT) {
@@ -1023,17 +1039,20 @@ impl Device {
                 Err(_) => Some("hung up"),
             };
             if let Some(why) = why {
+                // As `in_dispatch` lets the lock go: the old link stays, and
+                // a wait the hold turned away may have something on it.
+                let left = dispatch.anything_to_process();
+                drop(dispatch);
+                self.doorbell.ring_after_hold(seen, left);
                 return Err(ReconnectError::Subscribe { mask, why });
             }
         }
-        {
-            let mut dispatch = lock(&self.dispatch);
-            dispatch.samples = samples;
-            dispatch.pending.clear();
-            dispatch.state = LinkState::Up;
-            self.reported.store(false, Ordering::Relaxed);
-        }
-        // Also wakes a wait whose look the swap turned away.
+        dispatch.samples = samples;
+        dispatch.pending.clear();
+        dispatch.state = LinkState::Up;
+        self.reported.store(false, Ordering::Relaxed);
+        drop(dispatch);
+        // Also wakes a wait whose look the hold turned away.
         self.doorbell.ring();
         let old = mem::replace(&mut command.link, link);
         command.device_info = None;
@@ -1043,17 +1062,20 @@ impl Device {
     }
 
     /// Drop every queued sample, once a process another thread runs has
-    /// finished its callbacks. A lost connection stays lost, and a loss not
-    /// reported yet is still reported. The answers are left alone: a late
-    /// ack dropped here would still be counted as owed.
+    /// finished its callbacks, or a reconnect another thread runs has put
+    /// its new link in place or failed. A lost connection stays lost, and a
+    /// loss not reported yet is still reported. The answers are left alone:
+    /// a late ack dropped here would still be counted as owed.
     ///
     /// The DLL's differs on both counts: it holds its API mutex (dev+0x4e0,
-    /// 0x180143a85), so it queues behind requests, and it clears by running
-    /// its process with the callbacks swapped out (0x180158a20), which
-    /// empties the device's notification queue but, while another thread
-    /// processes, fails its try-enter (0x18000e9d9) and leaves the rest
-    /// queued (read from the code, not observed). libtobii's waits for the
-    /// dispatch instead, and never for a request.
+    /// 0x180143a85), so it queues behind requests and reconnects, and it
+    /// clears by running its process with the callbacks swapped out
+    /// (0x180158a20), which empties the device's notification queue but,
+    /// while another thread processes, fails its try-enter (0x18000e9d9)
+    /// and leaves the rest queued (read from the code, not observed).
+    /// libtobii's waits for the dispatch instead: never for a request, but
+    /// for a reconnect too, which holds the dispatch lock while it waits for
+    /// its new link's ack.
     pub(crate) fn clear_buffers(&self) {
         self.in_dispatch(lock(&self.dispatch), |dispatch| {
             dispatch.take_all();
@@ -1075,10 +1097,12 @@ impl Device {
     ///
     /// It holds no lock while it sleeps. A look that finds another thread
     /// holding the dispatch lock (a process running the callbacks, another
-    /// look, a clear) finds nothing and sleeps on, where the DLL answers at
-    /// once with nothing to wait on; that thread rings again once it lets
-    /// the lock go if it leaves something to process, or a sample came
-    /// meanwhile (see [`Device::in_dispatch`]).
+    /// look, a clear, a reconnect waiting for its new link's ack) finds
+    /// nothing and sleeps on, where the DLL answers at once with nothing to
+    /// wait on; that thread rings again once it lets the lock go if it
+    /// leaves something to process, or a sample came meanwhile (see
+    /// [`Device::in_dispatch`]), and a reconnect that has swapped links
+    /// rings anyway.
     pub(crate) fn wait(&self, timeout: Duration) -> bool {
         self.doorbell.wait_for(timeout, || self.look())
     }
@@ -1105,8 +1129,9 @@ impl Device {
     ///
     /// One thread dispatches a device at a time. A call that finds another
     /// thread holding the dispatch lock (a process running the callbacks, a
-    /// look of `wait`, a clear, or a reconnect's swap) returns at once,
-    /// delivering nothing, and what is queued stays for the next call:
+    /// look of `wait`, a clear, or a reconnect, from its new link's
+    /// subscription to its swap) returns at once, delivering nothing, and
+    /// what is queued stays for the next call:
     /// `TOBII_ERROR_NO_ERROR`, or `TOBII_ERROR_CONNECTION_FAILED` once the
     /// loss has been reported. The DLL's returns at once too, once it has
     /// delivered the notifications queued for the device
@@ -1153,8 +1178,9 @@ impl Device {
     /// then let the lock go and ring the doorbell again if a `wait` on
     /// another thread may have looked meanwhile, found the lock held, and
     /// gone back to sleep with something to process (see
-    /// [`Doorbell::ring_after_hold`]). Every hold but a reconnect's, which
-    /// rings anyway, goes through here.
+    /// [`Doorbell::ring_after_hold`]). Every hold but a reconnect's goes
+    /// through here; a reconnect rings once it has swapped links, and as
+    /// this does when it fails.
     fn in_dispatch<R>(
         &self,
         mut dispatch: MutexGuard<'_, Dispatch>,
@@ -1403,6 +1429,7 @@ pub(crate) mod tests {
         LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO, TOBII_STATE_CALIBRATION_ACTIVE,
     };
     use std::ffi::c_char;
+    use std::io::Write as _;
     use std::ptr;
     use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize};
     use tobii_ipc::{
@@ -2526,8 +2553,8 @@ pub(crate) mod tests {
     /// A reconnect rings the doorbell once it has put its new link in place,
     /// though that link brings no sample: a wait on another thread that the
     /// new link's first samples woke while the reconnect still waited for
-    /// its ack looked at the old link and slept again, and this ring sends
-    /// it back to look at the new one. The
+    /// its ack was turned away by the dispatch lock the reconnect holds, and
+    /// slept again; this ring sends it back to look at the new link. The
     /// greeting here is the ack alone, and the old link's reader stopped
     /// before the count was read, so the reconnect's ring is the only one.
     #[test]
@@ -3620,10 +3647,10 @@ pub(crate) mod tests {
     }
 
     /// A reconnect on one thread waits for a callback another thread's
-    /// process is running: it reads the subscriptions under the callbacks
-    /// lock and swaps the samples channel under the dispatch lock, as the
-    /// DLL's reconnect waits for its process mutex (0x18000eb88). The next
-    /// process then delivers the new link's sample. It fails should the
+    /// process is running: it takes the dispatch lock, and reads the
+    /// subscriptions under the callbacks lock, before it asks for them back,
+    /// as the DLL's reconnect waits for its process mutex (0x18000eb88). The
+    /// next process then delivers the new link's sample. It fails should the
     /// reconnect take neither lock.
     #[test]
     fn a_reconnect_waits_for_a_callback_running_on_another_thread() {
@@ -3660,6 +3687,78 @@ pub(crate) mod tests {
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         assert_eq!(gate.calls(), 2, "the new connection's sample");
         drop(daemon);
+    }
+
+    /// A reconnect of a live link while another thread processes the device
+    /// delivers no sample twice. tobiid writes each tick to every client
+    /// subscribed to its streams, so the tick that acks the new link's
+    /// subscription reaches the old link too, and first; the reconnect holds
+    /// the dispatch lock from before it subscribes the new link until it has
+    /// swapped the samples channel, so the other thread delivers none of
+    /// that tick from the old link, and the new link's copy is delivered
+    /// alone. Here the stand-in writes the old link's copy once the new link
+    /// has subscribed, gives the other thread time to deliver it, then acks
+    /// the new link in one write with its copy. It fails should the
+    /// reconnect take the dispatch lock only for the swap: the other thread
+    /// delivers the old link's copy while the reconnect waits for its ack,
+    /// and then the new link's, stamped alike.
+    #[test]
+    fn a_reconnect_of_a_live_link_delivers_no_sample_twice() {
+        let deliveries = Deliveries::default();
+        let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(0)]);
+        let d = Device::new(connect, 1, 1).expect("device");
+        let mut old = daemons.recv().expect("daemon end");
+        let callback = Some(note_gaze_origin as EyePairFn);
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, callback, deliveries.ud()),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(subscription(&mut old), Some(STREAM_GAZE_ORIGIN));
+        let stop = AtomicBool::new(false);
+
+        let (reconnected, mut new) = thread::scope(|s| {
+            let processing = s.spawn(|| {
+                let until = Instant::now() + LONG_WAIT;
+                while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+                    d.wait(SHORT_WAIT);
+                    assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+                }
+            });
+            let (old, delivered) = (&mut old, &deliveries);
+            let daemon = s.spawn(move || {
+                let mut new = daemons.recv_timeout(LONG_WAIT).expect("new daemon end");
+                assert_eq!(subscription(&mut new), Some(STREAM_GAZE_ORIGIN));
+                // The tick that acks it, which reaches the old link first.
+                let tick = sample(STREAM_GAZE_ORIGIN, 1);
+                write_frame(old, &tick).expect("the old link's copy");
+                // Time for the other thread to deliver it, were it free to.
+                let until = Instant::now() + ASLEEP;
+                while delivered.calls() == 0 && Instant::now() < until {
+                    thread::sleep(TICK);
+                }
+                new.write_all(&frames([encode_subscribed(true), tick]))
+                    .expect("the ack and the new link's copy");
+                new
+            });
+            let reconnected = d.reconnect();
+            let new = joined(daemon);
+            stop.store(true, Ordering::Relaxed);
+            joined(processing);
+            (reconnected, new)
+        });
+        // The next tick, the new link's alone: once it is delivered, so is
+        // everything before it.
+        write_frame(&mut new, &sample(STREAM_GAZE_ORIGIN, 2)).expect("the next tick");
+        let until = Instant::now() + LONG_WAIT;
+        while deliveries.last[GAZE_ORIGIN].load(Ordering::Relaxed) < 2 && Instant::now() < until {
+            d.wait(SHORT_WAIT);
+            assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        }
+
+        assert_eq!(reconnected, TOBII_ERROR_NO_ERROR);
+        assert_eq!(deliveries.calls(), 2, "each tick once");
+        deliveries.assert_in_turn();
+        drop((d, old, new));
     }
 
     /// A guard: a reconnect on one thread waits for a device-info fetch
@@ -4119,70 +4218,148 @@ pub(crate) mod tests {
         hang_ups: AtomicUsize,
     }
 
-    /// A [`streaming_daemon`] connection's write half, which its two threads
-    /// share, and the timestamp of the last sample written to it.
-    struct Out {
+    /// A [`streaming_daemon`] connection, as its pump sees it.
+    struct Client {
+        /// The connection's write half.
         stream: UnixStream,
-        ts_us: i64,
+        /// When it was made.
+        born: Instant,
+        /// The streams last subscribed on it.
+        streams: u32,
+        /// The subscription changes read from it and not acked yet.
+        acks: usize,
+        /// Whether it has ended: the client hung up, a write failed, or the
+        /// pump hung up on it.
+        ended: bool,
     }
 
-    impl Out {
-        /// Write a sample of `stream`, gaze origin or presence, stamped one
-        /// later than the last.
-        fn sample(&mut self, stream: u32) -> io::Result<()> {
+    /// What a [`streaming_daemon`]'s threads share, under one lock as
+    /// tobiid's share its state: the clock every sample is stamped from,
+    /// whichever connection it goes to, and the connections, in the order
+    /// they were made.
+    #[derive(Default)]
+    struct Pump {
+        /// The stamp of the last sample written.
+        ts_us: i64,
+        clients: Vec<Client>,
+    }
+
+    impl Pump {
+        /// The next stamp: one microsecond after the last.
+        fn stamp(&mut self) -> i64 {
             self.ts_us += 1;
-            let frame = if stream == STREAM_PRESENCE {
-                tobii_ipc::encode_presence(self.ts_us, tobii_ipc::PRESENCE_PRESENT)
-            } else {
-                encode_gaze_origin(&tobii_ipc::EyePair {
-                    ts_us: self.ts_us,
-                    ..tobii_ipc::EyePair::default()
-                })
-            };
-            write_frame(&mut self.stream, &frame)
+            self.ts_us
+        }
+
+        /// One tick, as tobiid's pump writes it: to each connection in the
+        /// order they were made, the acks it is owed and then a sample of
+        /// each stream subscribed on it, in one write, the samples stamped
+        /// alike on every connection. So the tick that acks a connection's
+        /// subscription reaches those made before it first, bringing them
+        /// byte for byte what it brings the new one. A connection that has
+        /// lasted `life`, if given, is hung up on instead.
+        fn tick(&mut self, life: Option<Duration>, served: &Served) {
+            let ts_us = self.stamp();
+            for client in self.clients.iter_mut().filter(|c| !c.ended) {
+                if life.is_some_and(|life| client.born.elapsed() >= life) {
+                    served.hang_ups.fetch_add(1, Ordering::Relaxed);
+                    // Ends its reader's read too.
+                    let _ = client.stream.shutdown(Shutdown::Both);
+                    client.ended = true;
+                    continue;
+                }
+                let acks =
+                    std::iter::repeat_n(encode_subscribed(true), mem::take(&mut client.acks));
+                let samples = [STREAM_GAZE_ORIGIN, STREAM_PRESENCE]
+                    .into_iter()
+                    .filter(|&stream| client.streams & stream != 0)
+                    .map(|stream| sample(stream, ts_us));
+                let burst = frames(acks.chain(samples));
+                client.ended = client.stream.write_all(&burst).is_err();
+            }
         }
     }
 
-    /// A daemon stand-in that streams, as tobiid does, on each connection
-    /// from two threads writing whole frames. It acks every subscription
-    /// change, and from then on sends a gaze-origin sample every `TICK`
-    /// while gaze origin is subscribed, and a presence sample while presence
-    /// is. It answers a state request with true (`[1]`) and any other
-    /// request with the payload that request carried, each behind a
-    /// gaze-origin sample. A connection's threads stop once the client hangs
-    /// up, or once the connection has lasted `life`, if given, when it hangs
-    /// up itself.
+    /// A sample of `stream`, gaze origin or presence, stamped `ts_us`.
+    fn sample(stream: u32, ts_us: i64) -> Vec<u8> {
+        if stream == STREAM_PRESENCE {
+            tobii_ipc::encode_presence(ts_us, tobii_ipc::PRESENCE_PRESENT)
+        } else {
+            encode_gaze_origin(&tobii_ipc::EyePair {
+                ts_us,
+                ..tobii_ipc::EyePair::default()
+            })
+        }
+    }
+
+    /// `bodies` framed, one after another, for a single write.
+    fn frames(bodies: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+        let mut burst = Vec::new();
+        for body in bodies {
+            write_frame(&mut burst, &body).expect("a frame in memory");
+        }
+        burst
+    }
+
+    /// A daemon stand-in that streams as tobiid does: a pump thread writes
+    /// to every connection each `TICK` (see [`Pump::tick`]), and a thread
+    /// per connection reads what the client sends. A subscription change is
+    /// acked by the next tick, in one write with that tick's samples, and
+    /// from then on each tick brings a gaze-origin sample while gaze origin
+    /// is subscribed, and a presence sample while presence is. It answers a
+    /// state request with true (`[1]`) and any other request with the
+    /// payload that request carried, each behind a gaze-origin sample. It
+    /// hangs up on a connection once it has lasted `life`, if given. A
+    /// connection's reader stops once the client hangs up, or the stand-in
+    /// does, and the pump once the connector and every reader are gone.
     ///
-    /// Each sample on a connection is stamped one microsecond after the one
-    /// before, from the connection's number (counting from 0) shifted up 32
-    /// bits: the samples of any one connection, and those of a later one
-    /// after an earlier one's, come in the order of their stamps.
+    /// Every sample is stamped from one clock, whichever connection it goes
+    /// to, as tobiid stamps a tick once for all its clients: each tick's and
+    /// each answered request's one microsecond after the last. So the
+    /// samples a client is delivered come in the order of their stamps
+    /// however it reconnects, unless it delivers one twice, or one from
+    /// before another it delivered already.
     fn streaming_daemon(life: Option<Duration>) -> (Connector, Arc<Served>) {
         let served = Arc::new(Served::default());
+        let shared = Arc::new(Mutex::new(Pump::default()));
+        let (pump, noted) = (Arc::downgrade(&shared), Arc::clone(&served));
+        thread::spawn(move || {
+            loop {
+                thread::sleep(TICK);
+                let Some(shared) = pump.upgrade() else {
+                    return;
+                };
+                lock(&shared).tick(life, &noted);
+            }
+        });
         let noted = Arc::clone(&served);
         let connect: Connector = Box::new(move || {
             let (client, mut daemon) = UnixStream::pair()?;
+            let stream = daemon.try_clone()?;
             let connection = {
-                let mut subscribed = lock(&noted.subscribed);
-                subscribed.push(0);
-                subscribed.len() - 1
+                let mut pump = lock(&shared);
+                pump.clients.push(Client {
+                    stream,
+                    born: Instant::now(),
+                    streams: 0,
+                    acks: 0,
+                    ended: false,
+                });
+                lock(&noted.subscribed).push(0);
+                pump.clients.len() - 1
             };
-            let out = Arc::new(Mutex::new(Out {
-                stream: daemon.try_clone()?,
-                ts_us: i64::try_from(connection).expect("connections") << 32,
-            }));
-            let streams = Arc::new(AtomicU32::new(0));
-            let hung_up = Arc::new(AtomicBool::new(false));
-            let (notes, answers) = (Arc::clone(&noted), Arc::clone(&out));
-            let (wanted, done) = (Arc::clone(&streams), Arc::clone(&hung_up));
+            let (shared, notes) = (Arc::clone(&shared), Arc::clone(&noted));
             thread::spawn(move || {
                 while let Ok(Some(body)) = read_frame(&mut daemon) {
+                    let mut pump = lock(&shared);
                     let written = match body.first() {
                         Some(&tobii_ipc::TAG_SUBSCRIBE) => {
                             let mask = tobii_ipc::decode_subscribe(&body).expect("streams");
                             lock(&notes.subscribed)[connection] = mask;
-                            wanted.store(mask, Ordering::Relaxed);
-                            write_frame(&mut lock(&answers).stream, &encode_subscribed(true))
+                            let client = &mut pump.clients[connection];
+                            client.streams = mask;
+                            client.acks += 1;
+                            Ok(())
                         }
                         Some(&tobii_ipc::TAG_REQUEST) => {
                             let req = tobii_ipc::request::decode_request(&body).expect("request");
@@ -4191,10 +4368,12 @@ pub(crate) mod tests {
                             } else {
                                 req.payload
                             };
-                            let reply = encode_reply(req.id, 0, payload);
-                            let mut out = lock(&answers);
-                            out.sample(STREAM_GAZE_ORIGIN)
-                                .and_then(|()| write_frame(&mut out.stream, &reply))
+                            let ts_us = pump.stamp();
+                            let burst = frames([
+                                sample(STREAM_GAZE_ORIGIN, ts_us),
+                                encode_reply(req.id, 0, payload),
+                            ]);
+                            pump.clients[connection].stream.write_all(&burst)
                         }
                         _ => Ok(()),
                     };
@@ -4202,27 +4381,7 @@ pub(crate) mod tests {
                         break;
                     }
                 }
-                done.store(true, Ordering::Relaxed);
-            });
-            let notes = Arc::clone(&noted);
-            thread::spawn(move || {
-                let born = Instant::now();
-                while !hung_up.load(Ordering::Relaxed) {
-                    thread::sleep(TICK);
-                    let mut out = lock(&out);
-                    if life.is_some_and(|life| born.elapsed() >= life) {
-                        notes.hang_ups.fetch_add(1, Ordering::Relaxed);
-                        // Ends the other thread's read too.
-                        let _ = out.stream.shutdown(Shutdown::Both);
-                        return;
-                    }
-                    let mask = streams.load(Ordering::Relaxed);
-                    for stream in [STREAM_GAZE_ORIGIN, STREAM_PRESENCE] {
-                        if mask & stream != 0 && out.sample(stream).is_err() {
-                            return;
-                        }
-                    }
-                }
+                lock(&shared).clients[connection].ended = true;
             });
             Ok(client)
         });
@@ -4299,7 +4458,7 @@ pub(crate) mod tests {
         }
 
         /// Check that the callbacks ran, one at a time, each stream's
-        /// samples in the order they were sent.
+        /// samples in the order they were sent, none twice.
         fn assert_in_turn(&self) {
             assert!(self.calls() > 0, "the samples were delivered");
             let overlapped = self.overlapped.load(Ordering::Relaxed);
@@ -4445,21 +4604,23 @@ pub(crate) mod tests {
     /// connection is never lost; see
     /// `hammer_a_device_that_keeps_losing_its_connection`), each request
     /// with its own reply. The callbacks must run one at a time, each
-    /// stream's samples in the order the stand-in sent them, and none once
-    /// its unsubscribe has returned. At the end the daemon was last asked,
-    /// on the connection in use, for the streams the callbacks need, and
-    /// the log holds the connect and a line per reconnect. The watchdog
-    /// fails it should it deadlock.
+    /// stream's samples in the order the stand-in sent them, none twice, and
+    /// none once its unsubscribe has returned. At the end the daemon was
+    /// last asked, on the connection in use, for the streams the callbacks
+    /// need, and the log holds the connect and a line per reconnect. The
+    /// watchdog fails it should it deadlock.
     ///
     /// It fails, in every run tried, should a callback run outside the
     /// callbacks lock (an unsubscribe then returns while it runs), a request
     /// let the command lock go between its send and its reply (another
-    /// thread's subscription change reads the reply and drops it), or a
+    /// thread's subscription change reads the reply and drops it), a
     /// process let the dispatch lock go before it delivers what it took
-    /// (the other processing thread then delivers a later sample first).
-    /// The last ask on the connection in use is only checked once all is
-    /// done, so a race early in the run that a later change mends goes
-    /// unseen there.
+    /// (the other processing thread then delivers a later sample first), or
+    /// a reconnect take the dispatch lock only once its new link has its ack
+    /// (a processing thread delivers the tick that acks it from the old link
+    /// meanwhile, and then again from the new one). The last ask on the
+    /// connection in use is only checked once all is done, so a race early
+    /// in the run that a later change mends goes unseen there.
     ///
     /// Only a stress test: a race it does not happen to hit goes unseen. For
     /// data races, run the crate's tests by hand under the thread sanitizer,

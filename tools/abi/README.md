@@ -384,7 +384,9 @@ prototype declares or a float/integer position disagrees.
   returns 0, `TOBII_ERROR_NO_ERROR`, at once (read from the control flow,
   not observed). `tobii_device_reconnect` enters +0x4620, +0x4628 and
   +0x4630 with no timeout (0x18000eb5f, 0x18000eb88, 0x18000ebb1), after
-  dev+0x4e0, so it waits for a process or a wait on another thread.
+  dev+0x4e0, so it waits for a process or a wait on another thread, and
+  holds them through the platform module's reconnect (let go at
+  0x18000ed63..0x18000ed7f).
   `tobii_device_clear_callback_buffers` swaps the callback table out under
   dev+0x4d8 and runs the internal process (0x180158a20, at 0x180158ab2),
   whose try-enter fails while another thread processes, so only the
@@ -398,18 +400,22 @@ prototype declares or a float/integer position disagrees.
   libtobii splits a device the same way, with a std `Mutex` per concern
   (`Device` in `crates/tobii-ffi/src/device.rs`: `command` for dev+0x4e0,
   `dispatch` for +0x4628 and dev+0x9818, `callbacks` for dev+0x4d8), and
-  keeps the DLL's rule for destroy. Where it differs, it does on purpose:
+  keeps the DLL's rule for destroy. A reconnect holds `dispatch` for its
+  round trip, as the DLL's holds +0x4628 through the platform module's
+  reconnect: from before its new connection asks for the streams until it
+  has swapped connections or failed, so that nothing tobiid sends both
+  connections is delivered twice. Where it differs, it does on purpose:
   a wait holds no lock while it sleeps, and waits on a device another
   thread holds rather than skip it; a subscribe lets the callbacks
   lock go for its round trip; a busy process delivers nothing, and answers
   `TOBII_ERROR_CONNECTION_FAILED` once a loss has been reported; a clear
-  waits for another thread's process, never for a request; the callback
-  flag is one per thread, for every API instance, so a callback may call
-  into no device at all; `tobii_calibration_retrieve`'s receiver runs under
-  that flag, as the DLL's does, but under no lock, where the DLL's runs
-  under dev+0x4e0; and the logger never runs under a lock of the call that
-  logs. The std mutexes are not reentrant, which that flag makes safe: it
-  refuses a callback's call before any lock is taken.
+  waits for another thread's process, never for a request (both wait for
+  a reconnect, the DLL's under dev+0x4e0); the callback flag is one per thread, for every API instance, so a
+  callback may call into no device at all; `tobii_calibration_retrieve`'s
+  receiver runs under that flag, as the DLL's does, but under no lock,
+  where the DLL's runs under dev+0x4e0; and the logger never runs under a
+  lock of the call that logs. The std mutexes are not reentrant, which that
+  flag makes safe: it refuses a callback's call before any lock is taken.
 
 Layouts, and where each comes from:
 

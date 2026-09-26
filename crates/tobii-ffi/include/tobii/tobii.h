@@ -19,8 +19,9 @@
  *   calls answered by tobiid), subscribes, unsubscribes and
  *   tobii_device_reconnect run one at a time, each for its whole round trip
  *   to tobiid, so a slow one (a pause may take up to a minute) delays the
- *   others on that device, but never its callbacks, a
- *   tobii_device_process_callbacks or a tobii_wait_for_callbacks;
+ *   others on that device; of them only a reconnect holds back its
+ *   callbacks, tobii_device_process_callbacks and tobii_wait_for_callbacks,
+ *   for its own round trip (~500 ms at most);
  *   tobii_recenter, a write with no reply, waits for any of them under way;
  * - its callbacks run one at a time, on whichever thread calls
  *   tobii_device_process_callbacks, and such a call made while another
@@ -333,30 +334,34 @@ TOBII_API tobii_error_t TOBII_CALL tobii_wait_for_callbacks( int device_count,
  * connects again; libtobii never reconnects by itself. A tracker unplug is
  * not reported here: the daemon keeps the connection, and the samples resume
  * on it after a replug. One thread dispatches a device at a time: a call
- * that finds another thread at it (processing, or a wait, a clear or a
- * reconnect at its queue for a moment) returns at once and delivers nothing,
- * leaving what is queued for the next call: TOBII_ERROR_NO_ERROR, or
+ * that finds another thread at it (processing, a wait or a clear at its
+ * queue for a moment, or a reconnect waiting for tobiid to take the
+ * subscriptions back) returns at once and delivers nothing, leaving what is
+ * queued for the next call: TOBII_ERROR_NO_ERROR, or
  * TOBII_ERROR_CONNECTION_FAILED once the loss has been reported. The DLL's
  * returns TOBII_ERROR_NO_ERROR there even after a loss, once it has
  * delivered the device's queued notifications itself. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_t* device );
 /* Drops what is queued; a lost connection is still reported by the next
- * process call. It waits for a tobii_device_process_callbacks under way on
- * another thread, never for a request; the DLL's waits for requests, and for
- * a callback another thread is running, instead, and while another thread
- * processes it clears only the queued notifications. */
+ * process call. It waits for a tobii_device_process_callbacks, or a
+ * tobii_device_reconnect's round trip, under way on another thread, never
+ * for a request; the DLL's waits for requests and reconnects, under its API
+ * mutex, and for a callback another thread is running, and while another
+ * thread processes it clears only the queued notifications. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
 /* Connects to a running daemon (never spawns one) and restores the
  * subscriptions, not a calibration session or pause. Any failure is
  * TOBII_ERROR_CONNECTION_FAILED within ~500 ms, counted from when any
  * request, subscription change or other reconnect in flight on another
- * thread, and then any callback another thread is running, have finished
- * (it waits for them before it asks for the subscriptions back), and leaves
- * the device as it was. Once the subscriptions are back, it also waits for
- * a tobii_device_process_callbacks under way on another thread before it
- * swaps connections. While the daemon has no tracker (a request's
- * TOBII_ERROR_CONNECTION_FAILED with the connection intact) it succeeds
- * without bringing one back. */
+ * thread, and then any tobii_device_process_callbacks under way on another
+ * thread, have finished (it waits for them before it asks for the
+ * subscriptions back), and leaves the device as it was. From then until it
+ * has swapped connections or failed, a tobii_device_process_callbacks on
+ * another thread returns at once and delivers nothing: tobiid sends the new
+ * connection what it sends the old one from its ack on, and none of that is
+ * delivered twice, as what the old one has queued is dropped. While the
+ * daemon has no tracker (a request's TOBII_ERROR_CONNECTION_FAILED with the
+ * connection intact) it succeeds without bringing one back. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
 /* A no-op: the daemon maps the tracker's clock to the host clock for every
  * sample and keeps the mapping current itself (tobii_streams.h says how), so

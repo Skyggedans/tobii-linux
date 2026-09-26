@@ -400,13 +400,13 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
 /// The callbacks run one at a time per device, on whichever thread calls
 /// this. A call made while another thread holds the device's dispatch (a
 /// process running the callbacks, a look of `tobii_wait_for_callbacks`, a
-/// clear, or a reconnect's swap) returns at once and delivers nothing, what
-/// is queued staying for the next call: `TOBII_ERROR_NO_ERROR`, or
-/// `TOBII_ERROR_CONNECTION_FAILED` once the loss has been reported, until a
-/// reconnect. The DLL's returns `TOBII_ERROR_NO_ERROR` when another thread
-/// holds its process mutex (0x18000e9d9..0x18000e9ea), even after a loss,
-/// once it has delivered the device's queued notifications on this thread
-/// (0x180159515..0x180159566).
+/// clear, or a reconnect waiting for its new connection's ack) returns at
+/// once and delivers nothing, what is queued staying for the next call:
+/// `TOBII_ERROR_NO_ERROR`, or `TOBII_ERROR_CONNECTION_FAILED` once the loss
+/// has been reported, until a reconnect. The DLL's returns
+/// `TOBII_ERROR_NO_ERROR` when another thread holds its process mutex
+/// (0x18000e9d9..0x18000e9ea), even after a loss, once it has delivered the
+/// device's queued notifications on this thread (0x180159515..0x180159566).
 ///
 /// # Safety
 /// `device` must be null or a live handle from `tobii_device_create` that is
@@ -424,11 +424,12 @@ pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> 
 
 /// Drop every sample queued for `device` without delivering it. A lost
 /// daemon connection is still reported by the next process call. While
-/// another thread is dispatching the device, this waits for it to finish;
-/// it never waits for a request. The DLL's instead waits for requests, under
-/// its API mutex (0x180143a85), and while another thread processes it
-/// clears only the device's queued notifications (its try-enter at
-/// 0x18000e9d9, through 0x180158a20, fails), leaving the rest.
+/// another thread is dispatching the device, or reconnecting it, this waits
+/// for it to finish; it never waits for a request. The DLL's waits for
+/// requests and reconnects, under its API mutex (0x180143a85), and while
+/// another thread processes it clears only the device's queued
+/// notifications (its try-enter at 0x18000e9d9, through 0x180158a20,
+/// fails), leaving the rest.
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
@@ -462,10 +463,13 @@ pub unsafe extern "C" fn tobii_device_clear_callback_buffers(device: *mut Device
 /// the daemon has no tracker, a reconnect succeeds without bringing it back.
 ///
 /// On a device shared between threads it first waits for any request or
-/// subscription change another thread has under way (the ~500 ms count from
-/// then), then for a callback another thread is running before it asks for
-/// the subscriptions back, and swaps the connection once a dispatch another
-/// thread runs has finished.
+/// subscription change another thread has under way, then for a dispatch
+/// another thread runs (the ~500 ms count from then), before it asks for the
+/// subscriptions back. Until it has swapped connections or failed, a
+/// `tobii_device_process_callbacks` on another thread then returns at once,
+/// delivering nothing: tobiid sends the new connection what it sends the old
+/// one from its ack on, so delivering from the old one meanwhile would
+/// deliver those samples twice, their stamps stepping back.
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
