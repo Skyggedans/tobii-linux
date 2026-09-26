@@ -50,11 +50,17 @@
 //! `tobii_calibration_parse`.
 //!
 //! That refusal covers only the thread the callback runs on (the flag is
-//! thread-local), and nothing else stands between two threads: the Stream
-//! Engine promises thread safety across all its functions, but libtobii has
-//! no lock, so a device must not be used from two threads at once, as each
-//! entry point's `# Safety` section says. Different devices may be, and so
-//! may the API handle.
+//! thread-local); other threads' calls go on. Threads may share a device, as
+//! the Stream Engine promises thread safety across all its functions: a
+//! device's state is locked by concern, as the DLL's is (see
+//! `device::Device`), so requests and subscription changes on one device run
+//! one at a time, its callbacks run one at a time on whichever thread
+//! processes it, and a process call made while another thread dispatches it
+//! returns at once. `tobii_device_destroy` and `tobii_api_destroy` take no
+//! lock, as in the DLL: no other thread may be inside a call on the handle,
+//! or use it afterwards. A callback, or the logger, must not block on another
+//! thread's call into the same device, which can deadlock, as in the Stream
+//! Engine.
 //!
 //! An entry point that takes a device handle checks the callback first, then
 //! a null device, then its other arguments (`TOBII_ERROR_INVALID_PARAMETER`
@@ -103,8 +109,12 @@
 //! returns `TOBII_ERROR_CONNECTION_FAILED`. A reconnect only connects: unlike
 //! `tobii_device_create` it never spawns a daemon, and any failure is
 //! `TOBII_ERROR_CONNECTION_FAILED` within ~500 ms (at once when nothing
-//! listens). It restores the subscriptions, not a calibration session or
-//! pause the lost connection held.
+//! listens). On a device shared between threads that counts from when a
+//! request or subscription change under way on another thread has finished,
+//! and the reconnect also waits for a callback another thread is running
+//! before its round trip, and for that thread's whole dispatch before it
+//! swaps connections. It restores the subscriptions, not a calibration
+//! session or pause the lost connection held.
 //!
 //! `TOBII_ERROR_CONNECTION_FAILED` has a second source: a request that needs
 //! the tracker live (a clock pair, a pause, a calibration, a display-area
@@ -126,10 +136,11 @@
 //! `tobii_device_process_callbacks` reports it (once per loss) and a daemon
 //! reply that does not decode, INFO for each connect and reconnect. The
 //! logger is called on the thread inside the `tobii_*` call that logs, with
-//! no lock held and under the callback guard, so a call from inside it, on
-//! that thread, that a callback could not make either is
-//! `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A `tobii_custom_alloc_t` is checked as
-//! in the DLL and never called (see `logger` and `tobii_api_create`).
+//! no lock of that call's held and under the callback guard, so a call from
+//! inside it, on that thread, that a callback could not make either is
+//! `TOBII_ERROR_CALLBACK_IN_PROGRESS`; threads may log at once, and their
+//! lines may interleave. A `tobii_custom_alloc_t` is checked as in the DLL
+//! and never called (see `logger` and `tobii_api_create`).
 //!
 //! Every entry point takes raw handles from C, so each is an `unsafe fn` whose
 //! `# Safety` section states what the caller must uphold; the `unsafe` blocks

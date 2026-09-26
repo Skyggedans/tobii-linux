@@ -29,8 +29,8 @@ pub unsafe extern "C" fn tobii_gaze_data_subscribe(
 /// Undo `tobii_gaze_data_subscribe`.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call.
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_gaze_data_unsubscribe(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.

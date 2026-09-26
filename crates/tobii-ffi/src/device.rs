@@ -2,33 +2,38 @@
 //! daemon with a reader thread sorting decoded messages into two channels
 //! (the answers to requests and subscription changes, and the samples) and
 //! ringing the device's doorbell for `wait` after each sample, the
-//! registered callbacks, and a synchronous request/reply helper.
+//! registered callbacks, and a synchronous request/reply helper. Threads may
+//! share a device: its state is split by concern, each part behind a lock of
+//! its own (see [`Device`]).
 //!
 //! Invariant: every stored callback was registered through the matching
 //! `tobii_*_subscribe` entry point, whose safety contract makes it sound to
-//! invoke with the stored `user_data` until it is unsubscribed or the device
-//! is destroyed.
+//! invoke with the stored `user_data`, on any thread that processes the
+//! device, until it is unsubscribed or the device is destroyed.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::io;
+use std::mem;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tobii_ipc::request::{DeviceInfo as DeviceInfoMsg, encode_request};
+use tobii_ipc::request::{DeviceInfo as DeviceInfoMsg, decode_device_info, encode_request, kind};
 use tobii_ipc::{
     self, NotificationValue as WireValue, STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA,
     STREAM_GAZE_ORIGIN, STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
     ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
 };
 
-use crate::logger::{self, Level, Logger};
+use crate::api::FACTS_TIMEOUT;
+use crate::logger::{self, Level, Logger, SharedLogger};
 use crate::status::{
     Status, TOBII_ERROR_ALREADY_SUBSCRIBED, TOBII_ERROR_CALLBACK_IN_PROGRESS,
     TOBII_ERROR_CONFLICTING_API_INSTANCES, TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL,
@@ -69,9 +74,13 @@ thread_local! {
     /// Set while this thread runs application code: a user callback or the
     /// application's logger. The entry points the crate documentation lists
     /// refuse a call made from inside one, as the Stream Engine does for a
-    /// callback: re-entering with the device being dispatched (or logging)
-    /// would alias its `&mut`, and destroying it would free it under the
-    /// dispatch loop.
+    /// callback, before they take any lock: a callback runs under its
+    /// device's dispatch and callbacks locks, which are not reentrant, so a
+    /// call into that device would deadlock this thread, and destroying it
+    /// would free it under the dispatch loop. A call into any other device
+    /// is refused too, so that no thread holds two devices' locks: two
+    /// callbacks each calling into the other's device would deadlock. The
+    /// flag is this thread's own; other threads' calls go on.
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -162,11 +171,22 @@ impl TryFrom<ServerMsg> for Answer {
 /// Lock `m`, taking a poisoned lock's data as it is. A lock is poisoned
 /// only by a panic while it is held. On an application's thread that never
 /// goes on to use the data: the panic cannot unwind out of an `extern "C"`
-/// entry point, which aborts the process instead. A lock another thread
-/// takes (the reader's) must keep its data whole through a panic itself
-/// (see [`Doorbell`]).
+/// entry point, which aborts the process instead, so no thread takes the
+/// lock again. A lock another thread takes (the reader's, which takes the
+/// doorbell's alone) must keep its data whole through a panic itself (see
+/// [`Doorbell`]).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Lock `m` if no other thread holds it, taking a poisoned lock's data as
+/// [`lock`] does; `None` while another thread holds it.
+fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// What `wait` sleeps on between its looks in the samples channel, rather
@@ -174,17 +194,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// and a condvar to sleep on until that moves. The reader rings it after
 /// each sample it queues and once when it stops, having hung up its
 /// channels first; an answer rings nothing, as it is nothing to process.
-/// A reconnect rings it once it has put its new link in place. The reader
-/// holds the lock only to bump the count, which cannot panic, so the count
-/// is whole even if the lock is poisoned.
+/// A reconnect rings it once it has put its new link in place, and a holder
+/// of the dispatch lock may ring it once it lets the lock go (see
+/// [`Doorbell::ring_after_hold`]). The reader holds the lock only to bump
+/// the count, which cannot panic, so the count is whole even if the lock is
+/// poisoned. No other lock is taken while it is held.
 ///
 /// One per device, kept across reconnects and rung by every link's reader,
 /// a failed reconnect's included: while a reconnect runs, the old link's
 /// reader and the new one's both ring it, and the old one rings last as
-/// the old link goes. Once a device may be shared between threads, that is
-/// what lets a wait sleeping on a lost link wake for the samples of the
-/// link a reconnect puts in its place; while a call borrows the device
-/// `&mut`, no reconnect runs during a wait, and it is structural.
+/// the old link goes. That is what lets a wait sleeping on a lost link wake
+/// for the samples of the link a reconnect on another thread puts in its
+/// place.
 #[derive(Debug, Default)]
 struct Doorbell {
     rings: Mutex<u64>,
@@ -235,24 +256,42 @@ impl Doorbell {
             .unwrap_or_else(PoisonError::into_inner);
         *rings != seen
     }
+
+    /// Ring once the dispatch lock is let go, for a wait whose look came
+    /// while it was held: such a look finds nothing, and the wait sleeps
+    /// until the count moves past what it read before it looked. It is
+    /// woken if the holder leaves something to process (`left`), or if the
+    /// doorbell rang during the hold, past `seen`, a count read once the
+    /// lock was taken: the wait may have read the count after that ring,
+    /// and the sample it rang for came after the holder's last look in the
+    /// channel, so it is still queued. Otherwise nothing: a wait turned away
+    /// from a device with nothing to process sleeps on, as it would have.
+    fn ring_after_hold(&self, seen: u64, left: bool) {
+        let mut rings = lock(&self.rings);
+        if *rings == seen && !left {
+            return;
+        }
+        *rings = rings.wrapping_add(1);
+        drop(rings);
+        self.rung.notify_all();
+    }
 }
 
 /// One daemon connection and the thread reading it, which sorts what the
 /// daemon sends into two channels, each in the order it came: the answers,
-/// read only by a request or subscription change waiting for its own, and
-/// the samples, read only by `wait`, `process` and `clear_buffers`. A call
-/// waiting for its answer leaves the samples where they are, and an answer
-/// nobody waits for any more never wakes `wait`. The reader rings the
-/// device's doorbell after each sample, and when it stops shuts the
-/// connection down and rings once more (see [`ReaderEnd`]).
+/// read only by a request or subscription change waiting for its own, under
+/// the command lock with the rest of the link, and the samples, whose
+/// receiver goes to the dispatch lock's [`Dispatch`], read only by `wait`,
+/// `process` and `clear_buffers`. A call waiting for its answer leaves the
+/// samples where they are, and an answer nobody waits for any more never
+/// wakes `wait`. The reader rings the device's doorbell after each sample,
+/// and when it stops shuts the connection down, hangs up both channels and
+/// rings once more (see [`ReaderEnd`]): a loss found under the command lock
+/// reaches `process` that way.
 struct Link {
     stream: UnixStream,
     answers: Receiver<Answer>,
-    samples: Receiver<ServerMsg>,
     reader: Option<JoinHandle<()>>,
-    /// Kept with the link, so a new one (a reconnect) starts `Up` and a later
-    /// loss is reported again.
-    state: LinkState,
     /// The acks still to come for subscription changes that gave up waiting.
     /// tobiid acks every change on a connection, in order, so the next this
     /// many acks are theirs, and a later change reads past them to its own
@@ -263,7 +302,11 @@ struct Link {
 
 impl Link {
     /// Connect through `connect` and start the reader, which rings `bell`.
-    fn open(connect: &mut Connector, bell: &Arc<Doorbell>) -> io::Result<Self> {
+    /// The samples channel's receiver comes back beside the link.
+    fn open(
+        connect: &mut Connector,
+        bell: &Arc<Doorbell>,
+    ) -> io::Result<(Self, Receiver<ServerMsg>)> {
         let stream = connect()?;
         let (answers_tx, answers) = mpsc::channel();
         let (samples_tx, samples) = mpsc::channel();
@@ -275,18 +318,18 @@ impl Link {
         let reader = thread::Builder::new()
             .name("tobii-ffi-reader".into())
             .spawn(move || end.run())?;
-        Ok(Self {
+        let link = Self {
             stream,
             answers,
-            samples,
             reader: Some(reader),
-            state: LinkState::Up,
             acks_owed: 0,
-        })
+        };
+        Ok((link, samples))
     }
 
     /// Close the connection and join the reader. Everything it read is then
-    /// in the channels, each followed by a disconnect.
+    /// in the channels, each followed by a disconnect, so the next `process`
+    /// or `wait` finds the loss whether or not the reader had seen one.
     fn close(&mut self) {
         // Shutting down the socket makes the reader's blocking read return, so
         // the join below cannot hang; a shutdown error only means it is already
@@ -299,19 +342,10 @@ impl Link {
         }
     }
 
-    /// Note that the connection has ended, and close it: the next `process`
-    /// reports the loss whether or not the reader has seen it.
-    fn lose(&mut self) {
-        if self.state == LinkState::Up {
-            self.close();
-            self.state = LinkState::Lost;
-        }
-    }
-
-    /// Write one frame to the daemon. A failed write loses the connection:
-    /// the daemon has closed it, or the frame is cut short mid-stream. A body
-    /// too long for a frame fails before a byte is written, and leaves the
-    /// connection as it was.
+    /// Write one frame to the daemon. A failed write loses the connection
+    /// (the daemon has closed it, or the frame is cut short mid-stream) and
+    /// closes it. A body too long for a frame fails before a byte is
+    /// written, and leaves the connection as it was.
     fn send(&mut self, body: &[u8]) -> Result<(), Status> {
         if u32::try_from(body.len()).is_err() {
             tracing::debug!(len = body.len(), "frame body too long for tobiid");
@@ -319,19 +353,20 @@ impl Link {
         }
         write_frame(&mut self.stream, body).map_err(|e| {
             tracing::debug!(error = %e, "could not write to tobiid");
-            self.lose();
+            self.close();
             TOBII_ERROR_CONNECTION_FAILED
         })
     }
 
     /// Wait up to `timeout` for the daemon's next answer. The samples that
-    /// arrive meanwhile stay queued for `process`.
+    /// arrive meanwhile stay queued for `process`. A hung-up channel closes
+    /// the connection.
     fn recv_answer(&mut self, timeout: Duration) -> Result<Answer, Status> {
         match self.answers.recv_timeout(timeout) {
             Ok(answer) => Ok(answer),
             Err(RecvTimeoutError::Timeout) => Err(TOBII_ERROR_TIMED_OUT),
             Err(RecvTimeoutError::Disconnected) => {
-                self.lose();
+                self.close();
                 Err(TOBII_ERROR_CONNECTION_FAILED)
             }
         }
@@ -434,6 +469,110 @@ impl Drop for ReaderEnd {
     }
 }
 
+/// What the command lock guards: the connection's write half and answers,
+/// how to open another, the request ids, and the identity fetched over the
+/// connection. A request, a subscription change, a recenter and a reconnect
+/// each hold it for their whole round trip, so they run one at a time on a
+/// device.
+struct Command {
+    link: Link,
+    connect: Connector,
+    next_request_id: u32,
+    /// Identity, fetched once per connection: a reconnect clears it, since a
+    /// restarted daemon may serve another tracker.
+    device_info: Option<DeviceInfoMsg>,
+}
+
+impl Command {
+    /// Send a request and wait up to `timeout` for its reply, dropping the
+    /// stale replies of requests that gave up, and the late acks it reads
+    /// past, which are then owed no more (see [`Link::acks_owed`]; no
+    /// subscription change waits at the same time, as both hold the command
+    /// lock). The samples that arrive meanwhile stay queued for `process`. A
+    /// reply with a non-zero status is that status.
+    fn request(&mut self, kind: u8, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, Status> {
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let id = self.next_request_id;
+        self.link.send(&encode_request(id, kind, payload))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .link
+                .recv_answer(deadline.saturating_duration_since(Instant::now()))?
+            {
+                Answer::Reply {
+                    request_id,
+                    status,
+                    payload,
+                } if request_id == id => {
+                    return if status == 0 {
+                        Ok(payload)
+                    } else {
+                        Err(Status::from(status))
+                    };
+                }
+                Answer::Reply { request_id, .. } => {
+                    tracing::debug!(request_id, "stale reply dropped");
+                }
+                Answer::Subscribed(_) => self.link.late_ack(),
+            }
+        }
+    }
+}
+
+/// What the dispatch lock guards: the samples channel, the samples a look
+/// of `wait` took from it ahead of `process`, and whether the connection is
+/// up. A reconnect swaps it for its new link's.
+struct Dispatch {
+    samples: Receiver<ServerMsg>,
+    pending: VecDeque<ServerMsg>,
+    /// Kept with the samples, so a new link (a reconnect) starts `Up` and a
+    /// later loss is reported again.
+    state: LinkState,
+}
+
+impl Dispatch {
+    fn new(samples: Receiver<ServerMsg>) -> Self {
+        Self {
+            samples,
+            pending: VecDeque::new(),
+            state: LinkState::Up,
+        }
+    }
+
+    /// Move the next queued sample into `pending`; whether there was one.
+    /// The channel empty and hung up is the loss of the connection: the
+    /// reader has stopped, having read everything, or a call under the
+    /// command lock has closed the link.
+    fn take_one(&mut self) -> bool {
+        if self.state != LinkState::Up {
+            return false;
+        }
+        match self.samples.try_recv() {
+            Ok(msg) => {
+                self.pending.push_back(msg);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.state = LinkState::Lost;
+                false
+            }
+        }
+    }
+
+    /// Move every queued sample into `pending`.
+    fn take_all(&mut self) {
+        while self.take_one() {}
+    }
+
+    /// Whether `process` has something to do among what has been taken: a
+    /// sample, or a loss it has not reported yet.
+    fn anything_to_process(&self) -> bool {
+        !self.pending.is_empty() || self.state == LinkState::Lost
+    }
+}
+
 /// A registered callback and its user data.
 pub(crate) type Slot<F> = Option<(F, *mut c_void)>;
 
@@ -452,6 +591,15 @@ pub(crate) struct Callbacks {
     /// Registered but never called: the field of use cannot change.
     pub(crate) field_of_use: Slot<FieldOfUseFn>,
 }
+
+// SAFETY: the `user_data` pointers are the application's, and libtobii never
+// reads through them: it hands each to its callback. The subscribe contract
+// (see `streams`) makes each callback sound to invoke with its `user_data` on
+// any thread that calls `tobii_device_process_callbacks` on the device, so the
+// table may move to, and be used on, whichever thread holds its lock; the
+// device keeps it behind one (`Device::callbacks`), which runs the callbacks
+// one at a time.
+unsafe impl Send for Callbacks {}
 
 impl Callbacks {
     /// The daemon streams these callbacks need; the single source of truth
@@ -478,32 +626,105 @@ impl Callbacks {
     }
 }
 
-/// Opaque device handle.
-pub struct Device {
-    link: Link,
-    connect: Connector,
-    pending: VecDeque<ServerMsg>,
-    /// Rung by every link's reader, kept across reconnects.
-    doorbell: Arc<Doorbell>,
-    pub(crate) callbacks: Callbacks,
-    pub(crate) field_of_use: FieldOfUse,
-    /// Address of the API handle this device was created from.
-    pub(crate) api: usize,
-    next_request_id: u32,
-    /// Identity, fetched once per connection: a reconnect clears it, since a
-    /// restarted daemon may serve another tracker.
-    pub(crate) device_info: Option<DeviceInfoMsg>,
-    /// The logger of the API this device was created from, copied, so the
-    /// device keeps it after `tobii_api_destroy`.
-    pub(crate) logger: Option<Logger>,
+/// Why a reconnect failed, as its ERROR line says.
+#[derive(Debug)]
+enum ReconnectError {
+    /// Nothing listens, or the connection could not be set up.
+    Connect(io::Error),
+    /// The daemon did not take back the streams in `mask`: `why` says how.
+    Subscribe { mask: u32, why: &'static str },
 }
 
-impl fmt::Debug for Device {
+impl fmt::Display for ReconnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Device")
-            .field("link", &self.link.state)
-            .field("streams", &self.callbacks.mask())
-            .field("pending", &self.pending.len())
+        match self {
+            Self::Connect(e) => write!(f, "{e}"),
+            Self::Subscribe { mask, why } => write!(
+                f,
+                "asked for the subscriptions back (streams {mask:#x}), it {why}"
+            ),
+        }
+    }
+}
+
+/// Opaque device handle, which threads may share, as the Stream Engine
+/// promises. Its state is split by concern, each part behind a lock of its
+/// own, as the DLL splits a device's among critical sections of its own:
+///
+/// - `command` (`Command`; the DLL's API mutex, dev+0x4e0, which its
+///   requests hold for the whole tracker round trip: device info at
+///   0x180142ee1, subscribe 0x18015ce3d..0x18015ceaf, reconnect
+///   0x180143873..0x180143a0f): held for a request's, subscription
+///   change's, recenter's or reconnect's whole round trip.
+/// - `dispatch` (`Dispatch`; its platform module's process mutex, +0x4628,
+///   which process only try-enters, 0x18000e9d9, and the notification
+///   queue's dev+0x9818): held by one `process` while it drains the samples
+///   and runs the callbacks, by `clear_buffers`, by each look of a `wait`,
+///   and by a reconnect while it swaps the samples channel.
+/// - `callbacks` (`Callbacks`; dev+0x4d8, held around each user callback,
+///   0x1801546a0..0x180155091): held around each callback, and while a
+///   subscription change reads or sets a slot.
+///
+/// Lock order: `command`, then `dispatch`, then `callbacks`; the doorbell's
+/// lock is a leaf, and the reader thread takes no other. A thread holds one
+/// device's locks at a time: `tobii_wait_for_callbacks` takes its devices
+/// one after another, and a callback, which runs under its device's
+/// `dispatch` and `callbacks`, may call into no device (`in_callback`
+/// refuses it before any lock is taken, so these locks, which are not
+/// reentrant, never deadlock on their own thread). Nothing is held while a
+/// `wait` sleeps, nor while the logger runs, but for a line a call made
+/// from inside a callback logs (a refused `field_of_use`), which runs under
+/// that callback's locks. A subscribe lets `callbacks` go for its round
+/// trip, where the DLL holds dev+0x4d8 (0x18015371b..0x180153845). A
+/// poisoned lock is taken as it is (see `lock`).
+///
+/// What can still deadlock is the Stream Engine's own: a callback that
+/// blocks on another thread's call into the same device. Of the calls that
+/// take a lock, only `process` and `wait` return promptly while a callback
+/// runs. A subscribe, an unsubscribe, a clear or a reconnect waits for it,
+/// on `callbacks` or `dispatch`, and a request or a recenter may wait, on
+/// `command`, behind a subscription change or reconnect under way.
+///
+/// Destroying the device takes no lock, as in the DLL: no other thread may
+/// be inside a call on it, or use it afterwards.
+pub struct Device {
+    /// Address of the API handle this device was created from.
+    pub(crate) api: usize,
+    pub(crate) field_of_use: FieldOfUse,
+    /// The logger of the API this device was created from, copied, so the
+    /// device keeps it after `tobii_api_destroy`.
+    logger: Option<SharedLogger>,
+    command: Mutex<Command>,
+    dispatch: Mutex<Dispatch>,
+    callbacks: Mutex<Callbacks>,
+    /// Rung by every link's reader, kept across reconnects.
+    doorbell: Arc<Doorbell>,
+    /// Whether `process` has reported the loss of the current connection:
+    /// what a `process` that finds another thread dispatching answers with.
+    /// Set and cleared under the dispatch lock, read without it.
+    reported: AtomicBool,
+}
+
+// Threads may share a device: every field is `Send` and `Sync` by type, the
+// application's pointers inside kept in the two types that say why they may
+// be (`Callbacks`, `SharedLogger`), so a field added later that is not fails
+// the build here rather than making the handle unsound to share.
+const _: () = {
+    const fn shareable<T: Send + Sync>() {}
+    shareable::<Device>();
+};
+
+impl fmt::Debug for Device {
+    // What can be read without waiting: a slot table another thread holds
+    // shows as locked. The dispatch state is left out, since holding its
+    // lock could turn a `wait` away (see `Device::in_dispatch`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Device");
+        match try_lock(&self.callbacks) {
+            Some(callbacks) => s.field("streams", &callbacks.mask()),
+            None => s.field("streams", &format_args!("<locked>")),
+        };
+        s.field("reported", &self.reported.load(Ordering::Relaxed))
             .field("field_of_use", &self.field_of_use)
             .finish_non_exhaustive()
     }
@@ -517,18 +738,21 @@ impl Device {
         field_of_use: FieldOfUse,
     ) -> io::Result<Self> {
         let doorbell = Arc::new(Doorbell::default());
-        let link = Link::open(&mut connect, &doorbell)?;
+        let (link, samples) = Link::open(&mut connect, &doorbell)?;
         Ok(Self {
-            link,
-            connect,
-            pending: VecDeque::new(),
-            doorbell,
-            callbacks: Callbacks::default(),
-            field_of_use,
             api,
-            next_request_id: 0,
-            device_info: None,
+            field_of_use,
             logger: None,
+            command: Mutex::new(Command {
+                link,
+                connect,
+                next_request_id: 0,
+                device_info: None,
+            }),
+            dispatch: Mutex::new(Dispatch::new(samples)),
+            callbacks: Mutex::new(Callbacks::default()),
+            doorbell,
+            reported: AtomicBool::new(false),
         })
     }
 
@@ -536,13 +760,19 @@ impl Device {
     /// has connected, as the DLL says on each connect ("Connected to
     /// platform module", INFO, 0x180153c19).
     pub(crate) fn adopt(&mut self, logger: Option<Logger>) {
-        self.logger = logger;
+        self.set_logger(logger);
         self.log(Level::Info, format_args!("connected to tobiid"));
     }
 
-    /// Log a line to the device's logger (see [`crate::logger`]).
+    /// Log to `logger` from now on, before the handle is handed out.
+    pub(crate) fn set_logger(&mut self, logger: Option<Logger>) {
+        self.logger = logger.map(SharedLogger);
+    }
+
+    /// Log a line to the device's logger (see [`crate::logger`]). Never
+    /// called with one of the device's locks held.
     pub(crate) fn log(&self, level: Level, args: fmt::Arguments<'_>) {
-        logger::emit(self.logger, level, args);
+        logger::emit(self.logger.map(|SharedLogger(l)| l), level, args);
     }
 
     /// A reply from the daemon that does not decode, `what` naming it:
@@ -576,23 +806,30 @@ impl Device {
         Self::new(connect, api, field_of_use)
     }
 
-    /// Write one frame to the daemon (see [`Link::send`]).
-    pub(crate) fn send(&mut self, body: &[u8]) -> Result<(), Status> {
-        self.link.send(body)
-    }
-
-    /// Resend the subscription mask and wait for the daemon's ack (see
-    /// [`Link::send_subscription`]). Returns the ack's `ok` flag.
-    fn resend_subscription(&mut self) -> Result<bool, Status> {
-        self.link
-            .send_subscription(self.callbacks.mask(), SUBSCRIBE_ACK_TIMEOUT)
+    /// Write one frame to the daemon (see [`Link::send`]), after any round
+    /// trip another thread has under way.
+    pub(crate) fn send(&self, body: &[u8]) -> Result<(), Status> {
+        lock(&self.command).link.send(body)
     }
 
     /// Register `callback` in `slot` and subscribe its stream. The Stream
     /// Engine's rules: a missing callback is invalid, an occupied slot is
     /// already subscribed.
+    ///
+    /// The slot is set before the daemon is asked, and the callbacks lock
+    /// let go for the round trip, so another thread's process keeps
+    /// delivering the streams already subscribed meanwhile, and a sample of
+    /// the new stream that comes ahead of the ack (a presence) is not lost.
+    /// So a callback may run on another thread before this returns, even
+    /// if the change then fails, where the DLL stores the callback only
+    /// once the tracker has taken the subscription (0x1801537cc..0x1801537de).
+    /// A change that fails is rolled back under that lock, so once this
+    /// returns, a callback another thread ran for such a sample has
+    /// returned too, and none runs later. Taking the lock, to check and set
+    /// the slot and to roll it back, waits for a callback another thread is
+    /// running.
     pub(crate) fn subscribe<F: Copy>(
-        &mut self,
+        &self,
         slot: fn(&mut Callbacks) -> &mut Slot<F>,
         callback: Option<F>,
         user_data: *mut c_void,
@@ -600,82 +837,87 @@ impl Device {
         let Some(callback) = callback else {
             return TOBII_ERROR_INVALID_PARAMETER;
         };
-        if slot(&mut self.callbacks).is_some() {
-            return TOBII_ERROR_ALREADY_SUBSCRIBED;
-        }
-        let before = self.callbacks.mask();
-        *slot(&mut self.callbacks) = Some((callback, user_data));
-        if self.callbacks.mask() == before {
-            return TOBII_ERROR_NO_ERROR;
-        }
-        let status = match self.resend_subscription() {
+        // Held throughout: the slots change only under it, so the mask sent
+        // is the table's until the change is done or undone.
+        let mut command = lock(&self.command);
+        let mask = {
+            let mut callbacks = lock(&self.callbacks);
+            if slot(&mut callbacks).is_some() {
+                return TOBII_ERROR_ALREADY_SUBSCRIBED;
+            }
+            let before = callbacks.mask();
+            *slot(&mut callbacks) = Some((callback, user_data));
+            let after = callbacks.mask();
+            if after == before {
+                return TOBII_ERROR_NO_ERROR;
+            }
+            after
+        };
+        let status = match command.link.send_subscription(mask, SUBSCRIBE_ACK_TIMEOUT) {
             Ok(true) => TOBII_ERROR_NO_ERROR,
             Ok(false) => TOBII_ERROR_CONFLICTING_API_INSTANCES,
             Err(status) => status,
         };
         if status != TOBII_ERROR_NO_ERROR {
-            *slot(&mut self.callbacks) = None;
+            *slot(&mut lock(&self.callbacks)) = None;
         }
         status
     }
 
     /// Drop the callback in `slot` and, if no other callback needs its
-    /// stream, tell the daemon.
-    pub(crate) fn unsubscribe<F: Copy>(
-        &mut self,
-        slot: fn(&mut Callbacks) -> &mut Slot<F>,
-    ) -> Status {
-        let before = self.callbacks.mask();
-        if slot(&mut self.callbacks).take().is_none() {
-            return TOBII_ERROR_NOT_SUBSCRIBED;
-        }
-        if self.callbacks.mask() == before {
-            return TOBII_ERROR_NO_ERROR;
-        }
-        match self.resend_subscription() {
+    /// stream, tell the daemon. Taking the slot waits for its callback to
+    /// return if another thread's process is running it, as the DLL's
+    /// unsubscribe waits on dev+0x4d8 (0x180153580): once this returns, the
+    /// callback is not running on any thread, and none calls it again.
+    pub(crate) fn unsubscribe<F: Copy>(&self, slot: fn(&mut Callbacks) -> &mut Slot<F>) -> Status {
+        let mut command = lock(&self.command);
+        let mask = {
+            let mut callbacks = lock(&self.callbacks);
+            let before = callbacks.mask();
+            if slot(&mut callbacks).take().is_none() {
+                return TOBII_ERROR_NOT_SUBSCRIBED;
+            }
+            let after = callbacks.mask();
+            if after == before {
+                return TOBII_ERROR_NO_ERROR;
+            }
+            after
+        };
+        match command.link.send_subscription(mask, SUBSCRIBE_ACK_TIMEOUT) {
             Ok(_) => TOBII_ERROR_NO_ERROR,
             Err(status) => status,
         }
     }
 
-    /// Send a request and wait up to `timeout` for its reply, dropping the
-    /// stale replies of requests that gave up, and the late acks it reads
-    /// past, which are then owed no more (see [`Link::acks_owed`]; no
-    /// subscription change waits at the same time). The samples that arrive
-    /// meanwhile stay queued for `process`. A reply with a non-zero status is
-    /// that status.
+    /// Send a request and wait up to `timeout` for its reply (see
+    /// [`Command::request`]), after any round trip another thread has under
+    /// way: requests on a device run one at a time.
     pub(crate) fn request(
-        &mut self,
+        &self,
         kind: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, Status> {
-        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        let id = self.next_request_id;
-        self.send(&encode_request(id, kind, payload))?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self
-                .link
-                .recv_answer(deadline.saturating_duration_since(Instant::now()))?
-            {
-                Answer::Reply {
-                    request_id,
-                    status,
-                    payload,
-                } if request_id == id => {
-                    return if status == 0 {
-                        Ok(payload)
-                    } else {
-                        Err(Status::from(status))
-                    };
-                }
-                Answer::Reply { request_id, .. } => {
-                    tracing::debug!(request_id, "stale reply dropped");
-                }
-                Answer::Subscribed(_) => self.link.late_ack(),
-            }
+        lock(&self.command).request(kind, payload, timeout)
+    }
+
+    /// The device's identity, fetched from the daemon once per connection.
+    /// The check, the fetch and the store make one round trip under the
+    /// command lock, so a fetch racing a reconnect on another thread cannot
+    /// keep the old connection's identity for the new one; a read of the
+    /// kept one, too, waits for a round trip another thread has under way.
+    pub(crate) fn device_info(&self) -> Result<DeviceInfoMsg, Status> {
+        let mut command = lock(&self.command);
+        if let Some(info) = &command.device_info {
+            return Ok(info.clone());
         }
+        let payload = command.request(kind::DEVICE_INFO, &[], FACTS_TIMEOUT)?;
+        let Some(info) = decode_device_info(&payload) else {
+            drop(command);
+            return Err(self.malformed("device info"));
+        };
+        command.device_info = Some(info.clone());
+        Ok(info)
     }
 
     /// Open a fresh connection and subscribe every registered stream on it,
@@ -696,22 +938,39 @@ impl Device {
     /// so its loss is reported again, and owes no acks. Once it is in place
     /// this rings the device's doorbell (see [`Doorbell`]): the new link's
     /// reader rings it too, but its first samples may come while this still
-    /// waits for the ack, and a wait they woke then (once a device may be
-    /// shared between threads) looked at the old link and slept again. The
-    /// device info is fetched again: a restarted daemon may serve another
-    /// tracker. Each failure is logged at ERROR, a success at INFO.
-    pub(crate) fn reconnect(&mut self) -> Status {
-        let mut link = match Link::open(&mut self.connect, &self.doorbell) {
-            Ok(link) => link,
+    /// waits for the ack, and a wait they woke then looked at the old link
+    /// and slept again. The device info is fetched again: a restarted daemon
+    /// may serve another tracker.
+    ///
+    /// It runs under the command lock, after any round trip another thread
+    /// has under way. It reads the subscriptions under the callbacks lock,
+    /// so before its own round trip it waits for a callback another thread
+    /// is running, and it swaps the samples channel under the dispatch
+    /// lock, once a process another thread runs has finished its callbacks,
+    /// as the DLL's waits for its process mutex (0x18000eb88). Each failure
+    /// is logged at ERROR, a success at INFO, once the locks are let go.
+    pub(crate) fn reconnect(&self) -> Status {
+        match self.replace_link() {
+            Ok(()) => {
+                self.log(Level::Info, format_args!("reconnected to tobiid"));
+                TOBII_ERROR_NO_ERROR
+            }
             Err(e) => {
                 self.log(
                     Level::Error,
                     format_args!("could not reconnect to tobiid: {e}"),
                 );
-                return TOBII_ERROR_CONNECTION_FAILED;
+                TOBII_ERROR_CONNECTION_FAILED
             }
-        };
-        let mask = self.callbacks.mask();
+        }
+    }
+
+    /// What [`Device::reconnect`] does under the command lock.
+    fn replace_link(&self) -> Result<(), ReconnectError> {
+        let mut command = lock(&self.command);
+        let (mut link, samples) =
+            Link::open(&mut command.connect, &self.doorbell).map_err(ReconnectError::Connect)?;
+        let mask = lock(&self.callbacks).mask();
         if mask != 0 {
             let why = match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT) {
                 Ok(true) => None,
@@ -720,30 +979,42 @@ impl Device {
                 Err(_) => Some("hung up"),
             };
             if let Some(why) = why {
-                self.log(
-                    Level::Error,
-                    format_args!(
-                        "could not reconnect to tobiid: asked for the subscriptions back \
-                         (streams {mask:#x}), it {why}"
-                    ),
-                );
-                return TOBII_ERROR_CONNECTION_FAILED;
+                return Err(ReconnectError::Subscribe { mask, why });
             }
         }
-        self.link = link;
-        self.pending.clear();
+        {
+            let mut dispatch = lock(&self.dispatch);
+            dispatch.samples = samples;
+            dispatch.pending.clear();
+            dispatch.state = LinkState::Up;
+            self.reported.store(false, Ordering::Relaxed);
+        }
+        // Also wakes a wait whose look the swap turned away.
         self.doorbell.ring();
-        self.device_info = None;
-        self.log(Level::Info, format_args!("reconnected to tobiid"));
-        TOBII_ERROR_NO_ERROR
+        let old = mem::replace(&mut command.link, link);
+        command.device_info = None;
+        drop(command);
+        drop(old);
+        Ok(())
     }
 
-    /// Drop every queued sample. A lost connection stays lost, and a loss not
-    /// reported yet is still reported. The answers are left alone: a late ack
-    /// dropped here would still be counted as owed.
-    pub(crate) fn clear_buffers(&mut self) {
-        while self.link.samples.try_recv().is_ok() {}
-        self.pending.clear();
+    /// Drop every queued sample, once a process another thread runs has
+    /// finished its callbacks. A lost connection stays lost, and a loss not
+    /// reported yet is still reported. The answers are left alone: a late
+    /// ack dropped here would still be counted as owed.
+    ///
+    /// The DLL's differs on both counts: it holds its API mutex (dev+0x4e0,
+    /// 0x180143a85), so it queues behind requests, and it clears by running
+    /// its process with the callbacks swapped out (0x180158a20), which
+    /// empties the device's notification queue but, while another thread
+    /// processes, fails its try-enter (0x18000e9d9) and leaves the rest
+    /// queued (read from the code, not observed). libtobii's waits for the
+    /// dispatch instead, and never for a request.
+    pub(crate) fn clear_buffers(&self) {
+        self.in_dispatch(lock(&self.dispatch), |dispatch| {
+            dispatch.take_all();
+            dispatch.pending.clear();
+        });
     }
 
     /// Whether `process` has something to do, waiting up to `timeout` for
@@ -756,32 +1027,30 @@ impl Device {
     /// quiet link; answering at once would spin a wait-and-process loop. A
     /// ring that brings nothing (from an old or a failed link, or for a
     /// sample an earlier look took) sends it back to sleep until the same
-    /// deadline. No reconnect runs during it while it borrows the device
-    /// `&mut`; once a device may be shared between threads, one on another
-    /// thread wakes it (see [`Device::reconnect`]).
-    pub(crate) fn wait(&mut self, timeout: Duration) -> bool {
-        // A handle of its own, so that the looks may borrow the device.
-        let bell = Arc::clone(&self.doorbell);
-        bell.wait_for(timeout, || self.anything_to_process())
+    /// deadline. A reconnect on another thread wakes it.
+    ///
+    /// It holds no lock while it sleeps. A look that finds another thread
+    /// holding the dispatch lock (a process running the callbacks, another
+    /// look, a clear) finds nothing and sleeps on, where the DLL answers at
+    /// once with nothing to wait on; that thread rings again once it lets
+    /// the lock go if it leaves something to process, or a sample came
+    /// meanwhile (see [`Device::in_dispatch`]).
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        self.doorbell.wait_for(timeout, || self.look())
     }
 
-    /// Whether `process` has something to do now: a sample, which this
-    /// moves into `pending`, or a loss it has not reported yet.
-    fn anything_to_process(&mut self) -> bool {
-        if !self.pending.is_empty() {
-            return true;
-        }
-        if self.link.state == LinkState::Up {
-            match self.link.samples.try_recv() {
-                Ok(msg) => {
-                    self.pending.push_back(msg);
-                    return true;
+    /// One look of `wait`: whether `process` has something to do now,
+    /// moving a queued sample into `pending`. Nothing while another thread
+    /// holds the dispatch lock.
+    fn look(&self) -> bool {
+        try_lock(&self.dispatch).is_some_and(|dispatch| {
+            self.in_dispatch(dispatch, |dispatch| {
+                if !dispatch.anything_to_process() {
+                    dispatch.take_one();
                 }
-                Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => self.link.lose(),
-            }
-        }
-        self.link.state == LinkState::Lost
+                dispatch.anything_to_process()
+            })
+        })
     }
 
     /// Deliver every queued sample to its callbacks, on this thread, then
@@ -789,43 +1058,78 @@ impl Device {
     /// arrived before is still delivered, and then this call and every later
     /// one returns `TOBII_ERROR_CONNECTION_FAILED` until a reconnect connects
     /// again.
+    ///
+    /// One thread dispatches a device at a time. A call that finds another
+    /// thread holding the dispatch lock (a process running the callbacks, a
+    /// look of `wait`, a clear, or a reconnect's swap) returns at once,
+    /// delivering nothing, and what is queued stays for the next call:
+    /// `TOBII_ERROR_NO_ERROR`, or `TOBII_ERROR_CONNECTION_FAILED` once the
+    /// loss has been reported. The DLL's returns at once too, once it has
+    /// delivered the notifications queued for the device
+    /// (0x180159515..0x180159566): it try-enters its process mutex only
+    /// then, and answers 0 when that fails (0x18000e9d9..0x18000e9ea), even
+    /// after a loss. libtobii has one queue, which the thread dispatching
+    /// delivers.
     #[must_use]
-    pub(crate) fn process(&mut self) -> Status {
-        loop {
-            match self.link.samples.try_recv() {
-                Ok(msg) => self.pending.push_back(msg),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.link.lose();
-                    break;
-                }
-            }
-        }
-        while let Some(msg) = self.pending.pop_front() {
-            self.dispatch(&msg);
-        }
-        match self.link.state {
-            LinkState::Up => TOBII_ERROR_NO_ERROR,
-            LinkState::Lost => {
-                // Once per loss: a host keeps calling at its frame rate.
-                self.link.state = LinkState::Reported;
-                self.log(
-                    Level::Error,
-                    format_args!(
-                        "lost the connection to tobiid; tobii_device_reconnect restores it"
-                    ),
-                );
+    pub(crate) fn process(&self) -> Status {
+        let Some(dispatch) = try_lock(&self.dispatch) else {
+            return if self.reported.load(Ordering::Relaxed) {
                 TOBII_ERROR_CONNECTION_FAILED
+            } else {
+                TOBII_ERROR_NO_ERROR
+            };
+        };
+        let (status, newly_lost) = self.in_dispatch(dispatch, |dispatch| {
+            dispatch.take_all();
+            while let Some(msg) = dispatch.pending.pop_front() {
+                self.deliver(&msg);
             }
-            LinkState::Reported => TOBII_ERROR_CONNECTION_FAILED,
+            match dispatch.state {
+                LinkState::Up => (TOBII_ERROR_NO_ERROR, false),
+                LinkState::Lost => {
+                    dispatch.state = LinkState::Reported;
+                    self.reported.store(true, Ordering::Relaxed);
+                    (TOBII_ERROR_CONNECTION_FAILED, true)
+                }
+                LinkState::Reported => (TOBII_ERROR_CONNECTION_FAILED, false),
+            }
+        });
+        if newly_lost {
+            // Once per loss, by the call that reported it: a host keeps
+            // calling at its frame rate.
+            self.log(
+                Level::Error,
+                format_args!("lost the connection to tobiid; tobii_device_reconnect restores it"),
+            );
         }
+        status
     }
 
-    /// Deliver one daemon message to the matching callbacks, if any. The
-    /// timestamps go through as the daemon sent them, on the host clock
-    /// already (gaze data's tracker time aside): nothing is converted here.
-    fn dispatch(&self, msg: &ServerMsg) {
-        let cb = &self.callbacks;
+    /// Run `f` on the dispatch state under `dispatch`, a guard of its lock,
+    /// then let the lock go and ring the doorbell again if a `wait` on
+    /// another thread may have looked meanwhile, found the lock held, and
+    /// gone back to sleep with something to process (see
+    /// [`Doorbell::ring_after_hold`]). Every hold but a reconnect's, which
+    /// rings anyway, goes through here.
+    fn in_dispatch<R>(
+        &self,
+        mut dispatch: MutexGuard<'_, Dispatch>,
+        f: impl FnOnce(&mut Dispatch) -> R,
+    ) -> R {
+        let seen = self.doorbell.rings();
+        let out = f(&mut dispatch);
+        let left = dispatch.anything_to_process();
+        drop(dispatch);
+        self.doorbell.ring_after_hold(seen, left);
+        out
+    }
+
+    /// Deliver one daemon message to the matching callbacks, if any, under
+    /// the callbacks lock. The timestamps go through as the daemon sent
+    /// them, on the host clock already (gaze data's tracker time aside):
+    /// nothing is converted here.
+    fn deliver(&self, msg: &ServerMsg) {
+        let cb = lock(&self.callbacks);
         match msg {
             ServerMsg::Head {
                 ts_us,
@@ -841,7 +1145,8 @@ impl Device {
                 };
                 if let Some((f, ud)) = cb.head {
                     // SAFETY: registered through `tobii_head_pose_subscribe`
-                    // (see the module invariant); `hp` outlives the call.
+                    // (see the module invariant), called on the processing
+                    // thread under the callbacks lock; `hp` outlives the call.
                     call(|| unsafe { f(&raw const hp, ud) });
                 }
             }
@@ -1026,20 +1331,23 @@ fn notification(n: &tobii_ipc::Notification) -> Notification {
     c
 }
 
-/// Borrow a device handle from C.
+/// Borrow a device handle from C, shared: threads may each borrow one at
+/// once, its locks keeping them apart.
 ///
-/// Refuses every call made from inside a callback (as the Stream Engine
-/// does), then a null handle.
+/// Refuses every call made from inside a callback or the logger (as the
+/// Stream Engine does for a callback), before any lock is taken, then a
+/// null handle.
 ///
 /// # Safety
-/// `device` must be null or a live handle from `tobii_device_create` that no
-/// other thread uses during the borrow.
-pub(crate) unsafe fn device_mut<'a>(device: *mut Device) -> Result<&'a mut Device, Status> {
+/// `device` must be null or a live handle from `tobii_device_create` that is
+/// not destroyed before the borrow ends.
+pub(crate) unsafe fn device_ref<'a>(device: *mut Device) -> Result<&'a Device, Status> {
     if in_callback() {
         return Err(TOBII_ERROR_CALLBACK_IN_PROGRESS);
     }
-    // SAFETY: the caller guarantees `device` is null or live and unaliased.
-    unsafe { device.as_mut() }.ok_or(TOBII_ERROR_INVALID_PARAMETER)
+    // SAFETY: the caller guarantees `device` is null or live for the borrow;
+    // other threads may borrow it meanwhile, as `Device` is `Sync`.
+    unsafe { device.as_ref() }.ok_or(TOBII_ERROR_INVALID_PARAMETER)
 }
 
 #[cfg(test)]
@@ -1048,9 +1356,33 @@ pub(crate) mod tests {
     use crate::logger::tests::Recorder;
     use crate::types::{LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO};
     use std::ffi::c_char;
+    use std::ptr;
     use tobii_ipc::{
         STREAM_GAZE_ORIGIN, encode_gaze, encode_gaze_origin, encode_reply, encode_subscribed,
     };
+
+    impl Device {
+        /// The streams its callbacks need.
+        fn mask(&self) -> u32 {
+            lock(&self.callbacks).mask()
+        }
+
+        /// Subscribe the streams in `mask` on the current connection, as a
+        /// subscription change does, waiting up to `timeout` for the ack.
+        fn send_subscription(&self, mask: u32, timeout: Duration) -> Result<bool, Status> {
+            lock(&self.command).link.send_subscription(mask, timeout)
+        }
+
+        /// Queue `msg` for the next `process`, as a look of `wait` does.
+        fn queue(&self, msg: ServerMsg) {
+            lock(&self.dispatch).pending.push_back(msg);
+        }
+
+        /// Whether a look of `wait` has taken a sample for `process`.
+        fn has_pending(&self) -> bool {
+            !lock(&self.dispatch).pending.is_empty()
+        }
+    }
 
     thread_local! {
         /// The daemon stand-in the next device constructor on this thread
@@ -1110,14 +1442,14 @@ pub(crate) mod tests {
                 encode_reply(req.id, 0, b"answer"),
             ]
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut stamps = Stamps::default();
-        d.callbacks.gaze = Some((stamp_gaze as GazePointFn, (&raw mut stamps).cast()));
+        lock(&d.callbacks).gaze = Some((stamp_gaze as GazePointFn, (&raw mut stamps).cast()));
 
         let got = d.request(1, &[], Duration::from_secs(2));
 
         assert_eq!(got, Ok(b"answer".to_vec()));
-        assert!(d.pending.is_empty(), "the request moved no sample");
+        assert!(!d.has_pending(), "the request moved no sample");
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         drop(d);
         assert_eq!(stamps.gaze, 1, "the gaze sample waited for process()");
@@ -1135,7 +1467,7 @@ pub(crate) mod tests {
             ],
             _ => vec![],
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut hits = 0u32;
         let ud = (&raw mut hits).cast::<c_void>();
 
@@ -1144,7 +1476,7 @@ pub(crate) mod tests {
             TOBII_ERROR_NO_ERROR
         );
 
-        assert!(d.pending.is_empty(), "the change moved no sample");
+        assert!(!d.has_pending(), "the change moved no sample");
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         drop(d);
         assert_eq!(hits, 1, "the sample waited for process()");
@@ -1169,9 +1501,9 @@ pub(crate) mod tests {
             }
             _ => vec![],
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         assert_eq!(
-            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            d.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
             Err(TOBII_ERROR_TIMED_OUT)
         );
         let mut hits = 0u32;
@@ -1182,7 +1514,7 @@ pub(crate) mod tests {
             TOBII_ERROR_CONFLICTING_API_INSTANCES
         );
 
-        assert_eq!(d.callbacks.mask(), 0, "rolled back");
+        assert_eq!(d.mask(), 0, "rolled back");
     }
 
     /// A daemon that leaves the first subscription change unacked and
@@ -1221,9 +1553,9 @@ pub(crate) mod tests {
             let req = tobii_ipc::request::decode_request(body).expect("request");
             vec![encode_reply(req.id, 0, b"answer")]
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         assert_eq!(
-            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            d.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
             Err(TOBII_ERROR_TIMED_OUT)
         );
         assert_eq!(d.request(1, &[], LONG_WAIT), Ok(b"answer".to_vec()));
@@ -1247,9 +1579,9 @@ pub(crate) mod tests {
         let connect = late_acking_daemon(tobii_ipc::TAG_RECENTER, |_| {
             vec![encode_gaze_origin(&tobii_ipc::EyePair::default())]
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         assert_eq!(
-            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            d.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
             Err(TOBII_ERROR_TIMED_OUT)
         );
         assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
@@ -1260,7 +1592,7 @@ pub(crate) mod tests {
         // A callback for the sample's stream, so `process` would deliver it
         // had the clear left it.
         let mut hits = 0u32;
-        d.callbacks.gaze_origin = Some((count_pair as EyePairFn, (&raw mut hits).cast()));
+        lock(&d.callbacks).gaze_origin = Some((count_pair as EyePairFn, (&raw mut hits).cast()));
 
         d.clear_buffers();
 
@@ -1269,7 +1601,7 @@ pub(crate) mod tests {
             d.subscribe(
                 |c| &mut c.eye_position,
                 Some(ignore_pair as EyePairFn),
-                std::ptr::null_mut()
+                ptr::null_mut()
             ),
             TOBII_ERROR_CONFLICTING_API_INSTANCES
         );
@@ -1289,7 +1621,7 @@ pub(crate) mod tests {
             encode_reply(7, 0, b"stale"),
             encode_subscribed(true),
         ]]);
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut daemon = daemons.recv().expect("daemon end");
 
         let t = Instant::now();
@@ -1302,7 +1634,7 @@ pub(crate) mod tests {
             d.subscribe(
                 |c| &mut c.gaze_origin,
                 Some(ignore_pair as EyePairFn),
-                std::ptr::null_mut()
+                ptr::null_mut()
             ),
             TOBII_ERROR_NO_ERROR
         );
@@ -1312,10 +1644,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_failed_reply_is_its_status_and_silence_times_out() {
-        let mut d = device_with(15, vec![]);
+        let d = device_with(15, vec![]);
         assert_eq!(d.request(0x10, &[2], Duration::from_secs(2)), Err(15));
 
-        let mut quiet = Device::new(fake_daemon(|_| vec![]), 1, 1).expect("device");
+        let quiet = Device::new(fake_daemon(|_| vec![]), 1, 1).expect("device");
         assert_eq!(
             quiet.request(1, &[], Duration::from_millis(50)),
             Err(TOBII_ERROR_TIMED_OUT)
@@ -1329,7 +1661,7 @@ pub(crate) mod tests {
 
     #[test]
     fn subscription_rules_follow_the_stream_engine() {
-        let mut d = device_with(0, vec![]);
+        let d = device_with(0, vec![]);
         let mut hits = 0u32;
         let ud = (&raw mut hits).cast::<c_void>();
 
@@ -1345,7 +1677,7 @@ pub(crate) mod tests {
             d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
             TOBII_ERROR_ALREADY_SUBSCRIBED
         );
-        assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN);
+        assert_eq!(d.mask(), STREAM_GAZE_ORIGIN);
         assert_eq!(d.unsubscribe(|c| &mut c.gaze_origin), 0);
         assert_eq!(
             d.unsubscribe(|c| &mut c.gaze_origin),
@@ -1357,7 +1689,7 @@ pub(crate) mod tests {
     /// bit stays while either is subscribed, and each sample reaches both.
     #[test]
     fn a_shared_stream_feeds_both_callbacks() {
-        let mut d = device_with(0, vec![]);
+        let d = device_with(0, vec![]);
         let mut hits = 0u32;
         let ud = (&raw mut hits).cast::<c_void>();
         assert_eq!(
@@ -1373,16 +1705,16 @@ pub(crate) mod tests {
             0
         );
 
-        d.dispatch(&ServerMsg::EyePosition(tobii_ipc::EyePair::default()));
+        d.deliver(&ServerMsg::EyePosition(tobii_ipc::EyePair::default()));
 
         assert_eq!(hits, 2);
         assert_eq!(d.unsubscribe(|c| &mut c.eye_position), 0);
-        assert_eq!(d.callbacks.mask(), STREAM_EYE_POSITION);
+        assert_eq!(d.mask(), STREAM_EYE_POSITION);
     }
 
     #[test]
     fn samples_are_dispatched_in_the_c_layout() {
-        let mut d = device_with(0, vec![]);
+        let d = device_with(0, vec![]);
         let mut hits = 0u32;
         let ud = (&raw mut hits).cast::<c_void>();
         assert_eq!(
@@ -1390,7 +1722,7 @@ pub(crate) mod tests {
             0
         );
         let body = encode_gaze_origin(&tobii_ipc::EyePair::default());
-        d.pending.push_back(decode_server(&body).expect("decodes"));
+        d.queue(decode_server(&body).expect("decodes"));
 
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
 
@@ -1489,10 +1821,10 @@ pub(crate) mod tests {
             }
             _ => vec![],
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut stamps = Stamps::default();
         let ud = (&raw mut stamps).cast::<c_void>();
-        d.callbacks = Callbacks {
+        *lock(&d.callbacks) = Callbacks {
             head: Some((stamp_head as HeadPoseFn, ud)),
             gaze: Some((stamp_gaze as GazePointFn, ud)),
             presence: Some((stamp_presence as PresenceFn, ud)),
@@ -1504,7 +1836,7 @@ pub(crate) mod tests {
             ..Callbacks::default()
         };
 
-        assert_eq!(d.resend_subscription(), Ok(true));
+        assert_eq!(d.send_subscription(d.mask(), LONG_WAIT), Ok(true));
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         drop(d);
 
@@ -1550,7 +1882,7 @@ pub(crate) mod tests {
             Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![frame.clone(), encode_subscribed(true)],
             _ => vec![],
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut seen: Option<GazeData> = None;
         let ud = (&raw mut seen).cast::<c_void>();
 
@@ -1576,7 +1908,7 @@ pub(crate) mod tests {
         // SAFETY: the test passes `&raw mut Status` as `ud`.
         let out = unsafe { &mut *ud.cast::<Status>() };
         // SAFETY: a null handle is never dereferenced; the guard answers first.
-        *out = match unsafe { device_mut(std::ptr::null_mut()) } {
+        *out = match unsafe { device_ref(ptr::null_mut()) } {
             Err(s) => s,
             Ok(_) => 0,
         };
@@ -1584,7 +1916,7 @@ pub(crate) mod tests {
 
     #[test]
     fn calls_from_inside_a_callback_are_refused() {
-        let mut d = device_with(0, vec![]);
+        let d = device_with(0, vec![]);
         let mut seen: Status = -1;
         let ud = (&raw mut seen).cast::<c_void>();
         assert_eq!(
@@ -1592,7 +1924,7 @@ pub(crate) mod tests {
             0
         );
 
-        d.dispatch(&ServerMsg::GazeOrigin(tobii_ipc::EyePair::default()));
+        d.deliver(&ServerMsg::GazeOrigin(tobii_ipc::EyePair::default()));
 
         assert_eq!(seen, TOBII_ERROR_CALLBACK_IN_PROGRESS);
         assert!(!in_callback());
@@ -1634,7 +1966,7 @@ pub(crate) mod tests {
     /// the cut to 511 bytes is `notifications_fill_the_520_byte_union`'s.
     #[test]
     fn fault_and_warning_lists_reach_the_notifications_callback() {
-        let mut d = device_with(0, vec![]);
+        let d = device_with(0, vec![]);
         let mut seen: Vec<Notification> = Vec::new();
         let ud = (&raw mut seen).cast::<c_void>();
         assert_eq!(
@@ -1653,7 +1985,7 @@ pub(crate) mod tests {
                 kind,
                 value: WireValue::String(text.to_owned()),
             });
-            d.pending.push_back(decode_server(&body).expect("decodes"));
+            d.queue(decode_server(&body).expect("decodes"));
         }
 
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
@@ -1677,14 +2009,14 @@ pub(crate) mod tests {
 
     #[test]
     fn reconnect_restores_the_subscription() {
-        let mut d = device_with(0, vec![]);
-        let ud = std::ptr::null_mut();
+        let d = device_with(0, vec![]);
+        let ud = ptr::null_mut();
         assert_eq!(
             d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
             0
         );
         assert_eq!(d.reconnect(), 0);
-        assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN);
+        assert_eq!(d.mask(), STREAM_GAZE_ORIGIN);
         d.clear_buffers();
         assert!(!d.wait(Duration::from_millis(10)));
     }
@@ -1739,8 +2071,9 @@ pub(crate) mod tests {
 
     /// Wait for the reader to see the daemon hang up, so everything the
     /// daemon sent is in the channels before the test looks.
-    fn hung_up(d: &mut Device) {
-        if let Some(h) = d.link.reader.take() {
+    fn hung_up(d: &Device) {
+        let reader = lock(&d.command).link.reader.take();
+        if let Some(h) = reader {
             h.join().expect("reader");
         }
     }
@@ -1757,7 +2090,7 @@ pub(crate) mod tests {
         let mut greetings = vec![ack_then_gaze_origin(samples)];
         greetings.extend(later);
         let (connect, daemons) = scripted_daemon(greetings);
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut daemon = daemons.recv().expect("daemon end");
         assert_eq!(
             d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
@@ -1765,14 +2098,14 @@ pub(crate) mod tests {
         );
         assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
         drop(daemon);
-        hung_up(&mut d);
+        hung_up(&d);
         (d, daemons)
     }
 
     #[test]
     fn process_delivers_what_arrived_then_reports_the_loss() {
         let mut hits = 0u32;
-        let (mut d, _daemons) = lost_device(2, vec![], (&raw mut hits).cast());
+        let (d, _daemons) = lost_device(2, vec![], (&raw mut hits).cast());
 
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         assert_eq!(hits, 2, "both samples came before the hang-up");
@@ -1787,7 +2120,7 @@ pub(crate) mod tests {
     #[test]
     fn wait_wakes_for_a_loss_until_process_reports_it_then_sleeps() {
         let mut hits = 0u32;
-        let (mut d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        let (d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
 
         let t = Instant::now();
         assert!(d.wait(LONG_WAIT), "the loss is something to process");
@@ -1805,7 +2138,7 @@ pub(crate) mod tests {
     #[test]
     fn clearing_the_buffers_does_not_hide_the_loss() {
         let mut hits = 0u32;
-        let (mut d, _daemons) = lost_device(1, vec![], (&raw mut hits).cast());
+        let (d, _daemons) = lost_device(1, vec![], (&raw mut hits).cast());
 
         d.clear_buffers();
 
@@ -1822,7 +2155,7 @@ pub(crate) mod tests {
     /// fails.
     pub(crate) fn deaf_daemon_device(ud: *mut c_void) -> (Device, UnixStream) {
         let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(1)]);
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut daemon = daemons.recv().expect("daemon end");
         assert_eq!(
             d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
@@ -1839,7 +2172,7 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_write_loses_the_connection_while_the_reader_still_runs() {
         let mut hits = 0u32;
-        let (mut d, daemon) = deaf_daemon_device((&raw mut hits).cast());
+        let (d, daemon) = deaf_daemon_device((&raw mut hits).cast());
 
         assert_eq!(
             d.request(tobii_ipc::request::kind::TRACK_BOX, &[], LONG_WAIT),
@@ -1861,7 +2194,7 @@ pub(crate) mod tests {
     fn requests_and_new_subscriptions_on_a_lost_connection_fail_at_once() {
         let mut hits = 0u32;
         let ud = (&raw mut hits).cast::<c_void>();
-        let (mut d, _daemons) = lost_device(0, vec![], ud);
+        let (d, _daemons) = lost_device(0, vec![], ud);
 
         let t = Instant::now();
         assert_eq!(
@@ -1878,15 +2211,14 @@ pub(crate) mod tests {
             TOBII_ERROR_CONNECTION_FAILED
         );
         assert!(t.elapsed() < PROMPT);
-        assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN, "rolled back");
+        assert_eq!(d.mask(), STREAM_GAZE_ORIGIN, "rolled back");
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
     }
 
     #[test]
     fn reconnect_restores_the_subscription_and_samples_flow_again() {
         let mut hits = 0u32;
-        let (mut d, daemons) =
-            lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
 
         assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
@@ -1908,8 +2240,7 @@ pub(crate) mod tests {
     #[test]
     fn a_second_loss_after_a_reconnect_wakes_wait_again() {
         let mut hits = 0u32;
-        let (mut d, daemons) =
-            lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
         let mut daemon = daemons.recv().expect("second daemon end");
@@ -1917,7 +2248,7 @@ pub(crate) mod tests {
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
 
         drop(daemon);
-        hung_up(&mut d);
+        hung_up(&d);
 
         let t = Instant::now();
         assert!(d.wait(LONG_WAIT), "the new loss is something to process");
@@ -1974,7 +2305,7 @@ pub(crate) mod tests {
     /// since the ack.
     fn subscribed_device(ud: *mut c_void) -> (Device, UnixStream) {
         let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(0)]);
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut daemon = daemons.recv().expect("daemon end");
         assert_eq!(
             d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
@@ -2006,7 +2337,7 @@ pub(crate) mod tests {
     #[test]
     fn a_sample_wakes_a_wait_asleep() {
         let mut hits = 0u32;
-        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let (d, daemon) = subscribed_device((&raw mut hits).cast());
         let (go, sampler) = sampler(daemon);
         go.send(ASLEEP).expect("go");
 
@@ -2033,7 +2364,7 @@ pub(crate) mod tests {
         const ROUNDS: u32 = 1000;
         let delays = [0, 0, 20, 50, 100, 200, 400].map(Duration::from_micros);
         let mut hits = 0u32;
-        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let (d, daemon) = subscribed_device((&raw mut hits).cast());
         let (go, sampler) = sampler(daemon);
 
         for (round, delay) in (0..ROUNDS).zip(delays.iter().cycle()) {
@@ -2058,7 +2389,7 @@ pub(crate) mod tests {
     #[test]
     fn a_loss_wakes_a_wait_asleep_once() {
         let mut hits = 0u32;
-        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let (d, daemon) = subscribed_device((&raw mut hits).cast());
         let hang_up = thread::spawn(move || {
             thread::sleep(ASLEEP);
             drop(daemon);
@@ -2085,10 +2416,10 @@ pub(crate) mod tests {
     fn a_wait_keeps_its_deadline_through_rings_that_bring_nothing() {
         let mut hits = 0u32;
         let quiet = Device::new(fake_daemon(|_| vec![]), 1, 1).expect("device");
-        let (mut lost, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        let (lost, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
         assert_eq!(lost.process(), TOBII_ERROR_CONNECTION_FAILED);
 
-        for mut d in [quiet, lost] {
+        for d in [quiet, lost] {
             // Rings every few ms until told to stop, or for `LONG_WAIT`
             // should the wait never end.
             let bell = Arc::clone(&d.doorbell);
@@ -2115,17 +2446,17 @@ pub(crate) mod tests {
     }
 
     /// A reconnect's new link rings the device's own doorbell, the one a
-    /// wait on the reported loss sleeps on: once another thread may
-    /// reconnect, that ring is what wakes such a wait for the new link's
-    /// samples. The count moves by two, the sample's ring and the one the
-    /// reconnect makes once the link is in place. Structural while a call
-    /// borrows the device `&mut`: it fails should a link ring a doorbell of
-    /// its own, which would leave the reconnect's ring alone on the device's.
+    /// wait on the reported loss sleeps on: when another thread reconnects,
+    /// that ring is what wakes such a wait for the new link's samples. The
+    /// count moves by two, the sample's ring and the one the reconnect makes
+    /// once the link is in place. Structural: it fails should a link ring a
+    /// doorbell of its own, which would leave the reconnect's ring alone on
+    /// the device's. The two-thread case is
+    /// `a_wait_on_a_reported_loss_wakes_for_a_reconnect_on_another_thread`.
     #[test]
     fn a_reconnects_samples_ring_the_doorbell_a_lost_wait_sleeps_on() {
         let mut hits = 0u32;
-        let (mut d, daemons) =
-            lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         let bell = Arc::clone(&d.doorbell);
         let seen = bell.rings();
@@ -2145,17 +2476,16 @@ pub(crate) mod tests {
     }
 
     /// A reconnect rings the doorbell once it has put its new link in place,
-    /// though that link brings no sample: once a device may be shared, a
-    /// wait on another thread that the new link's first samples woke while
-    /// the reconnect still waited for its ack looked at the old link and
-    /// slept again, and this ring sends it back to look at the new one. The
+    /// though that link brings no sample: a wait on another thread that the
+    /// new link's first samples woke while the reconnect still waited for
+    /// its ack looked at the old link and slept again, and this ring sends
+    /// it back to look at the new one. The
     /// greeting here is the ack alone, and the old link's reader stopped
     /// before the count was read, so the reconnect's ring is the only one.
     #[test]
     fn a_reconnect_rings_the_doorbell_once_its_new_link_is_in_place() {
         let mut hits = 0u32;
-        let (mut d, daemons) =
-            lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         let seen = d.doorbell.rings();
 
@@ -2177,13 +2507,13 @@ pub(crate) mod tests {
     #[test]
     fn the_reader_hangs_up_before_its_last_ring() {
         let mut hits = 0u32;
-        let (mut d, daemon) = subscribed_device((&raw mut hits).cast());
+        let (d, daemon) = subscribed_device((&raw mut hits).cast());
         let held = lock(&d.doorbell.rings);
 
         drop(daemon);
 
         assert_eq!(
-            d.link.samples.recv_timeout(PROMPT).err(),
+            lock(&d.dispatch).samples.recv_timeout(PROMPT).err(),
             Some(RecvTimeoutError::Disconnected),
             "hung up while the ring waits for the lock"
         );
@@ -2230,10 +2560,10 @@ pub(crate) mod tests {
             }
             _ => vec![],
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let before = d.doorbell.rings();
 
-        assert_eq!(d.link.send_subscription(STREAM_GAZE, LONG_WAIT), Ok(true));
+        assert_eq!(d.send_subscription(STREAM_GAZE, LONG_WAIT), Ok(true));
         assert_eq!(d.request(1, &[], LONG_WAIT), Ok(b"answer".to_vec()));
 
         assert_eq!(d.doorbell.rings(), before + 1, "the sample's ring alone");
@@ -2241,7 +2571,7 @@ pub(crate) mod tests {
 
     /// Wait out `SHORT_WAIT` and say no, as for a loss already reported, then
     /// report the loss still: the device is lost, and was not woken again.
-    fn assert_still_lost(d: &mut Device) {
+    fn assert_still_lost(d: &Device) {
         let t = Instant::now();
         assert!(!d.wait(SHORT_WAIT), "no second wake for the same loss");
         assert!(t.elapsed() >= SHORT_WAIT, "slept out the timeout");
@@ -2256,7 +2586,7 @@ pub(crate) mod tests {
     #[test]
     fn reconnecting_while_nothing_listens_fails_at_once_and_leaves_the_device_lost() {
         let mut hits = 0u32;
-        let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         drop(daemons);
 
@@ -2264,7 +2594,7 @@ pub(crate) mod tests {
         assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
         assert!(t.elapsed() < PROMPT);
 
-        assert_still_lost(&mut d);
+        assert_still_lost(&d);
     }
 
     /// The daemon takes the connection and the subscription but never acks:
@@ -2275,7 +2605,7 @@ pub(crate) mod tests {
     fn a_reconnect_the_daemon_does_not_ack_fails_soon_and_leaves_the_device_lost() {
         let mut hits = 0u32;
         // The second connection's daemon is sent nothing to answer with.
-        let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
 
         let t = Instant::now();
@@ -2292,13 +2622,13 @@ pub(crate) mod tests {
             matches!(read_frame(&mut daemon), Ok(None)),
             "the attempt's connection is closed"
         );
-        assert_still_lost(&mut d);
+        assert_still_lost(&d);
     }
 
     #[test]
     fn a_reconnect_the_daemon_hangs_up_on_fails_and_leaves_the_device_lost() {
         let mut hits = 0u32;
-        let (mut d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
         // Reads the subscription, then hangs up without acking it.
         let daemon = thread::spawn(move || {
@@ -2309,7 +2639,7 @@ pub(crate) mod tests {
         assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
 
         assert_eq!(daemon.join().expect("daemon"), Some(STREAM_GAZE_ORIGIN));
-        assert_still_lost(&mut d);
+        assert_still_lost(&d);
     }
 
     /// No daemon refuses a subscription today, but only an ack that takes
@@ -2319,7 +2649,7 @@ pub(crate) mod tests {
     fn a_reconnect_the_daemon_refuses_fails_and_leaves_the_device_lost() {
         let mut hits = 0u32;
         let refusal = vec![encode_subscribed(false)];
-        let (mut d, daemons) = lost_device(0, vec![refusal], (&raw mut hits).cast());
+        let (d, daemons) = lost_device(0, vec![refusal], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
 
         let t = Instant::now();
@@ -2332,8 +2662,8 @@ pub(crate) mod tests {
             matches!(read_frame(&mut daemon), Ok(None)),
             "the attempt's connection is closed"
         );
-        assert_eq!(d.callbacks.mask(), STREAM_GAZE_ORIGIN, "kept for a retry");
-        assert_still_lost(&mut d);
+        assert_eq!(d.mask(), STREAM_GAZE_ORIGIN, "kept for a retry");
+        assert_still_lost(&d);
     }
 
     /// Were the old connection closed first, the daemon could see no client
@@ -2341,9 +2671,9 @@ pub(crate) mod tests {
     #[test]
     fn reconnecting_a_live_connection_subscribes_the_new_one_before_closing_the_old() {
         let (connect, daemons) = scripted_daemon(vec![ack_then_gaze_origin(0)]);
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut old = daemons.recv().expect("daemon end");
-        let ud = std::ptr::null_mut();
+        let ud = ptr::null_mut();
         assert_eq!(
             d.subscribe(|c| &mut c.gaze_origin, Some(ignore_pair as EyePairFn), ud),
             TOBII_ERROR_NO_ERROR
@@ -2387,11 +2717,11 @@ pub(crate) mod tests {
     #[test]
     fn a_reconnect_owes_none_of_the_old_connections_acks() {
         let (connect, daemons) = scripted_daemon(vec![vec![], ack_then_gaze_origin(0)]);
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
         let old = daemons.recv().expect("daemon end");
-        d.callbacks.gaze_origin = Some((ignore_pair as EyePairFn, std::ptr::null_mut()));
+        lock(&d.callbacks).gaze_origin = Some((ignore_pair as EyePairFn, ptr::null_mut()));
         assert_eq!(
-            d.link.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
+            d.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
             Err(TOBII_ERROR_TIMED_OUT),
             "the old connection owes its ack"
         );
@@ -2438,9 +2768,9 @@ pub(crate) mod tests {
             }
             _ => vec![],
         });
-        let mut d = Device::new(connect, 1, 1).expect("device");
-        let ud = std::ptr::null_mut();
-        d.callbacks = Callbacks {
+        let d = Device::new(connect, 1, 1).expect("device");
+        let ud = ptr::null_mut();
+        *lock(&d.callbacks) = Callbacks {
             head: Some((ignore_head as HeadPoseFn, ud)),
             gaze: Some((ignore_gaze as GazePointFn, ud)),
             presence: Some((ignore_presence as PresenceFn, ud)),
@@ -2451,10 +2781,9 @@ pub(crate) mod tests {
             notifications: Some((ignore_notification as NotificationsFn, ud)),
             ..Callbacks::default()
         };
-        let serial =
-            |d: &mut Device| crate::api::fetch_device_info(d).map(|info| info.serial_number);
-        assert_eq!(serial(&mut d), Ok("1".into()));
-        assert_eq!(serial(&mut d), Ok("1".into()), "fetched once");
+        let serial = |d: &Device| d.device_info().map(|info| info.serial_number);
+        assert_eq!(serial(&d), Ok("1".into()));
+        assert_eq!(serial(&d), Ok("1".into()), "fetched once");
 
         assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
 
@@ -2467,7 +2796,7 @@ pub(crate) mod tests {
             | STREAM_IMAGE
             | STREAM_NOTIFICATIONS;
         assert_eq!(*masks.lock().expect("log"), [Some(every)]);
-        assert_eq!(serial(&mut d), Ok("2".into()), "asked the daemon again");
+        assert_eq!(serial(&d), Ok("2".into()), "asked the daemon again");
     }
 
     /// What `process` logs for a loss.
@@ -2493,7 +2822,7 @@ pub(crate) mod tests {
     fn a_lost_connection_is_logged_once() {
         let (recorder, mut hits) = (Recorder::default(), 0u32);
         let (mut d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
-        d.logger = recorder.logger();
+        d.set_logger(recorder.logger());
 
         for _ in 0..3 {
             assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
@@ -2508,7 +2837,7 @@ pub(crate) mod tests {
         let refusal = vec![encode_subscribed(false)];
         let (mut d, daemons) = lost_device(0, vec![refusal], (&raw mut hits).cast());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
-        d.logger = recorder.logger();
+        d.set_logger(recorder.logger());
 
         assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
         drop(daemons);
@@ -2533,7 +2862,7 @@ pub(crate) mod tests {
         let (recorder, mut hits) = (Recorder::default(), 0u32);
         let (mut d, daemons) =
             lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
-        d.logger = recorder.logger();
+        d.set_logger(recorder.logger());
         assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
 
         assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
@@ -2574,8 +2903,11 @@ pub(crate) mod tests {
             .set(unsafe { crate::api::tobii_device_process_callbacks(r.device) });
     }
 
-    /// The device that logs is borrowed while its logger runs, so the
-    /// logger may not use it: the guard refuses the call, as from a callback.
+    /// The logger runs under the callback guard, so a call from inside it
+    /// into the device that logs is refused, as from a callback. Kept as
+    /// the Stream Engine's rule for a callback, though no lock of the
+    /// device's is held while the logger runs (see
+    /// `a_logger_may_wait_for_another_thread_using_the_device`).
     #[test]
     fn a_logger_that_calls_back_in_is_refused() {
         let mut hits = 0u32;
@@ -2589,7 +2921,10 @@ pub(crate) mod tests {
         // SAFETY: `d` is live and destroyed once; `reentry` and `hits`
         // outlive it.
         unsafe {
-            (*d).logger = crate::logger::tests::logger(process_from_the_logger, context);
+            (*d).set_logger(crate::logger::tests::logger(
+                process_from_the_logger,
+                context,
+            ));
             assert_eq!(
                 crate::api::tobii_device_process_callbacks(d),
                 TOBII_ERROR_CONNECTION_FAILED
@@ -2619,7 +2954,7 @@ pub(crate) mod tests {
                 Err(io::ErrorKind::ConnectionRefused.into())
             },
         );
-        let mut d = Device::new(connect, 1, 1).expect("device");
+        let d = Device::new(connect, 1, 1).expect("device");
 
         for _ in 0..2 {
             assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
@@ -2630,5 +2965,676 @@ pub(crate) mod tests {
             laters.load(Ordering::Relaxed),
         );
         assert_eq!(calls, (1, 2));
+    }
+
+    // Threads sharing a device. Each test says whether it fails without the
+    // lock split it pins, or is a guard against locking too much.
+
+    /// What `f` gave, and how long it took.
+    fn timed<R>(f: impl FnOnce() -> R) -> (R, Duration) {
+        let t = Instant::now();
+        let got = f();
+        (got, t.elapsed())
+    }
+
+    /// A gaze-origin sample, as the reader queues it.
+    fn gaze_origin_sample() -> ServerMsg {
+        decode_server(&encode_gaze_origin(&tobii_ipc::EyePair::default())).expect("decodes")
+    }
+
+    /// A callback's user data that holds it inside until let go:
+    /// [`held_pair`] counts each call, then waits for `open`, or `LONG_WAIT`
+    /// at most, so a test that fails before letting it go cannot hang.
+    #[derive(Debug, Default)]
+    struct Gate {
+        /// The calls so far, and whether the gate is open.
+        state: Mutex<(u32, bool)>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn ud(&self) -> *mut c_void {
+            ptr::from_ref(self).cast_mut().cast()
+        }
+
+        /// Whether the callback has been called `n` times, waiting up to
+        /// `PROMPT` for it.
+        fn entered(&self, n: u32) -> bool {
+            let state = lock(&self.state);
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, PROMPT, |(calls, _)| *calls < n)
+                .unwrap_or_else(PoisonError::into_inner);
+            state.0 >= n
+        }
+
+        fn calls(&self) -> u32 {
+            lock(&self.state).0
+        }
+
+        /// Let every call through, now and later.
+        fn open(&self) {
+            lock(&self.state).1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    unsafe extern "C" fn held_pair(_p: *const EyePair, ud: *mut c_void) {
+        // SAFETY: the tests pass a live `Gate` as `ud`.
+        let gate = unsafe { &*ud.cast::<Gate>() };
+        let mut state = lock(&gate.state);
+        state.0 += 1;
+        gate.changed.notify_all();
+        drop(
+            gate.changed
+                .wait_timeout_while(state, LONG_WAIT, |(_, open)| !*open),
+        );
+    }
+
+    /// Run `f` on this thread while another thread's `process` on `d` is
+    /// held inside the gaze-origin callback, `gate`'s (set here), for a
+    /// sample queued for it; then let it go. What `f` gave, and what that
+    /// process returned. `gate` must outlive `d`.
+    fn while_a_callback_runs<R>(d: &Device, gate: &Gate, f: impl FnOnce() -> R) -> (R, Status) {
+        lock(&d.callbacks).gaze_origin = Some((held_pair as EyePairFn, gate.ud()));
+        d.queue(gaze_origin_sample());
+        thread::scope(|s| {
+            let processing = s.spawn(|| d.process());
+            assert!(gate.entered(1), "the callback runs on the other thread");
+            let got = f();
+            gate.open();
+            (got, processing.join().expect("process"))
+        })
+    }
+
+    /// A process call made while another thread dispatches the device
+    /// returns at once, as the DLL's does when its try-enter fails
+    /// (0x18000e9d9..0x18000e9ea): no error while the connection is up or
+    /// its loss is still to be reported (by the call dispatching), and
+    /// `TOBII_ERROR_CONNECTION_FAILED` once it has been, until a reconnect.
+    /// It fails should process wait for the dispatch lock (the callback's
+    /// `LONG_WAIT`), or answer from anything but the last report.
+    #[test]
+    fn a_busy_process_returns_at_once_with_what_the_last_report_said() {
+        let gates: [Gate; 3] = Default::default();
+        let mut hits = 0u32;
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+        let busy = || timed(|| d.process());
+
+        let ((unreported, took), dispatching) = while_a_callback_runs(&d, &gates[0], busy);
+        assert_eq!(
+            unreported, TOBII_ERROR_NO_ERROR,
+            "the other call reports it"
+        );
+        assert!(took < PROMPT, "{took:?}");
+        assert_eq!(dispatching, TOBII_ERROR_CONNECTION_FAILED);
+
+        let ((reported, took), dispatching) = while_a_callback_runs(&d, &gates[1], busy);
+        assert_eq!(reported, TOBII_ERROR_CONNECTION_FAILED);
+        assert!(took < PROMPT, "{took:?}");
+        assert_eq!(dispatching, TOBII_ERROR_CONNECTION_FAILED);
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        let ((mended, took), dispatching) = while_a_callback_runs(&d, &gates[2], busy);
+        assert_eq!(mended, TOBII_ERROR_NO_ERROR, "reconnected");
+        assert!(took < PROMPT, "{took:?}");
+        assert_eq!(dispatching, TOBII_ERROR_NO_ERROR);
+        assert_eq!(gates.each_ref().map(Gate::calls), [1; 3]);
+        drop((d, daemon));
+    }
+
+    /// An unsubscribe waits for its callback to return when another
+    /// thread's process is running it, as the DLL's waits on dev+0x4d8
+    /// (0x180153580), and once it has returned that callback is not called
+    /// again. It fails should unsubscribe take the slot without the
+    /// callbacks lock.
+    #[test]
+    fn an_unsubscribe_waits_for_its_callback_running_on_another_thread() {
+        let gate = Gate::default();
+        let d = device_with(0, vec![]);
+        assert_eq!(
+            d.subscribe(
+                |c| &mut c.gaze_origin,
+                Some(held_pair as EyePairFn),
+                gate.ud()
+            ),
+            TOBII_ERROR_NO_ERROR
+        );
+        d.queue(gaze_origin_sample());
+        let d = &d;
+
+        thread::scope(|s| {
+            let processing = s.spawn(|| d.process());
+            assert!(gate.entered(1), "the callback runs on the other thread");
+            let (tx, done) = mpsc::channel();
+            s.spawn(move || tx.send(d.unsubscribe(|c| &mut c.gaze_origin)));
+
+            assert_eq!(
+                done.recv_timeout(ASLEEP),
+                Err(RecvTimeoutError::Timeout),
+                "it waits for the callback"
+            );
+            gate.open();
+            assert_eq!(done.recv_timeout(PROMPT), Ok(TOBII_ERROR_NO_ERROR));
+            assert_eq!(processing.join().expect("process"), TOBII_ERROR_NO_ERROR);
+        });
+
+        d.queue(gaze_origin_sample());
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(gate.calls(), 1, "not called once the unsubscribe returned");
+        assert_eq!(d.mask(), 0);
+    }
+
+    /// A guard against locking too much: while another thread's process
+    /// runs a callback, a request on this thread goes through, as it needs
+    /// the command lock alone, and the callback guard refuses only the
+    /// callback's own thread.
+    #[test]
+    fn a_request_goes_through_while_another_thread_runs_a_callback() {
+        let gate = Gate::default();
+        let d = device_with(0, vec![1]);
+        let handle = ptr::from_ref(&d).cast_mut();
+
+        let ((got, took), processed) = while_a_callback_runs(&d, &gate, || {
+            timed(|| {
+                let mut active = 7u32;
+                // SAFETY: `handle` is `d`, live until the test ends, and the
+                // call forms only a shared borrow of it; `active` is a live
+                // local.
+                let status = unsafe {
+                    crate::api::tobii_get_state_bool(
+                        handle,
+                        crate::types::TOBII_STATE_CALIBRATION_ACTIVE,
+                        &raw mut active,
+                    )
+                };
+                (status, active)
+            })
+        });
+
+        assert_eq!(got, (TOBII_ERROR_NO_ERROR, 1));
+        assert!(took < PROMPT, "{took:?}");
+        assert_eq!(processed, TOBII_ERROR_NO_ERROR);
+    }
+
+    /// A wait on a device another thread is dispatching neither blocks
+    /// behind that dispatch nor answers at once, where the DLL answers at
+    /// once (see `tobii_wait_for_callbacks`): it sleeps out its timeout on
+    /// the doorbell. It fails should a look wait for the dispatch lock (it
+    /// would take the callback's `LONG_WAIT`), or should a busy device count
+    /// as something to process.
+    #[test]
+    fn a_wait_on_a_device_another_thread_dispatches_sleeps_out_its_timeout() {
+        let gate = Gate::default();
+        let d = device_with(0, vec![]);
+
+        let ((woke, took), processed) =
+            while_a_callback_runs(&d, &gate, || timed(|| d.wait(SHORT_WAIT)));
+
+        assert!(!woke);
+        assert!((SHORT_WAIT..PROMPT).contains(&took), "{took:?}");
+        assert_eq!(processed, TOBII_ERROR_NO_ERROR);
+    }
+
+    /// A subscribe lets the callbacks lock go for its round trip, so
+    /// another thread's process keeps delivering the streams already
+    /// subscribed while it waits for the ack. The DLL holds dev+0x4d8 across
+    /// it (0x18015371b..0x180153845), stalling every callback of the device
+    /// for as long as the ack takes. It fails should subscribe hold the lock
+    /// across the round trip: the process then waits for the 2 s the ack is
+    /// given.
+    #[test]
+    fn callbacks_keep_flowing_while_another_thread_subscribes() {
+        let mut hits = 0u32;
+        let (d, mut daemon) = subscribed_device((&raw mut hits).cast());
+        let sample = encode_gaze_origin(&tobii_ipc::EyePair::default());
+
+        thread::scope(|s| {
+            let subscribing = s.spawn(|| {
+                d.subscribe(
+                    |c| &mut c.eye_position,
+                    Some(ignore_pair as EyePairFn),
+                    ptr::null_mut(),
+                )
+            });
+            assert_eq!(
+                subscription(&mut daemon),
+                Some(STREAM_GAZE_ORIGIN | STREAM_EYE_POSITION),
+                "the other thread waits for its ack"
+            );
+            write_frame(&mut daemon, &sample).expect("sample");
+
+            let (status, took) = timed(|| {
+                assert!(d.wait(LONG_WAIT));
+                d.process()
+            });
+
+            assert_eq!(status, TOBII_ERROR_NO_ERROR);
+            assert!(took < PROMPT, "{took:?}");
+            write_frame(&mut daemon, &encode_subscribed(true)).expect("ack");
+            assert_eq!(subscribing.join().expect("subscribe"), TOBII_ERROR_NO_ERROR);
+        });
+
+        drop((d, daemon));
+        assert_eq!(hits, 1);
+    }
+
+    /// Clearing the buffers waits for a dispatch another thread runs, then
+    /// drops what came meanwhile: the next process delivers nothing from
+    /// before the clear. It fails should clear drain the channel without the
+    /// dispatch lock: it returns at once.
+    #[test]
+    fn clearing_waits_for_a_dispatch_on_another_thread_then_leaves_nothing() {
+        let gate = Gate::default();
+        let mut hits = 0u32;
+        let (d, mut daemon) = subscribed_device((&raw mut hits).cast());
+        lock(&d.callbacks).gaze_origin = Some((held_pair as EyePairFn, gate.ud()));
+        d.queue(gaze_origin_sample());
+        let d = &d;
+
+        thread::scope(|s| {
+            let processing = s.spawn(|| d.process());
+            assert!(gate.entered(1), "the callback runs on the other thread");
+            let seen = d.doorbell.rings();
+            write_frame(
+                &mut daemon,
+                &encode_gaze_origin(&tobii_ipc::EyePair::default()),
+            )
+            .expect("sample");
+            assert!(
+                d.doorbell.wait_past(seen, LONG_WAIT),
+                "the sample is queued"
+            );
+            let (tx, done) = mpsc::channel();
+            s.spawn(move || {
+                d.clear_buffers();
+                tx.send(())
+            });
+
+            assert_eq!(
+                done.recv_timeout(ASLEEP),
+                Err(RecvTimeoutError::Timeout),
+                "it waits for the dispatch"
+            );
+            gate.open();
+            assert_eq!(done.recv_timeout(PROMPT), Ok(()));
+            assert_eq!(processing.join().expect("process"), TOBII_ERROR_NO_ERROR);
+        });
+
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(gate.calls(), 1, "what came during the dispatch was cleared");
+        drop(daemon);
+    }
+
+    /// Requests from several threads at once run one at a time under the
+    /// command lock, each getting its own reply, and the samples the daemon
+    /// sends ahead of every reply stay queued for process. It fails should
+    /// the lock cover the write but not the wait: a thread would read
+    /// another's reply, drop it as stale, and time out.
+    #[test]
+    fn requests_from_several_threads_each_get_their_own_reply() {
+        const THREADS: u8 = 4;
+        const EACH: u8 = 100;
+        // Echoes each request's payload, a sample ahead of the reply.
+        let connect = fake_daemon(|body| {
+            let req = tobii_ipc::request::decode_request(body).expect("request");
+            vec![
+                encode_gaze(1, true, [0.5; 2], [f32::NAN; 2]),
+                encode_reply(req.id, 0, req.payload),
+            ]
+        });
+        let d = Device::new(connect, 1, 1).expect("device");
+
+        thread::scope(|s| {
+            for t in 0..THREADS {
+                let d = &d;
+                s.spawn(move || {
+                    for i in 0..EACH {
+                        let payload = [t, i];
+                        assert_eq!(d.request(1, &payload, LONG_WAIT), Ok(payload.to_vec()));
+                    }
+                });
+            }
+        });
+
+        let queued = lock(&d.dispatch).samples.try_iter().count();
+        assert_eq!(queued, usize::from(THREADS) * usize::from(EACH));
+    }
+
+    /// A wait whose look comes while another thread's process holds the
+    /// dispatch lock finds nothing and sleeps. A sample that came during
+    /// that dispatch is still queued when it ends, so the process rings the
+    /// doorbell once more as it lets the lock go. Here the sample's own ring
+    /// comes before the wait starts, so only that second ring can wake it.
+    /// It fails without it: the wait sleeps out its timeout with a sample
+    /// queued.
+    #[test]
+    fn a_wait_turned_away_by_a_dispatch_wakes_for_what_came_meanwhile() {
+        let gate = Gate::default();
+        let mut hits = 0u32;
+        let (d, mut daemon) = subscribed_device((&raw mut hits).cast());
+        lock(&d.callbacks).gaze_origin = Some((held_pair as EyePairFn, gate.ud()));
+        d.queue(gaze_origin_sample());
+        let d = &d;
+
+        let (woke, took) = thread::scope(|s| {
+            let processing = s.spawn(|| d.process());
+            assert!(gate.entered(1), "the callback runs on the other thread");
+            let seen = d.doorbell.rings();
+            write_frame(
+                &mut daemon,
+                &encode_gaze_origin(&tobii_ipc::EyePair::default()),
+            )
+            .expect("sample");
+            assert!(d.doorbell.wait_past(seen, LONG_WAIT), "the sample's ring");
+            let waiting = s.spawn(|| timed(|| d.wait(LONG_WAIT)));
+            // Long enough for its look to have been turned away.
+            thread::sleep(ASLEEP);
+            gate.open();
+            assert_eq!(processing.join().expect("process"), TOBII_ERROR_NO_ERROR);
+            waiting.join().expect("wait")
+        });
+
+        assert!(woke, "{took:?}");
+        assert!(took < ASLEEP + PROMPT, "{took:?}");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(gate.calls(), 2);
+        drop(daemon);
+    }
+
+    /// Two threads waiting on one device: a look on one takes a sample into
+    /// `pending` while the other's look is turned away. The sample rang
+    /// before either looked, so nothing rings during the hold, and the
+    /// holder rings once more as it lets the lock go because it leaves
+    /// something to process. It fails should the holder ring only for a
+    /// ring during its hold: the turned-away wait sleeps out its timeout
+    /// with the sample in `pending`.
+    #[test]
+    fn a_wait_turned_away_by_a_look_that_takes_a_sample_wakes_for_it() {
+        let mut hits = 0u32;
+        let (d, mut daemon) = subscribed_device((&raw mut hits).cast());
+        let seen = d.doorbell.rings();
+        write_frame(
+            &mut daemon,
+            &encode_gaze_origin(&tobii_ipc::EyePair::default()),
+        )
+        .expect("sample");
+        assert!(d.doorbell.wait_past(seen, LONG_WAIT), "the sample's ring");
+
+        let (woke, took) = thread::scope(|s| {
+            // The other thread's look, held open until this one's has come.
+            let waiting = d.in_dispatch(lock(&d.dispatch), |dispatch| {
+                let waiting = s.spawn(|| timed(|| d.wait(LONG_WAIT)));
+                // Long enough for its look to have been turned away.
+                thread::sleep(ASLEEP);
+                assert!(dispatch.take_one(), "the look takes the sample");
+                waiting
+            });
+            waiting.join().expect("wait")
+        });
+
+        assert!(woke, "{took:?}");
+        assert!(took < ASLEEP + PROMPT, "{took:?}");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop((d, daemon));
+        assert_eq!(hits, 1);
+    }
+
+    /// A reconnect on one thread waits for a callback another thread's
+    /// process is running: it reads the subscriptions under the callbacks
+    /// lock and swaps the samples channel under the dispatch lock, as the
+    /// DLL's reconnect waits for its process mutex (0x18000eb88). The next
+    /// process then delivers the new link's sample. It fails should the
+    /// reconnect take neither lock.
+    #[test]
+    fn a_reconnect_waits_for_a_callback_running_on_another_thread() {
+        let gate = Gate::default();
+        let mut hits = 0u32;
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        lock(&d.callbacks).gaze_origin = Some((held_pair as EyePairFn, gate.ud()));
+        d.queue(gaze_origin_sample());
+        let d = &d;
+
+        thread::scope(|s| {
+            let processing = s.spawn(|| d.process());
+            assert!(gate.entered(1), "the callback runs on the other thread");
+            let (tx, done) = mpsc::channel();
+            s.spawn(move || tx.send(d.reconnect()));
+
+            assert_eq!(
+                done.recv_timeout(ASLEEP),
+                Err(RecvTimeoutError::Timeout),
+                "it waits for the callback"
+            );
+            gate.open();
+            assert_eq!(done.recv_timeout(PROMPT), Ok(TOBII_ERROR_NO_ERROR));
+            assert_eq!(
+                processing.join().expect("process"),
+                TOBII_ERROR_CONNECTION_FAILED,
+                "the old connection's loss"
+            );
+        });
+
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert!(d.wait(LONG_WAIT));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(gate.calls(), 2, "the new connection's sample");
+        drop(daemon);
+    }
+
+    /// A guard: a reconnect on one thread waits for a device-info fetch
+    /// another thread has under way, which gets its answer from the
+    /// connection it asked, and the next fetch asks the new connection. Both
+    /// follow from the connection and the kept identity being the command
+    /// lock's. That the fetch checks, asks and keeps under one hold of it,
+    /// so that a reconnect cannot come between the ask and the keep and
+    /// leave the old identity kept for the new connection, this pins only
+    /// when the reconnect would win the race for the lock.
+    #[test]
+    fn a_reconnect_waits_for_a_device_info_fetch_on_another_thread() {
+        use tobii_ipc::request::{DeviceInfo, decode_request, encode_device_info};
+        // The id of the device-info request the client sent `daemon`.
+        let asked = |daemon: &mut UnixStream| {
+            let body = read_frame(daemon).expect("read").expect("a frame");
+            let req = decode_request(&body).expect("request");
+            assert_eq!(req.kind, kind::DEVICE_INFO);
+            req.id
+        };
+        let answer = |daemon: &mut UnixStream, id: u32, serial: &str| {
+            let info = DeviceInfo {
+                serial_number: serial.into(),
+                ..DeviceInfo::default()
+            };
+            let reply = encode_reply(id, 0, &encode_device_info(&info));
+            write_frame(daemon, &reply).expect("reply");
+        };
+        let serial = |d: &Device| d.device_info().map(|info| info.serial_number);
+        let (connect, daemons) = scripted_daemon(vec![]);
+        let d = Device::new(connect, 1, 1).expect("device");
+        let mut first = daemons.recv().expect("daemon end");
+
+        thread::scope(|s| {
+            let fetching = s.spawn(|| serial(&d));
+            let id = asked(&mut first);
+            let (tx, done) = mpsc::channel();
+            let reconnecting = &d;
+            s.spawn(move || tx.send(reconnecting.reconnect()));
+
+            assert!(
+                daemons.recv_timeout(ASLEEP).is_err(),
+                "it waits for the fetch before it connects"
+            );
+            answer(&mut first, id, "old");
+            assert_eq!(fetching.join().expect("fetch"), Ok("old".into()));
+            assert_eq!(done.recv_timeout(PROMPT), Ok(TOBII_ERROR_NO_ERROR));
+        });
+
+        let mut second = daemons.recv().expect("second daemon end");
+        thread::scope(|s| {
+            let fetching = s.spawn(|| serial(&d));
+            let id = asked(&mut second);
+            answer(&mut second, id, "new");
+            assert_eq!(fetching.join().expect("fetch"), Ok("new".into()));
+        });
+        drop((d, first, second));
+    }
+
+    /// An end-to-end guard: a wait sleeping on a reported loss wakes for the
+    /// sample of the link a reconnect on another thread puts in place. What
+    /// it depends on is pinned by
+    /// `a_reconnects_samples_ring_the_doorbell_a_lost_wait_sleeps_on`, which
+    /// fails should a link ring a doorbell of its own.
+    #[test]
+    fn a_wait_on_a_reported_loss_wakes_for_a_reconnect_on_another_thread() {
+        let mut hits = 0u32;
+        let (d, daemons) = lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+
+        let (woke, took) = thread::scope(|s| {
+            let waiting = s.spawn(|| timed(|| d.wait(LONG_WAIT)));
+            thread::sleep(ASLEEP);
+            assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+            waiting.join().expect("wait")
+        });
+
+        assert!(woke, "{took:?}");
+        assert!(took < ASLEEP + PROMPT, "{took:?}");
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop((d, daemon));
+        assert_eq!(hits, 1);
+    }
+
+    unsafe extern "C" fn count_lines(context: *mut c_void, _level: LogLevel, _text: *const c_char) {
+        // SAFETY: the test passes a live `AtomicU32` as the context.
+        unsafe { &*context.cast::<std::sync::atomic::AtomicU32>() }.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A guard: however many threads process a lost device at once, one
+    /// reports the loss and logs it, once; a call that finds another
+    /// dispatching answers from the last report. It held with one thread.
+    #[test]
+    fn a_loss_is_logged_once_however_many_threads_process() {
+        const THREADS: usize = 4;
+        let lines = std::sync::atomic::AtomicU32::new(0);
+        let mut hits = 0u32;
+        let (mut d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        d.set_logger(crate::logger::tests::logger(
+            count_lines,
+            ptr::from_ref(&lines).cast_mut().cast(),
+        ));
+        let d = &d;
+        let barrier = std::sync::Barrier::new(THREADS);
+
+        thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..50 {
+                        let status = d.process();
+                        assert!(
+                            matches!(status, TOBII_ERROR_NO_ERROR | TOBII_ERROR_CONNECTION_FAILED),
+                            "{status}"
+                        );
+                    }
+                });
+            }
+        });
+
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert_eq!(lines.load(Ordering::Relaxed), 1);
+    }
+
+    /// A logger's context that hands the device that logs to another
+    /// thread, which makes `call` on it, and waits `PROMPT` for it to come
+    /// back: whether it did, one per line.
+    struct Handoff {
+        /// The device that logs, set once its logger is.
+        device: Cell<*const Device>,
+        call: fn(&Device),
+        came_back: Mutex<Vec<bool>>,
+        threads: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl Handoff {
+        fn new(call: fn(&Device)) -> Self {
+            Self {
+                device: Cell::new(ptr::null()),
+                call,
+                came_back: Mutex::default(),
+                threads: Mutex::default(),
+            }
+        }
+
+        fn context(&self) -> *mut c_void {
+            ptr::from_ref(self).cast_mut().cast()
+        }
+
+        /// Join the threads it started, then say whether each call came back
+        /// while the logger waited.
+        fn came_back(&self) -> Vec<bool> {
+            for thread in lock(&self.threads).drain(..) {
+                thread.join().expect("call");
+            }
+            lock(&self.came_back).clone()
+        }
+    }
+
+    unsafe extern "C" fn hand_off(context: *mut c_void, _level: LogLevel, _text: *const c_char) {
+        // SAFETY: the test passes a live `Handoff` as the context, logging
+        // on the thread that set its device.
+        let h = unsafe { &*context.cast::<Handoff>() };
+        // SAFETY: the device is live, and the test joins every thread this
+        // starts (`Handoff::came_back`) before it drops the device.
+        let device: &'static Device = unsafe { &*h.device.get() };
+        let call = h.call;
+        let (tx, rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            call(device);
+            let _ = tx.send(());
+        });
+        lock(&h.came_back).push(rx.recv_timeout(PROMPT).is_ok());
+        lock(&h.threads).push(thread);
+    }
+
+    /// A call that logs lets every lock it took go first, so a logger may
+    /// wait for another thread's call into the device that logs: a clear,
+    /// which needs the dispatch lock, on the loss a process reports, and a
+    /// recenter, which needs the command lock, on a reconnect. It fails
+    /// should either line be logged under the lock its call needs: the call
+    /// then comes back only once the logger has given up on it.
+    #[test]
+    fn a_logger_may_wait_for_another_thread_using_the_device() {
+        let loss = Handoff::new(Device::clear_buffers);
+        let reconnect = Handoff::new(|d| {
+            assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
+        });
+        let mut hits = 0u32;
+        let (mut d, daemons) =
+            lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+
+        d.set_logger(crate::logger::tests::logger(hand_off, loss.context()));
+        loss.device.set(ptr::from_ref(&d));
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert_eq!(loss.came_back(), [true], "the clear, on the loss line");
+
+        d.set_logger(crate::logger::tests::logger(hand_off, reconnect.context()));
+        reconnect.device.set(ptr::from_ref(&d));
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(
+            reconnect.came_back(),
+            [true],
+            "the recenter, on the reconnect line"
+        );
+
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        let recenter = read_frame(&mut daemon).expect("read").expect("a frame");
+        assert_eq!(recenter.first(), Some(&tobii_ipc::TAG_RECENTER));
+        drop((d, daemon));
     }
 }

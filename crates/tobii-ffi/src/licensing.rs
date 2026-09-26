@@ -9,7 +9,7 @@
 use std::ffi::{c_char, c_void};
 
 use crate::api::create_device;
-use crate::device::{Api, Device, device_mut};
+use crate::device::{Api, Device, device_ref};
 use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
 use crate::stub::not_supported;
 use crate::types::{
@@ -56,16 +56,17 @@ pub unsafe extern "C" fn tobii_device_create_ex(
 /// Consumer.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call; `feature_group` must be null or valid for writing one
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns; `feature_group` must be null or valid for writing one
 /// `tobii_feature_group_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_get_feature_group(
     device: *mut Device,
     feature_group: *mut u32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     if feature_group.is_null() {

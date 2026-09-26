@@ -16,7 +16,7 @@ use tobii_ipc::request::{
 
 use crate::api::{FACTS_TIMEOUT, write_supported};
 use crate::calibration::request;
-use crate::device::{Device, device_mut, in_callback};
+use crate::device::{Device, device_ref, in_callback};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
     TOBII_ERROR_NOT_SUPPORTED,
@@ -31,16 +31,17 @@ use crate::types::{
 /// The field of use the device was created with.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call; `field_of_use` must be null or valid for writing one
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns; `field_of_use` must be null or valid for writing one
 /// `tobii_field_of_use_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_get_field_of_use(
     device: *mut Device,
     field_of_use: *mut FieldOfUse,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -70,8 +71,8 @@ pub unsafe extern "C" fn tobii_field_of_use_subscribe(
 /// Undo `tobii_field_of_use_subscribe`.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call.
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_field_of_use_unsubscribe(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
@@ -96,8 +97,8 @@ pub unsafe extern "C" fn tobii_image_subscribe(
 /// Undo `tobii_image_subscribe`.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call.
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_image_unsubscribe(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
@@ -320,8 +321,9 @@ pub unsafe extern "C" fn tobii_timesync(
     device: *mut Device,
     timesync: *mut TimesyncData,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -411,8 +413,9 @@ pub unsafe extern "C" fn tobii_enumerate_stream_types(
     receiver: Option<StreamTypeReceiver>,
     user_data: *mut c_void,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -450,8 +453,8 @@ const PAUSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// while a calibration session runs.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call.
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_pause_device(device: *mut Device) -> Status {
     // SAFETY: forwarded under the same contract.
@@ -549,8 +552,9 @@ pub unsafe extern "C" fn tobii_hardware_configuration_get(
     device: *mut Device,
     configuration: *mut HardwareConfiguration,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };

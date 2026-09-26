@@ -15,17 +15,22 @@
 //!
 //! The logger is called synchronously, on the thread inside the `tobii_*` call
 //! that has something to say, and never from the reader thread: a [`Logger`]
-//! holds the application's context pointer, so it is not `Send`. libtobii
-//! holds no lock while it runs, and does not serialise calls across
-//! threads, so devices used on two threads may log at once. It runs
-//! under the callback guard (see [`crate::device::call`]), because the device
-//! that logs may be borrowed: a call from inside it that a stream callback
-//! could not make either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`. The guard is
-//! the logging thread's own, so it does not stop another thread the logger
-//! hands the line to from using that device meanwhile; what forbids that is
-//! the rule every entry point's `# Safety` states, that no other thread uses
-//! the device during the call. These are libtobii's guarantees, not the
-//! DLL's.
+//! holds the application's context pointer, so it is not `Send`, and the
+//! [`SharedLogger`] a device keeps it in never reaches the reader. libtobii
+//! takes no lock of its own around it, lets every lock the logging call took
+//! go before it logs (a line logged from inside a callback still runs under
+//! that callback's, see below), and does not serialise calls across threads,
+//! so threads using one device, or several, may log at once, and their lines
+//! may interleave: a loss one thread's process reports can come after the
+//! reconnect another thread made since. It runs under the callback guard (see
+//! [`crate::device::call`]): a call from inside it that a stream callback
+//! could not make either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, as for a
+//! callback. The guard is the logging thread's own, so another thread the
+//! logger hands the line to may use the device meanwhile. A line logged by a
+//! call made from inside a callback (a refused `field_of_use`) runs under
+//! that callback's device locks, so a logger, like a callback, must not
+//! block on another thread's call into the same device. These are
+//! libtobii's guarantees, not the DLL's.
 //!
 //! The 4.1 DLL, for comparison: its error lines go through one helper,
 //! 0x18015e360(api, level, fmt, ...), which takes no lock and calls
@@ -37,9 +42,10 @@
 //! upgrade in progress (0x18014467e, 0x1801588e3). Nearly every failing call
 //! logs such a line, `tobii_device_process_callbacks` on every call that
 //! returns `TOBII_ERROR_CONNECTION_FAILED` (0x180143c74), and a device logs
-//! through the API it was created from. Some callers hold the device's
-//! critical section around it (`tobii_device_reconnect`,
-//! 0x180143873..0x180143a0f), and a thread of the DLL's own reaches it too
+//! through the API it was created from. Some callers hold the device's API
+//! mutex (dev+0x4e0) around it (`tobii_device_reconnect`,
+//! 0x180143873..0x180143a0f; `tobii_calibration_retrieve`'s error line,
+//! 0x180147c57), and a thread of the DLL's own reaches it too
 //! (0x18002b230, through 0x180169550). The helper is not the only path:
 //! thunks forward the lines of the DLL's own sub-libraries straight to
 //! `log_func`, at DEBUG and TRACE while it enumerates devices (0x18015b070,
@@ -68,6 +74,22 @@ pub(crate) struct Logger {
     func: LogFn,
     context: *mut c_void,
 }
+
+/// A device's copy of its API's logger, which every thread calling into the
+/// device may call, several at once. Only the device holds one, never the
+/// reader thread's end of its connection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedLogger(pub(crate) Logger);
+
+// SAFETY: `tobii_api_create`'s contract makes the logger sound to call on any
+// thread that calls into the API or a device created from it, from several
+// at once, until those are destroyed. libtobii calls it only from inside such
+// a call (see `emit`), never from a thread of its own, and never reads
+// through `context` itself: moving or sharing the copy moves two pointers.
+unsafe impl Send for SharedLogger {}
+// SAFETY: as for `Send`: a shared copy is only ever called, which the
+// contract allows from several threads at once.
+unsafe impl Sync for SharedLogger {}
 
 impl Logger {
     /// The logger `custom_log` describes: none for null, where the DLL
@@ -129,16 +151,16 @@ pub(crate) fn emit(logger: Option<Logger>, level: Level, args: fmt::Arguments<'_
     };
     // SAFETY: `tobii_api_create`'s contract makes `func` sound to call with
     // `context`, any level and a NUL-terminated string valid for the call, on
-    // any thread that calls into the API or a device created from it, until
-    // those are destroyed; this runs inside such a call, and `text` outlives
-    // it.
+    // any thread that calls into the API or a device created from it, from
+    // several at once, until those are destroyed; this runs inside such a
+    // call, and `text` outlives it.
     call(|| unsafe { (logger.func)(logger.context, level.c(), text.as_ptr()) });
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::device::{device_mut, in_callback};
+    use crate::device::{device_ref, in_callback};
     use crate::status::TOBII_ERROR_CALLBACK_IN_PROGRESS;
     use std::cell::{Cell, RefCell};
     use std::ffi::{CStr, c_char};
@@ -255,7 +277,7 @@ pub(crate) mod tests {
         // SAFETY: the test passes a live `Cell<Status>` as the context.
         let seen = unsafe { &*context.cast::<Cell<Status>>() };
         // SAFETY: a null handle is never dereferenced; the guard answers first.
-        seen.set(match unsafe { device_mut(ptr::null_mut()) } {
+        seen.set(match unsafe { device_ref(ptr::null_mut()) } {
             Err(status) => status,
             Ok(_) => 0,
         });

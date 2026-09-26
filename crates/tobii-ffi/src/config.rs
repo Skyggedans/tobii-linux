@@ -9,8 +9,8 @@ use tobii_ipc::request::{
     DEVICE_NAME_MAX, decode_display_area, decode_geometry_mounting, encode_display_area, kind,
 };
 
-use crate::api::{FACTS_TIMEOUT, fetch_device_info};
-use crate::device::{Api, Device, device_mut};
+use crate::api::FACTS_TIMEOUT;
+use crate::device::{Api, Device, device_ref};
 use crate::status::{
     Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUPPORTED,
 };
@@ -27,12 +27,13 @@ const DISPLAY_AREA_TIMEOUT: Duration = Duration::from_secs(8);
 /// Only both eyes: per-eye tracking was never captured.
 ///
 /// # Safety
-/// `device` must be null or a live handle from `tobii_device_create` that no
-/// other thread uses during the call.
+/// `device` must be null or a live handle from `tobii_device_create` that is
+/// not destroyed before the call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_set_enabled_eye(device: *mut Device, enabled_eye: u32) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     match enabled_eye {
@@ -52,8 +53,9 @@ pub unsafe extern "C" fn tobii_get_enabled_eye(
     device: *mut Device,
     enabled_eye: *mut u32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     if enabled_eye.is_null() {
@@ -103,8 +105,9 @@ pub unsafe extern "C" fn tobii_get_geometry_mounting(
     device: *mut Device,
     geometry_mounting: *mut GeometryMounting,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -135,8 +138,9 @@ pub unsafe extern "C" fn tobii_get_display_area(
     device: *mut Device,
     display_area: *mut DisplayArea,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -168,8 +172,9 @@ pub unsafe extern "C" fn tobii_set_display_area(
     device: *mut Device,
     display_area: *const DisplayArea,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -232,8 +237,9 @@ pub unsafe extern "C" fn tobii_get_device_name(
     device: *mut Device,
     device_name: *mut DeviceName,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -242,7 +248,7 @@ pub unsafe extern "C" fn tobii_get_device_name(
     }
     let bytes = match d.request(kind::DEVICE_NAME_GET, &[], FACTS_TIMEOUT) {
         Ok(bytes) => bytes,
-        Err(TOBII_ERROR_NOT_SUPPORTED) => match fetch_device_info(d) {
+        Err(TOBII_ERROR_NOT_SUPPORTED) => match d.device_info() {
             Ok(info) => info.model.into_bytes(),
             Err(status) => return status,
         },
@@ -268,8 +274,9 @@ pub unsafe extern "C" fn tobii_set_device_name(
     device: *mut Device,
     device_name: *const c_char,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -315,8 +322,9 @@ pub unsafe extern "C" fn tobii_enumerate_output_frequencies(
     receiver: Option<OutputFrequencyReceiver>,
     user_data: *mut c_void,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     let Some(receiver) = receiver else {
@@ -337,8 +345,9 @@ pub unsafe extern "C" fn tobii_set_output_frequency(
     device: *mut Device,
     output_frequency: f32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     if output_frequency.is_nan() || output_frequency < 0.0 {
@@ -361,8 +370,9 @@ pub unsafe extern "C" fn tobii_get_output_frequency(
     device: *mut Device,
     output_frequency: *mut f32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     if output_frequency.is_null() {

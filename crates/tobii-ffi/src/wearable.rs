@@ -4,7 +4,7 @@
 
 use std::ffi::c_void;
 
-use crate::device::{Device, device_mut};
+use crate::device::{Device, device_ref};
 use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
 use crate::stub::not_supported;
 use crate::types::TOBII_LENS_CONFIGURATION_NOT_WRITABLE;
@@ -24,8 +24,9 @@ pub unsafe extern "C" fn tobii_lens_configuration_writable(
     device: *mut Device,
     writable: *mut u32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     if writable.is_null() {

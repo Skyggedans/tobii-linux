@@ -4,9 +4,9 @@
 use std::ffi::{c_char, c_void};
 use std::time::Duration;
 
-use tobii_ipc::request::{self, decode_device_info, decode_track_box, kind};
+use tobii_ipc::request::{self, decode_track_box, kind};
 
-use crate::device::{Api, Device, device_mut, in_callback};
+use crate::device::{Api, Device, device_ref, in_callback};
 use crate::logger::{self, Level, Logger};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_CONFLICTING_API_INSTANCES,
@@ -78,8 +78,8 @@ pub unsafe extern "C" fn tobii_get_api_version(version: *mut Version) -> Status 
 /// `custom_log` must each be null or valid for reading one struct during the
 /// call. A `log_func` must be sound to call with `log_context`, any
 /// `tobii_log_level_t` and a NUL-terminated string valid for the call, on any
-/// thread that calls into the handle or a device created from it, until the
-/// handle and every such device are destroyed.
+/// thread that calls into the handle or a device created from it, from
+/// several at once, until the handle and every such device are destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_api_create(
     api: *mut *mut Api,
@@ -115,8 +115,8 @@ pub unsafe extern "C" fn tobii_api_create(
 ///
 /// # Safety
 /// `api` must be null or a handle from `tobii_api_create` that has not been
-/// destroyed yet; once this returns `TOBII_ERROR_NO_ERROR` it must not be
-/// used again.
+/// destroyed yet and that no other thread is inside a call on; once this
+/// returns `TOBII_ERROR_NO_ERROR` no thread may use it again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_api_destroy(api: *mut Api) -> Status {
     if api.is_null() {
@@ -126,7 +126,8 @@ pub unsafe extern "C" fn tobii_api_destroy(api: *mut Api) -> Status {
         return TOBII_ERROR_CALLBACK_IN_PROGRESS;
     }
     // SAFETY: non-null (checked above), and the caller guarantees it came
-    // from `Box::into_raw` in `tobii_api_create` and is destroyed only once.
+    // from `Box::into_raw` in `tobii_api_create`, is destroyed only once, and
+    // that no other thread is inside a call on it or uses it later.
     drop(unsafe { Box::from_raw(api) });
     TOBII_ERROR_NO_ERROR
 }
@@ -274,21 +275,24 @@ pub unsafe extern "C" fn tobii_device_create(
 /// `TOBII_ERROR_INVALID_PARAMETER`, and a call from inside a callback
 /// `TOBII_ERROR_CALLBACK_IN_PROGRESS` for any device, since the one a callback
 /// runs on is still being dispatched; as in the DLL, neither releases
-/// anything.
+/// anything. It takes none of the device's locks, as the DLL's destroy takes
+/// none (0x18015a320): the caller keeps every other thread out.
 ///
 /// # Safety
 /// `device` must be null or a handle from `tobii_device_create` that has not
-/// been destroyed yet and is not in use by another thread; once this returns
-/// `TOBII_ERROR_NO_ERROR` it must not be used again.
+/// been destroyed yet and that no other thread is inside a call on; once
+/// this returns `TOBII_ERROR_NO_ERROR` no thread may use it again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_device_destroy(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     // SAFETY: non-null (checked above), and the caller guarantees it came
-    // from `Box::into_raw` in `tobii_device_create` and is destroyed only
-    // once; no callback runs on this thread, so no dispatch loop borrows it.
+    // from `Box::into_raw` in `tobii_device_create`, is destroyed only once,
+    // and that no other thread is inside a call on it or uses it later; no
+    // callback runs on this thread, so no dispatch loop of its own holds it.
     drop(unsafe { Box::from_raw(device) });
     TOBII_ERROR_NO_ERROR
 }
@@ -315,10 +319,19 @@ const WAIT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// shows none. As in the DLL, whose internal wait gives back only 0 or 1,
 /// this never returns `TOBII_ERROR_CONNECTION_FAILED` itself.
 ///
+/// The devices are waited on one after another, each holding none of its
+/// locks while it sleeps. A device another thread is dispatching is waited
+/// on as usual, on its doorbell, until that thread leaves it something to
+/// process; the DLL instead skips a device whose process mutex another
+/// thread holds, and with nothing else to wait on returns
+/// `TOBII_ERROR_NO_ERROR` at once (its wait at 0x1801596e0: the try-enter at
+/// 0x18000e940, read from the code, not observed), which would spin a
+/// wait-and-process loop.
+///
 /// # Safety
 /// `devices` must be null or point to `device_count` initialised
 /// `*mut Device` values, each null or a live handle from
-/// `tobii_device_create` that no other thread uses during the call.
+/// `tobii_device_create` that is not destroyed before the call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_wait_for_callbacks(
     device_count: i32,
@@ -337,8 +350,8 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
     if handles.iter().any(|h| h.is_null()) {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    // Before any device is read: the one a callback runs on is still
-    // borrowed by the dispatch loop.
+    // Before any device is read: a callback runs under its device's locks,
+    // and may call into no device.
     if in_callback() {
         return TOBII_ERROR_CALLBACK_IN_PROGRESS;
     }
@@ -353,9 +366,9 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
     }
     let mut any = false;
     for &handle in handles {
-        // SAFETY: the caller guarantees each handle is live and unaliased;
-        // the reference is dropped before the next iteration.
-        match unsafe { device_mut(handle) } {
+        // SAFETY: the caller guarantees each handle is live until this
+        // returns; the reference is dropped before the next iteration.
+        match unsafe { device_ref(handle) } {
             Ok(d) => any |= d.wait(WAIT_POLL_TIMEOUT),
             Err(status) => return status,
         }
@@ -382,28 +395,46 @@ pub unsafe extern "C" fn tobii_wait_for_callbacks(
 /// `tobii_device_reconnect`), so this is the call that says whether the
 /// connection is gone.
 ///
+/// The callbacks run one at a time per device, on whichever thread calls
+/// this. A call made while another thread holds the device's dispatch (a
+/// process running the callbacks, a look of `tobii_wait_for_callbacks`, a
+/// clear, or a reconnect's swap) returns at once and delivers nothing, what
+/// is queued staying for the next call: `TOBII_ERROR_NO_ERROR`, or
+/// `TOBII_ERROR_CONNECTION_FAILED` once the loss has been reported, until a
+/// reconnect. The DLL's returns `TOBII_ERROR_NO_ERROR` when another thread
+/// holds its process mutex (0x18000e9d9..0x18000e9ea), even after a loss,
+/// once it has delivered the device's queued notifications on this thread
+/// (0x180159515..0x180159566).
+///
 /// # Safety
-/// `device` must be null or a live handle from `tobii_device_create` that no
-/// other thread uses during the call. The callbacks registered on it are
+/// `device` must be null or a live handle from `tobii_device_create` that is
+/// not destroyed before the call returns. The callbacks registered on it are
 /// invoked under the contracts stated on the `tobii_*_subscribe` functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_device_process_callbacks(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(d) => d.process(),
         Err(status) => status,
     }
 }
 
 /// Drop every sample queued for `device` without delivering it. A lost
-/// daemon connection is still reported by the next process call.
+/// daemon connection is still reported by the next process call. While
+/// another thread is dispatching the device, this waits for it to finish;
+/// it never waits for a request. The DLL's instead waits for requests, under
+/// its API mutex (0x180143a85), and while another thread processes it
+/// clears only the device's queued notifications (its try-enter at
+/// 0x18000e9d9, through 0x180158a20, fails), leaving the rest.
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_device_clear_callback_buffers(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(d) => {
             d.clear_buffers();
             TOBII_ERROR_NO_ERROR
@@ -428,12 +459,19 @@ pub unsafe extern "C" fn tobii_device_clear_callback_buffers(device: *mut Device
 /// tracker: when a request fails with `TOBII_ERROR_CONNECTION_FAILED` because
 /// the daemon has no tracker, a reconnect succeeds without bringing it back.
 ///
+/// On a device shared between threads it first waits for any request or
+/// subscription change another thread has under way (the ~500 ms count from
+/// then), then for a callback another thread is running before it asks for
+/// the subscriptions back, and swaps the connection once a dispatch another
+/// thread runs has finished.
+///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_device_reconnect(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(d) => d.reconnect(),
         Err(status) => status,
     }
@@ -448,8 +486,9 @@ pub unsafe extern "C" fn tobii_device_reconnect(device: *mut Device) -> Status {
 /// As `tobii_device_process_callbacks`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_update_timesync(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(_) => TOBII_ERROR_NO_ERROR,
         Err(status) => status,
     }
@@ -473,17 +512,6 @@ pub unsafe extern "C" fn tobii_system_clock(api: *mut Api, timestamp_us: *mut i6
     // SAFETY: non-null, and the caller guarantees it is writable.
     unsafe { timestamp_us.write(now) };
     TOBII_ERROR_NO_ERROR
-}
-
-/// Fetch the device's identity from the daemon, once per connection.
-pub(crate) fn fetch_device_info(d: &mut Device) -> Result<request::DeviceInfo, Status> {
-    if let Some(info) = &d.device_info {
-        return Ok(info.clone());
-    }
-    let payload = d.request(kind::DEVICE_INFO, &[], FACTS_TIMEOUT)?;
-    let info = decode_device_info(&payload).ok_or_else(|| d.malformed("device info"))?;
-    d.device_info = Some(info.clone());
-    Ok(info)
 }
 
 fn device_info_c(info: &request::DeviceInfo) -> DeviceInfo {
@@ -520,6 +548,8 @@ fn device_info_c(info: &request::DeviceInfo) -> DeviceInfo {
 /// `integration_id`, `hw_calibration_version`, `hw_calibration_date` and
 /// `lot_id` are empty, as the DLL leaves them for a tracker it drives over
 /// USB. From a daemon that predates it, the integration type is empty too.
+/// Fetched once per connection; a read of the one kept waits, too, for a
+/// request another thread has under way on the device.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `device_info` must be null or
@@ -529,15 +559,16 @@ pub unsafe extern "C" fn tobii_get_device_info(
     device: *mut Device,
     device_info: *mut DeviceInfo,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
     if device_info.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    match fetch_device_info(d) {
+    match d.device_info() {
         Ok(info) => {
             // SAFETY: non-null, and the caller guarantees it is writable.
             unsafe { device_info.write(device_info_c(&info)) };
@@ -558,8 +589,9 @@ pub unsafe extern "C" fn tobii_get_track_box(
     device: *mut Device,
     track_box: *mut TrackBox,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -590,7 +622,7 @@ pub unsafe extern "C" fn tobii_get_track_box(
 }
 
 /// Ask the daemon for a state value.
-fn query_state(d: &mut Device, state: u32) -> Result<Vec<u8>, Status> {
+fn query_state(d: &Device, state: u32) -> Result<Vec<u8>, Status> {
     d.request(kind::STATE, &request::encode_u32(state), STATE_TIMEOUT)
 }
 
@@ -613,8 +645,9 @@ pub unsafe extern "C" fn tobii_get_state_bool(
     state: u32,
     value: *mut u32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -653,8 +686,9 @@ pub unsafe extern "C" fn tobii_get_state_uint32(
     state: u32,
     value: *mut u32,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -705,8 +739,9 @@ pub unsafe extern "C" fn tobii_get_state_string(
     state: u32,
     value: *mut StateString,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
@@ -767,8 +802,9 @@ pub(crate) unsafe fn write_supported(
     supported: *mut u32,
     known: fn(u32) -> bool,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    if let Err(status) = unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    if let Err(status) = unsafe { device_ref(device) } {
         return status;
     }
     if supported.is_null() || i32::try_from(value).is_err() {
@@ -1002,7 +1038,7 @@ mod tests {
     fn a_reply_that_does_not_decode_is_logged_and_internal() {
         let recorder = Recorder::default();
         let mut d = crate::device::tests::device_with(0, vec![0xff]);
-        d.logger = recorder.logger();
+        d.set_logger(recorder.logger());
         let d = Box::into_raw(Box::new(d));
         let mut track_box = TrackBox::default();
         // SAFETY: `d` is live and destroyed once; `track_box` a live local.

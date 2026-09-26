@@ -1,19 +1,28 @@
 //! `tobii_streams.h`: the sample streams, plus the `tobii_recenter` extension.
 //!
 //! Every subscribe entry point has the same contract: `device` must be null
-//! or a live handle from `tobii_device_create` that no other thread uses
-//! during the call; `callback` must be null (rejected) or sound to invoke with
-//! a valid pointer to its sample type and `user_data`, must not re-enter this
-//! library (an implemented call that takes a device, one that creates a
+//! or a live handle from `tobii_device_create` that is not destroyed before
+//! the call returns; `callback` must be null (rejected) or sound to invoke
+//! with a valid pointer to its sample type and `user_data` on any thread that
+//! calls `tobii_device_process_callbacks` on the device, must not re-enter
+//! this library (an implemented call that takes a device, one that creates a
 //! device, `tobii_calibration_parse` or `tobii_api_destroy` is refused with
 //! `TOBII_ERROR_CALLBACK_IN_PROGRESS`; see the crate documentation), and
 //! `user_data` must stay valid until the stream is unsubscribed or the device
-//! destroyed. Callbacks run on the thread that calls
-//! `tobii_device_process_callbacks`.
+//! destroyed (until the call returns, if it fails). Callbacks run on the
+//! thread that calls `tobii_device_process_callbacks`, one at a time per
+//! device. A subscribe and an unsubscribe each wait for a callback of the
+//! device that another thread is running. Once an unsubscribe returns, its
+//! callback is not running on any thread, and none calls it again. A
+//! subscribe may have its callback called, on a thread processing the
+//! device, before it returns, even if it then fails; once it has returned an
+//! error, none calls it again. The DLL stores a callback only once the
+//! tracker has taken the subscription (0x1801537cc..0x1801537de), so a
+//! failed subscribe's callback never runs there.
 
 use std::ffi::c_void;
 
-use crate::device::{Callbacks, Device, Slot, device_mut};
+use crate::device::{Callbacks, Device, Slot, device_ref};
 use crate::status::{Status, TOBII_ERROR_NO_ERROR};
 use crate::types::{EyePairFn, GazePointFn, HeadPoseFn, NotificationsFn, PresenceFn};
 
@@ -27,8 +36,9 @@ pub(crate) unsafe fn subscribe<F: Copy>(
     callback: Option<F>,
     user_data: *mut c_void,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(d) => d.subscribe(slot, callback, user_data),
         Err(status) => status,
     }
@@ -37,14 +47,15 @@ pub(crate) unsafe fn subscribe<F: Copy>(
 /// Unsubscribe `slot` of the device behind `device`.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call.
+/// `device` must be null or a live handle that is not destroyed before the
+/// call returns.
 pub(crate) unsafe fn unsubscribe<F: Copy>(
     device: *mut Device,
     slot: fn(&mut Callbacks) -> &mut Slot<F>,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(d) => d.unsubscribe(slot),
         Err(status) => status,
     }
@@ -69,8 +80,8 @@ macro_rules! stream_pair {
         #[doc = concat!("Undo `", stringify!($sub), "`.")]
         ///
         /// # Safety
-        /// `device` must be null or a live handle that no other thread uses
-        /// during the call.
+        /// `device` must be null or a live handle that is not destroyed
+        /// before the call returns.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $unsub(device: *mut Device) -> Status {
             // SAFETY: forwarded under the same contract.
@@ -103,12 +114,13 @@ stream_pair! {
 /// Engine). Affects whichever client currently holds the device's mode.
 ///
 /// # Safety
-/// `device` must be null or a live handle from `tobii_device_create` that no
-/// other thread uses during the call.
+/// `device` must be null or a live handle from `tobii_device_create` that is
+/// not destroyed before the call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };

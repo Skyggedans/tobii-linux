@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
 
-use crate::device::{Api, Device, device_mut, in_callback};
+use crate::device::{Api, Device, device_ref, in_callback};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
     TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_OPERATION_FAILED,
@@ -41,16 +41,17 @@ const CLEAR_TIMEOUT: Duration = Duration::from_secs(8);
 /// Run a request on `device`, discarding the reply payload.
 ///
 /// # Safety
-/// `device` must be null or a live handle from `tobii_device_create` that no
-/// other thread uses during the call.
+/// `device` must be null or a live handle from `tobii_device_create` that is
+/// not destroyed before the call returns.
 pub(crate) unsafe fn request(
     device: *mut Device,
     request: u8,
     payload: &[u8],
     timeout: Duration,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    match unsafe { device_ref(device) } {
         Ok(d) => match d.request(request, payload, timeout) {
             Ok(_) => TOBII_ERROR_NO_ERROR,
             Err(status) => status,
@@ -63,8 +64,8 @@ pub(crate) unsafe fn request(
 /// `TOBII_ERROR_CALIBRATION_BUSY`; only `TOBII_ENABLED_EYE_BOTH` is supported.
 ///
 /// # Safety
-/// `device` must be null or a live handle that no other thread uses during
-/// the call.
+/// `device` must be null or a live handle from `tobii_device_create` that is
+/// not destroyed before the call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_eye: u32) -> Status {
     let Ok(eye) = u8::try_from(enabled_eye) else {
@@ -170,8 +171,9 @@ pub unsafe extern "C" fn tobii_calibration_retrieve(
     receiver: Option<DataReceiver>,
     user_data: *mut c_void,
 ) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live, unaliased handle.
-    let d = match unsafe { device_mut(device) } {
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
         Ok(d) => d,
         Err(status) => return status,
     };
