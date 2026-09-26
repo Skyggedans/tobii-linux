@@ -29,7 +29,7 @@
 //! logger hands the line to may use the device meanwhile. A line logged by a
 //! call made from inside a callback (a refused `field_of_use`) runs under
 //! that callback's device locks, so a logger, like a callback, must not
-//! block on another thread's call into the same device. These are
+//! block on another thread's call into any device. These are
 //! libtobii's guarantees, not the DLL's.
 //!
 //! The 4.1 DLL, for comparison: its error lines go through one helper,
@@ -42,11 +42,13 @@
 //! upgrade in progress (0x18014467e, 0x1801588e3). Nearly every failing call
 //! logs such a line, `tobii_device_process_callbacks` on every call that
 //! returns `TOBII_ERROR_CONNECTION_FAILED` (0x180143c74), and a device logs
-//! through the API it was created from. Some callers hold the device's API
-//! mutex (dev+0x4e0) around it (`tobii_device_reconnect`,
-//! 0x180143873..0x180143a0f; `tobii_calibration_retrieve`'s error line,
-//! 0x180147c57), and a thread of the DLL's own reaches it too
-//! (0x18002b230, through 0x180169550). The helper is not the only path:
+//! through the API it was created from. Many callers hold the device's API
+//! mutex (dev+0x4e0) around it, a failing call's error line included (a
+//! subscribe, 0x18015cea0; `tobii_get_device_info`, 0x18014327b;
+//! `tobii_get_track_box`, 0x180142dd1; `tobii_device_reconnect`, 0x180143943
+//! and 0x1801439fe; `tobii_calibration_retrieve`, 0x180147c57), and a
+//! thread of the DLL's own reaches it too (0x18002b230, through
+//! 0x180169550). The helper is not the only path:
 //! thunks forward the lines of the DLL's own sub-libraries straight to
 //! `log_func`, at DEBUG and TRACE while it enumerates devices (0x18015b070,
 //! installed at 0x18015d5c2), at their own level 0..4 from its legacy TTP
@@ -54,10 +56,10 @@
 //! The DLL sets its callback flag while enumeration logs, not around the
 //! helper's lines. Where libtobii differs, it does on purpose: its own
 //! diagnostics rather than a line per failing call, a lost connection once
-//! rather than at the host's frame rate, and always the guard, never a lock,
-//! never a thread of its own. A device copies its API's logger, so it keeps
-//! logging after `tobii_api_destroy`, where the DLL's would log through the
-//! freed API.
+//! rather than at the host's frame rate, and always the guard, never a lock
+//! of the logging call's, never a thread of its own. A device copies its
+//! API's logger, so it keeps logging after `tobii_api_destroy`, where the
+//! DLL's would log through the freed API.
 
 use std::ffi::{CString, c_void};
 use std::fmt;

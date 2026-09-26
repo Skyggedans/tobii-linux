@@ -12,13 +12,42 @@
  * tobii_config.h, tobii_licensing.h, tobii_advanced.h, tobii_wearable.h, and
  * tobii_internal.h for the exports the Stream Engine never documented.
  *
- * Threads: the Stream Engine promises thread safety across all its
- * functions; libtobii.so holds no lock. One device must not be used from two
- * threads at once, a tobii_wait_for_callbacks waiting on it included: an
- * application that shares a device between threads serialises its calls on
- * it. Different devices, and the API handle, may be used from several
- * threads at once. TOBII_ERROR_CALLBACK_IN_PROGRESS guards only the thread
- * a callback or the logger runs on.
+ * Threads: as the Stream Engine promises, the functions may be called from
+ * several threads at once, on one device too. A device's state is locked by
+ * concern, as the DLL's is:
+ * - its requests (device info, states, calibration, pause and the other
+ *   calls answered by tobiid), subscribes, unsubscribes and
+ *   tobii_device_reconnect run one at a time, each for its whole round trip
+ *   to tobiid, so a slow one (a pause may take up to a minute) delays the
+ *   others on that device, but never its callbacks, a
+ *   tobii_device_process_callbacks or a tobii_wait_for_callbacks;
+ *   tobii_recenter, a write with no reply, waits for any of them under way;
+ * - its callbacks run one at a time, on whichever thread calls
+ *   tobii_device_process_callbacks, and such a call made while another
+ *   thread processes the device returns at once;
+ * - a subscribe, an unsubscribe, tobii_device_clear_callback_buffers and
+ *   tobii_device_reconnect wait for a callback another thread is running
+ *   (the last two for that thread's whole process call), and once an
+ *   unsubscribe returns, its callback is not running and never runs again
+ *   (tobii_streams.h says more);
+ * - tobii_device_destroy and tobii_api_destroy take no lock, as in the
+ *   Stream Engine: no other thread may be inside a call on the handle, a
+ *   tobii_wait_for_callbacks waiting on the device included, and none may
+ *   use it afterwards. Join the thread that processes a device first.
+ * TOBII_ERROR_CALLBACK_IN_PROGRESS guards only the thread a callback or the
+ * logger runs on; other threads' calls go on. A callback, or the logger,
+ * must not block on another thread's call into any device (nor on a thread
+ * that waits for one), which can deadlock, as in the Stream Engine: only
+ * tobii_device_process_callbacks and tobii_wait_for_callbacks are sure to
+ * return while a callback runs; any other call on its device may wait for
+ * it, itself or queued behind one that does, and a call on another device
+ * may wait for that device's own callback, which may be waiting in turn.
+ * Where libtobii.so differs from the DLL, besides what the functions below
+ * say: tobii_wait_for_callbacks waits on a device another thread is
+ * processing as on any other, where the DLL skips such a device, returning
+ * at once when it was the only one; a subscribe lets the device's other
+ * callbacks run during its round trip, where the DLL holds them back; and
+ * the logger is never called under a lock of the call that logs.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -107,14 +136,19 @@ typedef enum tobii_log_level_t
  * TOBII_LOG_LEVEL_INFO when a device connects or reconnects.
  *
  * It is called synchronously, on the thread inside the tobii_* call that
- * logs, never on a thread of libtobii's own, with no lock of libtobii's held,
- * and not serialised across threads. A call from inside it that a stream
- * callback could not make either returns TOBII_ERROR_CALLBACK_IN_PROGRESS,
- * on that thread only: another thread it hands the line to is not refused,
- * and must not use the logging device while the call that logs runs (see
- * Threads at the top). text is valid only during the call. log_func and
- * log_context must stay valid until the API and every device created from
- * it are destroyed: a device keeps logging after tobii_api_destroy. */
+ * logs, never on a thread of libtobii's own, with none of the locks that call
+ * took held (a call made from inside a callback logs under that callback's),
+ * and not serialised: threads may log at once, through one device too, so
+ * log_func must be safe to call that way, as in the Stream Engine, and lines
+ * from different threads may interleave (a loss one thread's
+ * tobii_device_process_callbacks reports can come after a reconnect another
+ * thread made since). A call from inside it that a stream callback could not
+ * make either returns TOBII_ERROR_CALLBACK_IN_PROGRESS, on that thread only:
+ * another thread it hands the line to may use any device meanwhile, but the
+ * logger, like a callback, must not block on that thread's call into one
+ * (see Threads at the top). text is valid only during the call. log_func
+ * and log_context must stay valid until the API and every device created
+ * from it are destroyed: a device keeps logging after tobii_api_destroy. */
 typedef void ( *tobii_log_func_t )( void* log_context, tobii_log_level_t level, char const* text );
 
 typedef struct tobii_custom_log_t
@@ -253,6 +287,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_get_api_version( tobii_version_t* versi
 
 TOBII_API tobii_error_t TOBII_CALL tobii_api_create( tobii_api_t** api,
     tobii_custom_alloc_t const* custom_alloc, tobii_custom_log_t const* custom_log );
+/* Takes no lock, as in the Stream Engine: no other thread may be inside a
+ * call on the API handle, and none may use it afterwards. The devices
+ * created from it keep working, and keep logging to its logger. */
 TOBII_API tobii_error_t TOBII_CALL tobii_api_destroy( tobii_api_t* api );
 
 /* Calls `receiver` once: libtobii.so is backed by the tobiid daemon, which
@@ -268,25 +305,50 @@ TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_local_device_urls_ex( tobii_a
  * daemon cannot be reached (it is spawned on demand). */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_create( tobii_api_t* api, char const* url,
     tobii_field_of_use_t field_of_use, tobii_device_t** device );
+/* Closes the daemon connection. Takes no lock, as in the Stream Engine: no
+ * other thread may be inside a call on the device, a tobii_wait_for_callbacks
+ * waiting on it included, and none may use it afterwards. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_destroy( tobii_device_t* device );
 
 /* Blocks until a device has a sample queued or a lost daemon connection not
  * yet reported by tobii_device_process_callbacks, or ~100 ms per idle device,
  * so a wait-and-process loop wakes once for a loss. A reported loss waits
- * like an idle device. Never TOBII_ERROR_CONNECTION_FAILED. */
+ * like an idle device, unless the samples of a tobii_device_reconnect made on
+ * another thread wake it. Never TOBII_ERROR_CONNECTION_FAILED. It holds no
+ * lock while it sleeps, and waits on a device another thread is processing
+ * as on any other, until that thread leaves it something to process; the DLL
+ * skips such a device (read from its code, not observed), and with no other
+ * returns TOBII_ERROR_NO_ERROR at once, which spins a wait-and-process
+ * loop. */
 TOBII_API tobii_error_t TOBII_CALL tobii_wait_for_callbacks( int device_count,
     tobii_device_t* const* devices );
 /* Once the daemon connection is lost: delivers what had arrived, then returns
  * TOBII_ERROR_CONNECTION_FAILED on every call until tobii_device_reconnect
  * connects again; libtobii never reconnects by itself. A tracker unplug is
  * not reported here: the daemon keeps the connection, and the samples resume
- * on it after a replug. */
+ * on it after a replug. One thread dispatches a device at a time: a call
+ * that finds another thread at it (processing, or a wait, a clear or a
+ * reconnect at its queue for a moment) returns at once and delivers nothing,
+ * leaving what is queued for the next call: TOBII_ERROR_NO_ERROR, or
+ * TOBII_ERROR_CONNECTION_FAILED once the loss has been reported. The DLL's
+ * returns TOBII_ERROR_NO_ERROR there even after a loss, once it has
+ * delivered the device's queued notifications itself. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_t* device );
+/* Drops what is queued; a lost connection is still reported by the next
+ * process call. It waits for a tobii_device_process_callbacks under way on
+ * another thread, never for a request; the DLL's waits for requests, and for
+ * a callback another thread is running, instead, and while another thread
+ * processes it clears only the queued notifications. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
 /* Connects to a running daemon (never spawns one) and restores the
  * subscriptions, not a calibration session or pause. Any failure is
- * TOBII_ERROR_CONNECTION_FAILED within ~500 ms and leaves the device as it
- * was. While the daemon has no tracker (a request's
+ * TOBII_ERROR_CONNECTION_FAILED within ~500 ms, counted from when any
+ * request, subscription change or other reconnect in flight on another
+ * thread, and then any callback another thread is running, have finished
+ * (it waits for them before it asks for the subscriptions back), and leaves
+ * the device as it was. Once the subscriptions are back, it also waits for
+ * a tobii_device_process_callbacks under way on another thread before it
+ * swaps connections. While the daemon has no tracker (a request's
  * TOBII_ERROR_CONNECTION_FAILED with the connection intact) it succeeds
  * without bringing one back. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
@@ -304,7 +366,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_system_clock( tobii_api_t* api, int64_t
  * reports them; runtime_build_version names libtobii.so. integration_id,
  * hw_calibration_version, hw_calibration_date and lot_id are empty, as the
  * DLL leaves them for a tracker it drives over USB. From a tobiid that
- * predates it, the integration type is empty too. */
+ * predates it, the integration type is empty too. Fetched once per
+ * connection; a read of the kept copy, too, waits for any request in flight
+ * on another thread, as in the DLL. */
 TOBII_API tobii_error_t TOBII_CALL tobii_get_device_info( tobii_device_t* device,
     tobii_device_info_t* device_info );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_track_box( tobii_device_t* device,

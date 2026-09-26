@@ -426,12 +426,24 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   reports it (once per loss) or a daemon reply that does not decode, and
   `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
   The logger is called on the thread inside the `tobii_*` call that logs,
-  with no lock of libtobii's held; a call from inside it, on that thread,
-  that a callback could not make either returns
-  `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A `tobii_custom_alloc_t` is checked as
-  in the Stream Engine and never called. Unlike the Stream Engine, libtobii
-  does not serialise calls on a device: one device must not be used from
-  two threads at once (README.md, Architecture, "Threads").
+  with none of that call's locks held, and from several threads at once if
+  they log at once, so lines from different threads may interleave; a call
+  from inside it, on that thread, that a callback could not make either
+  returns `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A `tobii_custom_alloc_t` is
+  checked as in the Stream Engine and never called.
+
+  Threads may share a device, as the Stream Engine promises: calls on it
+  from several threads at once are safe. Its requests, subscription changes
+  and reconnects run one at a time (a slow one, such as a pause, delays the
+  others), its callbacks run one at a time on whichever thread processes it,
+  and a process call made while another thread processes it returns at once.
+  `tobii_device_destroy` and `tobii_api_destroy` must not overlap any other
+  call on the handle, and nothing may use it afterwards: join the thread
+  that processes a device before destroying it. A callback, or the logger,
+  must not block on another thread's call into any device (nor on a thread
+  that waits for one), which can deadlock, as in the Stream Engine
+  (README.md, Architecture, "Threads", has the rest, and where it differs
+  from Windows).
 
   #### OpenTrack's `tracker-tobii` plugin
 

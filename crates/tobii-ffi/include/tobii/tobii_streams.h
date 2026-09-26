@@ -15,10 +15,23 @@
  * with. A head pose has the time of the IR image it was made from. Tracker
  * time is left only in gaze data's timestamp_tracker_us (tobii_advanced.h)
  * and tobii_timesync's tracker_us (tobii_internal.h).
- * Callbacks run on the thread that calls tobii_device_process_callbacks;
- * calling an implemented device function from one (creating or destroying a
+ * Callbacks run on the thread that calls tobii_device_process_callbacks, one
+ * at a time per device, whichever thread that is: a callback and its
+ * user_data must be sound to use on any thread that processes the device.
+ * Calling an implemented device function from one (creating or destroying a
  * device included), tobii_calibration_parse or tobii_api_destroy returns
- * TOBII_ERROR_CALLBACK_IN_PROGRESS.
+ * TOBII_ERROR_CALLBACK_IN_PROGRESS, on that thread; other threads' calls go
+ * on. A callback must not block on another thread's call into any device
+ * (tobii.h, Threads). A subscribe and an unsubscribe each wait for a
+ * callback of the device that another thread is running. Once an
+ * unsubscribe returns, its callback is not running on any thread, and none
+ * calls it again. A subscribe sets its callback before it asks tobiid, and
+ * lets the device's callbacks run during that round trip, so its own may be
+ * called, on a thread processing the device, before it returns, even if it
+ * then fails; once it has returned an error, none calls it again. The DLL
+ * stores a callback only once the tracker has taken the subscription, and
+ * holds the device's other callbacks back meanwhile, so a failed
+ * subscribe's never runs there.
  *
  * SPDX-License-Identifier: MIT
  */

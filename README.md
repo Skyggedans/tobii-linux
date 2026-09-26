@@ -229,20 +229,45 @@ Where the answers come from, and where they differ from Windows:
   answered its command (2120) with no data, so
   `tobii_hardware_configuration_get` is `TOBII_ERROR_NOT_SUPPORTED` until it
   reports one.
-- **Threads.** The Stream Engine promises thread safety across all its
-  functions; libtobii has no lock, so one device must not be used from two
-  threads at once, a `tobii_wait_for_callbacks` waiting on it included. An
-  application that shares a device between threads serialises its calls on
-  it; different devices, and the API handle, may be used from several
-  threads at once. `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the
-  thread a callback or the logger runs on, not another thread it hands
-  work to.
+- **Threads.** As the Stream Engine promises, the functions may be called
+  from several threads at once, on one device too: a device's state is
+  locked by concern, as the DLL's is. Its requests, subscription changes and
+  reconnects run one at a time, each for its whole round trip to tobiid (a
+  pause may take up to a minute), without holding up its callbacks,
+  processing or waiting, and a recenter, a write with no reply, waits for
+  any of them under way; a reconnect's ~500 ms counts from when the call
+  ahead of it, and then a callback another thread is running, have
+  finished. Its callbacks run one at a time, on whichever thread processes
+  it, and a subscribe, an unsubscribe, a clear or a reconnect waits for one
+  running on another thread; once an unsubscribe returns, its callback is
+  not running and never runs again. `tobii_device_destroy` and
+  `tobii_api_destroy` take no lock, as in the Stream Engine (whose
+  documentation says so for `tobii_device_destroy`): no other thread may be
+  inside a call on the handle, or use it afterwards.
+  `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the thread a callback or
+  the logger runs on. A callback, or the logger, must not block on another
+  thread's call into any device (nor on a thread that waits for one), which
+  can deadlock, as in the Stream Engine: only processing and waiting are
+  sure to go on while a callback runs. Unlike the DLL,
+  `tobii_wait_for_callbacks` waits on a device another thread is processing
+  as on any other, where the DLL skips such a device, returning at once
+  when it was the only one, so a wait-and-process loop on that device alone
+  spins; a subscribe lets the device's other callbacks run during its round
+  trip, where the DLL holds them back, so a subscribe that fails may have
+  had its callback called before it returned; a
+  `tobii_device_process_callbacks` that finds another thread processing
+  returns at once, as there, but with `TOBII_ERROR_CONNECTION_FAILED` once
+  the loss has been reported, and delivers nothing (the DLL first delivers
+  the device's queued notifications); a clear waits for another thread's
+  processing, never for a request; and the logger is never called under a
+  lock of the call that logs.
 - **Logging and allocation.** The `tobii_custom_log_t` logger gets
   libtobii's own few lines (a refused `field_of_use`, a failed connect or
   reconnect, a lost daemon connection once per loss, a daemon reply that
   does not decode, each connect and reconnect), not the line per failing
   call the Stream Engine writes: the returned status says that. It is
-  called on the thread inside the call that logs, and a device keeps
+  called on the thread inside the call that logs, from several threads at
+  once if they log at once (their lines may interleave), and a device keeps
   logging through it after `tobii_api_destroy`. A `tobii_custom_alloc_t` is
   checked as in the Stream Engine and never called: libtobii allocates with
   Rust's allocator, where the DLL allocates the API handle, each device and

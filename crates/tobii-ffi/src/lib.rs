@@ -59,8 +59,18 @@
 //! returns at once. `tobii_device_destroy` and `tobii_api_destroy` take no
 //! lock, as in the DLL: no other thread may be inside a call on the handle,
 //! or use it afterwards. A callback, or the logger, must not block on another
-//! thread's call into the same device, which can deadlock, as in the Stream
-//! Engine.
+//! thread's call into any device (nor on a thread that waits for one), which
+//! can deadlock, as in the Stream Engine: only
+//! `tobii_device_process_callbacks` and `tobii_wait_for_callbacks` are sure
+//! to return while a callback runs; any other call on its device may wait for
+//! it, itself or queued behind one that does, and a call on another device
+//! may wait for that device's own callback, which may be waiting in turn.
+//! Where the DLL differs: its wait skips a device another thread is
+//! processing, returning at once when it was the only one, where libtobii's
+//! waits as for any other; its subscribe holds the device's callbacks back
+//! for its round trip, where libtobii's lets them run; and many of its calls
+//! log their error lines under the device's API mutex, where libtobii logs
+//! with none of the logging call's locks held (see `logger`).
 //!
 //! An entry point that takes a device handle checks the callback first, then
 //! a null device, then its other arguments (`TOBII_ERROR_INVALID_PARAMETER`
@@ -110,11 +120,12 @@
 //! `tobii_device_create` it never spawns a daemon, and any failure is
 //! `TOBII_ERROR_CONNECTION_FAILED` within ~500 ms (at once when nothing
 //! listens). On a device shared between threads that counts from when a
-//! request or subscription change under way on another thread has finished,
-//! and the reconnect also waits for a callback another thread is running
-//! before its round trip, and for that thread's whole dispatch before it
-//! swaps connections. It restores the subscriptions, not a calibration
-//! session or pause the lost connection held.
+//! request, subscription change or other reconnect under way on another
+//! thread, and then a callback another thread is running, have finished: the
+//! reconnect waits for them before its round trip, and for that thread's
+//! whole dispatch before it swaps connections. It restores the
+//! subscriptions, not a calibration session or pause the lost connection
+//! held.
 //!
 //! `TOBII_ERROR_CONNECTION_FAILED` has a second source: a request that needs
 //! the tracker live (a clock pair, a pause, a calibration, a display-area

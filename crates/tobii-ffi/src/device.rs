@@ -679,11 +679,14 @@ impl fmt::Display for ReconnectError {
 /// poisoned lock is taken as it is (see `lock`).
 ///
 /// What can still deadlock is the Stream Engine's own: a callback that
-/// blocks on another thread's call into the same device. Of the calls that
-/// take a lock, only `process` and `wait` return promptly while a callback
-/// runs. A subscribe, an unsubscribe, a clear or a reconnect waits for it,
-/// on `callbacks` or `dispatch`, and a request or a recenter may wait, on
-/// `command`, behind a subscription change or reconnect under way.
+/// blocks on another thread's call into any device (or on a thread that
+/// waits for one). Of the calls that take a lock, only `process` and `wait`
+/// return promptly while a callback runs. A subscribe, an unsubscribe, a
+/// clear or a reconnect waits for it, on `callbacks` or `dispatch`, and a
+/// request or a recenter may wait, on `command`, behind a subscription
+/// change or reconnect under way. Across devices the same makes a cycle:
+/// X's callback waits for an unsubscribe of Y, which waits for Y's
+/// callback, which waits for an unsubscribe of X, which waits for X's.
 ///
 /// Destroying the device takes no lock, as in the DLL: no other thread may
 /// be inside a call on it, or use it afterwards.
@@ -3767,8 +3770,8 @@ pub(crate) mod tests {
     /// that waited for such a request would deadlock, as in the DLL, whose
     /// unsubscribe takes its API mutex (dev+0x4e0, 0x18015d0b4) and then
     /// waits on dev+0x4d8 (0x180153580), and a callback must not block on
-    /// any other thread's call into the same device. With nothing queued
-    /// ahead, the request goes through
+    /// any other thread's call into a device, its own included. With
+    /// nothing queued ahead, the request goes through
     /// (`a_request_goes_through_while_another_thread_runs_a_callback`).
     ///
     /// Should unsubscribe stop holding the command lock while it waits for

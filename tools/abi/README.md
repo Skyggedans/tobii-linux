@@ -332,6 +332,82 @@ prototype declares or a float/integer position disagrees.
     value is constant, and the daemon's init is not tied to a client;
   - type 7, which has no producer. There is no device-name notification
     type.
+- How the DLL keeps the 4.1 docs' promise of "full thread safety across
+  all API functions" (and why libtobii locks a device as it does). It
+  imports critical sections and no SRW locks; its wrappers are create
+  0x18003b1f0, lock 0x18003b2b0 (`EnterCriticalSection`), try-lock
+  0x18003b2c0 (`TryEnterCriticalSection`), unlock 0x18003b2e0 and delete
+  0x18003b270. A critical section is reentrant on its own thread (Windows
+  semantics, not read from the DLL). The callback flag is a TLS slot per API
+  instance: `tobii_api_create` allocates it (`TlsAlloc` at 0x180144be1,
+  kept at api+0x130), `tobii_api_destroy` frees it (`TlsFree` at
+  0x180144a00) and takes no lock, and the device entry points check it
+  first (process 0x180143b55, the subscribe helper 0x18015cc9c, wait
+  0x180143f58, reconnect 0x180143845, destroy 0x180144100), so
+  `TOBII_ERROR_CALLBACK_IN_PROGRESS` refuses only the callback's own thread.
+  Device create makes three critical sections, and the platform module
+  three more (+0x4620, +0x4628, +0x4630: 0x18000e580, 0x18000e5ce,
+  0x18000e61c):
+  - dev+0x4e0, an API mutex held for a call's whole tracker round trip:
+    subscribe 0x18015ce3d..0x18015ceaf, device info 0x180142ee1, track box
+    0x180142cd1, timesync 0x180145c08, calibration start 0x180149a60,
+    reconnect 0x180143873..0x180143a0f, clear 0x180143a85. Process, wait
+    and destroy never take it. The calls that take it generally log under
+    it, their error lines included: for example subscribe (the error helper
+    0x1800010f0 at 0x18015cea0), device info (0x18014327b), track box
+    (0x180142d5a, 0x180142dd1), reconnect (0x180143943, 0x1801439fe) and
+    `tobii_calibration_retrieve` (0x180147c57); retrieve also calls its
+    receiver under it with the callback flag set (0x180147bbc..0x180147c79).
+  - dev+0x4d8, held around every user callback (streams 0x1801546a0 to
+    0x180155091, notifications 0x180153ed7 to 0x180153f04), by an
+    unsubscribe (0x180153580) and by the subscribe worker across the
+    platform module's subscribe (0x18015371b..0x180153845), which stores
+    the callback only once that has succeeded (0x1801537cc..0x1801537de).
+    So an unsubscribe on another thread waits for a callback that is
+    running, and every callback of the device waits out a subscribe's
+    round trip.
+  - dev+0x9818, around the device's notification queue.
+
+  `tobii_device_process_callbacks` (0x180143b30 → 0x1801593f0) sets the
+  flag (0x1801594ff), swaps the notification queue out under dev+0x9818 and
+  delivers it (0x180159515..0x180159566), and only then try-enters the
+  platform module's +0x4628 (0x18000e9d9). When another thread holds that,
+  it returns 0 (0x18000e9ea), which the export's jump table turns into
+  `TOBII_ERROR_NO_ERROR` (0x180143eb8, case 0 at 0x180143c06), after a loss
+  too. So two threads can each deliver notifications of one device, one
+  after the other under dev+0x4d8, while one processes the rest.
+  `tobii_wait_for_callbacks` (0x1801596e0) returns at once if a device has
+  data queued (0x180157030, called at 0x18015972a); otherwise it try-enters
+  each device's +0x4628 (0x18000e940) and holds it through the whole wait,
+  100 ms at most (0x180159a54; released at 0x180159b17). A device another
+  thread holds gets no wait handle, and with no handle at all the wait
+  returns 0, `TOBII_ERROR_NO_ERROR`, at once (read from the control flow,
+  not observed). `tobii_device_reconnect` enters +0x4620, +0x4628 and
+  +0x4630 with no timeout (0x18000eb5f, 0x18000eb88, 0x18000ebb1), after
+  dev+0x4e0, so it waits for a process or a wait on another thread.
+  `tobii_device_clear_callback_buffers` swaps the callback table out under
+  dev+0x4d8 and runs the internal process (0x180158a20, at 0x180158ab2),
+  whose try-enter fails while another thread processes, so only the
+  notifications are dropped then. `tobii_device_destroy` (0x1801440e0 →
+  0x18015a320) takes no lock and deletes the device's three critical
+  sections (0x18015a395, 0x18015a3a6, 0x18015a3b7), so another thread's
+  call on the device meanwhile is undefined, as the docs say ("Make sure
+  that no background thread is using the device"). `tobii_system_clock`
+  (0x1801432d0) reads the clock and checks no flag.
+
+  libtobii splits a device the same way, with a std `Mutex` per concern
+  (`Device` in `crates/tobii-ffi/src/device.rs`: `command` for dev+0x4e0,
+  `dispatch` for +0x4628 and dev+0x9818, `callbacks` for dev+0x4d8), and
+  keeps the DLL's rule for destroy. Where it differs, it does on purpose:
+  a wait holds no lock while it sleeps, and waits on a device another
+  thread holds rather than skip it; a subscribe lets the callbacks
+  lock go for its round trip; a busy process delivers nothing, and answers
+  `TOBII_ERROR_CONNECTION_FAILED` once a loss has been reported; a clear
+  waits for another thread's process, never for a request; the callback
+  flag is one per thread, for every API instance, so a callback may call
+  into no device at all; and the logger never runs under a lock of the
+  call that logs. The std mutexes are not reentrant, which that flag makes
+  safe: it refuses a callback's call before any lock is taken.
 
 Layouts, and where each comes from:
 
