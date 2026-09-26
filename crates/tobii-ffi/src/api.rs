@@ -245,7 +245,9 @@ pub(crate) unsafe fn create_device(
 
 /// Connect to the daemon (spawning it if needed) and create a device handle.
 /// `url` is accepted for signature compatibility and ignored: there is one
-/// device, owned by the daemon.
+/// device, owned by the daemon. Threads that create devices at once while no
+/// daemon runs spawn one between them: the others wait for that spawn, then
+/// connect to its daemon or fail as it did.
 ///
 /// `field_of_use` is validated exactly as the Stream Engine validates it, and
 /// that check is load-bearing: a caller compiled against the three-argument

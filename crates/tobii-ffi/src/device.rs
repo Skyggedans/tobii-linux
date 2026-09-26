@@ -123,6 +123,37 @@ fn first_then(
     })
 }
 
+/// A device's first connection: `connect`, and when nothing listens,
+/// `connect_or_spawn` (which connects again before it spawns tobiid) with
+/// `spawning` held, so that threads creating devices at once while no
+/// daemon runs start one between them. Two would both run: the second binds
+/// the socket path over the first's, which keeps the clients it has, and
+/// the clients are split between them. A thread that finds another's
+/// attempt under way waits for it and then only connects, to the daemon
+/// that attempt started or failing as it did, rather than making an attempt
+/// of its own after it: in turn, the last of them would wait out all the
+/// others' (some 3 s each when tobiid cannot be started). A daemon that
+/// listens is reached without the lock, so devices created while one runs
+/// never wait for each other. Other processes' clients are not covered: two
+/// applications that find no daemon at once can still start one each.
+fn connect_or_spawn_alone(
+    spawning: &Mutex<()>,
+    connect: impl Fn() -> io::Result<UnixStream>,
+    connect_or_spawn: impl FnOnce() -> io::Result<UnixStream>,
+) -> io::Result<UnixStream> {
+    if let Ok(stream) = connect() {
+        return Ok(stream);
+    }
+    if let Some(_spawning) = try_lock(spawning) {
+        return connect_or_spawn();
+    }
+    // Only the wait matters: holding the lock across this connect would
+    // hold up the other waiters' connects, and a thread arriving later
+    // would wait for it as if for an attempt.
+    drop(lock(spawning));
+    connect()
+}
+
 /// Whether a daemon connection is up, and whether its loss has been reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinkState {
@@ -793,13 +824,18 @@ impl Device {
         TOBII_ERROR_INTERNAL
     }
 
-    /// Connect to the daemon, spawning it if needed. A reconnect only
+    /// Connect to the daemon, spawning it if needed, one spawn at a time in
+    /// this process (see [`connect_or_spawn_alone`]). A reconnect only
     /// connects: it fails at once when no daemon listens, and never spawns
     /// one, which could start a daemon outside systemd or race other clients
     /// into starting two.
     #[cfg(not(test))]
     pub(crate) fn connect_daemon(api: usize, field_of_use: FieldOfUse) -> io::Result<Self> {
-        let connect = first_then(tobii_ipc::connect_or_spawn, tobii_ipc::connect);
+        /// Held while a device's first connection may spawn tobiid.
+        static SPAWNING: Mutex<()> = Mutex::new(());
+        let first =
+            || connect_or_spawn_alone(&SPAWNING, tobii_ipc::connect, tobii_ipc::connect_or_spawn);
+        let connect = first_then(first, tobii_ipc::connect);
         Self::new(connect, api, field_of_use)
     }
 
@@ -2948,8 +2984,9 @@ pub(crate) mod tests {
     }
 
     /// A device's first connection goes through `first` (`connect_daemon`
-    /// passes `tobii_ipc::connect_or_spawn`), and every reconnect through
-    /// `later` (`tobii_ipc::connect`, which never spawns).
+    /// passes `tobii_ipc::connect_or_spawn`, through
+    /// [`connect_or_spawn_alone`]), and every reconnect through `later`
+    /// (`tobii_ipc::connect`, which never spawns).
     #[test]
     fn first_then_uses_first_once_then_later() {
         use std::sync::Arc;
@@ -2977,6 +3014,168 @@ pub(crate) mod tests {
             laters.load(Ordering::Relaxed),
         );
         assert_eq!(calls, (1, 2));
+    }
+
+    /// How many threads create a device at once in the spawn tests below.
+    const CREATORS: usize = 4;
+
+    /// A stand-in for tobiid and for `tobii_ipc`'s connect and spawn, which
+    /// counts the spawns: a daemon that listens from `STARTUP` after the
+    /// first spawn on, if it `starts` at all.
+    #[derive(Default)]
+    struct Spawnable {
+        starts: bool,
+        first_spawn: std::sync::OnceLock<Instant>,
+        spawns: AtomicUsize,
+        /// The connects [`Spawnable::create`] has tried before looking at
+        /// the lock, and after waiting on it.
+        tried: AtomicUsize,
+    }
+
+    impl Spawnable {
+        /// How long a spawned daemon takes to listen: far longer than the
+        /// creating threads take to try their first connects.
+        const STARTUP: Duration = Duration::from_millis(200);
+        /// How long a spawn waits for its daemon to listen
+        /// (`tobii_ipc::connect_or_spawn` waits about 3 s).
+        const GIVE_UP: Duration = PROMPT;
+
+        fn new(starts: bool) -> Arc<Self> {
+            Arc::new(Self {
+                starts,
+                ..Self::default()
+            })
+        }
+
+        /// As `tobii_ipc::connect`.
+        fn connect(&self) -> io::Result<UnixStream> {
+            let up = self
+                .first_spawn
+                .get()
+                .is_some_and(|t| self.starts && t.elapsed() >= Self::STARTUP);
+            if up {
+                UnixStream::pair().map(|(client, _daemon)| client)
+            } else {
+                Err(io::ErrorKind::ConnectionRefused.into())
+            }
+        }
+
+        /// As `tobii_ipc::connect_or_spawn`: connect, else spawn and retry
+        /// until the daemon listens or `GIVE_UP` has passed. Past `GIVE_UP`
+        /// it also waits, for up to a `PROMPT` more, until `CREATORS`
+        /// connects have been tried, which, while it holds the lock, are the
+        /// creating threads' first ones: a thread held up past `GIVE_UP`
+        /// would otherwise find the lock free, and its attempt would count
+        /// against the lock.
+        fn connect_or_spawn(&self) -> io::Result<UnixStream> {
+            if let Ok(stream) = self.connect() {
+                return Ok(stream);
+            }
+            self.spawns.fetch_add(1, Ordering::Relaxed);
+            let spawned = Instant::now();
+            self.first_spawn.get_or_init(|| spawned);
+            let trying = |waited: Duration| {
+                waited < Self::GIVE_UP
+                    || (self.tried.load(Ordering::Relaxed) < CREATORS
+                        && waited < Self::GIVE_UP + PROMPT)
+            };
+            while trying(spawned.elapsed()) {
+                thread::sleep(Duration::from_millis(5));
+                if let Ok(stream) = self.connect() {
+                    return Ok(stream);
+                }
+            }
+            self.connect()
+        }
+
+        /// A device's first connection through `spawning`, as
+        /// `connect_daemon` makes it.
+        fn create(&self, spawning: &Mutex<()>) -> io::Result<UnixStream> {
+            let connect = || {
+                self.tried.fetch_add(1, Ordering::Relaxed);
+                self.connect()
+            };
+            connect_or_spawn_alone(spawning, connect, || self.connect_or_spawn())
+        }
+
+        /// Have `CREATORS` threads make their first connection at once
+        /// through `spawning`, and hand back what each got.
+        fn create_at_once(&self, spawning: &Mutex<()>) -> Vec<io::Result<UnixStream>> {
+            let start = std::sync::Barrier::new(CREATORS);
+            thread::scope(|s| {
+                let creators: Vec<_> = (0..CREATORS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            self.create(spawning)
+                        })
+                    })
+                    .collect();
+                creators.into_iter().map(joined).collect()
+            })
+        }
+    }
+
+    /// Threads creating devices at once while no daemon listens spawn one
+    /// between them, and all connect to it. Fails without the lock: each
+    /// thread finds nothing listening and spawns a daemon of its own.
+    #[test]
+    fn devices_created_together_while_no_daemon_runs_spawn_one() {
+        let tobiid = Spawnable::new(true);
+
+        let daemon = Arc::clone(&tobiid);
+        let got = within(WATCHDOG, move || daemon.create_at_once(&Mutex::new(())));
+
+        assert!(got.iter().all(Result::is_ok), "{got:?}");
+        assert_eq!(tobiid.spawns.load(Ordering::Relaxed), 1);
+    }
+
+    /// When the spawned daemon never listens, the threads that waited for
+    /// that spawn fail with it rather than each spawning in turn, and a
+    /// device created once they have failed makes an attempt of its own: the
+    /// lock serialises the attempts, it does not make one for good. Fails
+    /// without the lock (a spawn per thread), with a lock that makes each
+    /// waiting thread spawn again once it has it (a spawn per thread, each
+    /// after the last has given up), and with a spawn made at most once per
+    /// process (none for the later device, which then could never start
+    /// tobiid again once it had stopped).
+    #[test]
+    fn a_failed_spawn_fails_the_threads_that_waited_but_not_a_later_device() {
+        let tobiid = Spawnable::new(false);
+
+        let daemon = Arc::clone(&tobiid);
+        let (together, took, spawned, later) = within(WATCHDOG, move || {
+            let spawning = Mutex::new(());
+            let (together, took) = timed(|| daemon.create_at_once(&spawning));
+            let spawned = daemon.spawns.load(Ordering::Relaxed);
+            (together, took, spawned, daemon.create(&spawning))
+        });
+
+        assert!(together.iter().all(Result::is_err), "{together:?}");
+        assert!(later.is_err(), "{later:?}");
+        let spawns = (spawned, tobiid.spawns.load(Ordering::Relaxed));
+        assert_eq!(spawns, (1, 2), "one for the threads, one for the later");
+        assert!(
+            took < Spawnable::GIVE_UP + PROMPT,
+            "one spawn's wait: {took:?}"
+        );
+    }
+
+    /// A device created while a daemon listens connects without the lock,
+    /// even while another thread holds it for a spawn. A guard against
+    /// locking too much: it passes without the lock too.
+    #[test]
+    fn a_device_created_while_a_daemon_listens_waits_for_no_spawn() {
+        let tobiid = Spawnable::new(true);
+        tobiid.connect_or_spawn().expect("the daemon listens");
+        let spawning = Arc::new(Mutex::new(()));
+        let _held = lock(&spawning);
+
+        let (daemon, busy) = (Arc::clone(&tobiid), Arc::clone(&spawning));
+        let got = within(PROMPT, move || daemon.create(&busy));
+
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(tobiid.spawns.load(Ordering::Relaxed), 1, "the first alone");
     }
 
     // Threads sharing a device. Each test says whether it fails without the

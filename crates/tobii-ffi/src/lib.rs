@@ -101,7 +101,10 @@
 //! `TOBII_ERROR_NO_ERROR`.
 //!
 //! `tobii_device_create` connects to the daemon (auto-spawning it if needed),
-//! so several processes can use the device at once. Pump with
+//! so several processes can use the device at once. Threads that create
+//! devices at once while no daemon runs spawn one between them: the others
+//! wait for that spawn, then connect to its daemon or fail as it did (two
+//! processes doing so can still spawn one each). Pump with
 //! `tobii_wait_for_callbacks` + `tobii_device_process_callbacks` exactly like
 //! the Stream Engine. Every sample's timestamp is on the host clock
 //! `tobii_system_clock` reads, as the daemon sends it (gaze data's tracker

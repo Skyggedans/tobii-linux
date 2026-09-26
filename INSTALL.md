@@ -439,7 +439,9 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   and a process call made while another thread processes it returns at once.
   `tobii_device_destroy` and `tobii_api_destroy` must not overlap any other
   call on the handle, and nothing may use it afterwards: join the thread
-  that processes a device before destroying it. A callback, or the logger,
+  that processes a device before destroying it. Threads that create devices
+  at once while no daemon runs spawn one `tobiid` between them (processes
+  that do so can still spawn one each). A callback, or the logger,
   must not block on another thread's call into any device (nor on a thread
   that waits for one), which can deadlock, as in the Stream Engine.
   `tobii_calibration_retrieve`'s receiver is refused on its thread the calls

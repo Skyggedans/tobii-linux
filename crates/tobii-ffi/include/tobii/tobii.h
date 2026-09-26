@@ -306,7 +306,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_enumerate_local_device_urls_ex( tobii_a
     tobii_device_url_receiver_t receiver, void* user_data, uint32_t device_generations );
 
 /* `url` is accepted and ignored. Returns TOBII_ERROR_CONNECTION_FAILED if the
- * daemon cannot be reached (it is spawned on demand). */
+ * daemon cannot be reached (it is spawned on demand). Threads that create
+ * devices at once while no daemon runs spawn one between them: the others
+ * wait for that spawn, then connect to its daemon or fail as it did. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_create( tobii_api_t* api, char const* url,
     tobii_field_of_use_t field_of_use, tobii_device_t** device );
 /* Closes the daemon connection. Takes no lock, as in the Stream Engine: no

@@ -243,7 +243,10 @@ Where the answers come from, and where they differ from Windows:
   not running and never runs again. `tobii_device_destroy` and
   `tobii_api_destroy` take no lock, as in the Stream Engine (whose
   documentation says so for `tobii_device_destroy`): no other thread may be
-  inside a call on the handle, or use it afterwards.
+  inside a call on the handle, or use it afterwards. Threads that create
+  devices at once while no daemon runs spawn one `tobiid` between them: the
+  others wait for that spawn, then connect to its daemon or fail as it did
+  (two processes doing so can still spawn one each).
   `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the thread a callback, the
   logger or `tobii_calibration_retrieve`'s receiver runs on. A callback, or
   the logger, must not block on another thread's call into any device (nor
