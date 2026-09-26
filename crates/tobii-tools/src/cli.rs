@@ -7,6 +7,10 @@ use anyhow::{Context, Result, bail, ensure};
 use std::env;
 use std::iter::{Peekable, Skip};
 use std::str::FromStr;
+use tobii_ipc::{
+    STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW,
+    STREAM_HEAD, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
+};
 
 use crate::opentrack::{
     AngleComponent, AngleSource, CouplingMode, DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
@@ -26,6 +30,17 @@ pub(crate) const DEFAULT_OPENTRACK_HOST: &str = "127.0.0.1";
 
 /// `OpenTrack` UDP port used when only `--opentrack-host` is given.
 pub(crate) const DEFAULT_OPENTRACK_PORT: u16 = 4242;
+
+/// Streams `ipc-probe` watches when no `--streams` is given: every one but
+/// the ~2.6 MB/s IR image stream.
+const DEFAULT_IPC_PROBE_STREAMS: u32 = STREAM_HEAD
+    | STREAM_GAZE
+    | STREAM_PRESENCE
+    | STREAM_GAZE_ORIGIN
+    | STREAM_EYE_POSITION
+    | STREAM_GAZE_DATA
+    | STREAM_NOTIFICATIONS
+    | STREAM_GAZE_RAW;
 
 /// Init-packet capture replayed to bring the device up when none is given.
 const DEFAULT_INIT_PATH: &str = concat!(
@@ -468,7 +483,7 @@ impl Options {
     fn parse_ipc_probe(args: &mut Args) -> Result<Self> {
         const USAGE: &str =
             "usage: ipc-probe [--streams MASK] [--secs N] [--set-display W,H[,OFFSET_X]]";
-        let mut streams = 0xbf; // everything but the 2.6 MB/s image stream
+        let mut streams = DEFAULT_IPC_PROBE_STREAMS;
         let mut secs = 5;
         let mut set_display = None;
         while let Some(arg) = args.next() {

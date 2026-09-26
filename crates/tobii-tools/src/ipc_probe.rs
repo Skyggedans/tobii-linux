@@ -88,6 +88,7 @@ fn kind_of(msg: &ServerMsg) -> &'static str {
         ServerMsg::GazeOrigin(_) => "gaze_origin",
         ServerMsg::EyePosition(_) => "eye_position",
         ServerMsg::GazeData(_) => "gaze_data",
+        ServerMsg::GazeRaw(_) => "gaze_raw",
         ServerMsg::Image(_) => "image",
         ServerMsg::Notification(_) => "notification",
         ServerMsg::Subscribed { .. } => "subscribed",
