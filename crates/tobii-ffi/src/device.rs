@@ -25,9 +25,10 @@ use tobii_ipc::{
     ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
 };
 
+use crate::logger::{self, Level, Logger};
 use crate::status::{
     Status, TOBII_ERROR_ALREADY_SUBSCRIBED, TOBII_ERROR_CALLBACK_IN_PROGRESS,
-    TOBII_ERROR_CONFLICTING_API_INSTANCES, TOBII_ERROR_CONNECTION_FAILED,
+    TOBII_ERROR_CONFLICTING_API_INSTANCES, TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL,
     TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUBSCRIBED,
     TOBII_ERROR_TIMED_OUT,
 };
@@ -62,28 +63,30 @@ const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 thread_local! {
-    /// Set while this thread runs a user callback. The entry points the crate
-    /// documentation lists refuse a call made from inside one, as the Stream
-    /// Engine does: re-entering with the device being dispatched would alias
-    /// its `&mut`, and destroying it would free it under the dispatch loop.
+    /// Set while this thread runs application code: a user callback or the
+    /// application's logger. The entry points the crate documentation lists
+    /// refuse a call made from inside one, as the Stream Engine does for a
+    /// callback: re-entering with the device being dispatched (or logging)
+    /// would alias its `&mut`, and destroying it would free it under the
+    /// dispatch loop.
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether the current thread is inside a user callback.
+/// Whether the current thread is inside a user callback or the logger.
 pub(crate) fn in_callback() -> bool {
     IN_CALLBACK.get()
 }
 
-/// Opaque API handle. Carries no state; it exists so the entry points keep the
-/// Stream Engine signatures.
+/// Opaque API handle: the application's logger, if it gave one. Each device
+/// created from the handle copies it.
 #[derive(Debug)]
 pub struct Api {
-    _private: u8,
+    pub(crate) logger: Option<Logger>,
 }
 
 impl Api {
-    pub(crate) fn new() -> Self {
-        Self { _private: 0 }
+    pub(crate) fn new(logger: Option<Logger>) -> Self {
+        Self { logger }
     }
 }
 
@@ -287,6 +290,9 @@ pub struct Device {
     /// Identity, fetched once per connection: a reconnect clears it, since a
     /// restarted daemon may serve another tracker.
     pub(crate) device_info: Option<DeviceInfoMsg>,
+    /// The logger of the API this device was created from, copied, so the
+    /// device keeps it after `tobii_api_destroy`.
+    pub(crate) logger: Option<Logger>,
 }
 
 impl fmt::Debug for Device {
@@ -317,7 +323,31 @@ impl Device {
             api,
             next_request_id: 0,
             device_info: None,
+            logger: None,
         })
+    }
+
+    /// Take the logger of the API this device was created from, and say it
+    /// has connected, as the DLL says on each connect ("Connected to
+    /// platform module", INFO, 0x180153c19).
+    pub(crate) fn adopt(&mut self, logger: Option<Logger>) {
+        self.logger = logger;
+        self.log(Level::Info, format_args!("connected to tobiid"));
+    }
+
+    /// Log a line to the device's logger (see [`crate::logger`]).
+    pub(crate) fn log(&self, level: Level, args: fmt::Arguments<'_>) {
+        logger::emit(self.logger, level, args);
+    }
+
+    /// A reply from the daemon that does not decode, `what` naming it:
+    /// logged, and `TOBII_ERROR_INTERNAL`.
+    pub(crate) fn malformed(&self, what: &str) -> Status {
+        self.log(
+            Level::Error,
+            format_args!("tobiid sent a {what} reply that does not decode"),
+        );
+        TOBII_ERROR_INTERNAL
     }
 
     /// Connect to the daemon, spawning it if needed. A reconnect only
@@ -332,10 +362,13 @@ impl Device {
 
     /// Unit tests never reach the real daemon, which would open the tracker:
     /// their devices talk to `tests::fake_daemon`, and a constructor that
-    /// gets this far fails as if no daemon could be reached.
+    /// gets this far connects through the stand-in a test left in
+    /// `tests::DAEMON` on this thread, or fails as if no daemon could be
+    /// reached.
     #[cfg(test)]
-    pub(crate) fn connect_daemon(_api: usize, _field_of_use: FieldOfUse) -> io::Result<Self> {
-        Err(io::ErrorKind::NotConnected.into())
+    pub(crate) fn connect_daemon(api: usize, field_of_use: FieldOfUse) -> io::Result<Self> {
+        let connect = tests::DAEMON.take().ok_or(io::ErrorKind::NotConnected)?;
+        Self::new(connect, api, field_of_use)
     }
 
     /// Write one frame to the daemon (see [`Link::send`]).
@@ -456,33 +489,43 @@ impl Device {
     /// only the old connection's requests kept, until the next request.
     /// Samples queued from the old link are dropped. The new link starts up,
     /// so its loss is reported again. The device info is fetched again: a
-    /// restarted daemon may serve another tracker.
+    /// restarted daemon may serve another tracker. Each failure is logged at
+    /// ERROR, a success at INFO.
     pub(crate) fn reconnect(&mut self) -> Status {
         let mut link = match Link::open(&mut self.connect) {
             Ok(link) => link,
             Err(e) => {
-                tracing::warn!(error = %e, "could not reconnect to tobiid");
+                self.log(
+                    Level::Error,
+                    format_args!("could not reconnect to tobiid: {e}"),
+                );
                 return TOBII_ERROR_CONNECTION_FAILED;
             }
         };
         let mut pending = VecDeque::new();
         let mask = self.callbacks.mask();
         if mask != 0 {
-            match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT, &mut pending) {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(mask, "tobiid refused the subscriptions back");
-                    return TOBII_ERROR_CONNECTION_FAILED;
-                }
-                Err(status) => {
-                    tracing::warn!(status, mask, "tobiid did not take the subscriptions back");
-                    return TOBII_ERROR_CONNECTION_FAILED;
-                }
+            let why = match link.send_subscription(mask, RECONNECT_ACK_TIMEOUT, &mut pending) {
+                Ok(true) => None,
+                Ok(false) => Some("refused them"),
+                Err(TOBII_ERROR_TIMED_OUT) => Some("did not acknowledge them in time"),
+                Err(_) => Some("hung up"),
+            };
+            if let Some(why) = why {
+                self.log(
+                    Level::Error,
+                    format_args!(
+                        "could not reconnect to tobiid: asked for the subscriptions back \
+                         (streams {mask:#x}), it {why}"
+                    ),
+                );
+                return TOBII_ERROR_CONNECTION_FAILED;
             }
         }
         self.link = link;
         self.pending = pending;
         self.device_info = None;
+        self.log(Level::Info, format_args!("reconnected to tobiid"));
         TOBII_ERROR_NO_ERROR
     }
 
@@ -543,8 +586,13 @@ impl Device {
             LinkState::Up => TOBII_ERROR_NO_ERROR,
             LinkState::Lost => {
                 // Once per loss: a host keeps calling at its frame rate.
-                tracing::warn!("lost the connection to tobiid; tobii_device_reconnect restores it");
                 self.link.state = LinkState::Reported;
+                self.log(
+                    Level::Error,
+                    format_args!(
+                        "lost the connection to tobiid; tobii_device_reconnect restores it"
+                    ),
+                );
                 TOBII_ERROR_CONNECTION_FAILED
             }
             LinkState::Reported => TOBII_ERROR_CONNECTION_FAILED,
@@ -664,11 +712,13 @@ impl Device {
     }
 }
 
-/// Run a user callback with the re-entry guard set.
-fn call(f: impl FnOnce()) {
-    IN_CALLBACK.set(true);
+/// Run application code (a user callback or the logger) with the re-entry
+/// guard set, then leave the guard as it was: the logger can run inside a
+/// callback, whose dispatch still needs the guard once the line is logged.
+pub(crate) fn call(f: impl FnOnce()) {
+    let was = IN_CALLBACK.replace(true);
     f();
-    IN_CALLBACK.set(false);
+    IN_CALLBACK.set(was);
 }
 
 fn validity(valid: bool) -> Validity {
@@ -773,9 +823,19 @@ pub(crate) unsafe fn device_mut<'a>(device: *mut Device) -> Result<&'a mut Devic
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::logger::tests::Recorder;
+    use crate::types::{LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO};
+    use std::ffi::c_char;
     use tobii_ipc::{
         STREAM_GAZE_ORIGIN, encode_gaze, encode_gaze_origin, encode_reply, encode_subscribed,
     };
+
+    thread_local! {
+        /// The daemon stand-in the next device constructor on this thread
+        /// connects to, taken by the test build of `Device::connect_daemon`;
+        /// with none there, the constructor fails to connect.
+        pub(crate) static DAEMON: Cell<Option<Connector>> = const { Cell::new(None) };
+    }
 
     /// A daemon stand-in: answers each client frame with whatever `handler`
     /// returns (whole frame bodies), on a socket pair.
@@ -1126,7 +1186,9 @@ pub(crate) mod tests {
     /// socket until the client asks. Once the test drops the receiver, a
     /// connect fails as if nothing listened. A read of a frame the client
     /// never sends fails after `LONG_WAIT` rather than hanging the suite.
-    fn scripted_daemon(greetings: Vec<Vec<Vec<u8>>>) -> (Connector, Receiver<UnixStream>) {
+    pub(crate) fn scripted_daemon(
+        greetings: Vec<Vec<Vec<u8>>>,
+    ) -> (Connector, Receiver<UnixStream>) {
         let (tx, daemons) = mpsc::channel();
         let mut greetings = VecDeque::from(greetings);
         let connect: Connector = Box::new(move || {
@@ -1551,6 +1613,136 @@ pub(crate) mod tests {
             | STREAM_NOTIFICATIONS;
         assert_eq!(*masks.lock().expect("log"), [Some(every)]);
         assert_eq!(serial(&mut d), Ok("2".into()), "asked the daemon again");
+    }
+
+    /// What `process` logs for a loss.
+    const LOST: &str = "lost the connection to tobiid; tobii_device_reconnect restores it";
+
+    /// `tobii_device_create` hands a connected device its API's logger
+    /// through `adopt`, which says so at INFO, once.
+    #[test]
+    fn adopting_the_apis_logger_logs_the_connect() {
+        let recorder = Recorder::default();
+        let mut d = device_with(0, vec![]);
+
+        d.adopt(recorder.logger());
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        assert_eq!(
+            recorder.lines(),
+            [(TOBII_LOG_LEVEL_INFO, "connected to tobiid".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_lost_connection_is_logged_once() {
+        let (recorder, mut hits) = (Recorder::default(), 0u32);
+        let (mut d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        d.logger = recorder.logger();
+
+        for _ in 0..3 {
+            assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        }
+
+        assert_eq!(recorder.lines(), [(TOBII_LOG_LEVEL_ERROR, LOST.to_owned())]);
+    }
+
+    #[test]
+    fn each_failed_reconnect_is_logged() {
+        let (recorder, mut hits) = (Recorder::default(), 0u32);
+        let refusal = vec![encode_subscribed(false)];
+        let (mut d, daemons) = lost_device(0, vec![refusal], (&raw mut hits).cast());
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        d.logger = recorder.logger();
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+        drop(daemons);
+        assert_eq!(d.reconnect(), TOBII_ERROR_CONNECTION_FAILED);
+
+        let lines = recorder.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|(level, text)| *level == TOBII_LOG_LEVEL_ERROR
+                    && text.starts_with("could not reconnect to tobiid: ")),
+            "{lines:?}"
+        );
+        assert!(lines[0].1.ends_with("it refused them"), "{lines:?}");
+    }
+
+    /// One INFO line for the reconnect, and nothing for the samples that
+    /// flow again after it.
+    #[test]
+    fn a_reconnect_is_logged_at_info() {
+        let (recorder, mut hits) = (Recorder::default(), 0u32);
+        let (mut d, daemons) =
+            lost_device(0, vec![ack_then_gaze_origin(1)], (&raw mut hits).cast());
+        d.logger = recorder.logger();
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+
+        let mut daemon = daemons.recv().expect("second daemon end");
+        assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
+        assert!(d.wait(LONG_WAIT));
+        for _ in 0..2 {
+            assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        }
+        assert_eq!(hits, 1);
+        assert_eq!(
+            recorder.lines(),
+            [
+                (TOBII_LOG_LEVEL_ERROR, LOST.to_owned()),
+                (TOBII_LOG_LEVEL_INFO, "reconnected to tobiid".to_owned()),
+            ]
+        );
+        drop(daemon);
+    }
+
+    /// A logger's context: the device it calls back into, and what that call
+    /// returned.
+    struct Reentry {
+        device: *mut Device,
+        got: Cell<Status>,
+    }
+
+    unsafe extern "C" fn process_from_the_logger(
+        context: *mut c_void,
+        _level: LogLevel,
+        _text: *const c_char,
+    ) {
+        // SAFETY: the test passes a live `Reentry` as the context.
+        let r = unsafe { &*context.cast::<Reentry>() };
+        // SAFETY: the guard refuses the call before the device is read.
+        r.got
+            .set(unsafe { crate::api::tobii_device_process_callbacks(r.device) });
+    }
+
+    /// The device that logs is borrowed while its logger runs, so the
+    /// logger may not use it: the guard refuses the call, as from a callback.
+    #[test]
+    fn a_logger_that_calls_back_in_is_refused() {
+        let mut hits = 0u32;
+        let (d, _daemons) = lost_device(0, vec![], (&raw mut hits).cast());
+        let d = Box::into_raw(Box::new(d));
+        let reentry = Reentry {
+            device: d,
+            got: Cell::new(-1),
+        };
+        let context = std::ptr::from_ref(&reentry).cast_mut().cast();
+        // SAFETY: `d` is live and destroyed once; `reentry` and `hits`
+        // outlive it.
+        unsafe {
+            (*d).logger = crate::logger::tests::logger(process_from_the_logger, context);
+            assert_eq!(
+                crate::api::tobii_device_process_callbacks(d),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+            assert_eq!(crate::api::tobii_device_destroy(d), TOBII_ERROR_NO_ERROR);
+        }
+        assert_eq!(reentry.got.get(), TOBII_ERROR_CALLBACK_IN_PROGRESS);
+        assert!(!in_callback());
     }
 
     /// A device's first connection goes through `first` (`connect_daemon`

@@ -12,8 +12,7 @@ use tobii_ipc::request::{
 use crate::api::{FACTS_TIMEOUT, fetch_device_info};
 use crate::device::{Api, Device, device_mut};
 use crate::status::{
-    Status, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
-    TOBII_ERROR_NOT_SUPPORTED,
+    Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUPPORTED,
 };
 use crate::types::{
     DeviceName, DisplayArea, GeometryMounting, OutputFrequencyReceiver, TOBII_ENABLED_EYE_BOTH,
@@ -121,7 +120,7 @@ pub unsafe extern "C" fn tobii_get_geometry_mounting(
             unsafe { geometry_mounting.write(mounting_c(&m)) };
             TOBII_ERROR_NO_ERROR
         }
-        Ok(None) => TOBII_ERROR_INTERNAL,
+        Ok(None) => d.malformed("geometry mounting"),
         Err(status) => status,
     }
 }
@@ -153,7 +152,7 @@ pub unsafe extern "C" fn tobii_get_display_area(
             unsafe { display_area.write(crate::device::display_area(&a)) };
             TOBII_ERROR_NO_ERROR
         }
-        Ok(None) => TOBII_ERROR_INTERNAL,
+        Ok(None) => d.malformed("display area"),
         Err(status) => status,
     }
 }

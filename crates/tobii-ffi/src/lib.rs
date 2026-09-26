@@ -102,6 +102,18 @@
 //! lost, so that call reports the loss, while after a daemon's answer that it
 //! has no tracker it returns `TOBII_ERROR_NO_ERROR`.
 //!
+//! libtobii prints nothing, and nothing outside it can subscribe to its
+//! `tracing` events (it is a cdylib with its own copy of `tracing`): the
+//! `tobii_custom_log_t` an application hands `tobii_api_create` is the only
+//! way to see its diagnostics. They are its own, and few: ERROR for a refused
+//! `field_of_use`, a failed connect or reconnect, a lost connection when
+//! `tobii_device_process_callbacks` reports it (once per loss) and a daemon
+//! reply that does not decode, INFO for each connect and reconnect. The logger is called on the thread inside the `tobii_*` call
+//! that logs, with no lock held and under the callback guard, so a call from
+//! inside it that a callback could not make either is
+//! `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A `tobii_custom_alloc_t` is checked as
+//! in the DLL and never called (see `logger` and `tobii_api_create`).
+//!
 //! Every entry point takes raw handles from C, so each is an `unsafe fn` whose
 //! `# Safety` section states what the caller must uphold; the `unsafe` blocks
 //! inside are kept to the single pointer operation that needs them. Entry
@@ -115,6 +127,7 @@ mod config;
 mod device;
 mod internal;
 mod licensing;
+mod logger;
 mod status;
 mod streams;
 mod stub;

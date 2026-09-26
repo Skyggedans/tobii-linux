@@ -49,6 +49,19 @@ pub const TOBII_STATE_CALIBRATION_ID: State = 6;
 /// A calibration session is running (bool).
 pub const TOBII_STATE_CALIBRATION_ACTIVE: State = 7;
 
+/// `tobii_log_level_t`: the level a [`LogFn`] is given.
+pub type LogLevel = u32;
+/// An error.
+pub const TOBII_LOG_LEVEL_ERROR: LogLevel = 0;
+/// A warning.
+pub const TOBII_LOG_LEVEL_WARN: LogLevel = 1;
+/// Information.
+pub const TOBII_LOG_LEVEL_INFO: LogLevel = 2;
+/// Debugging detail.
+pub const TOBII_LOG_LEVEL_DEBUG: LogLevel = 3;
+/// Tracing detail.
+pub const TOBII_LOG_LEVEL_TRACE: LogLevel = 4;
+
 /// `tobii_state_bool_t` false.
 pub const TOBII_STATE_BOOL_FALSE: u32 = 0;
 /// `tobii_state_bool_t` true.
@@ -479,6 +492,38 @@ pub struct LicenseKey {
     pub size_in: usize,
 }
 
+/// `tobii_malloc_func_t`.
+pub type MallocFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+/// `tobii_free_func_t`.
+pub type FreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+/// `tobii_log_func_t`.
+pub type LogFn = unsafe extern "C" fn(*mut c_void, LogLevel, *const c_char);
+
+/// `tobii_custom_alloc_t`: checked by `tobii_api_create` (the DLL reads
+/// `malloc_func` at +8 and `free_func` at +0x10, then copies all 24 bytes),
+/// never called.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CustomAlloc {
+    /// Handed to both functions.
+    pub mem_context: *mut c_void,
+    /// Required.
+    pub malloc_func: Option<MallocFn>,
+    /// Required.
+    pub free_func: Option<FreeFn>,
+}
+
+/// `tobii_custom_log_t`: the application's logger (the DLL reads `log_func`
+/// at +8 in `tobii_api_create`, then copies all 16 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CustomLog {
+    /// Handed to `log_func` with every line.
+    pub log_context: *mut c_void,
+    /// Required.
+    pub log_func: Option<LogFn>,
+}
+
 /// `tobii_device_name_t`.
 pub type DeviceName = [c_char; 64];
 /// `tobii_state_string_t`.
@@ -606,6 +651,14 @@ mod tests {
         assert_eq!(size_of::<CalibrationPointData>(), 32);
         assert_eq!(offset_of!(CalibrationPointData, right_status), 20);
         assert_eq!(size_of::<LicenseKey>(), 16);
+        // `tobii_api_create` checks +8 and +0x10 of the one and +8 of the
+        // other (0x180144ac7..0x180144ae2), and copies 24 and 16 bytes
+        // (0x180144b36, 0x180144b78).
+        assert_eq!(size_of::<CustomAlloc>(), 24);
+        assert_eq!(offset_of!(CustomAlloc, malloc_func), 8);
+        assert_eq!(offset_of!(CustomAlloc, free_func), 16);
+        assert_eq!(size_of::<CustomLog>(), 16);
+        assert_eq!(offset_of!(CustomLog, log_func), 8);
         assert_eq!(size_of::<DeviceName>(), 64);
         assert_eq!(size_of::<StateString>(), 512);
     }

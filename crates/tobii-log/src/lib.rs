@@ -1,9 +1,10 @@
 //! Process-wide diagnostics setup for the binaries.
 //!
-//! The library itself only emits through the `tracing` facade (it never
-//! installs a subscriber, so `libtobii.so` stays silent inside a host
-//! application unless that application sets one up). Each executable calls
-//! [`init`] once at start.
+//! The libraries only emit through the `tracing` facade and never install a
+//! subscriber; each executable calls [`init`] once at start. `libtobii.so`
+//! is not reached by this: a cdylib with its own copy of `tracing`, it stays
+//! silent inside a host application, C or Rust, whose only view of its
+//! diagnostics is the `tobii_custom_log_t` it hands `tobii_api_create`.
 
 use std::io::IsTerminal;
 

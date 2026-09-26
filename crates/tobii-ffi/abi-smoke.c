@@ -58,6 +58,35 @@ static void point_receiver( tobii_calibration_point_data_t const* point_data, vo
     ++*(int*)user_data;
 }
 
+/* What the logger was called with: how often, and the last call's arguments. */
+static int log_calls = 0;
+static void* last_log_context = NULL;
+static tobii_log_level_t last_log_level = TOBII_LOG_LEVEL_TRACE;
+static char last_log_text[ 256 ] = { 0 };
+
+static void log_func( void* log_context, tobii_log_level_t level, char const* text )
+{
+    ++log_calls;
+    last_log_context = log_context;
+    last_log_level = level;
+    snprintf( last_log_text, sizeof( last_log_text ), "%s", text );
+}
+
+/* An allocator that counts its calls, in the int its mem_context points to,
+ * and allocates nothing. */
+static void* counting_malloc( void* mem_context, size_t size )
+{
+    (void)size;
+    ++*(int*)mem_context;
+    return NULL;
+}
+
+static void counting_free( void* mem_context, void* ptr )
+{
+    (void)ptr;
+    ++*(int*)mem_context;
+}
+
 /* How far the system clock reads behind the wall clock at least: 1e15 us,
  * some 31.7 years, where the wall clock is some 1.8e15 us past its epoch and
  * CLOCK_MONOTONIC counts from boot. */
@@ -120,6 +149,30 @@ int main( void )
     assert( tobii_device_create_ex( api, first_url, (tobii_field_of_use_t)0, NULL, 2, results, &device )
         == TOBII_ERROR_INVALID_PARAMETER );
     assert( results[ 0 ] == 99 && device == NULL );
+
+    /* tobii_api_create checks custom_alloc and custom_log as the DLL does,
+     * leaving the handle alone when it refuses them. The allocator is never
+     * called; the logger hears libtobii's own diagnostics, here a refused
+     * field_of_use, with its context. */
+    int alloc_calls = 0;
+    int log_context = 0;
+    tobii_custom_alloc_t const custom_alloc = { &alloc_calls, counting_malloc, counting_free };
+    tobii_custom_alloc_t const no_free = { &alloc_calls, counting_malloc, NULL };
+    tobii_custom_log_t const custom_log = { &log_context, log_func };
+    tobii_custom_log_t const no_log_func = { &log_context, NULL };
+    static char untouched;
+    tobii_api_t* logging = (tobii_api_t*)&untouched;
+    assert( tobii_api_create( &logging, &no_free, &custom_log ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_api_create( &logging, &custom_alloc, &no_log_func ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( logging == (tobii_api_t*)&untouched );
+    assert( tobii_api_create( &logging, &custom_alloc, &custom_log ) == TOBII_ERROR_NO_ERROR );
+    assert( logging != NULL && logging != (tobii_api_t*)&untouched );
+    assert( tobii_device_create( logging, first_url, (tobii_field_of_use_t)0, &device )
+        == TOBII_ERROR_INVALID_PARAMETER );
+    assert( log_calls == 1 && last_log_context == &log_context );
+    assert( last_log_level == TOBII_LOG_LEVEL_ERROR && last_log_text[ 0 ] != '\0' );
+    assert( tobii_api_destroy( logging ) == TOBII_ERROR_NO_ERROR );
+    assert( alloc_calls == 0 && log_calls == 1 && device == NULL );
 
     /* Answered locally: the display area of a 597x336 mm monitor on the ET5
      * mounting is the one the Windows engine wrote (change-display.pcapng). */
@@ -196,6 +249,7 @@ int main( void )
             && TOBII_STREAM_WEARABLE_ADVANCED == 10 && TOBII_STREAM_WEARABLE_FOVEATED_GAZE == 11,
         "tobii_stream_t is numbered as the 4.1 DLL numbers it" );
     assert( TOBII_STATE_CALIBRATION_ACTIVE == 7 );
+    assert( TOBII_LOG_LEVEL_ERROR == 0 && TOBII_LOG_LEVEL_INFO == 2 && TOBII_LOG_LEVEL_TRACE == 4 );
     assert( TOBII_NOTIFICATION_TYPE_FACE_TYPE_CHANGED == 12 && TOBII_NOTIFICATION_VALUE_TYPE_STRING == 6 );
     assert( TOBII_LENS_CONFIGURATION_NOT_WRITABLE == 0 && TOBII_LENS_CONFIGURATION_WRITABLE == 1 );
     _Static_assert( TOBII_CALIBRATION_POINT_STATUS_FAILED_OR_INVALID == 0
@@ -243,6 +297,11 @@ int main( void )
     assert( offsetof( tobii_hardware_configuration_t, mode ) == 0x9a0 );
     assert( sizeof( tobii_calibration_point_data_t ) == 32 );
     assert( sizeof( tobii_license_key_t ) == 16 );
+    assert( sizeof( tobii_custom_alloc_t ) == 24 );
+    assert( offsetof( tobii_custom_alloc_t, malloc_func ) == 8 );
+    assert( offsetof( tobii_custom_alloc_t, free_func ) == 16 );
+    assert( sizeof( tobii_custom_log_t ) == 16 );
+    assert( offsetof( tobii_custom_log_t, log_func ) == 8 );
     assert( sizeof( tobii_device_name_t ) == 64 );
     assert( sizeof( tobii_state_string_t ) == 512 );
 

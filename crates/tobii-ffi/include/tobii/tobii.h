@@ -64,9 +64,11 @@ typedef struct tobii_version_t
 typedef struct tobii_api_t tobii_api_t;
 typedef struct tobii_device_t tobii_device_t;
 
-/* Accepted by tobii_api_create for signature compatibility, then ignored:
- * libtobii.so allocates with Rust's allocator and logs through `tracing`
- * (RUST_LOG). Pass NULL for both. */
+/* tobii_api_create checks custom_alloc as the Stream Engine does: without
+ * malloc_func or free_func it is TOBII_ERROR_INVALID_PARAMETER, and *api is
+ * left as it was. The allocator is then never called: libtobii.so allocates
+ * with Rust's allocator, so TOBII_ERROR_ALLOCATION_FAILED never comes from
+ * it. Pass NULL. */
 typedef void* ( *tobii_malloc_func_t )( void* mem_context, size_t size );
 typedef void ( *tobii_free_func_t )( void* mem_context, void* ptr );
 
@@ -86,6 +88,23 @@ typedef enum tobii_log_level_t
     TOBII_LOG_LEVEL_TRACE,
 } tobii_log_level_t;
 
+/* The only way to see libtobii.so's diagnostics: it prints nothing, and
+ * nothing outside it can subscribe to its internal tracing. A custom_log
+ * without log_func is TOBII_ERROR_INVALID_PARAMETER, as in the Stream Engine;
+ * with custom_log NULL nothing is logged. log_func gets libtobii's own
+ * diagnostics, not a line per failing call (the returned error says that):
+ * TOBII_LOG_LEVEL_ERROR when field_of_use is refused, a device cannot connect
+ * to tobiid or reconnect, tobii_device_process_callbacks reports a lost
+ * connection (once per loss), or tobiid sends a reply that does not decode;
+ * TOBII_LOG_LEVEL_INFO when a device connects or reconnects.
+ *
+ * It is called synchronously, on the thread inside the tobii_* call that
+ * logs, never on a thread of libtobii's own, with no lock of libtobii's held,
+ * and not serialised across threads. A call from inside it that a stream
+ * callback could not make either returns TOBII_ERROR_CALLBACK_IN_PROGRESS.
+ * text is valid only during the call. log_func and log_context must stay
+ * valid until the API and every device created from it are destroyed: a
+ * device keeps logging after tobii_api_destroy. */
 typedef void ( *tobii_log_func_t )( void* log_context, tobii_log_level_t level, char const* text );
 
 typedef struct tobii_custom_log_t

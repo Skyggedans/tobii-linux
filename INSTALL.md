@@ -301,6 +301,10 @@ the reports can be piped or redirected cleanly.
 (Auto-spawned daemons — option 4a — have their stdio sent to `/dev/null`; run
 `tobiid` by hand in a terminal if you want to see its output there.)
 
+`libtobii.so` prints nothing, whatever `RUST_LOG` says: inside an application
+its diagnostics go only to the `tobii_custom_log_t` the application hands
+`tobii_api_create` (§8).
+
 ---
 
 ## 7. Tuning (environment variables on the daemon)
@@ -408,6 +412,18 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   unplugged tracker never shows in `tobii_device_process_callbacks`: its
   samples stop and resume on the same connection once it is back (§9, *Lazy
   claim*).
+
+  Logging: `libtobii.so` prints nothing; an application sees its diagnostics
+  only through the `tobii_custom_log_t` it hands `tobii_api_create`. They are
+  libtobii's own, not a line per failing call as the Stream Engine writes:
+  `TOBII_LOG_LEVEL_ERROR` for a refused `field_of_use`, a failed connect or
+  reconnect, a lost daemon connection when `tobii_device_process_callbacks`
+  reports it (once per loss) or a daemon reply that does not decode, and
+  `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
+  The logger is called on the thread inside the `tobii_*` call that logs,
+  with no lock of libtobii's held; a call from inside it that a callback could
+  not make either returns `TOBII_ERROR_CALLBACK_IN_PROGRESS`. A
+  `tobii_custom_alloc_t` is checked as in the Stream Engine and never called.
 
   #### OpenTrack's `tracker-tobii` plugin
 

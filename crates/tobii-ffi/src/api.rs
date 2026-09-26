@@ -7,14 +7,15 @@ use std::time::Duration;
 use tobii_ipc::request::{self, decode_device_info, decode_track_box, kind};
 
 use crate::device::{Api, Device, device_mut, in_callback};
+use crate::logger::{self, Level, Logger};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_CONFLICTING_API_INSTANCES,
-    TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER,
-    TOBII_ERROR_NO_ERROR, TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_TIMED_OUT,
+    TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
+    TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_TIMED_OUT,
 };
 use crate::types::{
-    DeviceInfo, DeviceUrlReceiver, FieldOfUse, StateString, TOBII_CAPABILITY_CALIBRATION_2D,
-    TOBII_CAPABILITY_COMPOUND_STREAM_USER_POSITION_GUIDE_XY,
+    CustomAlloc, CustomLog, DeviceInfo, DeviceUrlReceiver, FieldOfUse, StateString,
+    TOBII_CAPABILITY_CALIBRATION_2D, TOBII_CAPABILITY_COMPOUND_STREAM_USER_POSITION_GUIDE_XY,
     TOBII_CAPABILITY_COMPOUND_STREAM_USER_POSITION_GUIDE_Z, TOBII_CAPABILITY_DISPLAY_AREA_WRITABLE,
     TOBII_FIELD_OF_USE_ANALYTICAL, TOBII_FIELD_OF_USE_INTERACTIVE, TOBII_NOT_SUPPORTED,
     TOBII_STATE_BOOL_FALSE, TOBII_STATE_CALIBRATION_ACTIVE, TOBII_STATE_CALIBRATION_ID,
@@ -57,22 +58,49 @@ pub unsafe extern "C" fn tobii_get_api_version(version: *mut Version) -> Status 
     TOBII_ERROR_NO_ERROR
 }
 
-/// Create the API handle. `custom_alloc` and `custom_log` are accepted for
-/// signature compatibility and ignored.
+/// Create the API handle. Its arguments are checked in the DLL's order
+/// (0x180144abc..0x180144ae7): a null `api`, a `custom_alloc` without
+/// `malloc_func` or `free_func`, then a `custom_log` without `log_func` is
+/// `TOBII_ERROR_INVALID_PARAMETER`, and `*api` is left as it was.
+///
+/// The logger is copied into the handle, as the DLL copies the struct, and
+/// hears libtobii's own diagnostics (see `logger`); with `custom_log` null
+/// nothing is logged. The allocator is never called: libtobii allocates with
+/// Rust's global allocator, which cannot be switched per handle, so
+/// `TOBII_ERROR_ALLOCATION_FAILED` never comes from it. (The DLL allocates
+/// through it: the handle (0x180144b09), each device (0x180157a3c), more
+/// through the sub-libraries it hands it to (0x180144c37), and a log line of
+/// 255 characters or more (0x18015e3dd).)
 ///
 /// # Safety
 /// `api` must be null or valid for writing one `*mut Api`. The handle written
-/// there must be released with `tobii_api_destroy`.
+/// there must be released with `tobii_api_destroy`. `custom_alloc` and
+/// `custom_log` must each be null or valid for reading one struct during the
+/// call. A `log_func` must be sound to call with `log_context`, any
+/// `tobii_log_level_t` and a NUL-terminated string valid for the call, on any
+/// thread that calls into the handle or a device created from it, until the
+/// handle and every such device are destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_api_create(
     api: *mut *mut Api,
-    _custom_alloc: *const c_void,
-    _custom_log: *const c_void,
+    custom_alloc: *const CustomAlloc,
+    custom_log: *const CustomLog,
 ) -> Status {
     if api.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
-    let handle = Box::into_raw(Box::new(Api::new()));
+    // SAFETY: null or readable during the call, per the contract.
+    if let Some(alloc) = unsafe { custom_alloc.as_ref() }
+        && (alloc.malloc_func.is_none() || alloc.free_func.is_none())
+    {
+        return TOBII_ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: null or readable during the call, per the contract.
+    let logger = match unsafe { Logger::from_c(custom_log) } {
+        Ok(logger) => logger,
+        Err(status) => return status,
+    };
+    let handle = Box::into_raw(Box::new(Api::new(logger)));
     // SAFETY: `api` is non-null (checked above) and the caller guarantees it
     // is valid for a write of one pointer.
     unsafe { api.write(handle) };
@@ -82,8 +110,8 @@ pub unsafe extern "C" fn tobii_api_create(
 /// Release an API handle. A null handle is `TOBII_ERROR_INVALID_PARAMETER`,
 /// then a call from inside a callback `TOBII_ERROR_CALLBACK_IN_PROGRESS`, in
 /// the DLL's order; neither releases anything. As in the DLL, devices created
-/// from the handle are not checked for; here they keep working, since the
-/// handle carries no state.
+/// from the handle are not checked for; here they keep working, and keep
+/// logging to the handle's logger, which each copied when it was created.
 ///
 /// # Safety
 /// `api` must be null or a handle from `tobii_api_create` that has not been
@@ -156,10 +184,14 @@ pub unsafe extern "C" fn tobii_enumerate_local_device_urls_ex(
 }
 
 /// Validate the arguments of the device constructors, refuse a call from
-/// inside a callback (after the arguments, as in the DLL) and connect.
+/// inside a callback (after the arguments, as in the DLL) and connect. A
+/// refused `field_of_use` is logged at ERROR, as in the DLL (0x1801442b3), and
+/// so is a failed connect; a connected device takes the API's logger, and
+/// logs so at INFO.
 ///
 /// # Safety
-/// `device` must be null or valid for writing one `*mut Device`.
+/// `api` must be null or a live handle from `tobii_api_create`; `device` must
+/// be null or valid for writing one `*mut Device`.
 pub(crate) unsafe fn create_device(
     api: *mut Api,
     field_of_use: FieldOfUse,
@@ -168,14 +200,19 @@ pub(crate) unsafe fn create_device(
     if api.is_null() || device.is_null() {
         return TOBII_ERROR_INVALID_PARAMETER;
     }
+    // SAFETY: non-null (checked above), and live per the contract.
+    let logger = unsafe { &*api }.logger;
     if !matches!(
         field_of_use,
         TOBII_FIELD_OF_USE_INTERACTIVE | TOBII_FIELD_OF_USE_ANALYTICAL
     ) {
-        tracing::warn!(
-            field_of_use,
-            "rejecting tobii_device_create: field_of_use must be 1 or 2 — a \
-             caller built against the 3-argument Stream Engine header lands here"
+        logger::emit(
+            logger,
+            Level::Error,
+            format_args!(
+                "refused field_of_use {field_of_use}: it must be 1 or 2 (a caller built \
+                 against the 3-argument Stream Engine header lands here)"
+            ),
         );
         return TOBII_ERROR_INVALID_PARAMETER;
     }
@@ -183,11 +220,21 @@ pub(crate) unsafe fn create_device(
     if in_callback() {
         return TOBII_ERROR_CALLBACK_IN_PROGRESS;
     }
-    let Ok(d) = Device::connect_daemon(api as usize, field_of_use)
-        .inspect_err(|e| tracing::warn!(error = %e, "could not connect to tobiid"))
-    else {
-        return TOBII_ERROR_CONNECTION_FAILED;
+    let mut d = match Device::connect_daemon(api as usize, field_of_use) {
+        Ok(d) => d,
+        Err(e) => {
+            logger::emit(
+                logger,
+                Level::Error,
+                format_args!(
+                    "could not open a connection to tobiid ({}): {e}",
+                    tobii_ipc::socket_path().display()
+                ),
+            );
+            return TOBII_ERROR_CONNECTION_FAILED;
+        }
     };
+    d.adopt(logger);
     let handle = Box::into_raw(Box::new(d));
     // SAFETY: `device` is non-null (checked above) and the caller guarantees
     // it is valid for a write of one pointer.
@@ -204,7 +251,8 @@ pub(crate) unsafe fn create_device(
 /// Stream Engine 3.x header lands here with a stack address in `field_of_use`
 /// and an uninitialised `device`, and is rejected instead of corrupting memory.
 /// A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS` once
-/// the arguments have been checked, as in the DLL.
+/// the arguments have been checked, as in the DLL. The device logs to
+/// `api`'s logger (see `tobii_api_create`).
 ///
 /// # Safety
 /// `api` must be null or a live handle from `tobii_api_create`. `device` must
@@ -433,7 +481,7 @@ pub(crate) fn fetch_device_info(d: &mut Device) -> Result<request::DeviceInfo, S
         return Ok(info.clone());
     }
     let payload = d.request(kind::DEVICE_INFO, &[], FACTS_TIMEOUT)?;
-    let info = decode_device_info(&payload).ok_or(TOBII_ERROR_INTERNAL)?;
+    let info = decode_device_info(&payload).ok_or_else(|| d.malformed("device info"))?;
     d.device_info = Some(info.clone());
     Ok(info)
 }
@@ -521,7 +569,7 @@ pub unsafe extern "C" fn tobii_get_track_box(
     let b = match d.request(kind::TRACK_BOX, &[], FACTS_TIMEOUT) {
         Ok(p) => match decode_track_box(&p) {
             Some(b) => b,
-            None => return TOBII_ERROR_INTERNAL,
+            None => return d.malformed("track box"),
         },
         Err(status) => return status,
     };
@@ -619,7 +667,7 @@ pub unsafe extern "C" fn tobii_get_state_uint32(
             unsafe { value.write(id) };
             TOBII_ERROR_NO_ERROR
         }
-        Ok(None) => TOBII_ERROR_INTERNAL,
+        Ok(None) => d.malformed("calibration id"),
         Err(status) => status,
     }
 }
@@ -774,9 +822,13 @@ pub unsafe extern "C" fn tobii_stream_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logger::tests::Recorder;
+    use crate::status::TOBII_ERROR_INTERNAL;
     use crate::types::{
-        CalibrationPointData, EyePair, EyePairFn, LicenseKey, TOBII_STATE_EXCLUSIVE_MODE,
+        CalibrationPointData, EyePair, EyePairFn, LicenseKey, TOBII_LOG_LEVEL_ERROR,
+        TOBII_LOG_LEVEL_INFO, TOBII_STATE_EXCLUSIVE_MODE,
     };
+    use std::cell::Cell;
     use std::ptr;
 
     fn api() -> *mut Api {
@@ -785,6 +837,228 @@ mod tests {
         let status = unsafe { tobii_api_create(&raw mut api, ptr::null(), ptr::null()) };
         assert_eq!(status, 0);
         api
+    }
+
+    /// An API handle whose logger records into `recorder`, which must
+    /// outlive it and every device created from it.
+    fn api_logging_to(recorder: &Recorder) -> *mut Api {
+        let log = recorder.custom_log();
+        let mut api: *mut Api = ptr::null_mut();
+        // SAFETY: `api` and `log` are live locals.
+        let status = unsafe { tobii_api_create(&raw mut api, ptr::null(), &raw const log) };
+        assert_eq!(status, 0);
+        api
+    }
+
+    // The `counting_*` allocator functions count their calls in the
+    // `Cell<u32>` the tests pass as `mem_context`, and allocate nothing.
+
+    unsafe extern "C" fn counting_malloc(context: *mut c_void, _size: usize) -> *mut c_void {
+        // SAFETY: `context` is a live `Cell<u32>` (see above).
+        let calls = unsafe { &*context.cast::<Cell<u32>>() };
+        calls.set(calls.get() + 1);
+        ptr::null_mut()
+    }
+
+    unsafe extern "C" fn counting_free(context: *mut c_void, _ptr: *mut c_void) {
+        // SAFETY: `context` is a live `Cell<u32>` (see above).
+        let calls = unsafe { &*context.cast::<Cell<u32>>() };
+        calls.set(calls.get() + 1);
+    }
+
+    /// As in the DLL (0x180144abc..0x180144ae7), an allocator without either
+    /// function or a logger without `log_func` is refused, and `*api` left as
+    /// it was; the allocator is never called, from the create to the destroy.
+    #[test]
+    fn api_create_checks_custom_alloc_and_custom_log_as_the_dll() {
+        let (calls, recorder) = (Cell::new(0u32), Recorder::default());
+        let alloc = CustomAlloc {
+            mem_context: ptr::from_ref(&calls).cast_mut().cast(),
+            malloc_func: Some(counting_malloc),
+            free_func: Some(counting_free),
+        };
+        let no_malloc = CustomAlloc {
+            malloc_func: None,
+            ..alloc
+        };
+        let no_free = CustomAlloc {
+            free_func: None,
+            ..alloc
+        };
+        let log = recorder.custom_log();
+        let no_log_func = CustomLog {
+            log_func: None,
+            ..log
+        };
+        let untouched = ptr::NonNull::<Api>::dangling().as_ptr();
+        let mut api = untouched;
+        let mut device: *mut Device = ptr::null_mut();
+        // SAFETY: `api`, `device` and the structs are live locals; a refused
+        // create writes nothing, and the handle made is destroyed once.
+        unsafe {
+            for (a, l) in [
+                (&raw const no_malloc, ptr::null()),
+                (&raw const no_free, ptr::null()),
+                (ptr::null(), &raw const no_log_func),
+                (&raw const alloc, &raw const no_log_func),
+            ] {
+                assert_eq!(
+                    tobii_api_create(&raw mut api, a, l),
+                    TOBII_ERROR_INVALID_PARAMETER
+                );
+                assert_eq!(api, untouched);
+            }
+            assert_eq!(
+                tobii_api_create(ptr::null_mut(), &raw const alloc, &raw const log),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_api_create(&raw mut api, &raw const alloc, &raw const log),
+                TOBII_ERROR_NO_ERROR
+            );
+            assert_ne!(api, untouched);
+            assert_eq!(
+                tobii_device_create(api, ptr::null(), 0, &raw mut device),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_api_destroy(api), TOBII_ERROR_NO_ERROR);
+        }
+        assert_eq!(calls.get(), 0, "the allocator is never called");
+        assert_eq!(recorder.lines().len(), 1, "the refused field_of_use");
+    }
+
+    /// A refused `field_of_use` and a failed connect are logged at ERROR, from
+    /// either constructor; a null argument is not, its status says it all.
+    #[test]
+    fn device_create_failures_reach_the_application_logger() {
+        let recorder = Recorder::default();
+        let api = api_logging_to(&recorder);
+        let mut device: *mut Device = ptr::null_mut();
+        let mut results = [99u32];
+        let key = LicenseKey {
+            license_key: ptr::null(),
+            size_in: 0,
+        };
+        // SAFETY: `api` is live and destroyed once; the rest are live
+        // locals. Nothing reaches a daemon: under test, connecting fails.
+        unsafe {
+            assert_eq!(
+                tobii_device_create(api, ptr::null(), 0, &raw mut device),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                crate::licensing::tobii_device_create_ex(
+                    api,
+                    ptr::null(),
+                    3,
+                    &raw const key,
+                    1,
+                    results.as_mut_ptr(),
+                    &raw mut device,
+                ),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_device_create(api, ptr::null(), 1, &raw mut device),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+            assert_eq!(
+                tobii_device_create(ptr::null_mut(), ptr::null(), 0, &raw mut device),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(
+                tobii_device_create(api, ptr::null(), 0, ptr::null_mut()),
+                TOBII_ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(tobii_api_destroy(api), TOBII_ERROR_NO_ERROR);
+        }
+        assert!(device.is_null());
+        assert_eq!(results, [99], "no licence result was written");
+        let lines = recorder.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|(level, _)| *level == TOBII_LOG_LEVEL_ERROR)
+        );
+        assert!(lines[0].1.contains("field_of_use 0"), "{lines:?}");
+        assert!(lines[1].1.contains("field_of_use 3"), "{lines:?}");
+        assert!(
+            lines[2]
+                .1
+                .starts_with("could not open a connection to tobiid ("),
+            "{lines:?}"
+        );
+    }
+
+    /// Every undecodable reply goes through `Device::malformed`: one is
+    /// enough to show it is logged and `TOBII_ERROR_INTERNAL`.
+    #[test]
+    fn a_reply_that_does_not_decode_is_logged_and_internal() {
+        let recorder = Recorder::default();
+        let mut d = crate::device::tests::device_with(0, vec![0xff]);
+        d.logger = recorder.logger();
+        let d = Box::into_raw(Box::new(d));
+        let mut track_box = TrackBox::default();
+        // SAFETY: `d` is live and destroyed once; `track_box` a live local.
+        unsafe {
+            assert_eq!(
+                tobii_get_track_box(d, &raw mut track_box),
+                TOBII_ERROR_INTERNAL
+            );
+            assert_eq!(tobii_device_destroy(d), TOBII_ERROR_NO_ERROR);
+        }
+        assert_eq!(track_box, TrackBox::default(), "nothing written");
+        assert_eq!(
+            recorder.lines(),
+            [(
+                TOBII_LOG_LEVEL_ERROR,
+                "tobiid sent a track box reply that does not decode".to_owned()
+            )]
+        );
+    }
+
+    /// `tobii_device_create` hands the device it connects its API's logger,
+    /// which hears the connect at INFO, once. The device keeps the logger
+    /// once the API is destroyed, as `tobii_api_create`'s contract says: its
+    /// daemon hanging up then still reaches it.
+    #[test]
+    fn a_created_device_logs_to_its_apis_logger_even_once_the_api_is_gone() {
+        let recorder = Recorder::default();
+        let api = api_logging_to(&recorder);
+        let (connect, daemons) = crate::device::tests::scripted_daemon(vec![]);
+        crate::device::tests::DAEMON.set(Some(connect));
+        let mut device: *mut Device = ptr::null_mut();
+        // SAFETY: `api` is live until it is destroyed, once, here; `device`
+        // is a live local.
+        unsafe {
+            assert_eq!(
+                tobii_device_create(api, ptr::null(), 1, &raw mut device),
+                TOBII_ERROR_NO_ERROR
+            );
+            assert_eq!(tobii_api_destroy(api), TOBII_ERROR_NO_ERROR);
+        }
+        assert_eq!(
+            recorder.lines(),
+            [(TOBII_LOG_LEVEL_INFO, "connected to tobiid".to_owned())]
+        );
+        drop(daemons.recv().expect("the daemon's end"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // SAFETY: `device` is live and destroyed once; `recorder` outlives it.
+        unsafe {
+            while tobii_wait_for_callbacks(1, &raw const device) != TOBII_ERROR_NO_ERROR {
+                assert!(std::time::Instant::now() < deadline, "the hang-up is seen");
+            }
+            assert_eq!(
+                tobii_device_process_callbacks(device),
+                TOBII_ERROR_CONNECTION_FAILED
+            );
+            assert_eq!(tobii_device_destroy(device), TOBII_ERROR_NO_ERROR);
+        }
+        let lines = recorder.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1].0, TOBII_LOG_LEVEL_ERROR);
+        assert!(lines[1].1.starts_with("lost the connection"), "{lines:?}");
     }
 
     #[test]
@@ -1276,11 +1550,9 @@ mod tests {
         });
     }
 
-    /// The DLL refuses these once their arguments check out; a callback
-    /// could not destroy a device it made.
-    #[test]
-    fn a_callback_cannot_create_a_device_or_parse_a_calibration() {
-        let api = api();
+    /// Run [`create`] on two samples, calling into `api`, then check that
+    /// every call was refused or rejected before it did anything.
+    fn assert_a_callback_creates_nothing(api: *mut Api) {
         let d = device_with_two_samples_per_ack();
         let mut c = Creation {
             api,
@@ -1311,6 +1583,33 @@ mod tests {
         assert!(c.device.is_null(), "no device was written");
         assert_eq!(c.license_results, [99], "no licence result was written");
         assert!(!in_callback());
+    }
+
+    /// The DLL refuses these once their arguments check out; a callback
+    /// could not destroy a device it made.
+    #[test]
+    fn a_callback_cannot_create_a_device_or_parse_a_calibration() {
+        assert_a_callback_creates_nothing(api());
+    }
+
+    /// The refused `field_of_use` is logged from inside the callback, and
+    /// the guard must outlive the line: were it cleared, the
+    /// `tobii_device_create_ex` after it would try to connect.
+    #[test]
+    fn a_callback_cannot_create_a_device_through_a_logging_api_either() {
+        let recorder = Recorder::default();
+
+        assert_a_callback_creates_nothing(api_logging_to(&recorder));
+
+        let lines = recorder.lines();
+        assert_eq!(lines.len(), 2, "one per sample: {lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|(level, text)| *level == TOBII_LOG_LEVEL_ERROR
+                    && text.contains("field_of_use 0")),
+            "{lines:?}"
+        );
     }
 
     #[test]

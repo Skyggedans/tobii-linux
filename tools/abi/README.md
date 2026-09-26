@@ -93,10 +93,18 @@ prototype declares or a float/integer position disagrees.
   Consistent, with the names only from the docs: feature group (the mapping
   at 0x18015026e in `tobii_get_feature_group`), enabled eye
   (`tobii_set_enabled_eye` at 0x180149c40), user presence status (the
-  presence notification at 0x180153f6e), log level (error paths pass 0, and
-  "Connected to platform module" passes 2, INFO, at 0x180153c19), validity
-  (the real DLL's Windows session output: 0 with position (-1,-1), 1
-  otherwise).
+  presence notification at 0x180153f6e), log level (below), validity (the
+  real DLL's Windows session output: 0 with position (-1,-1), 1 otherwise).
+  Log level: the DLL's own lines go through one helper, 0x18015e360. Its 810
+  direct call sites, plus 120 through two error-name helpers (0x1800010f0
+  and 0x180157440, which call it at 0x180001266 and 0x18015754a with the
+  level they are given, always 0), pass ERROR, 0, but for three at INFO, 2:
+  "Connected to platform module" at 0x180153c19 and a firmware upgrade in
+  progress at 0x18014467e and 0x1801588e3. That helper is not the only path:
+  thunks forward the lines of the DLL's sub-libraries to `log_func`
+  directly, at DEBUG, 3, and TRACE, 4, from enumeration (0x18015b070), at
+  their own level, 0..4 unchanged, from the legacy TTP layer (0x1801706c0),
+  and at a level taken from the message (0x18015d930).
   Calibration point status: values from the DLL, names from the SDK header
   (the 4.1 docs never define it). `tobii_calibration_parse` maps each eye's
   status word in the blob, reading its low 32 bits, at 0x180147910 (left) and
@@ -133,6 +141,8 @@ Layouts, and where each comes from:
 | `tobii_device_name_t` | `char[64]` | DLL (`tobii_get_device_name` writes 0x40 bytes) |
 | `tobii_state_string_t` | `char[512]` | DLL |
 | `tobii_version_t` | 16 | DLL (`tobii_get_api_version` writes {4,1,0,3}) |
+| `tobii_custom_alloc_t` | 24 | DLL (`tobii_api_create` checks +8 and +0x10 at 0x180144ac7..0x180144ad2 and copies 24 bytes at 0x180144b36) |
+| `tobii_custom_log_t` | 16 | DLL (`tobii_api_create` checks +8 at 0x180144ae2 and copies 16 bytes at 0x180144b78) |
 | `tobii_gaze_data_t` | 168 (8+8+76+76) | 4.1 docs field list |
 | `tobii_geometry_mounting_t` | 36 | 4.1 docs + the device's 2110 response shape |
 | `tobii_calibration_point_data_t` | 32 | SDK header; DLL (`tobii_calibration_parse` fills +8/+0xc/+0x14/+0x18 at 0x1801478ee..0x180147972) |

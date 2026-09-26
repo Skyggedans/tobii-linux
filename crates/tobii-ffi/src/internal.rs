@@ -15,9 +15,7 @@ use tobii_ipc::request::{
 use crate::api::{FACTS_TIMEOUT, write_supported};
 use crate::calibration::request;
 use crate::device::{Device, device_mut};
-use crate::status::{
-    Status, TOBII_ERROR_INTERNAL, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
-};
+use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR};
 use crate::streams::{subscribe, unsubscribe};
 use crate::stub::not_supported;
 use crate::types::{
@@ -187,7 +185,7 @@ pub unsafe extern "C" fn tobii_timesync(
             unsafe { timesync.write(out) };
             TOBII_ERROR_NO_ERROR
         }
-        Ok(None) => TOBII_ERROR_INTERNAL,
+        Ok(None) => d.malformed("timesync"),
         Err(status) => status,
     }
 }
@@ -267,7 +265,7 @@ pub unsafe extern "C" fn tobii_enumerate_stream_types(
         .map(|p| decode_stream_types(&p))
     {
         Ok(Some(types)) => types.iter().map(stream_type_c).collect(),
-        Ok(None) => return TOBII_ERROR_INTERNAL,
+        Ok(None) => return d.malformed("stream types"),
         Err(status) => return status,
     };
     for entry in &entries {
@@ -409,7 +407,7 @@ pub unsafe extern "C" fn tobii_hardware_configuration_get(
             unsafe { configuration.write(hardware_configuration_c(&h)) };
             TOBII_ERROR_NO_ERROR
         }
-        Ok(None) => TOBII_ERROR_INTERNAL,
+        Ok(None) => d.malformed("hardware configuration"),
         Err(status) => status,
     }
 }
@@ -485,7 +483,9 @@ not_supported! {
 mod tests {
     use super::*;
     use crate::api::tobii_device_destroy;
-    use crate::status::{TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_NOT_AVAILABLE};
+    use crate::status::{
+        TOBII_ERROR_CONNECTION_FAILED, TOBII_ERROR_INTERNAL, TOBII_ERROR_NOT_AVAILABLE,
+    };
     use crate::types::{TOBII_NOT_SUPPORTED, TOBII_SUPPORTED};
     use std::ffi::CStr;
     use std::ptr;
