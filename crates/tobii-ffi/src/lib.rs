@@ -21,17 +21,18 @@
 //!   system clock, output frequency (33 Hz), enabled eye (both), feature
 //!   group (consumer), license validation (every key valid), display-area
 //!   calculation, calibration parsing, internal-stream support (the IR image
-//!   only), internal-capability support (eyeball centres only), lens
-//!   configuration writability (never), and the subscribes and unsubscribes
-//!   of internal streams 3, 4, 5, 7 and 8: low-frequency head rotation and
-//!   position, multiple faces position, wearable limited image and secondary
-//!   camera image (never, as the DLL answers for a tracker it drives itself;
-//!   see `internal`).
+//!   only), internal-capability support (eyeball centres only) and lens
+//!   configuration writability (never).
 //! - **`TOBII_ERROR_NOT_SUPPORTED`** — everything the ET5 was never observed
 //!   doing: wearable, face id, illumination, power control, firmware,
 //!   diagnostics, extensions, custom streams, 3-D and per-eye calibration,
-//!   and the calibration stimulus points, as the DLL's in-process tracker
-//!   module answers for an ET5 (see `tobii_calibration_stimulus_points_get`).
+//!   the calibration stimulus points, and the subscribes and unsubscribes of
+//!   internal streams 3, 4, 5, 7 and 8: low-frequency head rotation and
+//!   position, multiple faces position, wearable limited image and secondary
+//!   camera image. For the stimulus points and those five streams that is
+//!   the DLL's own answer for a tracker it drives itself through its
+//!   in-process tracker module (see `tobii_calibration_stimulus_points_get`
+//!   and `internal`).
 //!
 //! Nothing is gated by a licence. What the Stream Engine reserves for a
 //! higher feature group or an extra licence (gaze data, timesync,

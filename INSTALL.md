@@ -390,11 +390,12 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   calibration stimulus points, the internal low-frequency head, multiple
   faces, wearable limited image and secondary camera image streams) returns
   `TOBII_ERROR_NOT_SUPPORTED`; for the stimulus points and those five
-  streams that is the Stream Engine's own answer without Tobii's service
-  (its in-process legacy TTP module), and its answer behind the service was
-  never captured. No licence is checked: what the Stream Engine reserves for
-  its professional, config or internal feature groups, or for an
-  additional-features licence (the IR image), works too.
+  streams that is the Stream Engine's own answer without Tobii's service,
+  for a tracker it drives itself through its in-process legacy TTP module,
+  and its answer behind the service was never captured. No licence is
+  checked: what the Stream Engine reserves for its professional, config or
+  internal feature groups, or for an additional-features licence (the IR
+  image), works too.
 
   A name set with `tobii_set_device_name` is kept by the daemon, not the
   tracker, in `~/.config/tobii/device-name` (`$XDG_CONFIG_HOME/tobii`): the

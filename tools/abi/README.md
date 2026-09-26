@@ -339,12 +339,20 @@ prototype declares or a float/integer position disagrees.
   0x18003b2c0 (`TryEnterCriticalSection`), unlock 0x18003b2e0 and delete
   0x18003b270. A critical section is reentrant on its own thread (Windows
   semantics, not read from the DLL). The callback flag is a TLS slot per API
-  instance: `tobii_api_create` allocates it (`TlsAlloc` at 0x180144be1,
-  kept at api+0x130), `tobii_api_destroy` frees it (`TlsFree` at
-  0x180144a00) and takes no lock, and the device entry points check it
-  first (process 0x180143b55, the subscribe helper 0x18015cc9c, wait
-  0x180143f58, reconnect 0x180143845, destroy 0x180144100), so
-  `TOBII_ERROR_CALLBACK_IN_PROGRESS` refuses only the callback's own thread.
+  instance, so `TOBII_ERROR_CALLBACK_IN_PROGRESS` refuses only the
+  callback's own thread: `tobii_api_create` allocates it (`TlsAlloc` at
+  0x180144be1, kept at api+0x130), `tobii_api_destroy` frees it (`TlsFree`
+  at 0x180144a00) and takes no lock, and the device entry points check it
+  before they take any lock, right after their first argument checks. Only
+  a null device has to come before it, as the slot index is read through
+  the device (`mov rax,[rcx]`, then `mov ecx,[rax+0x130]` in process).
+  Process tests its handle at 0x180143b39, then the flag at 0x180143b55,
+  and likewise the subscribe helper (a null device at 0x18015cc1b, a null
+  callback at 0x18015cc20, then the flag at 0x18015cc9c), wait (its count,
+  array and null handles at 0x180143f00..0x180143f24 and whether they share
+  an API instance at 0x180143f45, `TOBII_ERROR_CONFLICTING_API_INSTANCES`
+  if not, then the flag at 0x180143f58), reconnect (0x180143829, then
+  0x180143845) and destroy (0x1801440e9, then 0x180144100).
   Device create makes three critical sections, and the platform module
   three more (+0x4620, +0x4628, +0x4630: 0x18000e580, 0x18000e5ce,
   0x18000e61c):
