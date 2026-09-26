@@ -232,43 +232,48 @@ Where the answers come from, and where they differ from Windows:
 - **Threads.** As the Stream Engine promises, the functions may be called
   from several threads at once, on one device too: a device's state is
   locked by concern, as the DLL's is. Its requests, subscription changes and
-  reconnects run one at a time, each for its whole round trip to tobiid (a
-  pause may take up to a minute), without holding up its callbacks,
-  processing or waiting, but for a reconnect's round trip (~500 ms at
-  most), and a recenter, a write with no reply, waits for any of them under
-  way; a reconnect's ~500 ms counts from when the call ahead of it, and
-  then a process call another thread is making, have finished. Its
-  callbacks run one at a time, on whichever thread processes it, and a
-  subscribe, an unsubscribe, a clear or a reconnect waits for one running
-  on another thread; once an unsubscribe returns, its callback is not
-  running and never runs again. `tobii_device_destroy` and
-  `tobii_api_destroy` take no lock, as in the Stream Engine (whose
-  documentation says so for `tobii_device_destroy`): no other thread may be
-  inside a call on the handle, or use it afterwards. Threads that create
-  devices at once while no daemon runs spawn one `tobiid` between them: the
-  others wait for that spawn, then connect to its daemon or fail as it did
-  (two processes doing so can still spawn one each).
-  `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the thread a callback, the
-  logger or `tobii_calibration_retrieve`'s receiver runs on. A callback, or
-  the logger, must not block on another thread's call into any device (nor
-  on a thread that waits for one), which can deadlock, as in the Stream
-  Engine: only processing and waiting are sure to go on while a callback
-  runs. The retrieve receiver holds no lock, so it may wait for other
-  threads' calls. Unlike the DLL,
-  `tobii_wait_for_callbacks` waits on a device another thread is processing
-  as on any other, where the DLL skips such a device, returning at once
-  when it was the only one, so a wait-and-process loop on that device alone
-  spins; a subscribe lets the device's other callbacks run during its round
-  trip, where the DLL holds them back, so a subscribe that fails may have
-  had its callback called before it returned; a
-  `tobii_device_process_callbacks` that finds another thread processing
-  returns at once, as there, but with `TOBII_ERROR_CONNECTION_FAILED` once
-  the loss has been reported, and delivers nothing (the DLL first delivers
-  the device's queued notifications); a clear waits for another thread's
-  processing, never for a request (both wait for a reconnect's round
-  trip); `tobii_calibration_retrieve` calls its
-  receiver with no lock held, where the DLL holds the device's API mutex;
-  and the logger is never called under a lock of the call that logs.
+  reconnects run one at a time, in the order they are called, each for its
+  whole round trip to tobiid (a pause may take up to a minute), so one
+  thread's calls made back to back hold another thread's up for one of them
+  at most. They do not hold up its callbacks, processing or waiting, but for
+  a reconnect's round trip (~500 ms at most), and a recenter, a write with
+  no reply, waits for those under way or called before it; a reconnect's
+  ~500 ms counts from when the calls ahead of it, and then a process call
+  another thread is making, have finished. Its callbacks run one at a time,
+  on whichever thread processes it, and a subscribe, an unsubscribe, a clear
+  or a reconnect waits for one running on another thread; once an
+  unsubscribe returns, its callback is not running and never runs again.
+  `tobii_device_destroy` and `tobii_api_destroy` take no lock, as in the
+  Stream Engine (whose documentation says so for `tobii_device_destroy`): no
+  other thread may be inside a call on the handle, or use it afterwards.
+  Threads that create devices at once while no daemon runs spawn one
+  `tobiid` between them: the others wait for that spawn, then connect to its
+  daemon or fail as it did (two processes doing so can still spawn one
+  each). `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the thread a
+  callback, the logger or `tobii_calibration_retrieve`'s receiver runs on. A
+  callback, or the logger, must not block on another thread's call into any
+  device (nor on a thread that waits for one), which can deadlock, as in the
+  Stream Engine: only processing and waiting are sure to go on while a
+  callback runs. The retrieve receiver holds no lock, so it may wait for
+  other threads' calls. Unlike the DLL, a device's requests, subscription
+  changes and reconnects run in the order they are called, where the DLL's
+  critical section promises no order among its waiters (Windows semantics,
+  not read from the DLL), so there one thread's calls made back to back may
+  keep another thread's out for long; `tobii_wait_for_callbacks` waits on a
+  device another thread is processing as on any other, where the DLL skips
+  such a device, returning at once when it was the only one, so a
+  wait-and-process loop on that device alone spins; a subscribe lets the
+  device's other callbacks run during its round trip, where the DLL holds
+  them back, so a subscribe that fails may have had its callback called
+  before it returned; a `tobii_device_process_callbacks` that finds another
+  thread processing returns at once, as there, but with
+  `TOBII_ERROR_CONNECTION_FAILED` once the loss has been reported, and
+  delivers nothing (the DLL first delivers the device's queued
+  notifications); a clear waits for another thread's processing, never for a
+  request (both wait for a reconnect's round trip);
+  `tobii_calibration_retrieve` calls its receiver with no lock held, where
+  the DLL holds the device's API mutex; and the logger is never called under
+  a lock of the call that logs.
 - **Logging and allocation.** The `tobii_custom_log_t` logger gets
   libtobii's own few lines (a refused `field_of_use`, a failed connect or
   reconnect, a lost daemon connection once per loss, a daemon reply that

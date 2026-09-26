@@ -397,16 +397,21 @@ prototype declares or a float/integer position disagrees.
   that no background thread is using the device"). `tobii_system_clock`
   (0x1801432d0) reads the clock and checks no flag.
 
-  libtobii splits a device the same way, with a std `Mutex` per concern
-  (`Device` in `crates/tobii-ffi/src/device.rs`: `command` for dev+0x4e0,
-  `dispatch` for +0x4628 and dev+0x9818, `callbacks` for dev+0x4d8), and
+  libtobii splits a device the same way, with a lock per concern (`Device`
+  in `crates/tobii-ffi/src/device.rs`: `command`, a first-come,
+  first-served ticket lock, for dev+0x4e0, and std `Mutex`es, `dispatch`
+  for +0x4628 and dev+0x9818 and `callbacks` for dev+0x4d8), and
   keeps the DLL's rule for destroy. A reconnect holds `dispatch` for its
   round trip, as the DLL's holds +0x4628 through the platform module's
   reconnect: from before its new connection asks for the streams until it
   has swapped connections or failed, so that nothing tobiid sends both
   connections is delivered twice. Where it differs, it does on purpose:
-  a wait holds no lock while it sleeps, and waits on a device another
-  thread holds rather than skip it; a subscribe lets the callbacks
+  the command lock lets its waiters in in the order they asked, where a
+  critical section promises no order (Windows semantics, not read from the
+  DLL), so requests made back to back on one thread cannot keep another
+  thread's subscribe out, as they did for up to 5 s behind a std `Mutex`
+  on Linux; a wait holds no lock while it sleeps, and waits on a device
+  another thread holds rather than skip it; a subscribe lets the callbacks
   lock go for its round trip; a busy process delivers nothing, and answers
   `TOBII_ERROR_CONNECTION_FAILED` once a loss has been reported; a clear
   waits for another thread's process, never for a request (both wait for
@@ -414,7 +419,7 @@ prototype declares or a float/integer position disagrees.
   callback may call into no device at all; `tobii_calibration_retrieve`'s
   receiver runs under that flag, as the DLL's does, but under no lock,
   where the DLL's runs under dev+0x4e0; and the logger never runs under a
-  lock of the call that logs. The std mutexes are not reentrant, which that
+  lock of the call that logs. libtobii's locks are not reentrant, which that
   flag makes safe: it refuses a callback's call before any lock is taken.
 
 Layouts, and where each comes from:

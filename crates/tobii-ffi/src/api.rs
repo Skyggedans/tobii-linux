@@ -462,14 +462,14 @@ pub unsafe extern "C" fn tobii_device_clear_callback_buffers(device: *mut Device
 /// tracker: when a request fails with `TOBII_ERROR_CONNECTION_FAILED` because
 /// the daemon has no tracker, a reconnect succeeds without bringing it back.
 ///
-/// On a device shared between threads it first waits for any request or
-/// subscription change another thread has under way, then for a dispatch
-/// another thread runs (the ~500 ms count from then), before it asks for the
-/// subscriptions back. Until it has swapped connections or failed, a
-/// `tobii_device_process_callbacks` on another thread then returns at once,
-/// delivering nothing: tobiid sends the new connection what it sends the old
-/// one from its ack on, so delivering from the old one meanwhile would
-/// deliver those samples twice, their stamps stepping back.
+/// On a device shared between threads it first waits for the requests and
+/// subscription changes other threads have under way or queued ahead of it,
+/// then for a dispatch another thread runs (the ~500 ms count from then),
+/// before it asks for the subscriptions back. Until it has swapped connections
+/// or failed, a `tobii_device_process_callbacks` on another thread then
+/// returns at once, delivering nothing: tobiid sends the new connection what
+/// it sends the old one from its ack on, so delivering from the old one
+/// meanwhile would deliver those samples twice, their stamps stepping back.
 ///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
@@ -554,8 +554,8 @@ fn device_info_c(info: &request::DeviceInfo) -> DeviceInfo {
 /// `integration_id`, `hw_calibration_version`, `hw_calibration_date` and
 /// `lot_id` are empty, as the DLL leaves them for a tracker it drives over
 /// USB. From a daemon that predates it, the integration type is empty too.
-/// Fetched once per connection; a read of the one kept waits, too, for a
-/// request another thread has under way on the device.
+/// Fetched once per connection; a read of the one kept waits, too, for the
+/// requests other threads have under way on the device or queued ahead of it.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `device_info` must be null or

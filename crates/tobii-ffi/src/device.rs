@@ -18,6 +18,7 @@ use std::fmt;
 use std::io;
 use std::mem;
 use std::net::Shutdown;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -221,6 +222,101 @@ fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
         Ok(guard) => Some(guard),
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+/// A lock that lets its waiters in in the order they asked, first come,
+/// first served: each takes a ticket and waits for its turn. It is the
+/// command lock (see [`Device`]), for which a std `Mutex` will not do: it
+/// promises no order, and on Linux a thread that lets it go and asks again
+/// at once, as one making requests back to back does, takes it back ahead
+/// of a thread already waiting, time after time (on hardware, subscribes and
+/// unsubscribes on another thread waited up to 5 s so). The data sits
+/// behind a `Mutex` of its own, which only the thread whose turn it is
+/// takes, so no thread waits for it. A poisoned lock is taken as it is (see
+/// [`lock`]): the tickets' lock is held only to count, which cannot panic,
+/// and a holder that panics passes its turn on as it unwinds.
+struct TicketLock<T> {
+    tickets: Tickets,
+    data: Mutex<T>,
+}
+
+impl<T> TicketLock<T> {
+    fn new(data: T) -> Self {
+        Self {
+            tickets: Tickets::default(),
+            data: Mutex::new(data),
+        }
+    }
+
+    /// Lock it, once every thread that asked before this one has had it and
+    /// let it go.
+    fn lock(&self) -> TicketGuard<'_, T> {
+        let turn = self.tickets.wait_turn();
+        TicketGuard {
+            data: lock(&self.data),
+            _turn: turn,
+        }
+    }
+}
+
+/// A [`TicketLock`]'s queue.
+#[derive(Debug, Default)]
+struct Tickets {
+    /// The next ticket to hand out, and the one whose turn it is. They
+    /// cannot wrap in practice, and would stay in step if they did.
+    counts: Mutex<(u64, u64)>,
+    /// Notified each time a turn is passed on.
+    passed: Condvar,
+}
+
+impl Tickets {
+    /// Take the next ticket and wait for its turn.
+    fn wait_turn(&self) -> Turn<'_> {
+        let mut counts = lock(&self.counts);
+        let ticket = counts.0;
+        counts.0 = ticket.wrapping_add(1);
+        drop(
+            self.passed
+                .wait_while(counts, |counts| counts.1 != ticket)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        Turn(self)
+    }
+}
+
+/// The turn of a ticket; dropping it passes the turn on to the next.
+struct Turn<'a>(&'a Tickets);
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut counts = lock(&self.0.counts);
+        counts.1 = counts.1.wrapping_add(1);
+        drop(counts);
+        self.0.passed.notify_all();
+    }
+}
+
+/// A locked [`TicketLock`]: the data, and the turn.
+#[must_use = "if unused the lock is let go at once"]
+struct TicketGuard<'a, T> {
+    // Declared first, so dropped first: the data's lock is let go before the
+    // turn is passed on.
+    data: MutexGuard<'a, T>,
+    _turn: Turn<'a>,
+}
+
+impl<T> Deref for TicketGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
+
+impl<T> DerefMut for TicketGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.data
     }
 }
 
@@ -508,7 +604,7 @@ impl Drop for ReaderEnd {
 /// how to open another, the request ids, and the identity fetched over the
 /// connection. A request, a subscription change, a recenter and a reconnect
 /// each hold it for their whole round trip, so they run one at a time on a
-/// device.
+/// device, in the order they asked (see [`TicketLock`]).
 struct Command {
     link: Link,
     connect: Connector,
@@ -690,7 +786,13 @@ impl fmt::Display for ReconnectError {
 ///   requests hold for the whole tracker round trip: device info at
 ///   0x180142ee1, subscribe 0x18015ce3d..0x18015ceaf, reconnect
 ///   0x180143873..0x180143a0f): held for a request's, subscription
-///   change's, recenter's or reconnect's whole round trip.
+///   change's, recenter's or reconnect's whole round trip. It is a
+///   `TicketLock`: its waiters take it in the order they asked, so a call
+///   waits for the round trip under way and those asked for before it, and
+///   no more, however soon the thread ahead asks again. A critical section
+///   promises no order among its waiters (Windows semantics, not read from
+///   the DLL), nor does a std `Mutex`, which on Linux kept subscribes out
+///   for up to 5 s behind requests made back to back.
 /// - `dispatch` (`Dispatch`; its platform module's process mutex, +0x4628,
 ///   which process only try-enters, 0x18000e9d9, and the notification
 ///   queue's dev+0x9818): held by one `process` while it drains the samples
@@ -713,7 +815,7 @@ impl fmt::Display for ReconnectError {
 /// (a refused `field_of_use`), which runs under that callback's locks. A
 /// subscribe lets `callbacks` go for its round trip, where the DLL holds
 /// dev+0x4d8 (0x18015371b..0x180153845). A poisoned lock is taken as it is
-/// (see `lock`).
+/// (see `lock` and `TicketLock`).
 ///
 /// What can still deadlock is the Stream Engine's own: a callback that
 /// blocks on another thread's call into any device (or on a thread that
@@ -721,8 +823,8 @@ impl fmt::Display for ReconnectError {
 /// return promptly while a callback runs. A subscribe, an unsubscribe, a
 /// clear or a reconnect waits for it, on `callbacks` or `dispatch`; a
 /// request or a recenter may wait, on `command`, behind a subscription
-/// change or reconnect under way, and a clear, on `dispatch`, behind a
-/// reconnect's round trip. Across devices the same makes a cycle: X's
+/// change or reconnect under way or queued ahead of it, and a clear, on
+/// `dispatch`, behind a reconnect's round trip. Across devices the same makes a cycle: X's
 /// callback waits for an unsubscribe of Y, which waits for Y's callback,
 /// which waits for an unsubscribe of X, which waits for X's.
 ///
@@ -735,7 +837,7 @@ pub struct Device {
     /// The logger of the API this device was created from, copied, so the
     /// device keeps it after `tobii_api_destroy`.
     logger: Option<SharedLogger>,
-    command: Mutex<Command>,
+    command: TicketLock<Command>,
     dispatch: Mutex<Dispatch>,
     callbacks: Mutex<Callbacks>,
     /// Rung by every link's reader, kept across reconnects.
@@ -784,7 +886,7 @@ impl Device {
             api,
             field_of_use,
             logger: None,
-            command: Mutex::new(Command {
+            command: TicketLock::new(Command {
                 link,
                 connect,
                 next_request_id: 0,
@@ -852,10 +954,10 @@ impl Device {
         Self::new(connect, api, field_of_use)
     }
 
-    /// Write one frame to the daemon (see [`Link::send`]), after any round
-    /// trip another thread has under way.
+    /// Write one frame to the daemon (see [`Link::send`]), after the round
+    /// trips other threads have under way or queued ahead of it.
     pub(crate) fn send(&self, body: &[u8]) -> Result<(), Status> {
-        lock(&self.command).link.send(body)
+        self.command.lock().link.send(body)
     }
 
     /// Register `callback` in `slot` and subscribe its stream. The Stream
@@ -885,7 +987,7 @@ impl Device {
         };
         // Held throughout: the slots change only under it, so the mask sent
         // is the table's until the change is done or undone.
-        let mut command = lock(&self.command);
+        let mut command = self.command.lock();
         let mask = {
             let mut callbacks = lock(&self.callbacks);
             if slot(&mut callbacks).is_some() {
@@ -916,7 +1018,7 @@ impl Device {
     /// unsubscribe waits on dev+0x4d8 (0x180153580): once this returns, the
     /// callback is not running on any thread, and none calls it again.
     pub(crate) fn unsubscribe<F: Copy>(&self, slot: fn(&mut Callbacks) -> &mut Slot<F>) -> Status {
-        let mut command = lock(&self.command);
+        let mut command = self.command.lock();
         let mask = {
             let mut callbacks = lock(&self.callbacks);
             let before = callbacks.mask();
@@ -944,16 +1046,17 @@ impl Device {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, Status> {
-        lock(&self.command).request(kind, payload, timeout)
+        self.command.lock().request(kind, payload, timeout)
     }
 
     /// The device's identity, fetched from the daemon once per connection.
     /// The check, the fetch and the store make one round trip under the
     /// command lock, so a fetch racing a reconnect on another thread cannot
     /// keep the old connection's identity for the new one; a read of the
-    /// kept one, too, waits for a round trip another thread has under way.
+    /// kept one, too, waits for the round trips other threads have under way
+    /// or queued ahead of it.
     pub(crate) fn device_info(&self) -> Result<DeviceInfoMsg, Status> {
-        let mut command = lock(&self.command);
+        let mut command = self.command.lock();
         if let Some(info) = &command.device_info {
             return Ok(info.clone());
         }
@@ -993,17 +1096,17 @@ impl Device {
     /// dispatch lock and slept again. The device info is fetched again: a
     /// restarted daemon may serve another tracker.
     ///
-    /// It runs under the command lock, after any round trip another thread
-    /// has under way. Before it asks for the subscriptions back it takes the
-    /// dispatch lock, once a process another thread runs has finished its
-    /// callbacks, as the DLL's waits for its process mutex (0x18000eb88),
-    /// and it holds that lock until it has swapped the samples channel, or
-    /// failed: for up to [`RECONNECT_ACK_TIMEOUT`], a process on another
-    /// thread returns at once, delivering nothing, a wait sleeps until this
-    /// rings or its own timeout ends, and a clear waits. It reads the
-    /// subscriptions under the callbacks lock, which is free by then. Each
-    /// failure is logged at ERROR, a success at INFO, once the locks are let
-    /// go.
+    /// It runs under the command lock, after the round trips other threads
+    /// have under way or queued ahead of it. Before it asks for the
+    /// subscriptions back it takes the dispatch lock, once a process another
+    /// thread runs has finished its callbacks, as the DLL's waits for its
+    /// process mutex (0x18000eb88), and it holds that lock until it has
+    /// swapped the samples channel, or failed: for up to
+    /// [`RECONNECT_ACK_TIMEOUT`], a process on another thread returns at
+    /// once, delivering nothing, a wait sleeps until this rings or its own
+    /// timeout ends, and a clear waits. It reads the subscriptions under the
+    /// callbacks lock, which is free by then. Each failure is logged at
+    /// ERROR, a success at INFO, once the locks are let go.
     pub(crate) fn reconnect(&self) -> Status {
         match self.replace_link() {
             Ok(()) => {
@@ -1022,7 +1125,7 @@ impl Device {
 
     /// What [`Device::reconnect`] does under the command lock.
     fn replace_link(&self) -> Result<(), ReconnectError> {
-        let mut command = lock(&self.command);
+        let mut command = self.command.lock();
         let (mut link, samples) =
             Link::open(&mut command.connect, &self.doorbell).map_err(ReconnectError::Connect)?;
         // Taken before the new link asks for anything, and held until the
@@ -1445,7 +1548,7 @@ pub(crate) mod tests {
         /// Subscribe the streams in `mask` on the current connection, as a
         /// subscription change does, waiting up to `timeout` for the ack.
         fn send_subscription(&self, mask: u32, timeout: Duration) -> Result<bool, Status> {
-            lock(&self.command).link.send_subscription(mask, timeout)
+            self.command.lock().link.send_subscription(mask, timeout)
         }
 
         /// Queue `msg` for the next `process`, as a look of `wait` does.
@@ -1456,6 +1559,23 @@ pub(crate) mod tests {
         /// Whether a look of `wait` has taken a sample for `process`.
         fn has_pending(&self) -> bool {
             !lock(&self.dispatch).pending.is_empty()
+        }
+    }
+
+    impl<T> TicketLock<T> {
+        /// Whether a thread holds it, rather than only waits for it: only
+        /// the thread whose turn it is takes the data's lock. A holder
+        /// shows as such once it has taken that lock, a moment after its
+        /// turn came.
+        fn held(&self) -> bool {
+            try_lock(&self.data).is_none()
+        }
+
+        /// The tickets handed out whose turn has not been passed on: the
+        /// holder's, if any, and the waiters'.
+        fn out(&self) -> u64 {
+            let counts = lock(&self.tickets.counts);
+            counts.0.wrapping_sub(counts.1)
         }
     }
 
@@ -2147,7 +2267,7 @@ pub(crate) mod tests {
     /// Wait for the reader to see the daemon hang up, so everything the
     /// daemon sent is in the channels before the test looks.
     fn hung_up(d: &Device) {
-        let reader = lock(&d.command).link.reader.take();
+        let reader = d.command.lock().link.reader.take();
         if let Some(h) = reader {
             h.join().expect("reader");
         }
@@ -3567,6 +3687,165 @@ pub(crate) mod tests {
         assert_eq!(queued, usize::from(THREADS) * usize::from(EACH));
     }
 
+    /// Whether `turns` has `n` tickets out, waiting up to `PROMPT` for it.
+    fn tickets_out<T>(turns: &TicketLock<T>, n: u64) -> bool {
+        let deadline = Instant::now() + PROMPT;
+        while turns.out() != n {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// The command lock's order: the threads waiting for a ticket lock get
+    /// it in the order they asked, and a thread that lets it go and asks
+    /// again at once waits behind them, where a std `Mutex` would usually
+    /// let it straight back in. It fails should a ticket not wait for its
+    /// turn (tried: the first thread then goes straight back in).
+    #[test]
+    fn a_ticket_lock_lets_its_waiters_in_in_the_order_they_asked() {
+        within(WATCHDOG, || {
+            let turns = TicketLock::new(Vec::new());
+            let mut held = turns.lock();
+            held.push('a');
+            thread::scope(|s| {
+                for (waiter, out) in [('b', 2), ('c', 3)] {
+                    let turns = &turns;
+                    s.spawn(move || turns.lock().push(waiter));
+                    assert!(tickets_out(turns, out), "{waiter} waits its turn");
+                }
+                drop(held);
+                turns.lock().push('a');
+            });
+            assert_eq!(*turns.lock(), ['a', 'b', 'c', 'a']);
+        });
+    }
+
+    /// A ticket lock held by a thread that panics passes the turn on as it
+    /// unwinds, and the next holder takes the data as it was left, as
+    /// [`lock`] takes a poisoned `Mutex`'s. It fails at the watchdog should
+    /// the panic leave the turn with the thread that panicked.
+    #[test]
+    fn a_ticket_lock_passes_the_turn_on_through_a_panic() {
+        within(WATCHDOG, || {
+            let turns = TicketLock::new(0u32);
+            let panicked = thread::scope(|s| {
+                s.spawn(|| {
+                    let mut held = turns.lock();
+                    *held = 1;
+                    panic!("panicking with the lock held");
+                })
+                .join()
+                .is_err()
+            });
+            assert!(panicked);
+            assert_eq!(*turns.lock(), 1);
+            assert_eq!(turns.out(), 0, "no ticket is left out");
+        });
+    }
+
+    /// While another thread makes requests back to back, a thread's
+    /// subscription changes each wait for the request under way when they
+    /// ask, and no more: the command lock lets its waiters in in the order
+    /// they asked. For each change the daemon stand-in holds a request until
+    /// the change has asked (its ticket is out, behind the requester's),
+    /// then lets it go, and notes how many more requests it reads before the
+    /// change: none, however soon the requester asks again. It fails, in
+    /// every run tried, with a lock that lets a thread that has just let it
+    /// go take it again ahead of one already waiting, as a std `Mutex` does
+    /// on Linux (tried: tickets that do not wait, which leaves the order to
+    /// the data's `Mutex`): the requester then goes ahead of a change, for
+    /// up to thousands of requests (on hardware, subscribes and unsubscribes
+    /// waited up to 5 s so).
+    #[test]
+    fn subscription_changes_are_not_starved_by_requests_back_to_back() {
+        /// The subscribes made, each followed by an unsubscribe.
+        const CHANGES: usize = 20;
+
+        /// What the daemon stand-in shares with the test.
+        #[derive(Debug, Default)]
+        struct Held {
+            /// The gate the next request it reads waits at.
+            next: Option<Arc<Gate>>,
+            /// The requests it has read since the last one held.
+            since: usize,
+            /// For each change it has read, the requests it read between the
+            /// last one held and the change.
+            ahead: Vec<usize>,
+        }
+
+        within(WATCHDOG, || {
+            let held = Arc::new(Mutex::new(Held::default()));
+            let noted = Arc::clone(&held);
+            let connect = fake_daemon(move |body| {
+                if body.first() == Some(&tobii_ipc::TAG_SUBSCRIBE) {
+                    let mut noted = lock(&noted);
+                    let since = noted.since;
+                    noted.ahead.push(since);
+                    return vec![encode_subscribed(true)];
+                }
+                let gate = {
+                    let mut noted = lock(&noted);
+                    let gate = noted.next.take();
+                    noted.since = if gate.is_some() { 0 } else { noted.since + 1 };
+                    gate
+                };
+                if let Some(gate) = gate {
+                    gate.hold();
+                }
+                let req = tobii_ipc::request::decode_request(body).expect("request");
+                vec![encode_reply(req.id, 0, req.payload)]
+            });
+            let device = Device::new(connect, 1, 1).expect("device");
+            let d = &device;
+            let stop = AtomicBool::new(false);
+
+            let ahead = thread::scope(|s| {
+                let requester = s.spawn(|| {
+                    let deadline = Instant::now() + LONG_WAIT;
+                    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        assert_eq!(d.request(ECHOED, &[], LONG_WAIT), Ok(vec![]));
+                    }
+                });
+                let callback = Some(ignore_pair as EyePairFn);
+                for on in [true, false].into_iter().cycle().take(2 * CHANGES) {
+                    let gate = Arc::new(Gate::default());
+                    lock(&held).next = Some(Arc::clone(&gate));
+                    assert!(gate.entered(1), "a request is under way");
+                    let change = s.spawn(move || {
+                        if on {
+                            d.subscribe(|c| &mut c.gaze_origin, callback, ptr::null_mut())
+                        } else {
+                            d.unsubscribe(|c| &mut c.gaze_origin)
+                        }
+                    });
+                    assert!(
+                        tickets_out(&d.command, 2),
+                        "the change waits behind the request"
+                    );
+                    gate.open();
+                    assert_eq!(joined(change), TOBII_ERROR_NO_ERROR);
+                    // Stop at the first change kept out, rather than wait for
+                    // the requester to stop.
+                    if lock(&held).ahead.last() != Some(&0) {
+                        break;
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+                joined(requester);
+                lock(&held).ahead.clone()
+            });
+
+            assert_eq!(
+                ahead,
+                [0; 2 * CHANGES],
+                "the requests read between the one held and each change"
+            );
+        });
+    }
+
     /// A wait whose look comes while another thread's process holds the
     /// dispatch lock finds nothing and sleeps. A sample that came during
     /// that dispatch is still queued when it ends, so the process rings the
@@ -4057,12 +4336,12 @@ pub(crate) mod tests {
         assert_eq!(processed, TOBII_ERROR_NO_ERROR);
     }
 
-    /// Whether another thread holds `d`'s command lock, looking for up to
-    /// `PROMPT`: a call that holds it while it waits for another lock shows
-    /// as held however often this looks.
+    /// Whether another thread holds `d`'s command lock, rather than only
+    /// waits for it, looking for up to `PROMPT`: a call that holds it while
+    /// it waits for another lock shows as held however often this looks.
     fn command_held(d: &Device) -> bool {
         let deadline = Instant::now() + PROMPT;
-        while try_lock(&d.command).is_some() {
+        while !d.command.held() {
             if Instant::now() >= deadline {
                 return false;
             }

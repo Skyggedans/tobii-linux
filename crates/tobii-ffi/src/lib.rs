@@ -58,26 +58,29 @@
 //! the Stream Engine promises thread safety across all its functions: a
 //! device's state is locked by concern, as the DLL's is (see
 //! `device::Device`), so requests and subscription changes on one device run
-//! one at a time, its callbacks run one at a time on whichever thread
-//! processes it, and a process call made while another thread dispatches it
-//! returns at once. `tobii_device_destroy` and `tobii_api_destroy` take no
-//! lock, as in the DLL: no other thread may be inside a call on the handle,
-//! or use it afterwards. A callback (not `tobii_calibration_retrieve`'s
-//! receiver, which holds no lock), or the logger, must not block on another
-//! thread's call into any device (nor on a thread that waits for one), which
-//! can deadlock, as in the Stream Engine: only
-//! `tobii_device_process_callbacks` and `tobii_wait_for_callbacks` are sure
-//! to return while a callback runs; any other call on its device may wait for
-//! it, itself or queued behind one that does, and a call on another device
-//! may wait for that device's own callback, which may be waiting in turn.
-//! Where the DLL differs: its wait skips a device another thread is
-//! processing, returning at once when it was the only one, where libtobii's
-//! waits as for any other; its subscribe holds the device's callbacks back
-//! for its round trip, where libtobii's lets them run; its
-//! `tobii_calibration_retrieve` calls the receiver under the device's API
-//! mutex, where libtobii's holds no lock; and many of its calls log their
-//! error lines under that mutex, where libtobii logs with none of the
-//! logging call's locks held (see `logger`).
+//! one at a time, in the order they are called, its callbacks run one at a
+//! time on whichever thread processes it, and a process call made while
+//! another thread dispatches it returns at once. `tobii_device_destroy` and
+//! `tobii_api_destroy` take no lock, as in the DLL: no other thread may be
+//! inside a call on the handle, or use it afterwards. A callback (not
+//! `tobii_calibration_retrieve`'s receiver, which holds no lock), or the
+//! logger, must not block on another thread's call into any device (nor on a
+//! thread that waits for one), which can deadlock, as in the Stream Engine:
+//! only `tobii_device_process_callbacks` and `tobii_wait_for_callbacks` are
+//! sure to return while a callback runs; any other call on its device may
+//! wait for it, itself or queued behind one that does, and a call on another
+//! device may wait for that device's own callback, which may be waiting in
+//! turn. Where the DLL differs: its API mutex, a critical section, promises
+//! no order among its waiters (Windows semantics, not read from the DLL),
+//! where libtobii's lets requests and subscription changes in in the order
+//! they are called; its wait skips a device another thread is processing,
+//! returning at once when it was the only one, where libtobii's waits as for
+//! any other; its subscribe holds the device's callbacks back for its round
+//! trip, where libtobii's lets them run; its `tobii_calibration_retrieve`
+//! calls the receiver under the device's API mutex, where libtobii's holds
+//! no lock; and many of its calls log their error lines under that mutex,
+//! where libtobii logs with none of the logging call's locks held (see
+//! `logger`).
 //!
 //! An entry point that takes a device handle checks the callback first, then
 //! a null device, then its other arguments (`TOBII_ERROR_INVALID_PARAMETER`
@@ -129,13 +132,13 @@
 //! returns `TOBII_ERROR_CONNECTION_FAILED`. A reconnect only connects: unlike
 //! `tobii_device_create` it never spawns a daemon, and any failure is
 //! `TOBII_ERROR_CONNECTION_FAILED` within ~500 ms (at once when nothing
-//! listens). On a device shared between threads that counts from when a
-//! request, subscription change or other reconnect under way on another
-//! thread, and then another thread's dispatch, have finished: the reconnect
-//! waits for them before its round trip, and until it has swapped
-//! connections or failed a process call on another thread returns at once,
-//! delivering nothing, so no sample tobiid sends both connections is
-//! delivered twice.
+//! listens). On a device shared between threads that counts from when the
+//! requests, subscription changes and other reconnects other threads have
+//! under way or queued ahead of it, and then another thread's dispatch, have
+//! finished: the reconnect waits for them before its round trip, and until
+//! it has swapped connections or failed a process call on another thread
+//! returns at once, delivering nothing, so no sample tobiid sends both
+//! connections is delivered twice.
 //! It restores the subscriptions, not a calibration session or pause the
 //! lost connection held.
 //!

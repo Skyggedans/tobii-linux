@@ -17,12 +17,14 @@
  * concern, as the DLL's is:
  * - its requests (device info, states, calibration, pause and the other
  *   calls answered by tobiid), subscribes, unsubscribes and
- *   tobii_device_reconnect run one at a time, each for its whole round trip
- *   to tobiid, so a slow one (a pause may take up to a minute) delays the
- *   others on that device; of them only a reconnect holds back its
- *   callbacks, tobii_device_process_callbacks and tobii_wait_for_callbacks,
- *   for its own round trip (~500 ms at most);
- *   tobii_recenter, a write with no reply, waits for any of them under way;
+ *   tobii_device_reconnect run one at a time, in the order they are called,
+ *   each for its whole round trip to tobiid, so a slow one (a pause may take
+ *   up to a minute) delays the others on that device, and one thread's
+ *   calls made back to back hold another thread's up for one of them at
+ *   most; of them only a reconnect holds back its callbacks,
+ *   tobii_device_process_callbacks and tobii_wait_for_callbacks, for its own
+ *   round trip (~500 ms at most); tobii_recenter, a write with no reply,
+ *   waits for those under way or called before it;
  * - its callbacks run one at a time, on whichever thread calls
  *   tobii_device_process_callbacks, and such a call made while another
  *   thread processes the device returns at once;
@@ -46,13 +48,16 @@
  * callback, which may be waiting in turn. The retrieve receiver holds no
  * lock, so it may wait for other threads' calls (tobii_config.h).
  * Where libtobii.so differs from the DLL, besides what the functions below
- * say: tobii_wait_for_callbacks waits on a device another thread is
- * processing as on any other, where the DLL skips such a device, returning
- * at once when it was the only one; a subscribe lets the device's other
- * callbacks run during its round trip, where the DLL holds them back;
- * tobii_calibration_retrieve calls its receiver with no lock held, where the
- * DLL holds the device's API mutex; and the logger is never called under a
- * lock of the call that logs.
+ * say: a device's requests, subscription changes and reconnects run in the
+ * order they are called, where the DLL's critical section promises no order
+ * among its waiters (Windows semantics, not read from the DLL), so there one
+ * thread's calls made back to back may keep another thread's out for long;
+ * tobii_wait_for_callbacks waits on a device another thread is processing as
+ * on any other, where the DLL skips such a device, returning at once when it
+ * was the only one; a subscribe lets the device's other callbacks run during
+ * its round trip, where the DLL holds them back; tobii_calibration_retrieve
+ * calls its receiver with no lock held, where the DLL holds the device's API
+ * mutex; and the logger is never called under a lock of the call that logs.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -351,17 +356,18 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_process_callbacks( tobii_device_
 TOBII_API tobii_error_t TOBII_CALL tobii_device_clear_callback_buffers( tobii_device_t* device );
 /* Connects to a running daemon (never spawns one) and restores the
  * subscriptions, not a calibration session or pause. Any failure is
- * TOBII_ERROR_CONNECTION_FAILED within ~500 ms, counted from when any
- * request, subscription change or other reconnect in flight on another
- * thread, and then any tobii_device_process_callbacks under way on another
- * thread, have finished (it waits for them before it asks for the
- * subscriptions back), and leaves the device as it was. From then until it
- * has swapped connections or failed, a tobii_device_process_callbacks on
- * another thread returns at once and delivers nothing: tobiid sends the new
- * connection what it sends the old one from its ack on, and none of that is
- * delivered twice, as what the old one has queued is dropped. While the
- * daemon has no tracker (a request's TOBII_ERROR_CONNECTION_FAILED with the
- * connection intact) it succeeds without bringing one back. */
+ * TOBII_ERROR_CONNECTION_FAILED within ~500 ms, counted from when the
+ * requests, subscription changes and other reconnects other threads have in
+ * flight or called before it, and then any tobii_device_process_callbacks
+ * under way on another thread, have finished (it waits for them before it
+ * asks for the subscriptions back), and leaves the device as it was. From
+ * then until it has swapped connections or failed, a
+ * tobii_device_process_callbacks on another thread returns at once and
+ * delivers nothing: tobiid sends the new connection what it sends the old one
+ * from its ack on, and none of that is delivered twice, as what the old one
+ * has queued is dropped. While the daemon has no tracker (a request's
+ * TOBII_ERROR_CONNECTION_FAILED with the connection intact) it succeeds
+ * without bringing one back. */
 TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* device );
 /* A no-op: the daemon maps the tracker's clock to the host clock for every
  * sample and keeps the mapping current itself (tobii_streams.h says how), so
@@ -378,8 +384,8 @@ TOBII_API tobii_error_t TOBII_CALL tobii_system_clock( tobii_api_t* api, int64_t
  * hw_calibration_version, hw_calibration_date and lot_id are empty, as the
  * DLL leaves them for a tracker it drives over USB. From a tobiid that
  * predates it, the integration type is empty too. Fetched once per
- * connection; a read of the kept copy, too, waits for any request in flight
- * on another thread, as in the DLL. */
+ * connection; a read of the kept copy, too, waits for the requests other
+ * threads have in flight, as in the DLL, or called before it. */
 TOBII_API tobii_error_t TOBII_CALL tobii_get_device_info( tobii_device_t* device,
     tobii_device_info_t* device_info );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_track_box( tobii_device_t* device,
