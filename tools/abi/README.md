@@ -405,9 +405,11 @@ prototype declares or a float/integer position disagrees.
   `TOBII_ERROR_CONNECTION_FAILED` once a loss has been reported; a clear
   waits for another thread's process, never for a request; the callback
   flag is one per thread, for every API instance, so a callback may call
-  into no device at all; and the logger never runs under a lock of the
-  call that logs. The std mutexes are not reentrant, which that flag makes
-  safe: it refuses a callback's call before any lock is taken.
+  into no device at all; `tobii_calibration_retrieve`'s receiver runs under
+  that flag, as the DLL's does, but under no lock, where the DLL's runs
+  under dev+0x4e0; and the logger never runs under a lock of the call that
+  logs. The std mutexes are not reentrant, which that flag makes safe: it
+  refuses a callback's call before any lock is taken.
 
 Layouts, and where each comes from:
 

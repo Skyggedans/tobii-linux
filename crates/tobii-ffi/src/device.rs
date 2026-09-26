@@ -71,20 +71,24 @@ const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 thread_local! {
-    /// Set while this thread runs application code: a user callback or the
-    /// application's logger. The entry points the crate documentation lists
-    /// refuse a call made from inside one, as the Stream Engine does for a
-    /// callback, before they take any lock: a callback runs under its
-    /// device's dispatch and callbacks locks, which are not reentrant, so a
-    /// call into that device would deadlock this thread, and destroying it
-    /// would free it under the dispatch loop. A call into any other device
-    /// is refused too, so that no thread holds two devices' locks: two
-    /// callbacks each calling into the other's device would deadlock. The
-    /// flag is this thread's own; other threads' calls go on.
+    /// Set while this thread runs application code: a user callback, the
+    /// application's logger or `tobii_calibration_retrieve`'s receiver. The
+    /// entry points the crate documentation lists refuse a call made from
+    /// inside one, as the Stream Engine does for a callback, before they
+    /// take any lock: a callback runs under its device's dispatch and
+    /// callbacks locks, which are not reentrant, so a call into that device
+    /// would deadlock this thread, and destroying it would free it under the
+    /// dispatch loop. A call into any other device is refused too, so that
+    /// no thread holds two devices' locks: two callbacks each calling into
+    /// the other's device would deadlock. The receiver runs with no lock
+    /// held, and is guarded as the DLL guards it (see
+    /// `tobii_calibration_retrieve`). The flag is this thread's own; other
+    /// threads' calls go on.
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether the current thread is inside a user callback or the logger.
+/// Whether the current thread is inside a user callback, the logger or
+/// `tobii_calibration_retrieve`'s receiver.
 pub(crate) fn in_callback() -> bool {
     IN_CALLBACK.get()
 }
@@ -672,11 +676,12 @@ impl fmt::Display for ReconnectError {
 /// `dispatch` and `callbacks`, may call into no device (`in_callback`
 /// refuses it before any lock is taken, so these locks, which are not
 /// reentrant, never deadlock on their own thread). Nothing is held while a
-/// `wait` sleeps, nor while the logger runs, but for a line a call made
-/// from inside a callback logs (a refused `field_of_use`), which runs under
-/// that callback's locks. A subscribe lets `callbacks` go for its round
-/// trip, where the DLL holds dev+0x4d8 (0x18015371b..0x180153845). A
-/// poisoned lock is taken as it is (see `lock`).
+/// `wait` sleeps or `tobii_calibration_retrieve`'s receiver runs, nor while
+/// the logger runs, but for a line a call made from inside a callback logs
+/// (a refused `field_of_use`), which runs under that callback's locks. A
+/// subscribe lets `callbacks` go for its round trip, where the DLL holds
+/// dev+0x4d8 (0x18015371b..0x180153845). A poisoned lock is taken as it is
+/// (see `lock`).
 ///
 /// What can still deadlock is the Stream Engine's own: a callback that
 /// blocks on another thread's call into any device (or on a thread that
@@ -1242,9 +1247,10 @@ impl Device {
     }
 }
 
-/// Run application code (a user callback or the logger) with the re-entry
-/// guard set, then leave the guard as it was: the logger can run inside a
-/// callback, whose dispatch still needs the guard once the line is logged.
+/// Run application code (a user callback, the logger or
+/// `tobii_calibration_retrieve`'s receiver) with the re-entry guard set, then
+/// leave the guard as it was: the logger can run inside a callback or the
+/// receiver, which still need the guard once the line is logged.
 pub(crate) fn call(f: impl FnOnce()) {
     let was = IN_CALLBACK.replace(true);
     f();
@@ -1337,9 +1343,9 @@ fn notification(n: &tobii_ipc::Notification) -> Notification {
 /// Borrow a device handle from C, shared: threads may each borrow one at
 /// once, its locks keeping them apart.
 ///
-/// Refuses every call made from inside a callback or the logger (as the
-/// Stream Engine does for a callback), before any lock is taken, then a
-/// null handle.
+/// Refuses every call made from inside a callback, the logger or
+/// `tobii_calibration_retrieve`'s receiver (as the Stream Engine does for a
+/// callback), before any lock is taken, then a null handle.
 ///
 /// # Safety
 /// `device` must be null or a live handle from `tobii_device_create` that is
@@ -2030,7 +2036,7 @@ pub(crate) mod tests {
     /// Far longer than any wait answered at once takes.
     const LONG_WAIT: Duration = Duration::from_secs(5);
     /// What "at once" means here: well under `LONG_WAIT`.
-    const PROMPT: Duration = Duration::from_secs(1);
+    pub(crate) const PROMPT: Duration = Duration::from_secs(1);
     /// A wait that is meant to run out.
     const SHORT_WAIT: Duration = Duration::from_millis(50);
 
@@ -3024,23 +3030,24 @@ pub(crate) mod tests {
     }
 
     /// A callback's user data that holds it inside until let go:
-    /// [`held_pair`] counts each call, then waits for `open`, or `LONG_WAIT`
-    /// at most, so a test that fails before letting it go cannot hang.
+    /// [`Gate::hold`], which [`held_pair`] calls, counts each call, then
+    /// waits for `open`, or `LONG_WAIT` at most, so a test that fails before
+    /// letting it go cannot hang.
     #[derive(Debug, Default)]
-    struct Gate {
+    pub(crate) struct Gate {
         /// The calls so far, and whether the gate is open.
         state: Mutex<(u32, bool)>,
         changed: Condvar,
     }
 
     impl Gate {
-        fn ud(&self) -> *mut c_void {
+        pub(crate) fn ud(&self) -> *mut c_void {
             ptr::from_ref(self).cast_mut().cast()
         }
 
         /// Whether the callback has been called `n` times, waiting up to
         /// `PROMPT` for it.
-        fn entered(&self, n: u32) -> bool {
+        pub(crate) fn entered(&self, n: u32) -> bool {
             let state = lock(&self.state);
             let (state, _) = self
                 .changed
@@ -3054,22 +3061,26 @@ pub(crate) mod tests {
         }
 
         /// Let every call through, now and later.
-        fn open(&self) {
+        pub(crate) fn open(&self) {
             lock(&self.state).1 = true;
             self.changed.notify_all();
+        }
+
+        /// Count a call, then wait for `open`, or `LONG_WAIT` at most.
+        pub(crate) fn hold(&self) {
+            let mut state = lock(&self.state);
+            state.0 += 1;
+            self.changed.notify_all();
+            drop(
+                self.changed
+                    .wait_timeout_while(state, LONG_WAIT, |(_, open)| !*open),
+            );
         }
     }
 
     unsafe extern "C" fn held_pair(_p: *const EyePair, ud: *mut c_void) {
         // SAFETY: the tests pass a live `Gate` as `ud`.
-        let gate = unsafe { &*ud.cast::<Gate>() };
-        let mut state = lock(&gate.state);
-        state.0 += 1;
-        gate.changed.notify_all();
-        drop(
-            gate.changed
-                .wait_timeout_while(state, LONG_WAIT, |(_, open)| !*open),
-        );
+        unsafe { &*ud.cast::<Gate>() }.hold();
     }
 
     /// Run `f` on this thread while another thread's `process` on `d` is

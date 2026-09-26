@@ -244,11 +244,13 @@ Where the answers come from, and where they differ from Windows:
   `tobii_api_destroy` take no lock, as in the Stream Engine (whose
   documentation says so for `tobii_device_destroy`): no other thread may be
   inside a call on the handle, or use it afterwards.
-  `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the thread a callback or
-  the logger runs on. A callback, or the logger, must not block on another
-  thread's call into any device (nor on a thread that waits for one), which
-  can deadlock, as in the Stream Engine: only processing and waiting are
-  sure to go on while a callback runs. Unlike the DLL,
+  `TOBII_ERROR_CALLBACK_IN_PROGRESS` guards only the thread a callback, the
+  logger or `tobii_calibration_retrieve`'s receiver runs on. A callback, or
+  the logger, must not block on another thread's call into any device (nor
+  on a thread that waits for one), which can deadlock, as in the Stream
+  Engine: only processing and waiting are sure to go on while a callback
+  runs. The retrieve receiver holds no lock, so it may wait for other
+  threads' calls. Unlike the DLL,
   `tobii_wait_for_callbacks` waits on a device another thread is processing
   as on any other, where the DLL skips such a device, returning at once
   when it was the only one, so a wait-and-process loop on that device alone
@@ -259,8 +261,9 @@ Where the answers come from, and where they differ from Windows:
   returns at once, as there, but with `TOBII_ERROR_CONNECTION_FAILED` once
   the loss has been reported, and delivers nothing (the DLL first delivers
   the device's queued notifications); a clear waits for another thread's
-  processing, never for a request; and the logger is never called under a
-  lock of the call that logs.
+  processing, never for a request; `tobii_calibration_retrieve` calls its
+  receiver with no lock held, where the DLL holds the device's API mutex;
+  and the logger is never called under a lock of the call that logs.
 - **Logging and allocation.** The `tobii_custom_log_t` logger gets
   libtobii's own few lines (a refused `field_of_use`, a failed connect or
   reconnect, a lost daemon connection once per loss, a daemon reply that

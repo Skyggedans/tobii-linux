@@ -34,20 +34,24 @@
  *   Stream Engine: no other thread may be inside a call on the handle, a
  *   tobii_wait_for_callbacks waiting on the device included, and none may
  *   use it afterwards. Join the thread that processes a device first.
- * TOBII_ERROR_CALLBACK_IN_PROGRESS guards only the thread a callback or the
- * logger runs on; other threads' calls go on. A callback, or the logger,
- * must not block on another thread's call into any device (nor on a thread
- * that waits for one), which can deadlock, as in the Stream Engine: only
- * tobii_device_process_callbacks and tobii_wait_for_callbacks are sure to
- * return while a callback runs; any other call on its device may wait for
- * it, itself or queued behind one that does, and a call on another device
- * may wait for that device's own callback, which may be waiting in turn.
+ * TOBII_ERROR_CALLBACK_IN_PROGRESS guards only the thread a callback, the
+ * logger or tobii_calibration_retrieve's receiver runs on; other threads'
+ * calls go on. A callback, or the logger, must not block on another thread's
+ * call into any device (nor on a thread that waits for one), which can
+ * deadlock, as in the Stream Engine: only tobii_device_process_callbacks and
+ * tobii_wait_for_callbacks are sure to return while a callback runs; any
+ * other call on its device may wait for it, itself or queued behind one that
+ * does, and a call on another device may wait for that device's own
+ * callback, which may be waiting in turn. The retrieve receiver holds no
+ * lock, so it may wait for other threads' calls (tobii_config.h).
  * Where libtobii.so differs from the DLL, besides what the functions below
  * say: tobii_wait_for_callbacks waits on a device another thread is
  * processing as on any other, where the DLL skips such a device, returning
  * at once when it was the only one; a subscribe lets the device's other
- * callbacks run during its round trip, where the DLL holds them back; and
- * the logger is never called under a lock of the call that logs.
+ * callbacks run during its round trip, where the DLL holds them back;
+ * tobii_calibration_retrieve calls its receiver with no lock held, where the
+ * DLL holds the device's API mutex; and the logger is never called under a
+ * lock of the call that logs.
  *
  * SPDX-License-Identifier: MIT
  */

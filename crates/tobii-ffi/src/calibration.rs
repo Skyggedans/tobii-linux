@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
 
-use crate::device::{Api, Device, device_ref, in_callback};
+use crate::device::{Api, Device, call, device_ref, in_callback};
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
     TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_OPERATION_FAILED,
@@ -159,12 +159,23 @@ pub unsafe extern "C" fn tobii_calibration_compute_and_apply(device: *mut Device
     unsafe { request(device, kind::CALIBRATION_COMPUTE, &[], COMPUTE_TIMEOUT) }
 }
 
-/// Read the active calibration and hand it to `receiver`.
+/// Read the active calibration and hand it to `receiver`, on this thread.
+///
+/// The receiver runs as a callback does, under the callback guard (see
+/// [`crate::device::call`]): a call from inside it that a stream callback
+/// could not make either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, a destroy
+/// included, while `tobii_system_clock` goes through. So it is in the DLL,
+/// which sets its callback flag around the command that calls the receiver
+/// (0x180147bd9..0x180147c66), and the 4.1 documentation names retrieve
+/// among the calls whose callbacks may not call in. Unlike a stream
+/// callback, and unlike the DLL's receiver, which runs under the device's
+/// API mutex (dev+0x4e0, 0x180147bbc..0x180147c79), it runs with none of the
+/// device's locks held: other threads' calls into the device go on
+/// meanwhile, and it may wait for them.
 ///
 /// # Safety
-/// As `tobii_calibration_start`; `receiver` must be null or sound to call
-/// with a data pointer, its size and `user_data`, and must not re-enter this
-/// library.
+/// As `tobii_calibration_start`; `receiver` must be null or sound to call,
+/// on the calling thread, with a data pointer, its size and `user_data`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_retrieve(
     device: *mut Device,
@@ -182,9 +193,14 @@ pub unsafe extern "C" fn tobii_calibration_retrieve(
     };
     match d.request(kind::CALIBRATION_RETRIEVE, &[], RETRIEVE_TIMEOUT) {
         Ok(blob) => {
+            // The request has let the command lock go, so no lock is held.
+            // `call` leaves the guard as it found it, down (a call from
+            // inside a callback was refused above), where the DLL clears its
+            // flag outright (0x180147c66).
             // SAFETY: the caller guarantees `receiver` is sound to call like
-            // this; `blob` outlives the call.
-            unsafe { receiver(blob.as_ptr().cast(), blob.len(), user_data) };
+            // this; `blob` outlives the call. The guard refuses a destroy of
+            // the device from inside it, and `d` is not used after it.
+            call(|| unsafe { receiver(blob.as_ptr().cast(), blob.len(), user_data) });
             TOBII_ERROR_NO_ERROR
         }
         Err(status) => status,
@@ -338,8 +354,18 @@ not_supported! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::CalibrationStimulusPoint;
+    use crate::api::{
+        tobii_api_create, tobii_device_create, tobii_device_destroy,
+        tobii_device_process_callbacks, tobii_get_state_bool, tobii_system_clock,
+    };
+    use crate::device::tests::{Gate, PROMPT, device_with};
+    use crate::logger::tests::Recorder;
+    use crate::types::{
+        CalibrationStimulusPoint, TOBII_LOG_LEVEL_ERROR, TOBII_STATE_CALIBRATION_ACTIVE,
+    };
     use std::ptr;
+    use std::thread;
+    use std::time::Instant;
 
     unsafe extern "C" fn collect(p: *const CalibrationPointData, ud: *mut c_void) {
         // SAFETY: the test passes `&raw mut Vec<CalibrationPointData>` and the
@@ -671,6 +697,232 @@ mod tests {
             );
             assert_eq!(crate::api::tobii_device_destroy(d), 0);
         }
+    }
+
+    unsafe extern "C" fn keep_blob(data: *const c_void, size: usize, ud: *mut c_void) {
+        // SAFETY: the tests pass a live `Vec<u8>` as `ud`, and the library
+        // `size` readable bytes at `data`.
+        unsafe { *ud.cast::<Vec<u8>>() = std::slice::from_raw_parts(data.cast(), size).to_vec() };
+    }
+
+    /// A retrieve receiver's user data: the handles it calls into, and what
+    /// it saw from inside.
+    struct Inside {
+        api: *mut Api,
+        device: *mut Device,
+        /// Another device: the guard refuses a call into any.
+        other: *mut Device,
+        blob: Vec<u8>,
+        guarded: bool,
+        got: Vec<Status>,
+    }
+
+    impl Inside {
+        fn new(api: *mut Api, device: *mut Device, other: *mut Device) -> Self {
+            Self {
+                api,
+                device,
+                other,
+                blob: Vec::new(),
+                guarded: false,
+                got: Vec::new(),
+            }
+        }
+    }
+
+    unsafe extern "C" fn call_back_in(data: *const c_void, size: usize, ud: *mut c_void) {
+        // SAFETY: the test passes a live `Inside` as `ud`, whose handles are
+        // live.
+        let inside = unsafe { &mut *ud.cast::<Inside>() };
+        // SAFETY: the library passes `size` readable bytes at `data`.
+        unsafe { keep_blob(data, size, (&raw mut inside.blob).cast()) };
+        inside.guarded = in_callback();
+        let (mut blob, mut active, mut now) = (Vec::<u8>::new(), 7u32, 0i64);
+        let mut points: Vec<CalibrationPointData> = Vec::new();
+        // SAFETY: live handles and locals; `NEGATIVE_COUNT` is 8 readable
+        // bytes, and the receivers match their contracts.
+        inside.got = unsafe {
+            vec![
+                tobii_calibration_retrieve(inside.device, Some(keep_blob), (&raw mut blob).cast()),
+                tobii_calibration_clear(inside.device),
+                tobii_device_process_callbacks(inside.device),
+                tobii_get_state_bool(
+                    inside.other,
+                    TOBII_STATE_CALIBRATION_ACTIVE,
+                    &raw mut active,
+                ),
+                tobii_calibration_parse(
+                    inside.api,
+                    NEGATIVE_COUNT.as_ptr().cast(),
+                    NEGATIVE_COUNT.len(),
+                    Some(collect),
+                    (&raw mut points).cast(),
+                ),
+                tobii_device_destroy(inside.other),
+                tobii_system_clock(inside.api, &raw mut now),
+            ]
+        };
+    }
+
+    /// The receiver runs as a callback does, as in the DLL
+    /// (0x180147bd9..0x180147c66): each call from inside it that a callback
+    /// could not make either is refused, into its own device or another, a
+    /// nested retrieve and a destroy included, while `tobii_system_clock`
+    /// goes through; once retrieve has returned, the guard is down again.
+    /// Without the guard every call goes through, the destroy too, and the
+    /// test fails before it touches that device again.
+    #[test]
+    fn a_retrieve_receiver_is_refused_what_a_callback_is() {
+        let blob = embedded_blob();
+        let d = Box::into_raw(Box::new(device_with(0, blob.clone())));
+        let other = Box::into_raw(Box::new(device_with(0, vec![1])));
+        let mut api: *mut Api = ptr::null_mut();
+        // SAFETY: a live local; a null allocator and logger are allowed.
+        let created = unsafe { tobii_api_create(&raw mut api, ptr::null(), ptr::null()) };
+        assert_eq!(created, TOBII_ERROR_NO_ERROR);
+        let mut inside = Inside::new(api, d, other);
+
+        // SAFETY: `d` is live, and `call_back_in` matches the receiver
+        // contract for the live `inside`.
+        let status =
+            unsafe { tobii_calibration_retrieve(d, Some(call_back_in), (&raw mut inside).cast()) };
+
+        assert_eq!(status, TOBII_ERROR_NO_ERROR);
+        assert!(inside.guarded, "the receiver runs under the guard");
+        let refused = TOBII_ERROR_CALLBACK_IN_PROGRESS;
+        assert_eq!(
+            inside.got,
+            [
+                refused,
+                refused,
+                refused,
+                refused,
+                refused,
+                refused,
+                TOBII_ERROR_NO_ERROR
+            ]
+        );
+        assert_eq!(inside.blob, blob);
+        assert!(!in_callback(), "the guard is down again");
+        let mut again = Vec::<u8>::new();
+        // SAFETY: live handles, each destroyed once; `keep_blob` matches the
+        // receiver contract for the live `again`.
+        unsafe {
+            let retrieved = tobii_calibration_retrieve(d, Some(keep_blob), (&raw mut again).cast());
+            assert_eq!(retrieved, TOBII_ERROR_NO_ERROR);
+            assert_eq!(tobii_device_destroy(other), 0);
+            assert_eq!(tobii_device_destroy(d), 0);
+            assert_eq!(crate::api::tobii_api_destroy(api), 0);
+        }
+        assert_eq!(again, blob);
+    }
+
+    unsafe extern "C" fn log_then_call_back_in(
+        _data: *const c_void,
+        _size: usize,
+        ud: *mut c_void,
+    ) {
+        // SAFETY: the test passes a live `Inside` as `ud`, whose handles are
+        // live.
+        let inside = unsafe { &mut *ud.cast::<Inside>() };
+        let mut device: *mut Device = ptr::null_mut();
+        // SAFETY: a live handle and local.
+        let created = unsafe { tobii_device_create(inside.api, ptr::null(), 99, &raw mut device) };
+        inside.guarded = in_callback();
+        // SAFETY: a live handle.
+        inside.got = vec![created, unsafe { tobii_calibration_clear(inside.device) }];
+    }
+
+    /// A line logged from inside the receiver (a refused `field_of_use`,
+    /// which the create checks ahead of the guard, as in the DLL) runs under
+    /// the guard too, and leaves it up: the receiver's next call is still
+    /// refused, and the guard is down once retrieve returns.
+    #[test]
+    fn a_line_logged_inside_a_retrieve_receiver_leaves_the_guard_up() {
+        let recorder = Recorder::default();
+        let log = recorder.custom_log();
+        let d = Box::into_raw(Box::new(device_with(0, vec![1])));
+        let mut api: *mut Api = ptr::null_mut();
+        // SAFETY: `api` and `log` are live locals.
+        let created = unsafe { tobii_api_create(&raw mut api, ptr::null(), &raw const log) };
+        assert_eq!(created, TOBII_ERROR_NO_ERROR);
+        let mut inside = Inside::new(api, d, ptr::null_mut());
+
+        // SAFETY: `d` is live, and `log_then_call_back_in` matches the
+        // receiver contract for the live `inside`.
+        let status = unsafe {
+            tobii_calibration_retrieve(d, Some(log_then_call_back_in), (&raw mut inside).cast())
+        };
+
+        assert_eq!(status, TOBII_ERROR_NO_ERROR);
+        assert_eq!(
+            inside.got,
+            [
+                TOBII_ERROR_INVALID_PARAMETER,
+                TOBII_ERROR_CALLBACK_IN_PROGRESS
+            ]
+        );
+        assert!(inside.guarded, "the guard outlives the line");
+        assert!(!in_callback(), "and is down once retrieve returns");
+        let lines = recorder.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, TOBII_LOG_LEVEL_ERROR);
+        assert!(
+            lines[0].1.starts_with("refused field_of_use 99"),
+            "{lines:?}"
+        );
+        // SAFETY: live handles, each destroyed once.
+        unsafe {
+            assert_eq!(tobii_device_destroy(d), 0);
+            assert_eq!(crate::api::tobii_api_destroy(api), 0);
+        }
+    }
+
+    unsafe extern "C" fn held_blob(_data: *const c_void, _size: usize, ud: *mut c_void) {
+        // SAFETY: the test passes a live `Gate` as `ud`.
+        unsafe { &*ud.cast::<Gate>() }.hold();
+    }
+
+    /// A guard against locking too much, which passes with the receiver
+    /// unguarded too: it runs with none of the device's locks held, and the
+    /// guard is its own thread's, so another thread's request on the device
+    /// goes through while it runs, and the receiver may wait for it, as this
+    /// one does. It fails should the receiver run under the command lock, as
+    /// the DLL's runs under its API mutex (dev+0x4e0,
+    /// 0x180147bbc..0x180147c79): the request then waits out the receiver's
+    /// hold. It fails too should the guard be one flag for the whole
+    /// process: the request is refused.
+    #[test]
+    fn another_threads_request_goes_through_while_a_retrieve_receiver_runs() {
+        let gate = Gate::default();
+        let device = device_with(0, vec![1]);
+        let handle = || ptr::from_ref(&device).cast_mut();
+
+        let ((ours, took), retrieved) = thread::scope(|s| {
+            // SAFETY: `device` outlives the scope, and the call borrows it
+            // shared only; `held_blob` matches the receiver contract for the
+            // live `gate`.
+            let retrieving = s.spawn(|| unsafe {
+                tobii_calibration_retrieve(handle(), Some(held_blob), gate.ud())
+            });
+            assert!(gate.entered(1), "the receiver runs on the other thread");
+            let started = Instant::now();
+            let mut active = 7u32;
+            // SAFETY: as above; `active` is a live local.
+            let status = unsafe {
+                tobii_get_state_bool(handle(), TOBII_STATE_CALIBRATION_ACTIVE, &raw mut active)
+            };
+            let took = started.elapsed();
+            gate.open();
+            (
+                ((status, active), took),
+                retrieving.join().expect("retrieve"),
+            )
+        });
+
+        assert_eq!(ours, (TOBII_ERROR_NO_ERROR, 1));
+        assert!(took < PROMPT, "{took:?}");
+        assert_eq!(retrieved, TOBII_ERROR_NO_ERROR);
     }
 
     /// Stimulus points no call may write.

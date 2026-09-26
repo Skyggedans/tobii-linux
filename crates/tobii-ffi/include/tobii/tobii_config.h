@@ -72,6 +72,11 @@ TOBII_API tobii_error_t TOBII_CALL tobii_calibration_compute_and_apply( tobii_de
 /* NOT IMPLEMENTED: returns TOBII_ERROR_NOT_SUPPORTED */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_compute_and_apply_per_eye(
     tobii_device_t* device, tobii_enabled_eye_t* calibrated_eyes );
+/* The receiver runs on the calling thread as a callback does, as in the Stream
+ * Engine: a call from inside it that a callback could not make either returns
+ * TOBII_ERROR_CALLBACK_IN_PROGRESS (tobii_system_clock goes through). Unlike
+ * there, it runs with none of the device's locks held, so other threads' calls
+ * into the device go on meanwhile, and it may wait for them. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_retrieve( tobii_device_t* device,
     tobii_data_receiver_t receiver, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_apply( tobii_device_t* device,

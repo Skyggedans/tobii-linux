@@ -441,9 +441,11 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   call on the handle, and nothing may use it afterwards: join the thread
   that processes a device before destroying it. A callback, or the logger,
   must not block on another thread's call into any device (nor on a thread
-  that waits for one), which can deadlock, as in the Stream Engine
-  (README.md, Architecture, "Threads", has the rest, and where it differs
-  from Windows).
+  that waits for one), which can deadlock, as in the Stream Engine.
+  `tobii_calibration_retrieve`'s receiver is refused on its thread the calls
+  a callback is, but holds no lock, so it may wait for other threads' calls.
+  README.md (Architecture, "Threads") has the rest, and where it differs
+  from Windows.
 
   #### OpenTrack's `tracker-tobii` plugin
 

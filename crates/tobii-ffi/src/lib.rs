@@ -47,7 +47,11 @@
 //! check out, as in the DLL: `tobii_api_destroy` (the DLL keeps its callback
 //! flag in the API instance), `tobii_device_create` and
 //! `tobii_device_create_ex` (a callback could not destroy what they make) and
-//! `tobii_calibration_parse`.
+//! `tobii_calibration_parse`. `tobii_calibration_retrieve`'s receiver counts
+//! as a callback, as in the DLL, which sets its callback flag around it:
+//! every call from inside it that a callback could not make either is
+//! refused, though as it runs with no lock held it may wait for other
+//! threads' calls.
 //!
 //! That refusal covers only the thread the callback runs on (the flag is
 //! thread-local); other threads' calls go on. Threads may share a device, as
@@ -58,7 +62,8 @@
 //! processes it, and a process call made while another thread dispatches it
 //! returns at once. `tobii_device_destroy` and `tobii_api_destroy` take no
 //! lock, as in the DLL: no other thread may be inside a call on the handle,
-//! or use it afterwards. A callback, or the logger, must not block on another
+//! or use it afterwards. A callback (not `tobii_calibration_retrieve`'s
+//! receiver, which holds no lock), or the logger, must not block on another
 //! thread's call into any device (nor on a thread that waits for one), which
 //! can deadlock, as in the Stream Engine: only
 //! `tobii_device_process_callbacks` and `tobii_wait_for_callbacks` are sure
@@ -68,9 +73,11 @@
 //! Where the DLL differs: its wait skips a device another thread is
 //! processing, returning at once when it was the only one, where libtobii's
 //! waits as for any other; its subscribe holds the device's callbacks back
-//! for its round trip, where libtobii's lets them run; and many of its calls
-//! log their error lines under the device's API mutex, where libtobii logs
-//! with none of the logging call's locks held (see `logger`).
+//! for its round trip, where libtobii's lets them run; its
+//! `tobii_calibration_retrieve` calls the receiver under the device's API
+//! mutex, where libtobii's holds no lock; and many of its calls log their
+//! error lines under that mutex, where libtobii logs with none of the
+//! logging call's locks held (see `logger`).
 //!
 //! An entry point that takes a device handle checks the callback first, then
 //! a null device, then its other arguments (`TOBII_ERROR_INVALID_PARAMETER`
@@ -79,9 +86,9 @@
 //! count and null handles. The DLL checks the handle, and sometimes more,
 //! first, so the two differ only for an invalid argument passed from inside a
 //! callback. The DLL also refuses only calls into the API instance whose
-//! callbacks run, where here any is refused, and it counts the receivers of
-//! `tobii_calibration_retrieve` and `tobii_enumerate_local_device_urls(_ex)`
-//! as callbacks, where here their `# Safety` sections forbid re-entry.
+//! callbacks run, where here any is refused, and it counts the receiver of
+//! `tobii_enumerate_local_device_urls(_ex)` as a callback, where here its
+//! `# Safety` section forbids re-entry.
 //!
 //! `tobii_calibration_parse` checks in the DLL's order: a null `api` or
 //! `data`, a `data_size` under 8 or a null `receiver`

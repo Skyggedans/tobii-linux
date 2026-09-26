@@ -53,13 +53,15 @@
 //! `log_func`, at DEBUG and TRACE while it enumerates devices (0x18015b070,
 //! installed at 0x18015d5c2), at their own level 0..4 from its legacy TTP
 //! layer (0x1801706c0), and at a level taken from the message (0x18015d930).
-//! The DLL sets its callback flag while enumeration logs, not around the
-//! helper's lines. Where libtobii differs, it does on purpose: its own
-//! diagnostics rather than a line per failing call, a lost connection once
-//! rather than at the host's frame rate, and always the guard, never a lock
-//! of the logging call's, never a thread of its own. A device copies its
-//! API's logger, so it keeps logging after `tobii_api_destroy`, where the
-//! DLL's would log through the freed API.
+//! The DLL sets its callback flag while enumeration logs, and around
+//! `tobii_calibration_retrieve`'s error line (0x180147c57, inside
+//! 0x180147bd9..0x180147c66), but not around the helper's other lines.
+//! Where libtobii differs, it does on purpose: its own diagnostics rather
+//! than a line per failing call, a lost connection once rather than at the
+//! host's frame rate, and always the guard, never a lock of the logging
+//! call's, never a thread of its own. A device copies its API's logger, so
+//! it keeps logging after `tobii_api_destroy`, where the DLL's would log
+//! through the freed API.
 
 use std::ffi::{CString, c_void};
 use std::fmt;
