@@ -85,6 +85,25 @@ prototype declares or a float/integer position disagrees.
   (`VALID_BUT_NOT_USED_IN_CALIBRATION`), anything else 0
   (`FAILED_OR_INVALID`; it tests for -1 explicitly).
   No DLL evidence: wearable foveated tracking state, device generation.
+- What `tobii_device_info_t` holds for a tracker the DLL drives over USB.
+  `tobii_get_device_info` (0x180142e00) copies every field from the device's
+  cached copy, which the connect callback (0x180153bf0) fills with one
+  memcpy (0x180153c1e) on create and on reconnect. For a URL that is neither
+  `tobii-prp://` nor `tprp-tcp://` the DLL runs its own tracker module
+  in-process: `setup_device_info` (0x18016e250) takes serial, model,
+  generation and firmware from command 1420 and the properties from 1330
+  (`tracker_get_properties`, 0x1801a22a0), keeping property 0, the
+  integration type (0x18016e33a; `Peripheral` on the ET5). `platmod_start`
+  (0x18016ac30) passes on those five strings and properties 3 and 4, and no
+  other device string; the host copies them into the connect message
+  (0x18001ff1f; the serialiser writes the integration type at 0x180040425),
+  so `integration_id`, `hw_calibration_version`, `hw_calibration_date` and
+  `lot_id` arrive empty. `runtime_build_version` is the module's
+  `Legacy TTP (4.1.0/3)` (sprintf at 0x18016aad0, copied at 0x180032a3e);
+  libtobii names itself there instead. `tobii_get_device_info_internal`
+  reads properties 3 and 4 (0x18014ffe2..0x18015003d). Not traced: only the
+  transport between the in-process server and the host's deserialiser
+  (0x180043df0).
 
 Layouts, and where each comes from:
 

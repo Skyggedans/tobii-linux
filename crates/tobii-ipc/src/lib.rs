@@ -470,6 +470,7 @@ mod tests {
             model: "IS5_Large_Eyetracker_5".into(),
             generation: "IS5".into(),
             firmware_version: "02a1a6a977".into(),
+            integration_type: "Peripheral".into(),
         };
         assert_eq!(decode_device_info(&encode_device_info(&info)), Some(info));
 
@@ -504,6 +505,41 @@ mod tests {
             Some((0.1, 0.9))
         );
         assert_eq!(decode_display_area(&[0; 35]), None);
+    }
+
+    #[test]
+    fn a_device_info_reply_without_the_integration_type_still_decodes() {
+        use request::*;
+        let info = DeviceInfo {
+            serial_number: "SERIAL-0001".into(),
+            model: "IS5_Large_Eyetracker_5".into(),
+            generation: "IS5".into(),
+            firmware_version: "02a1a6a977".into(),
+            integration_type: String::new(),
+        };
+        // What a daemon from before the integration type sends.
+        let four = wire::Writer::default()
+            .str(&info.serial_number)
+            .str(&info.model)
+            .str(&info.generation)
+            .str(&info.firmware_version)
+            .finish();
+        assert_eq!(decode_device_info(&four), Some(info.clone()));
+
+        // A client from before it reads the four strings and ignores the
+        // rest, so a new daemon's reply must start with them.
+        let with_type = DeviceInfo {
+            integration_type: "Peripheral".into(),
+            ..info.clone()
+        };
+        assert!(encode_device_info(&with_type).starts_with(&four));
+
+        // A tail that claims more bytes than follow is dropped, not the reply.
+        let mut cut = four.clone();
+        cut.extend_from_slice(&[10, 0, b'P', b'e']);
+        assert_eq!(decode_device_info(&cut), Some(info));
+
+        assert_eq!(decode_device_info(&four[..four.len() - 1]), None);
     }
 
     #[test]

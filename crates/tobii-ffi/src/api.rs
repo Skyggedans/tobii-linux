@@ -455,6 +455,11 @@ fn device_info_c(info: &request::DeviceInfo) -> DeviceInfo {
     copy_c_string(&mut c.model, &info.model);
     copy_c_string(&mut c.generation, &info.generation);
     copy_c_string(&mut c.firmware_version, &info.firmware_version);
+    copy_c_string(&mut c.integration_type, &info.integration_type);
+    // integration_id, hw_calibration_version, hw_calibration_date and
+    // lot_id stay empty: for a tracker it drives over USB the DLL's
+    // built-in tracker module never passes them on (`platmod_start`,
+    // 0x18016ac30), so the DLL returns them empty too.
     copy_c_string(
         &mut c.runtime_build_version,
         concat!("libtobii.so ", env!("CARGO_PKG_VERSION")),
@@ -462,7 +467,11 @@ fn device_info_c(info: &request::DeviceInfo) -> DeviceInfo {
     c
 }
 
-/// The device's serial, model, generation and firmware.
+/// The device's serial, model, generation, firmware and integration type,
+/// as the tracker reports them; `runtime_build_version` names libtobii.so.
+/// `integration_id`, `hw_calibration_version`, `hw_calibration_date` and
+/// `lot_id` are empty, as the DLL leaves them for a tracker it drives over
+/// USB. From a daemon that predates it, the integration type is empty too.
 ///
 /// # Safety
 /// `device` as `tobii_device_process_callbacks`; `device_info` must be null or
@@ -1351,6 +1360,27 @@ mod tests {
         }
     }
 
+    /// A C string field's bytes up to its NUL.
+    fn c_bytes(s: &[c_char]) -> Vec<u8> {
+        s.iter()
+            .take_while(|c| **c != 0)
+            .map(|c| c.to_ne_bytes()[0])
+            .collect()
+    }
+
+    /// `tobii_get_device_info` against a daemon that answers `payload`.
+    fn device_info_from(payload: Vec<u8>) -> (Status, DeviceInfo) {
+        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, payload)));
+        let mut info = device_info_c(&request::DeviceInfo::default());
+        // SAFETY: `d` is live and destroyed once; `info` a live local.
+        let status = unsafe {
+            let status = tobii_get_device_info(d, &raw mut info);
+            assert_eq!(tobii_device_destroy(d), 0);
+            status
+        };
+        (status, info)
+    }
+
     #[test]
     fn device_info_is_fetched_once_and_filled_in() {
         let payload = request::encode_device_info(&request::DeviceInfo {
@@ -1358,22 +1388,43 @@ mod tests {
             model: "IS5_Large_Eyetracker_5".into(),
             generation: "IS5".into(),
             firmware_version: "02a1a6a977".into(),
+            integration_type: "Peripheral".into(),
         });
-        let d = Box::into_raw(Box::new(crate::device::tests::device_with(0, payload)));
-        let mut info = device_info_c(&request::DeviceInfo::default());
-        // SAFETY: `d` is live and destroyed once; `info` a live local.
-        unsafe {
-            assert_eq!(tobii_get_device_info(d, &raw mut info), 0);
-            assert_eq!(tobii_device_destroy(d), 0);
+
+        let (status, info) = device_info_from(payload);
+
+        assert_eq!(status, 0);
+        assert_eq!(c_bytes(&info.model), b"IS5_Large_Eyetracker_5");
+        assert_eq!(c_bytes(&info.integration_type), b"Peripheral");
+        for (name, field) in [
+            ("integration_id", &info.integration_id),
+            ("hw_calibration_version", &info.hw_calibration_version),
+            ("hw_calibration_date", &info.hw_calibration_date),
+            ("lot_id", &info.lot_id),
+        ] {
+            assert_eq!(c_bytes(field), b"", "{name} stays empty, as in the DLL");
         }
-        let model: Vec<u8> = info
-            .model
-            .iter()
-            .take_while(|c| **c != 0)
-            .map(|c| c.to_ne_bytes()[0])
-            .collect();
-        assert_eq!(model, b"IS5_Large_Eyetracker_5");
-        assert_eq!(info.runtime_build_version[0].to_ne_bytes()[0], b'l');
+        assert_eq!(
+            c_bytes(&info.runtime_build_version),
+            concat!("libtobii.so ", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+    }
+
+    #[test]
+    fn device_info_from_an_older_daemon_leaves_the_integration_type_empty() {
+        let mut payload = request::encode_device_info(&request::DeviceInfo {
+            model: "IS5_Large_Eyetracker_5".into(),
+            ..request::DeviceInfo::default()
+        });
+        // Drop the empty tail's length: the four strings an older daemon
+        // sends.
+        payload.truncate(payload.len() - 2);
+
+        let (status, info) = device_info_from(payload);
+
+        assert_eq!(status, 0);
+        assert_eq!(c_bytes(&info.model), b"IS5_Large_Eyetracker_5");
+        assert_eq!(c_bytes(&info.integration_type), b"");
     }
 
     #[test]

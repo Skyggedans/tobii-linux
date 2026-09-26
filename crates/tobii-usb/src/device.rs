@@ -1791,6 +1791,7 @@ fn gaze_stream_loop(
     info!(
         model = %facts.info.model,
         firmware = %facts.info.firmware_version,
+        integration_type = %facts.device_info().integration_type,
         calibration_id = ?facts.calibration_id,
         faults = ?facts.status_string(STATUS_FAULTS),
         warnings = ?facts.status_string(STATUS_WARNINGS),

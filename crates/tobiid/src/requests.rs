@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use tobii_ipc::geometry::{DisplayArea, display_area_basic};
 use tobii_ipc::request::{
-    self, DeviceInfo, Request, Timesync, decode_display_area, encode_device_info,
-    encode_display_area, encode_geometry_mounting, encode_hardware_configuration,
-    encode_stream_types, encode_timesync, encode_track_box, encode_u32, kind, state, status,
+    self, Request, Timesync, decode_display_area, encode_device_info, encode_display_area,
+    encode_geometry_mounting, encode_hardware_configuration, encode_stream_types, encode_timesync,
+    encode_track_box, encode_u32, kind, state, status,
 };
 use tobii_proto::facts::{
     DEFAULT_DISPLAY_ID, DeviceFacts, STATUS_FAULTS, STATUS_WARNINGS, display_area_set_payload,
@@ -83,7 +83,9 @@ const ENGINE_LOST_GRACE: Duration = Duration::from_millis(100);
 /// Answer one request from `client`.
 pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Reply {
     match req.kind {
-        kind::DEVICE_INFO => facts(state, client, |f| Some(encode_device_info(&device_info(f)))),
+        kind::DEVICE_INFO => facts(state, client, |f| {
+            Some(encode_device_info(&f.device_info()))
+        }),
         kind::TRACK_BOX => facts(state, client, |f| {
             f.track_box.as_ref().map(encode_track_box)
         }),
@@ -144,10 +146,6 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, req: &Request<'_>) -> Re
         }
         _ => Reply::err(status::NOT_SUPPORTED),
     }
-}
-
-fn device_info(f: &DeviceFacts) -> DeviceInfo {
-    f.info.clone()
 }
 
 fn is_finite(area: &DisplayArea) -> bool {
@@ -654,6 +652,55 @@ pub(crate) mod tests {
             assert_eq!(ask(state::FAULT), Reply::err(status::NOT_SUPPORTED));
             assert_eq!(ask(state::WARNING), Reply::err(status::NOT_SUPPORTED));
         }
+    }
+
+    #[test]
+    fn device_info_answers_from_the_facts() {
+        let mut st = crate::daemon::tests::state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        let state = Mutex::new(st);
+        let ask = || {
+            handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind: kind::DEVICE_INFO,
+                    payload: &[],
+                },
+            )
+        };
+        let with_properties = |properties: &[(u32, &str)]| {
+            lock_state(&state).facts = Some(Arc::new(DeviceFacts {
+                info: request::DeviceInfo {
+                    model: "IS5_Large_Eyetracker_5".into(),
+                    ..request::DeviceInfo::default()
+                },
+                properties: properties
+                    .iter()
+                    .map(|(i, s)| (*i, (*s).to_owned()))
+                    .collect(),
+                ..DeviceFacts::default()
+            }));
+        };
+
+        // What the ET5 reports in both Windows captures (abridged).
+        with_properties(&[(0, "Peripheral"), (3, "IS5LEYETRACKER5")]);
+        let reply = ask();
+
+        assert_eq!(reply.status, status::OK);
+        let info = request::decode_device_info(&reply.payload).expect("device info");
+        assert_eq!(info.model, "IS5_Large_Eyetracker_5");
+        assert_eq!(info.integration_type, "Peripheral");
+        assert!(lock_state(&state).clients[0].holds_device);
+
+        // A first init whose 1330 was lost (nothing earlier to keep).
+        with_properties(&[]);
+        let reply = ask();
+        assert_eq!(reply.status, status::OK);
+        let info = request::decode_device_info(&reply.payload).expect("device info");
+        assert_eq!(info.model, "IS5_Large_Eyetracker_5");
+        assert_eq!(info.integration_type, "");
     }
 
     #[test]

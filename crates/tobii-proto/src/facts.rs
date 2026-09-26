@@ -39,13 +39,18 @@ pub const STATUS_FAULTS: u32 = 5;
 pub const STATUS_WARNINGS: u32 = 6;
 /// Index of the calibration id in the status strings.
 const STATUS_CALIBRATION_ID: u32 = 7;
+/// Index of the integration type in the property strings (command 1330;
+/// the DLL's `setup_device_info`, 0x18016e250, stores it at 0x18016e33a).
+const PROPERTY_INTEGRATION_TYPE: u32 = 0;
 /// The display id the Windows engine writes with every display area.
 pub const DEFAULT_DISPLAY_ID: u32 = 12345;
 
 /// Everything the init replay learns about the device.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceFacts {
-    /// Serial, model, generation, firmware (command 1420).
+    /// Serial, model, generation, firmware (command 1420). Its integration
+    /// type is always empty: [`DeviceFacts::device_info`] adds it from the
+    /// properties.
     pub info: DeviceInfo,
     /// Property strings by index (command 1330).
     pub properties: Vec<(u32, String)>,
@@ -137,6 +142,34 @@ impl DeviceFacts {
             .map(|(_, s)| s.as_str())
     }
 
+    /// What `tobii_get_device_info` reports: [`Self::info`] and the
+    /// integration type, property 0 of command 1330 (`Peripheral` on the
+    /// ET5). Of the device's strings, the DLL's built-in tracker module
+    /// passes on only these and properties 3 and 4 (`platmod_start`,
+    /// 0x18016ac30), so its other device-info fields stay empty. The
+    /// integration type is the last record for index 0, as the DLL's
+    /// `tracker_get_properties` (0x1801a22a0) keeps the last, and empty
+    /// when the tracker left it out or the 1330 was lost. The DLL then skips
+    /// its store (0x18016e328, 0x18016e332) and keeps what it held before,
+    /// which tobiid mirrors by keeping the previous init's properties across
+    /// a lost 1330. Not modelled: the DLL voids the whole 1330, index 0
+    /// included, when one of the boolean records (index 1, 5 or 7) holds
+    /// anything but `true` or `false` (0x1801a2824); the ET5 sends only
+    /// those.
+    #[must_use]
+    pub fn device_info(&self) -> DeviceInfo {
+        let integration_type = self
+            .properties
+            .iter()
+            .rfind(|(i, _)| *i == PROPERTY_INTEGRATION_TYPE)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        DeviceInfo {
+            integration_type,
+            ..self.info.clone()
+        }
+    }
+
     /// Facts from the init replay's responses, in order.
     #[must_use]
     pub fn from_messages<'a>(msgs: impl IntoIterator<Item = Message<'a>>) -> Self {
@@ -148,7 +181,9 @@ impl DeviceFacts {
     }
 }
 
-/// Command 1420: serial, model, generation, firmware.
+/// Command 1420: serial, model, generation, firmware. The integration type
+/// comes from command 1330 (see [`DeviceFacts::device_info`]), so a 1420
+/// answered after it cannot blank it.
 #[must_use]
 pub fn parse_device_strings(msg: &Message<'_>) -> Option<DeviceInfo> {
     let mut strings = msg.tlvs().filter_map(|t| t.string());
@@ -157,6 +192,7 @@ pub fn parse_device_strings(msg: &Message<'_>) -> Option<DeviceInfo> {
         model: strings.next()?,
         generation: strings.next()?,
         firmware_version: strings.next()?,
+        ..DeviceInfo::default()
     })
 }
 
@@ -508,12 +544,61 @@ mod tests {
         assert_eq!(facts.info.firmware_version, "02a1a6a977");
         assert!(facts.info.serial_number.starts_with("IS50F-"));
         assert!(facts.properties.iter().any(|(_, s)| s == "IS5LEYETRACKER5"));
+        assert_eq!(facts.device_info().integration_type, "Peripheral");
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
         assert_eq!(facts.status_string(STATUS_FAULTS), Some("ok"));
         assert_eq!(facts.status_string(STATUS_WARNINGS), Some("ok"));
         assert_eq!(facts.status_string(9), None);
         assert_eq!(facts.output_hz, Some(33));
         assert_eq!(facts.streams.len(), 9);
+    }
+
+    #[test]
+    fn device_info_adds_the_integration_type_whichever_answer_comes_first() {
+        let identity_first = facts_from(&[
+            crate::fixture!("init-rsp-1420"),
+            crate::fixture!("init-rsp-1330"),
+        ]);
+        let properties_first = facts_from(&[
+            crate::fixture!("init-rsp-1330"),
+            crate::fixture!("init-rsp-1420"),
+        ]);
+
+        for facts in [&identity_first, &properties_first] {
+            let info = facts.device_info();
+            assert_eq!(info.model, "IS5_Large_Eyetracker_5");
+            assert_eq!(info.firmware_version, "02a1a6a977");
+            assert_eq!(info.integration_type, "Peripheral");
+            assert_eq!(facts.info.integration_type, "", "only the property");
+        }
+        assert_eq!(identity_first.device_info(), properties_first.device_info());
+    }
+
+    #[test]
+    fn the_integration_type_is_the_last_property_0() {
+        let with = |properties: &[(u32, &str)]| DeviceFacts {
+            properties: properties
+                .iter()
+                .map(|(i, s)| (*i, (*s).to_owned()))
+                .collect(),
+            ..DeviceFacts::default()
+        };
+
+        // A 1330 that was lost, and one without index 0.
+        assert_eq!(DeviceFacts::default().device_info().integration_type, "");
+        assert_eq!(
+            with(&[(3, "IS5LEYETRACKER5")])
+                .device_info()
+                .integration_type,
+            ""
+        );
+        // The DLL's reader keeps the last record for an index.
+        assert_eq!(
+            with(&[(0, "Peripheral"), (1, "true"), (0, "HMD")])
+                .device_info()
+                .integration_type,
+            "HMD"
+        );
     }
 
     #[test]

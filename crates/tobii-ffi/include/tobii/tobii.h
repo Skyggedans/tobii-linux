@@ -268,8 +268,11 @@ TOBII_API tobii_error_t TOBII_CALL tobii_update_timesync( tobii_device_t* device
  * data's timestamp_tracker_us) and of tobii_timesync's system times. */
 TOBII_API tobii_error_t TOBII_CALL tobii_system_clock( tobii_api_t* api, int64_t* timestamp_us );
 
-/* Serial, model, generation and firmware; runtime_build_version names
- * libtobii.so; the other fields are empty. */
+/* Serial, model, generation, firmware and integration type, as the tracker
+ * reports them; runtime_build_version names libtobii.so. integration_id,
+ * hw_calibration_version, hw_calibration_date and lot_id are empty, as the
+ * DLL leaves them for a tracker it drives over USB. From a tobiid that
+ * predates it, the integration type is empty too. */
 TOBII_API tobii_error_t TOBII_CALL tobii_get_device_info( tobii_device_t* device,
     tobii_device_info_t* device_info );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_track_box( tobii_device_t* device,

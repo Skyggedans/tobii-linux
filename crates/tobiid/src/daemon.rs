@@ -432,10 +432,14 @@ impl State {
 }
 
 /// Fill in, from the previous init's facts, what a new init did not report
-/// because a response was lost: the stream catalogue and the hardware
-/// configuration are the firmware's, so the old ones still hold, and a lost
-/// 1200 or 2120 must not blank them. The status strings (1490) are not kept:
-/// the DLL's reconnect empties its copy of the fault and warning lists too.
+/// because a response was lost: the stream catalogue, the hardware
+/// configuration and the property strings (1330, which give the integration
+/// type) are the firmware's, so the old ones still hold, and a lost 1200,
+/// 2120 or 1330 must not blank them. The DLL, too, leaves its copy of the
+/// integration type as it was when a 1330 fails (0x18016e328; whether that
+/// copy outlives a reconnect is not traced). The status strings (1490) are
+/// not kept: the DLL's reconnect empties its copy of the fault and warning
+/// lists too.
 fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
     let Some(previous) = previous else {
         return;
@@ -445,6 +449,9 @@ fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
     }
     if facts.hardware.is_none() {
         facts.hardware.clone_from(&previous.hardware);
+    }
+    if facts.properties.is_empty() {
+        facts.properties.clone_from(&previous.properties);
     }
 }
 
@@ -1220,6 +1227,47 @@ pub(crate) mod tests {
         assert_eq!(
             st.facts.as_ref().and_then(|f| f.hardware.clone()),
             Some(hardware)
+        );
+    }
+
+    #[test]
+    fn an_init_without_properties_keeps_the_integration_type() {
+        use crate::requests::{handle, tests::Answering};
+        use tobii_ipc::request::{Request, decode_device_info, kind, status};
+        let mut st = state_with_client(1);
+        st.fake_device = Some(Arc::new(Answering(1)));
+        let state = Mutex::new(st);
+        let ready = |properties: Vec<(u32, String)>| {
+            Sample::DeviceReady(Arc::new(DeviceFacts {
+                properties,
+                ..DeviceFacts::default()
+            }))
+        };
+        let integration_type = || {
+            let reply = handle(
+                &state,
+                1,
+                &Request {
+                    id: 1,
+                    kind: kind::DEVICE_INFO,
+                    payload: &[],
+                },
+            );
+            assert_eq!(reply.status, status::OK);
+            decode_device_info(&reply.payload).map(|i| i.integration_type)
+        };
+        lock_state(&state).observe(&ready(vec![(0, "Peripheral".into())]));
+        assert_eq!(integration_type().as_deref(), Some("Peripheral"));
+
+        lock_state(&state).observe(&ready(vec![]));
+
+        assert_eq!(integration_type().as_deref(), Some("Peripheral"));
+
+        lock_state(&state).observe(&ready(vec![(0, "HMD".into())]));
+        assert_eq!(
+            integration_type().as_deref(),
+            Some("HMD"),
+            "reported properties replace the old ones"
         );
     }
 

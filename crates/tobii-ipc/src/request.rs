@@ -11,7 +11,8 @@ use crate::wire::{Reader, Writer};
 
 /// Request kinds.
 pub mod kind {
-    /// Device identity: reply is a [`super::DeviceInfo`].
+    /// Device identity: reply is a [`super::DeviceInfo`] (see
+    /// [`super::encode_device_info`]).
     pub const DEVICE_INFO: u8 = 1;
     /// Track box: reply is a [`super::TrackBox`](crate::geometry::TrackBox).
     pub const TRACK_BOX: u8 = 2;
@@ -153,7 +154,7 @@ pub fn decode_request(body: &[u8]) -> Option<Request<'_>> {
     })
 }
 
-/// Device identity, the four strings the tracker reports about itself.
+/// Device identity, the strings the tracker reports about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceInfo {
     /// Serial number.
@@ -164,9 +165,15 @@ pub struct DeviceInfo {
     pub generation: String,
     /// Firmware version.
     pub firmware_version: String,
+    /// Integration type (`Peripheral` on the ET5); empty from a daemon that
+    /// predates it.
+    pub integration_type: String,
 }
 
-/// Reply payload of [`kind::DEVICE_INFO`].
+/// Reply payload of [`kind::DEVICE_INFO`]: 4 x (`u16` length + UTF-8), the
+/// serial, model, generation and firmware, then the integration type the
+/// same way. That fifth string is an optional tail: a daemon from before it
+/// omits it, and an older client reads four strings and ignores the rest.
 #[must_use]
 pub fn encode_device_info(info: &DeviceInfo) -> Vec<u8> {
     Writer::default()
@@ -174,10 +181,12 @@ pub fn encode_device_info(info: &DeviceInfo) -> Vec<u8> {
         .str(&info.model)
         .str(&info.generation)
         .str(&info.firmware_version)
+        .str(&info.integration_type)
         .finish()
 }
 
-/// Decode a [`kind::DEVICE_INFO`] reply payload.
+/// Decode a [`kind::DEVICE_INFO`] reply payload. The integration type is
+/// empty when the tail is missing (an older daemon) or cut short.
 #[must_use]
 pub fn decode_device_info(payload: &[u8]) -> Option<DeviceInfo> {
     let mut r = Reader::new(payload);
@@ -186,6 +195,7 @@ pub fn decode_device_info(payload: &[u8]) -> Option<DeviceInfo> {
         model: r.str()?,
         generation: r.str()?,
         firmware_version: r.str()?,
+        integration_type: r.str().unwrap_or_default(),
     })
 }
 
