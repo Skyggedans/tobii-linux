@@ -882,9 +882,8 @@ fn pump(state: &Mutex<State>) {
             for s in &samples {
                 st.observe(s);
             }
-            let display = st.facts.as_ref().and_then(|f| f.display_area);
             for s in &samples {
-                push_sample_frames(s, wanted, display.as_ref(), &mut frames);
+                push_sample_frames(s, wanted, &mut frames);
             }
             for client in &mut st.clients {
                 let mut ok = true;
@@ -1159,7 +1158,7 @@ pub(crate) mod tests {
 
         assert_eq!((st.clock, st.gaze_frames), (Some((5_000_000, 100)), 1));
         let mut sent = Vec::new();
-        push_sample_frames(&gaze, tobii_ipc::STREAM_GAZE_DATA, None, &mut sent);
+        push_sample_frames(&gaze, tobii_ipc::STREAM_GAZE_DATA, &mut sent);
         let [(_, body)] = &sent[..] else {
             panic!("no gaze data frame: {sent:?}");
         };
@@ -1332,7 +1331,7 @@ pub(crate) mod tests {
             })
         );
         let mut live = Vec::new();
-        push_sample_frames(&presence, STREAM_PRESENCE, None, &mut live);
+        push_sample_frames(&presence, STREAM_PRESENCE, &mut live);
         assert_eq!(
             live,
             [(STREAM_PRESENCE, sent[0].clone())],

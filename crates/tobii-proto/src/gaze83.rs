@@ -9,6 +9,13 @@
 //! passed through even when their validity flag is clear; the flag is
 //! reported next to them.
 //!
+//! The other per-eye 3-D positions, in mm, are in the tracker frame: the
+//! cornea centres `0x02`/`0x08`, the eyeball centres `0x17`/`0x18` and the
+//! 3-D gaze points `0x04`/`0x0a`, which on the display area of the capture
+//! lie on the screen plane, where the 2-D gaze points `0x05`/`0x0b` put them.
+//! The track-box position (`0x03`/`0x09`) and those 2-D points are
+//! normalised, not in mm.
+//!
 //! There is no pupil diameter on this wire. The fields that decode.rs labels
 //! `pupil_*` (keys `0x25`/`0x27`, third component) track the eye's range, not
 //! its pupil, and keys `0x06`/`0x0c` are an unidentified quantity.
@@ -46,7 +53,7 @@ pub mod key {
         pub origin_display_valid: u32,
         /// Eye position normalised to the track box, x1024.
         pub track_box: u32,
-        /// 3-D gaze point on the screen plane, display frame.
+        /// 3-D gaze point on the screen plane, tracker frame.
         pub gaze_point_3d: u32,
         /// 2-D gaze point, display-normalised x1024.
         pub gaze_point_2d: u32,
@@ -105,8 +112,8 @@ pub struct EyeFrame {
     pub origin_display_mm: Valued<[f64; 3]>,
     /// Eye position normalised to the track box, `0..1` per axis.
     pub track_box: Valued<[f64; 3]>,
-    /// Gaze point on the screen plane, display frame, mm.
-    pub gaze_point_display_mm: Valued<[f64; 3]>,
+    /// Gaze point on the screen plane, tracker frame, mm.
+    pub gaze_point_tracker_mm: Valued<[f64; 3]>,
     /// Gaze point, normalised display coordinates.
     pub gaze_point_norm: Valued<[f64; 2]>,
     /// Eyeball rotation centre, tracker frame, mm.
@@ -171,7 +178,7 @@ pub fn decode_gaze_frame(msg: &Message<'_>) -> Option<GazeFrame> {
             origin_tracker_mm: flagged3(k.origin_tracker, k.origin_tracker_valid),
             origin_display_mm: flagged3(k.origin_display, k.origin_display_valid),
             track_box: unflagged3(k.track_box),
-            gaze_point_display_mm: flagged3(k.gaze_point_3d, k.gaze_point_valid),
+            gaze_point_tracker_mm: flagged3(k.gaze_point_3d, k.gaze_point_valid),
             gaze_point_norm: fields
                 .point::<2>(k.gaze_point_2d)
                 .map_or_else(Valued::default, |v| Valued {
@@ -231,6 +238,7 @@ pub fn decode_presence_frame(msg: &Message<'_>) -> Option<PresenceFrame> {
 mod tests {
     use super::*;
     use crate::protocol::parse_message;
+    use tobii_ipc::geometry::tracker_to_display;
 
     /// Frame 43780 of session1: what the Windows Stream Engine delivered for
     /// it is in session1.jsonl (gazePoint and gazeOrigin at 323209472 µs).
@@ -277,6 +285,45 @@ mod tests {
                 .iter()
                 .all(|v| (0.0..=1.0).contains(v))
         );
+    }
+
+    /// Keys `0x04`/`0x0a` are in the tracker frame, like `0x02`/`0x08`: on
+    /// the display area of the capture (the init's 1430), key `0x02` maps
+    /// onto the display-frame origin the Stream Engine reported (`0x22`), and
+    /// key `0x04` onto the screen plane, where the 2-D gaze point (`0x05`)
+    /// puts it.
+    #[test]
+    fn the_3d_gaze_point_is_in_the_tracker_frame() {
+        let frame = decode_gaze_frame(
+            &parse_message(&crate::fixture!("session1-gaze-frame")).expect("message"),
+        )
+        .expect("gaze frame");
+        let (area, _) = crate::facts::parse_display_area(
+            &parse_message(&crate::fixture!("init-rsp-1430")).expect("message"),
+        )
+        .expect("display area");
+        let length = |a: [f64; 3], b: [f64; 3]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let width = length(area.top_right_mm, area.top_left_mm);
+        let height = length(area.top_left_mm, area.bottom_left_mm);
+
+        for eye in [frame.left, frame.right] {
+            let origin = tracker_to_display(&area, eye.origin_tracker_mm.value);
+            assert!(
+                length(origin, eye.origin_display_mm.value) < 1e-3,
+                "{origin:?}"
+            );
+            let [x, y, z] = tracker_to_display(&area, eye.gaze_point_tracker_mm.value);
+            let [u, v] = eye.gaze_point_norm.value;
+            assert!(z.abs() < 1e-3, "{z} mm off the screen");
+            assert!((x / width + 0.5 - u).abs() < 1e-4, "{x} vs {u}");
+            assert!((0.5 - y / height - v).abs() < 1e-4, "{y} vs {v}");
+        }
     }
 
     #[test]
