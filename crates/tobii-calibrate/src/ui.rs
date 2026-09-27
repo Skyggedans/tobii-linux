@@ -145,7 +145,11 @@ pub(crate) struct Ui {
     pointer_x: Option<f64>,
     drag: Option<Drag>,
     shift: bool,
-    /// Set when the session ended badly, for the exit code.
+    /// Set when the session ended badly: the window's own failure (no such
+    /// monitor, no window), or its copy of the worker's. The terminal says
+    /// it first, unless the worker reports a calibration tobiid saved, whose
+    /// message and exit status are the worker's (see `window_failure` in
+    /// `main`).
     pub(crate) failed: Option<String>,
     /// The user closed the window (Esc or the window's close).
     pub(crate) escaped: bool,
@@ -848,8 +852,10 @@ fn paint(
             );
         }
         Screen::Failed(text) => {
-            c.text_centered(h / 2, s, WARNING, text);
-            c.text_centered(h / 2 + 12 * s, s, MUTED, "Esc to close");
+            // Wrapped: a failure often says more than a line holds.
+            let lines = c.paragraph_centered(h / 2, s, 10 * s, WARNING, text);
+            let below = h / 2 + lines.saturating_sub(1) * 10 * s + 12 * s;
+            c.text_centered(below, s, MUTED, "Esc to close");
         }
         Screen::DisplaySetup(setup) => paint_setup(c, setup, s, unit),
     }
@@ -1103,6 +1109,37 @@ mod tests {
             );
         }
         assert!(px.iter().any(|p| *p != BACKGROUND));
+    }
+
+    /// A failure longer than a line (80 characters on a 16:9 or 16:10
+    /// screen) goes on over the next lines, "Esc to close" below them.
+    #[test]
+    fn a_long_failure_is_shown_in_full() {
+        let (w, h) = (1280, 800);
+        let s = scale_for(h);
+        let text = "the calibration was saved and the tracker takes it at its next start; it \
+                    may not have taken it now: the tracker refused (status 13)";
+        assert!(text.chars().count() > w / (8 * s), "longer than a line");
+        let mut px = vec![0u32; w * h];
+        let mut c = Canvas {
+            pixels: &mut px,
+            width: w,
+            height: h,
+        };
+
+        paint(
+            &mut c,
+            &Screen::Failed(text.into()),
+            Duration::ZERO,
+            TIMING,
+            None,
+        );
+
+        let rows = |y: usize, color: u32| px[y * w..(y + 8 * s) * w].contains(&color);
+        let second = h / 2 + 10 * s;
+        assert!(rows(h / 2, WARNING) && rows(second, WARNING));
+        assert!(!rows(second + 10 * s, WARNING), "two lines");
+        assert!(rows(second + 12 * s, MUTED), "Esc to close, below them");
     }
 
     #[test]

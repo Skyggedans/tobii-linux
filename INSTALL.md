@@ -431,8 +431,10 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   libtobii's own, not a line per failing call as the Stream Engine writes:
   `TOBII_LOG_LEVEL_ERROR` for a refused `field_of_use`, a failed connect or
   reconnect, a lost daemon connection when `tobii_device_process_callbacks`
-  reports it (once per loss) or a daemon reply that does not decode, and
-  `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
+  reports it (once per loss), a daemon reply that does not decode, or a
+  `tobii_calibration_stop` that failed after the daemon saved the
+  calibration (saved but perhaps not applied: the tracker loads it at its
+  next init), and `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
   The logger is called on the thread inside the `tobii_*` call that logs,
   with none of that call's locks held, and from several threads at once if
   they log at once, so lines from different threads may interleave; a call
@@ -552,14 +554,19 @@ until the ring closes and the spinner finishes. The daemon has the tracker
 compute the calibration after each batch, and when the session ends normally
 saves the last one to `~/.config/tobii/calibration.bin` (the previous one is
 kept as `calibration.bin.prev`), with the display area it was made on, and
-uploads it at every later start. A session that does not run to its end
+uploads it at every later start. The result screen then shows the targets
+and your live gaze to check it. A session that does not run to its end
 (Esc, a failure, the client dying, the daemon or tracker going away, or the
 tracker re-initialising) leaves nothing behind: the calibration and display
 area it started from stay. A stop that has saved the calibration keeps it
-even if the tracker then refuses it or goes away before taking it: the stop
-reports the failure, but the tracker loads the saved calibration and display
-area at its next init. The result screen shows the targets and your live
-gaze to check it.
+even if the tracker then refuses it, goes away before taking it or does not
+answer in time: the stop reports the failure, but the tracker loads the
+saved calibration and display area at its next init. `tobii-calibrate` then
+says the calibration was saved and the tracker takes it at its next start
+(it may not have taken it at once), on its failure screen rather than the
+result screen, still writes `--export`, and exits with status 2 (1 for any
+other failure; with a daemon from before this was told, such a stop reads
+as not kept).
 
 Each step waits for the tracker as long as the daemon may take over it, so
 that `tobii-calibrate` never gives up on a step the daemon still carries
@@ -588,7 +595,8 @@ whether the daemon still saves the calibration (the save was under way;
   the previous calibration back.
 - Stream Engine applications can calibrate too, through `tobii_calibration_*`
   in `libtobii.so`; the result is saved the same way, once the application
-  calls `tobii_calibration_stop`. A session that ends before that (the
+  calls `tobii_calibration_stop` (whose failure after the save only its
+  logger hears of, as an ERROR line). A session that ends before that (the
   application exiting, the daemon or tracker going away, or the tracker
   re-initialising) leaves nothing behind, as above. When the tracker went
   away or re-initialised, the application's later calls in it,

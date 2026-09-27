@@ -177,14 +177,15 @@
 //! `tobii_custom_log_t` an application hands `tobii_api_create` is the only
 //! way to see its diagnostics. They are its own, and few: ERROR for a refused
 //! `field_of_use`, a failed connect or reconnect, a lost connection when
-//! `tobii_device_process_callbacks` reports it (once per loss) and a daemon
-//! reply that does not decode, INFO for each connect and reconnect. The
-//! logger is called on the thread inside the `tobii_*` call that logs, with
-//! no lock of that call's held and under the callback guard, so a call from
-//! inside it, on that thread, that a callback could not make either is
-//! `TOBII_ERROR_CALLBACK_IN_PROGRESS`; threads may log at once, and their
-//! lines may interleave. A `tobii_custom_alloc_t` is checked as in the DLL
-//! and never called (see `logger` and `tobii_api_create`).
+//! `tobii_device_process_callbacks` reports it (once per loss), a daemon
+//! reply that does not decode and a `tobii_calibration_stop` that failed
+//! after the daemon saved the calibration, INFO for each connect and
+//! reconnect. The logger is called on the thread inside the `tobii_*` call
+//! that logs, with no lock of that call's held and under the callback guard,
+//! so a call from inside it, on that thread, that a callback could not make
+//! either is `TOBII_ERROR_CALLBACK_IN_PROGRESS`; threads may log at once, and
+//! their lines may interleave. A `tobii_custom_alloc_t` is checked as in the
+//! DLL and never called (see `logger` and `tobii_api_create`).
 //!
 //! Every entry point takes raw handles from C, so each is an `unsafe fn` whose
 //! `# Safety` section states what the caller must uphold; the `unsafe` blocks

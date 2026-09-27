@@ -27,10 +27,14 @@
 //! calibration is then saved as the user's, stays on the device and is
 //! uploaded at every later init. One that cannot be saved is not kept either
 //! (the stop is `OPERATION_FAILED`). One saved is kept even if the device
-//! then refuses it or goes away before taking it: the stop answers that
-//! failure, and the next init uploads it. With `TOBII_CALIBRATION=embedded`
-//! none is saved, and the one kept runs until the next init. Stopped with
-//! [`STOP_DISCARD`], by its owner going away, by the engine dying or by the
+//! then refuses it, goes away before taking it or does not answer in time:
+//! the stop answers that failure, and the next init uploads it. Whatever its
+//! status, the stop's reply says whether it saved one
+//! ([`encode_stop_reply`]), so its client can tell a calibration kept,
+//! though perhaps not taken yet, from one not kept. With
+//! `TOBII_CALIBRATION=embedded` none is saved (the reply says so), and the
+//! one kept runs until the next init. Stopped with [`STOP_DISCARD`], by its
+//! owner going away, by the engine dying or by the
 //! device re-initialising (the engine re-opening it after a stall or a USB
 //! error), a session leaves nothing behind: the calibration it started from
 //! goes back on the device and nothing is saved.
@@ -54,7 +58,9 @@ use std::time::Duration;
 use tobii_calib::store::{self, Location};
 use tobii_ipc::deadline;
 use tobii_ipc::geometry::DisplayArea;
-use tobii_ipc::request::{STOP_DISCARD, STOP_KEEP, decode_point_2d, encode_u32, kind, status};
+use tobii_ipc::request::{
+    STOP_DISCARD, STOP_KEEP, decode_point_2d, encode_stop_reply, encode_u32, kind, status,
+};
 use tobii_ipc::{
     Notification, NotificationValue, STREAM_NOTIFICATIONS, encode_notification, notification,
 };
@@ -305,8 +311,8 @@ pub(crate) fn handle(state: &Mutex<State>, client: u64, request: u8, payload: &[
     match request {
         kind::CALIBRATION_START => start(state, client, payload),
         kind::CALIBRATION_STOP => match payload {
-            STOP_KEEP => stop(state, client, true).into(),
-            STOP_DISCARD => stop(state, client, false).into(),
+            STOP_KEEP => stop(state, client, true),
+            STOP_DISCARD => stop(state, client, false),
             _ => Reply::err(status::INVALID_PARAMETER),
         },
         kind::CALIBRATION_COLLECT_2D => {
@@ -519,18 +525,24 @@ fn apply(state: &Mutex<State>, client: u64, payload: &[u8]) -> Result<Vec<u8>, u
 
 /// End `client`'s session: commit what it computed when `keep` (and it
 /// computed something, and it could be saved), else put back what it
-/// started from.
-fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
+/// started from. The reply says whether the calibration was saved
+/// ([`encode_stop_reply`]), whatever its status: one saved stands even if
+/// the device then does not take it, as the next init uploads it.
+fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Reply {
     if lock_state(state).calibration.orphaned == Some(client) {
         // Its session ended without it (the engine lost, or the device
         // re-initialised); the stop only closes that out.
         lock_state(state).calibration.orphaned = None;
-        return Err(status::CALIBRATION_NOT_STARTED);
+        return Reply::err(status::CALIBRATION_NOT_STARTED);
     }
     let on_bus = look_for_tracker(state);
     let (device, session, location, losses) = {
         let mut st = lock_state(state);
-        let (device, session, location) = prepare_locked(&mut st, client, &Access::Owner, on_bus)?;
+        let (device, session, location) =
+            match prepare_locked(&mut st, client, &Access::Owner, on_bus) {
+                Ok(prepared) => prepared,
+                Err(code) => return Reply::err(code),
+            };
         // Under the same lock: a device init from now on leaves the session
         // to this stop, whose commands still reach the device; so does a
         // lost engine when the stop saves, as the owner's display area then
@@ -546,7 +558,7 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
         (device, session, location, st.engine_losses)
     };
     let Some(session) = session else {
-        return Err(status::CALIBRATION_NOT_STARTED);
+        return Reply::err(status::CALIBRATION_NOT_STARTED);
     };
     let commit = session.computed.clone().filter(|_| keep);
     // Saved before the device gets it: an init from now on (the device
@@ -626,11 +638,16 @@ fn stop(state: &Mutex<State>, client: u64, keep: bool) -> Result<Vec<u8>, u8> {
     } else if st.calibration.orphaned == Some(client) {
         st.calibration.orphaned = None;
     }
-    info!(client, kept = kept.is_some(), "calibration stopped");
-    if unsaved {
-        return Err(status::OPERATION_FAILED);
+    info!(client, kept = kept.is_some(), saved, "calibration stopped");
+    let code = match written {
+        _ if unsaved => status::OPERATION_FAILED,
+        Ok(_) => status::OK,
+        Err(code) => code,
+    };
+    Reply {
+        status: code,
+        payload: encode_stop_reply(saved),
     }
-    written.map(|_| Vec::new())
 }
 
 /// A client disconnected: a session it owned is discarded (it never said to
@@ -1040,6 +1057,11 @@ pub(crate) mod tests {
         handle(&s.state, client, k, payload)
     }
 
+    /// A stop's answer when it kept the session's calibration and saved it.
+    fn saved() -> Reply {
+        Reply::ok(encode_stop_reply(true))
+    }
+
     /// Make `request` on this thread; its reply, and the longest its device
     /// commands may keep it waiting in the daemon (see
     /// [`deadline::commands`]). The commands other threads send meanwhile,
@@ -1077,7 +1099,7 @@ pub(crate) mod tests {
         );
         let computed = ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]);
         assert_eq!(decode_u32(&computed.payload), Some(0x1234_5678));
-        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, &[]), Reply::ok(vec![]));
+        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, &[]), saved());
 
         assert_eq!(
             *s.device.log.lock().expect("log"),
@@ -1157,10 +1179,7 @@ pub(crate) mod tests {
         );
         let computed = ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]);
         assert_eq!(decode_u32(&computed.payload), Some(0x1234_5678));
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
-            Reply::ok(vec![])
-        );
+        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP), saved());
 
         // What the device computed is written back, not the calibration the
         // session started from, and saved.
@@ -1359,10 +1378,7 @@ pub(crate) mod tests {
             status::OPERATION_FAILED
         );
 
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
-            Reply::ok(Vec::new())
-        );
+        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP), saved());
         assert!(
             s.dir.join("calibration.bin").exists(),
             "what the session computed is still committed"
@@ -1412,7 +1428,7 @@ pub(crate) mod tests {
         refuse_for_bad_state(&s, None);
         assert_eq!(
             ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
-            Reply::ok(Vec::new()),
+            saved(),
             "its owner may still stop it"
         );
         assert!(
@@ -1619,10 +1635,7 @@ pub(crate) mod tests {
             !file.exists(),
             "nothing is saved before the session commits"
         );
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, &[]),
-            Reply::ok(Vec::new())
-        );
+        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, &[]), saved());
 
         assert_eq!(display_writes(&s), 1);
         assert_eq!(lock_state(&s.state).display_override, Some(new));
@@ -1766,10 +1779,7 @@ pub(crate) mod tests {
         );
         *s.device.refuse.lock().expect("refuse") = Some(cmd::STOP);
 
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
-            Reply::ok(Vec::new())
-        );
+        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP), saved());
         assert!(s.dir.join("calibration.bin").exists());
     }
 
@@ -1786,6 +1796,145 @@ pub(crate) mod tests {
             status::OPERATION_FAILED
         );
         assert_eq!(lock_state(&s.state).calibration.id, None);
+    }
+
+    /// A stop that saved the calibration and then could not write it to the
+    /// device answers the write's failure, and says it saved: the device
+    /// takes it at its next init, and the display area it was made on is
+    /// saved and stays configured.
+    #[test]
+    fn a_saved_calibration_the_device_does_not_take_at_the_stop_is_answered_as_saved() {
+        let (s, file, _) = display_setup("saved-not-taken");
+        let new = area(597.0);
+        assert_eq!(set_area(&s, 1, &new), Reply::ok(Vec::new()));
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+            status::OK
+        );
+        *s.device.refuse.lock().expect("refuse") = Some(cmd::WRITE);
+
+        let reply = ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP);
+
+        assert_eq!(reply.status, status::OPERATION_FAILED);
+        assert_eq!(reply.payload, encode_stop_reply(true));
+        let (saved, _) = store::load(&s.dir.join("calibration.bin"))
+            .expect("load")
+            .expect("saved");
+        assert_eq!(saved, s.device.blob);
+        assert_eq!(
+            s.device.payloads.lock().expect("payloads").last(),
+            Some(&(cmd::WRITE, write_payload(&saved))),
+            "the refused write was the saved calibration"
+        );
+        assert_eq!(crate::display::load(&file).expect("load"), Some(new));
+        let st = lock_state(&s.state);
+        assert_eq!(st.display_override, Some(new), "the area stays configured");
+        assert_eq!(st.calibration.id, None, "unknown once the write failed");
+        assert!(!st.calibration.is_active());
+    }
+
+    /// Only a stop that saved the session's calibration says so, whether or
+    /// not the device took it; every other stop answers as before the flag.
+    #[test]
+    fn a_stop_says_whether_it_saved_the_calibration() {
+        /// Where the session's calibration would be saved.
+        #[derive(Clone, Copy)]
+        enum Store {
+            /// The calibration file.
+            File,
+            /// A path that cannot be written: it is a directory.
+            Unwritable,
+            /// Nowhere (`TOBII_CALIBRATION=embedded`).
+            Embedded,
+        }
+        // Tag, stop payload, computes, where it is saved, the command the
+        // device refuses, the answer.
+        for (tag, payload, computes, store_in, refused, answer) in [
+            ("flag-kept", STOP_KEEP, true, Store::File, None, saved()),
+            (
+                "flag-kept-not-taken",
+                STOP_KEEP,
+                true,
+                Store::File,
+                Some(cmd::WRITE),
+                Reply {
+                    status: status::OPERATION_FAILED,
+                    payload: encode_stop_reply(true),
+                },
+            ),
+            (
+                "flag-nothing-computed",
+                STOP_KEEP,
+                false,
+                Store::File,
+                None,
+                Reply::ok(Vec::new()),
+            ),
+            (
+                "flag-embedded",
+                STOP_KEEP,
+                true,
+                Store::Embedded,
+                None,
+                Reply::ok(Vec::new()),
+            ),
+            (
+                "flag-unsavable",
+                STOP_KEEP,
+                true,
+                Store::Unwritable,
+                None,
+                Reply::err(status::OPERATION_FAILED),
+            ),
+            (
+                "flag-discard",
+                STOP_DISCARD,
+                true,
+                Store::File,
+                None,
+                Reply::ok(Vec::new()),
+            ),
+            (
+                "flag-discard-not-taken",
+                STOP_DISCARD,
+                true,
+                Store::File,
+                Some(cmd::WRITE),
+                Reply::err(status::OPERATION_FAILED),
+            ),
+        ] {
+            let s = setup(tag);
+            match store_in {
+                Store::File => {}
+                Store::Unwritable => {
+                    std::fs::create_dir_all(s.dir.join("calibration.bin")).expect("dir");
+                }
+                Store::Embedded => lock_state(&s.state).calibration.location = Location::Embedded,
+            }
+            assert_eq!(
+                ask(&s, 1, kind::CALIBRATION_START, &[2]),
+                Reply::ok(Vec::new()),
+                "{tag}"
+            );
+            if computes {
+                assert_eq!(
+                    ask(&s, 1, kind::CALIBRATION_COMPUTE, &[]).status,
+                    status::OK,
+                    "{tag}"
+                );
+            }
+            *s.device.refuse.lock().expect("refuse") = refused;
+
+            assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, payload), answer, "{tag}");
+
+            assert!(!lock_state(&s.state).calibration.is_active(), "{tag}");
+        }
+        // No session to stop.
+        let s = setup("flag-not-started");
+        assert_eq!(
+            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+            Reply::err(status::CALIBRATION_NOT_STARTED)
+        );
     }
 
     #[test]
@@ -1811,9 +1960,9 @@ pub(crate) mod tests {
             }
 
             assert_eq!(
-                ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP).status,
-                status::OPERATION_FAILED,
-                "{tag}"
+                ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
+                Reply::err(status::OPERATION_FAILED),
+                "{tag}: failed, and saved nothing"
             );
 
             assert!(!file.exists(), "{tag}: saved only with its calibration");
@@ -2060,10 +2209,7 @@ pub(crate) mod tests {
         );
         befall(&s, cmd::STOP, Mishap::Reinit);
 
-        assert_eq!(
-            ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP),
-            Reply::ok(Vec::new())
-        );
+        assert_eq!(ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP), saved());
 
         {
             let st = lock_state(&s.state);
@@ -2239,6 +2385,11 @@ pub(crate) mod tests {
             let (reply, waited) = timed(&s, || ask(&s, 1, kind::CALIBRATION_STOP, STOP_KEEP));
 
             assert_eq!(reply.status, answer, "{tag}");
+            assert_eq!(
+                reply.payload,
+                encode_stop_reply(true),
+                "{tag}: saved, whatever the status"
+            );
             assert!(
                 waited <= worst::CALIBRATION_STOP,
                 "{tag}: {waited:?}, the successor's write included"

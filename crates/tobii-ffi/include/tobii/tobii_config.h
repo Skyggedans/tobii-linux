@@ -43,10 +43,14 @@ TOBII_API tobii_error_t TOBII_CALL tobii_calibration_start( tobii_device_t* devi
 /* Keeps the last calibration computed and the display area set in the
  * session. Restores the previous ones only when nothing was computed, or when
  * the daemon cannot save the calibration (TOBII_ERROR_OPERATION_FAILED). Once
- * saved, both are kept even if the tracker then refuses the calibration or
- * goes away before taking it (TOBII_ERROR_OPERATION_FAILED or
- * TOBII_ERROR_CONNECTION_FAILED all the same): it loads them at its next
- * init. */
+ * saved, both are kept even if the tracker then refuses the calibration,
+ * goes away before taking it or does not answer in time
+ * (TOBII_ERROR_OPERATION_FAILED, TOBII_ERROR_CONNECTION_FAILED or
+ * TOBII_ERROR_TIMED_OUT all the same; after a timeout it may have taken it):
+ * it loads them at its next init. The status alone does not tell the two
+ * failures apart; the second logs a TOBII_LOG_LEVEL_ERROR line to the logger
+ * given to tobii_api_create, that the calibration was saved but may not have
+ * been applied (not with a tobiid from before this was told). */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_stop( tobii_device_t* device );
 /* Normalised display coordinates; blocks for most of a second. */
 TOBII_API tobii_error_t TOBII_CALL tobii_calibration_collect_data_2d( tobii_device_t* device,

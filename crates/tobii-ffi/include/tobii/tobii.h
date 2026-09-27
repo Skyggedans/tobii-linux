@@ -144,7 +144,9 @@ typedef enum tobii_log_level_t
  * diagnostics, not a line per failing call (the returned error says that):
  * TOBII_LOG_LEVEL_ERROR when field_of_use is refused, a device cannot connect
  * to tobiid or reconnect, tobii_device_process_callbacks reports a lost
- * connection (once per loss), or tobiid sends a reply that does not decode;
+ * connection (once per loss), tobiid sends a reply that does not decode, or
+ * tobii_calibration_stop fails after tobiid saved the calibration (saved but
+ * perhaps not applied: the tracker loads it at its next init);
  * TOBII_LOG_LEVEL_INFO when a device connects or reconnects.
  *
  * It is called synchronously, on the thread inside the tobii_* call that

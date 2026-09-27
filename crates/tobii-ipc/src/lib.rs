@@ -809,6 +809,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_reply_says_whether_the_calibration_was_saved() {
+        use request::*;
+
+        let saved = encode_stop_reply(true);
+        let not_saved = encode_stop_reply(false);
+
+        assert_eq!(saved, [1]);
+        assert!(decode_stop_reply(&saved));
+        // As a daemon from before the flag answers every stop.
+        assert_eq!(not_saved, []);
+        assert!(!decode_stop_reply(&not_saved));
+        assert!(!decode_stop_reply(&[0]));
+        // A tail a later daemon may add leaves the flag as it is.
+        assert!(decode_stop_reply(&[1, 0xff]));
+        assert!(!decode_stop_reply(&[0, 0xff]));
+        // The payload reaches a client whatever the status.
+        assert_eq!(
+            decode_server(&encode_reply(9, request::status::OPERATION_FAILED, &saved)),
+            Some(ServerMsg::Reply {
+                request_id: 9,
+                status: request::status::OPERATION_FAILED,
+                payload: saved,
+            })
+        );
+    }
+
+    #[test]
     fn a_device_info_reply_without_the_integration_type_still_decodes() {
         use request::*;
         let info = DeviceInfo {

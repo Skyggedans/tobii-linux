@@ -618,13 +618,28 @@ struct Command {
 }
 
 impl Command {
+    /// Send a request and wait up to `timeout` for its reply (see
+    /// [`Self::reply`]). A reply with a non-zero status is that status.
+    fn request(&mut self, kind: u8, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, Status> {
+        match self.reply(kind, payload, timeout)? {
+            (TOBII_ERROR_NO_ERROR, payload) => Ok(payload),
+            (status, _) => Err(status),
+        }
+    }
+
     /// Send a request and wait up to `timeout` for its reply, dropping the
     /// stale replies of requests that gave up, and the late acks it reads
     /// past, which are then owed no more (see [`Link::acks_owed`]; no
     /// subscription change waits at the same time, as both hold the command
-    /// lock). The samples that arrive meanwhile stay queued for `process`. A
-    /// reply with a non-zero status is that status.
-    fn request(&mut self, kind: u8, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, Status> {
+    /// lock). The samples that arrive meanwhile stay queued for `process`.
+    /// The reply's status and payload, whatever the status; `Err` only when
+    /// no reply comes.
+    fn reply(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(Status, Vec<u8>), Status> {
         #[cfg(test)]
         tests::note_request(timeout);
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
@@ -640,13 +655,7 @@ impl Command {
                     request_id,
                     status,
                     payload,
-                } if request_id == id => {
-                    return if status == 0 {
-                        Ok(payload)
-                    } else {
-                        Err(Status::from(status))
-                    };
-                }
+                } if request_id == id => return Ok((Status::from(status), payload)),
                 Answer::Reply { request_id, .. } => {
                     tracing::debug!(request_id, "stale reply dropped");
                 }
@@ -1092,6 +1101,18 @@ impl Device {
         timeout: Duration,
     ) -> Result<Vec<u8>, Status> {
         self.command.lock().request(kind, payload, timeout)
+    }
+
+    /// As [`Self::request`], for a reply whose payload says something
+    /// whatever its status: the status and the payload, `Err` only when no
+    /// reply comes.
+    pub(crate) fn request_reply(
+        &self,
+        kind: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(Status, Vec<u8>), Status> {
+        self.command.lock().reply(kind, payload, timeout)
     }
 
     /// The device's identity, fetched from the daemon once per connection.

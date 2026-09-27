@@ -8,10 +8,12 @@
 //! refused, a device cannot connect to `tobiid` or reconnect,
 //! `tobii_device_process_callbacks` reports a lost connection (once per loss;
 //! a loss a request runs into goes unlogged if a reconnect mends it before a
-//! process call, the request's status having said it), or `tobiid` sends a
-//! reply that does not decode; INFO when a device connects or reconnects. A
-//! failing call is not logged as such: its status says it. Each line goes to
-//! `tracing` too, as the crate's other events do.
+//! process call, the request's status having said it), `tobiid` sends a
+//! reply that does not decode, or `tobii_calibration_stop` fails after
+//! `tobiid` saved the calibration (its status cannot tell that from a
+//! failure that kept nothing); INFO when a device connects or reconnects.
+//! A failing call is not otherwise logged as such: its status says it. Each
+//! line goes to `tracing` too, as the crate's other events do.
 //!
 //! The logger is called synchronously, on the thread inside the `tobii_*` call
 //! that has something to say, and never from the reader thread: a [`Logger`]

@@ -50,7 +50,8 @@ pub mod kind {
     pub const CALIBRATION_START: u8 = 0x10;
     /// End the calibration session: payload [`super::STOP_KEEP`] (keep
     /// what it computed) or [`super::STOP_DISCARD`] (put back what was
-    /// there before it).
+    /// there before it). Reply: whether the stop saved the session's
+    /// calibration, whatever its status (see [`super::encode_stop_reply`]).
     pub const CALIBRATION_STOP: u8 = 0x11;
     /// Collect a 2-D point: payload `f32 x, f32 y` (normalised display).
     pub const CALIBRATION_COLLECT_2D: u8 = 0x12;
@@ -512,6 +513,33 @@ pub fn encode_u32(v: u32) -> Vec<u8> {
 #[must_use]
 pub fn decode_u32(payload: &[u8]) -> Option<u32> {
     Reader::new(payload).u32()
+}
+
+/// Reply payload of [`kind::CALIBRATION_STOP`], with any status: `u8 1` when
+/// the stop saved the session's calibration, so that the tracker takes it at
+/// every later start even if it may not have taken it at the stop (a
+/// failure status then); empty when it saved none (a discard, nothing
+/// computed, `TOBII_CALIBRATION=embedded`, or a save that failed). The
+/// display area the calibration was made on is saved alongside it, best
+/// effort: the flag is the calibration's alone, and a display area that
+/// could not be written leaves the one saved before for later starts. A
+/// daemon from before the flag answers every stop empty, and a client from
+/// before it ignores the payload.
+#[must_use]
+pub fn encode_stop_reply(saved: bool) -> Vec<u8> {
+    if saved {
+        Writer::default().bool(true).finish()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether a [`kind::CALIBRATION_STOP`] reply payload says the calibration
+/// was saved (see [`encode_stop_reply`]). Only its first byte counts, so a
+/// later daemon may add a tail; an empty payload is not saved.
+#[must_use]
+pub fn decode_stop_reply(payload: &[u8]) -> bool {
+    Reader::new(payload).bool().unwrap_or(false)
 }
 
 /// A normalised display point: the payload of

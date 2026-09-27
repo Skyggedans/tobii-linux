@@ -21,6 +21,7 @@
 //! or discard say on screen that they wait for the tracker, and a point or a
 //! compute keeps its spinner turning.
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread;
@@ -30,8 +31,8 @@ use anyhow::{Context, Result, bail};
 use tobii_calib::{PointRecord, STIMULUS_POINTS};
 use tobii_ipc::geometry::{DisplayArea, GeometryMounting, display_area_basic};
 use tobii_ipc::request::{
-    STOP_DISCARD, STOP_KEEP, decode_display_area, decode_geometry_mounting, encode_display_area,
-    encode_point_2d, kind, status,
+    STOP_DISCARD, STOP_KEEP, decode_display_area, decode_geometry_mounting, decode_stop_reply,
+    encode_display_area, encode_point_2d, kind, status,
 };
 use tobii_ipc::timeout;
 
@@ -88,6 +89,35 @@ pub(crate) enum UiEvent {
     /// The session failed.
     Failed(String),
 }
+
+/// A session whose stop tobiid answered with a failure after it had saved
+/// the calibration (see [`tobii_ipc::request::encode_stop_reply`]): the
+/// tracker takes it at its next start, and may not have taken it then (it
+/// refused it or went away; one that did not answer in time may have). A
+/// tobiid from before its stop reply said so answers such a stop as one
+/// that saved nothing, which is reported as not kept.
+#[derive(Debug)]
+pub(crate) struct SavedNotTaken {
+    /// The session, whose calibration is the one saved.
+    pub(crate) summary: Summary,
+    /// The stop's status.
+    pub(crate) status: u8,
+}
+
+impl fmt::Display for SavedNotTaken {
+    // What counts first, as a window too narrow for the whole line still
+    // shows its start.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the calibration was saved and the tracker takes it at its next start; it may not \
+             have taken it now: {}",
+            describe(self.status)
+        )
+    }
+}
+
+impl std::error::Error for SavedNotTaken {}
 
 /// What a target is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +354,10 @@ fn mean_offset(points: &[PointRecord]) -> Option<f32> {
 /// What the error of a session adds: it was discarded.
 const NOT_CALIBRATED: &str = "not calibrated; the previous calibration stays";
 
+/// What the error of a session run to its end adds when its stop failed
+/// before it saved the calibration, or said nothing of a save.
+const NOT_KEPT: &str = "the calibration was not kept";
+
 /// How often a worker waiting for the window to be in place looks again.
 const PLACEMENT_POLL: Duration = Duration::from_millis(100);
 
@@ -338,6 +372,8 @@ const PLACEMENT_POLL: Duration = Duration::from_millis(100);
 ///
 /// # Errors
 /// Fails when the tracker refuses a step, stops answering, or `abort` is set.
+/// A stop that fails after tobiid saved the calibration is a
+/// [`SavedNotTaken`], which carries the session's summary.
 pub(crate) fn run(
     backend: &mut dyn Backend,
     rounds: usize,
@@ -382,13 +418,23 @@ pub(crate) fn run(
         emit(UiEvent::Status(DISCARDING.into()));
         STOP_DISCARD
     };
-    let stopped = backend
-        .request(kind::CALIBRATION_STOP, stop, timeout::CALIBRATION_STOP)
-        .and_then(|r| expect_ok(r, "could not stop"));
+    let stopped = backend.request(kind::CALIBRATION_STOP, stop, timeout::CALIBRATION_STOP);
     let summary = result.context(NOT_CALIBRATED)?;
-    // Nothing is kept unless the stop went through.
-    stopped.context("the calibration was not kept")?;
-    Ok(summary)
+    // Nothing is kept unless the stop went through, or failed only once
+    // tobiid had saved the calibration.
+    match stopped.context(NOT_KEPT)? {
+        (code, payload) if code != status::OK && decode_stop_reply(&payload) => {
+            Err(SavedNotTaken {
+                summary,
+                status: code,
+            }
+            .into())
+        }
+        reply => {
+            expect_ok(reply, "could not stop").context(NOT_KEPT)?;
+            Ok(summary)
+        }
+    }
 }
 
 /// Wait until the window is in place for the points (or `abort`).
@@ -525,6 +571,7 @@ pub(crate) fn reset(backend: &mut dyn Backend) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tobii_ipc::request::encode_stop_reply;
 
     #[test]
     #[allow(clippy::float_cmp)] // reason: the pattern's exact constants
@@ -665,6 +712,8 @@ mod tests {
         mounting: u8,
         /// What `CALIBRATION_COLLECT_2D` answers.
         collect: u8,
+        /// What `CALIBRATION_STOP` answers.
+        stop: Reply,
         /// Set on this request (the user pressing Esc then).
         abort_on: Option<(u8, std::sync::Arc<AtomicBool>)>,
     }
@@ -677,6 +726,7 @@ mod tests {
                 start: status::OK,
                 mounting: status::OK,
                 collect: status::OK,
+                stop: (status::OK, Vec::new()),
                 abort_on: None,
             }
         }
@@ -716,6 +766,7 @@ mod tests {
                 ),
                 kind::DISPLAY_AREA_GET => (status::OK, encode_display_area(&before())),
                 kind::CALIBRATION_COLLECT_2D => (self.collect, Vec::new()),
+                kind::CALIBRATION_STOP => self.stop.clone(),
                 _ => (status::OK, Vec::new()),
             })
         }
@@ -1018,6 +1069,82 @@ mod tests {
             (*kind, payload.as_slice()),
             (kind::CALIBRATION_STOP, STOP_DISCARD)
         );
+    }
+
+    /// Run a session to its end on a device whose keeping stop answers
+    /// `stop`.
+    fn kept_session(stop: Reply) -> Result<Summary> {
+        let rx = answered(CHOICE);
+        let mut device = SetupDevice {
+            stop,
+            ..SetupDevice::new()
+        };
+        let summary = run(
+            &mut device,
+            1,
+            QUICK,
+            Some(&rx),
+            &PLACED,
+            &AtomicBool::new(false),
+            &|_| {},
+        );
+        let (kind, payload) = device.log.last().expect("stop");
+        assert_eq!(
+            (*kind, payload.as_slice()),
+            (kind::CALIBRATION_STOP, STOP_KEEP)
+        );
+        summary
+    }
+
+    /// A stop that failed once tobiid had saved the calibration is told
+    /// apart from one that kept nothing: the tracker takes it at its next
+    /// start, and may have taken it already (a write that timed out). The
+    /// session's summary comes with it, for `--export`.
+    #[test]
+    fn a_stop_that_failed_after_the_save_says_the_calibration_was_saved() {
+        let saved = encode_stop_reply(true);
+
+        let refused =
+            kept_session((status::OPERATION_FAILED, saved.clone())).expect_err("not taken");
+        let gone = kept_session((status::CONNECTION_FAILED, saved.clone())).expect_err("not taken");
+        let late = kept_session((status::TIMED_OUT, saved)).expect_err("maybe not taken");
+
+        let not_taken = refused.downcast_ref::<SavedNotTaken>().expect("told apart");
+        assert_eq!(not_taken.status, status::OPERATION_FAILED);
+        assert_eq!(not_taken.summary.id, 0, "the stand-in computes no id");
+        assert_eq!(
+            refused.to_string(),
+            "the calibration was saved and the tracker takes it at its next start; it may not \
+             have taken it now: the tracker refused (status 13)"
+        );
+        for (tag, e, why) in [
+            ("gone", gone, "the tracker is not available"),
+            ("late", late, "the tracker did not answer in time"),
+        ] {
+            let text = format!("{e:#}");
+            assert!(
+                text.starts_with("the calibration was saved and the tracker takes it"),
+                "{tag}: {text}"
+            );
+            assert!(text.ends_with(why), "{tag}: {text}");
+            assert!(!text.contains("not kept"), "{tag}: {text}");
+        }
+    }
+
+    /// A stop that failed without saving, or whose tobiid does not say
+    /// (an empty payload: one from before the flag), kept nothing; one that
+    /// went through kept the calibration, flag or not.
+    #[test]
+    fn a_stop_that_failed_without_the_flag_says_nothing_was_kept() {
+        let unsaved = kept_session((status::OPERATION_FAILED, Vec::new())).expect_err("not kept");
+
+        assert!(unsaved.downcast_ref::<SavedNotTaken>().is_none());
+        assert_eq!(
+            format!("{unsaved:#}"),
+            "the calibration was not kept: could not stop: the tracker refused (status 13)"
+        );
+        kept_session((status::OK, encode_stop_reply(true))).expect("kept");
+        kept_session((status::OK, Vec::new())).expect("kept by an older tobiid");
     }
 
     #[test]

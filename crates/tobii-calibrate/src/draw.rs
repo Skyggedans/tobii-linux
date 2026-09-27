@@ -166,6 +166,67 @@ impl Canvas<'_> {
         let x = self.width.saturating_sub(Self::text_width(text, scale)) / 2;
         self.text(x, y, scale, color, text);
     }
+
+    /// `text` [`wrap`]ped to the canvas width, each line centred, the first
+    /// at row `y` and each next one `pitch` rows lower. The number of lines.
+    pub(crate) fn paragraph_centered(
+        &mut self,
+        y: usize,
+        scale: usize,
+        pitch: usize,
+        color: u32,
+        text: &str,
+    ) -> usize {
+        let lines = wrap(text, self.width / (8 * scale.max(1)));
+        for (i, line) in lines.iter().enumerate() {
+            self.text_centered(y + i * pitch, scale, color, line);
+        }
+        lines.len()
+    }
+}
+
+/// `text` broken at whitespace into lines of at most `columns` characters,
+/// a word longer than a line split across lines. No empty lines.
+pub(crate) fn wrap(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    // Characters in `line`.
+    let mut len = 0;
+    for mut word in text.split_whitespace() {
+        loop {
+            let n = word.chars().count();
+            let gap = usize::from(len > 0);
+            if len + gap + n <= columns {
+                if gap > 0 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                len += gap + n;
+                break;
+            }
+            if len > 0 {
+                lines.push(std::mem::take(&mut line));
+                len = 0;
+                continue;
+            }
+            // Longer than a line on its own: its first `columns` characters
+            // make one, and the rest goes on.
+            let cut = word
+                .char_indices()
+                .nth(columns)
+                .map_or(word.len(), |(i, _)| i);
+            lines.push(word[..cut].to_owned());
+            word = &word[cut..];
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if len > 0 {
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -234,6 +295,43 @@ mod tests {
         c.text(0, 0, 1, rgb(255, 255, 255), "A\u{1F600}");
         assert!(lit(&px) > 0);
         assert_eq!(Canvas::text_width("abc", 2), 48);
+    }
+
+    #[test]
+    fn wrapped_text_breaks_between_words_and_splits_only_a_word_too_long() {
+        assert_eq!(wrap("a bc  def", 4), ["a bc", "def"]);
+        assert_eq!(wrap("a bc def", 8), ["a bc def"]);
+        assert_eq!(wrap("abcdefghij k", 4), ["abcd", "efgh", "ij k"]);
+        assert_eq!(wrap("é ü", 1), ["é", "ü"], "characters, not bytes");
+        assert!(wrap("  ", 4).is_empty());
+        assert_eq!(
+            wrap("ab", 0),
+            ["a", "b"],
+            "a line holds a character at least"
+        );
+        let long = "the calibration was saved and the tracker takes it at its next start; it \
+                    may not have taken it now: the tracker refused (status 13)";
+        let lines = wrap(long, 80);
+        assert!(lines.iter().all(|l| l.chars().count() <= 80), "{lines:?}");
+        assert_eq!(lines.join(" "), long, "nothing is lost");
+    }
+
+    #[test]
+    fn a_paragraph_wraps_to_the_canvas() {
+        let mut px = vec![0u32; 64 * 40];
+        let mut c = Canvas {
+            pixels: &mut px,
+            width: 64,
+            height: 40,
+        };
+
+        // 8 columns at scale 1.
+        let lines = c.paragraph_centered(0, 1, 10, rgb(255, 255, 255), "ab cdefgh ij");
+
+        assert_eq!(lines, 3);
+        let lit_row = |row: usize| px[row * 64..(row + 8) * 64].iter().any(|p| *p != 0);
+        assert!(lit_row(0) && lit_row(10) && lit_row(20));
+        assert!(!lit_row(30), "no fourth line");
     }
 
     #[test]

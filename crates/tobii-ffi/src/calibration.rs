@@ -12,9 +12,10 @@
 use std::ffi::c_void;
 use std::time::Duration;
 
-use tobii_ipc::request::{STOP_KEEP, encode_point_2d, kind};
+use tobii_ipc::request::{STOP_KEEP, decode_stop_reply, encode_point_2d, kind};
 
 use crate::device::{Api, Device, call, device_ref, in_callback};
+use crate::logger::Level;
 use crate::status::{
     Status, TOBII_ERROR_CALLBACK_IN_PROGRESS, TOBII_ERROR_INVALID_PARAMETER, TOBII_ERROR_NO_ERROR,
     TOBII_ERROR_NOT_SUPPORTED, TOBII_ERROR_OPERATION_FAILED,
@@ -76,24 +77,48 @@ pub unsafe extern "C" fn tobii_calibration_start(device: *mut Device, enabled_ey
 /// display area set during it). Only if nothing was computed, or the daemon
 /// could not save it (`TOBII_ERROR_OPERATION_FAILED`), are the previous
 /// calibration and display area restored. Once saved, both are kept even if
-/// the tracker then refuses the calibration or goes away before taking it
-/// (`TOBII_ERROR_OPERATION_FAILED` or `TOBII_ERROR_CONNECTION_FAILED` all
-/// the same): it loads them at its next init. A session the daemon already
-/// ended, because the tracker re-initialised or went away, saved nothing:
-/// its stop is `TOBII_ERROR_CALIBRATION_NOT_STARTED`.
+/// the tracker then refuses the calibration, goes away before taking it or
+/// does not answer in time (`TOBII_ERROR_OPERATION_FAILED`,
+/// `TOBII_ERROR_CONNECTION_FAILED` or `TOBII_ERROR_TIMED_OUT` all the same;
+/// after a timeout it may have taken it): it loads them at its next init.
+/// The status is the daemon's either way; a failure after the save is told
+/// apart only by an ERROR line to the application's logger, saying the
+/// calibration was saved but may not have been applied, from a daemon that
+/// says it saved (see
+/// [`tobii_ipc::request::encode_stop_reply`]; an older one does not, and
+/// nothing is logged). A session the daemon already ended, because the
+/// tracker re-initialised or went away, saved nothing: its stop is
+/// `TOBII_ERROR_CALIBRATION_NOT_STARTED`.
 ///
 /// # Safety
 /// As `tobii_calibration_start`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tobii_calibration_stop(device: *mut Device) -> Status {
-    // SAFETY: forwarded under the same contract.
-    unsafe {
-        request(
-            device,
-            kind::CALIBRATION_STOP,
-            STOP_KEEP,
-            timeouts::CALIBRATION_STOP,
-        )
+    // SAFETY: caller guarantees `device` is null or a live handle, not
+    // destroyed before this returns.
+    let d = match unsafe { device_ref(device) } {
+        Ok(d) => d,
+        Err(status) => return status,
+    };
+    match d.request_reply(
+        kind::CALIBRATION_STOP,
+        STOP_KEEP,
+        timeouts::CALIBRATION_STOP,
+    ) {
+        Ok((TOBII_ERROR_NO_ERROR, _)) => TOBII_ERROR_NO_ERROR,
+        Ok((status, payload)) => {
+            if decode_stop_reply(&payload) {
+                d.log(
+                    Level::Error,
+                    format_args!(
+                        "tobii_calibration_stop: the calibration was saved, but the tracker \
+                         may not have applied it (error {status}); it loads it at its next init"
+                    ),
+                );
+            }
+            status
+        }
+        Err(status) => status,
     }
 }
 
@@ -725,6 +750,58 @@ mod tests {
                 TOBII_ERROR_INVALID_PARAMETER
             );
             assert_eq!(crate::api::tobii_device_destroy(d), 0);
+        }
+    }
+
+    /// A stop that failed after the daemon saved the calibration returns the
+    /// daemon's status and says so at ERROR to the application's logger.
+    /// One that saved nothing, or whose daemon predates the flag (an empty
+    /// payload), and one that went through, log nothing.
+    #[test]
+    fn a_stop_that_failed_after_the_save_tells_the_logger() {
+        use crate::status::TOBII_ERROR_CONNECTION_FAILED;
+        use tobii_ipc::request::encode_stop_reply;
+        let saved = encode_stop_reply(true);
+        for (tag, status, payload, logged) in [
+            ("refused", TOBII_ERROR_OPERATION_FAILED, saved.clone(), true),
+            ("gone", TOBII_ERROR_CONNECTION_FAILED, saved.clone(), true),
+            ("unsaved", TOBII_ERROR_OPERATION_FAILED, Vec::new(), false),
+            ("kept", TOBII_ERROR_NO_ERROR, saved.clone(), false),
+            (
+                "kept by an older daemon",
+                TOBII_ERROR_NO_ERROR,
+                Vec::new(),
+                false,
+            ),
+        ] {
+            let recorder = Recorder::default();
+            let wire = u8::try_from(status).expect("a wire status");
+            let mut device = device_with(wire, payload);
+            device.set_logger(recorder.logger());
+            let d = Box::into_raw(Box::new(device));
+
+            // SAFETY: `d` is live and destroyed once.
+            let got = unsafe {
+                let got = tobii_calibration_stop(d);
+                assert_eq!(crate::api::tobii_device_destroy(d), 0, "{tag}");
+                got
+            };
+
+            assert_eq!(got, status, "{tag}: the daemon's status");
+            let lines = recorder.lines();
+            if logged {
+                assert_eq!(lines.len(), 1, "{tag}: {lines:?}");
+                assert_eq!(lines[0].0, TOBII_LOG_LEVEL_ERROR, "{tag}");
+                let text = &lines[0].1;
+                assert!(
+                    text.contains("was saved, but the tracker may not have applied it")
+                        && text.contains(&format!("error {status}"))
+                        && text.ends_with("at its next init"),
+                    "{tag}: {text}"
+                );
+            } else {
+                assert!(lines.is_empty(), "{tag}: {lines:?}");
+            }
         }
     }
 

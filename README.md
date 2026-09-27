@@ -127,7 +127,10 @@ Where the answers come from, and where they differ from Windows:
   `TOBII_ERROR_CALIBRATION_NOT_STARTED`. A stop under way finishes, and a
   calibration it has saved stays saved even if the stop then fails
   (`TOBII_ERROR_CONNECTION_FAILED` when the tracker went away); the tracker
-  loads it at its next init.
+  loads it at its next init. Such a stop logs an ERROR line saying the
+  calibration was saved but may not have been applied, since its status
+  alone reads as a stop that kept nothing, and `tobii-calibrate` says so and
+  exits 2.
 - **Waiting for the daemon.** A call that asks the daemon (any but a
   subscription change or a reconnect, which wait 2 s and ~500 ms for their
   acknowledgement) waits for the answer longer than the daemon's own
@@ -305,7 +308,8 @@ Where the answers come from, and where they differ from Windows:
 - **Logging and allocation.** The `tobii_custom_log_t` logger gets
   libtobii's own few lines (a refused `field_of_use`, a failed connect or
   reconnect, a lost daemon connection once per loss, a daemon reply that
-  does not decode, each connect and reconnect), not the line per failing
+  does not decode, a calibration stop that failed after the daemon saved
+  the calibration, each connect and reconnect), not the line per failing
   call the Stream Engine writes: the returned status says that. It is
   called on the thread inside the call that logs, from several threads at
   once if they log at once (their lines may interleave), and a device keeps

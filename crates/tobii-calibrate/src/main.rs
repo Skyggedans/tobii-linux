@@ -18,6 +18,7 @@ mod sequence;
 mod setup;
 mod ui;
 
+use std::fmt;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use winit::event_loop::EventLoop;
 
-use crate::sequence::{Backend, DryRun, Timing, UiEvent};
+use crate::sequence::{Backend, DryRun, SavedNotTaken, Summary, Timing, UiEvent};
 use crate::ui::{MonitorChoice, Signals, Ui};
 
 const USAGE: &str = "\
@@ -46,7 +47,10 @@ usage: tobii-calibrate [options]
   --export PATH      also write the calibration to PATH
   --reset            go back to the driver's built-in calibration and exit
   --dry-run          run the screens without a tracker
-  --windowed         a 1280x800 window instead of fullscreen";
+  --windowed         a 1280x800 window instead of fullscreen
+
+exit status: 0 calibrated; 2 the calibration was saved and the tracker takes
+it at its next start, but may not have taken it at once; 1 anything else";
 
 struct Options {
     monitor: MonitorChoice,
@@ -129,6 +133,77 @@ fn reset() -> Result<()> {
     Ok(())
 }
 
+/// Exit status of any failure but [`EXIT_SAVED_NOT_TAKEN`].
+const EXIT_FAILURE: u8 = 1;
+
+/// Exit status when tobiid saved the calibration but the tracker may not
+/// have taken it at the end of the session: it takes it at its next start.
+const EXIT_SAVED_NOT_TAKEN: u8 = 2;
+
+/// How the worker says a session ended badly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failure {
+    /// What the terminal says.
+    reason: String,
+    /// tobiid saved the calibration all the same (a [`SavedNotTaken`]): the
+    /// exit status is [`EXIT_SAVED_NOT_TAKEN`].
+    saved: bool,
+}
+
+impl Failure {
+    fn new(reason: String) -> Self {
+        Self {
+            reason,
+            saved: false,
+        }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+/// The exit status for what `run` failed with.
+fn exit_status(e: &anyhow::Error) -> u8 {
+    match e.downcast_ref::<Failure>() {
+        Some(Failure { saved: true, .. }) => EXIT_SAVED_NOT_TAKEN,
+        _ => EXIT_FAILURE,
+    }
+}
+
+/// What the worker reports once the session has ended, having written its
+/// calibration to `export` if it was kept, or saved by tobiid though the
+/// tracker may not have taken it (it is the user's from the tracker's next
+/// start).
+fn report(outcome: &Result<Summary>, export: Option<&str>) -> Result<(), Failure> {
+    let (summary, not_taken) = match outcome {
+        Ok(summary) => (summary, None),
+        Err(e) => match e.downcast_ref::<SavedNotTaken>() {
+            Some(saved) => (&saved.summary, Some(format!("{e:#}"))),
+            None => return Err(Failure::new(format!("{e:#}"))),
+        },
+    };
+    let exported = export.map_or(Ok(()), |path| {
+        std::fs::write(path, &summary.blob)
+            .map_err(|e| format!("could not be exported to {path}: {e}"))
+    });
+    match (not_taken, exported) {
+        (None, Ok(())) => Ok(()),
+        (None, Err(why)) => Err(Failure::new(format!("the calibration is kept, but {why}"))),
+        (Some(reason), exported) => Err(Failure {
+            reason: match exported {
+                Ok(()) => reason,
+                Err(why) => format!("{reason}; the calibration {why}"),
+            },
+            saved: true,
+        }),
+    }
+}
+
 /// How long closing the window waits for the worker to wind the session
 /// down. A pending step usually answers within seconds; one the tracker
 /// holds up may take minutes, and tobiid then carries it out after this
@@ -144,11 +219,11 @@ const WORKER_NOTICE: Duration = Duration::from_secs(1);
 /// window has closed. Past `notice`, `tell` says that the wait goes on, so
 /// that a step the tracker holds up does not leave the terminal silent.
 fn wait_for_worker(
-    worker_done: &mpsc::Receiver<Result<(), String>>,
+    worker_done: &mpsc::Receiver<Result<(), Failure>>,
     notice: Duration,
     grace: Duration,
     tell: impl FnOnce(),
-) -> Result<Result<(), String>, mpsc::RecvTimeoutError> {
+) -> Result<Result<(), Failure>, mpsc::RecvTimeoutError> {
     match worker_done.recv_timeout(notice.min(grace)) {
         Err(mpsc::RecvTimeoutError::Timeout) => {
             tell();
@@ -167,15 +242,16 @@ fn wait_for_worker(
 /// still holds: a stop under way that keeps the session still keeps it.
 /// That is still a failure here: this exits before the stop answers, so
 /// the save is not confirmed (the stop may yet fail), and the calibration
-/// is not exported.
+/// is not exported. A [`Failure`] the worker reports is the error as it is,
+/// for [`exit_status`].
 fn outcome(
-    worker: Result<Result<(), String>, mpsc::RecvTimeoutError>,
+    worker: Result<Result<(), Failure>, mpsc::RecvTimeoutError>,
     escaped: bool,
     saving: bool,
     export: Option<&str>,
 ) -> Result<()> {
     match worker {
-        Ok(Err(reason)) => bail!(reason),
+        Ok(Err(failure)) => Err(failure.into()),
         Ok(Ok(())) => {
             if escaped {
                 println!("the calibration was kept: it was saved before the window closed");
@@ -198,6 +274,17 @@ fn outcome(
             )
         }
     }
+}
+
+/// The window's own failure (no such monitor, no window), which the
+/// terminal says before [`outcome`]: the worker then only saw the abort
+/// that followed it. Not over a calibration tobiid saved, which the worker
+/// tells itself: the window took the worker's failure for its own too.
+fn window_failure(
+    window_failed: Option<String>,
+    worker: &Result<Result<(), Failure>, mpsc::RecvTimeoutError>,
+) -> Option<String> {
+    window_failed.filter(|_| !matches!(worker, Ok(Err(Failure { saved: true, .. }))))
 }
 
 fn run() -> Result<()> {
@@ -225,7 +312,7 @@ fn run() -> Result<()> {
 
     // The worker reports how the session ended, so that closing the window
     // waits for it to stop the session, and the outcome reaches the terminal.
-    let (done, worker_done) = mpsc::channel::<Result<(), String>>();
+    let (done, worker_done) = mpsc::channel::<Result<(), Failure>>();
     // Whether the stop that keeps the session has been sent.
     let saving = Arc::new(AtomicBool::new(false));
     if !o.list_monitors {
@@ -255,15 +342,7 @@ fn run() -> Result<()> {
             let outcome = backend.and_then(|mut b| {
                 sequence::run(b.as_mut(), rounds, timing, setup, &placed, &abort, &emit)
             });
-            let reported = match &outcome {
-                Ok(summary) => match &export {
-                    Some(path) => std::fs::write(path, &summary.blob).map_err(|e| {
-                        format!("the calibration is kept, but could not be exported to {path}: {e}")
-                    }),
-                    None => Ok(()),
-                },
-                Err(e) => Err(format!("{e:#}")),
-            };
+            let reported = report(&outcome, export.as_deref());
             match outcome {
                 Ok(summary) => emit(UiEvent::Finished(summary)),
                 Err(e) => emit(UiEvent::Failed(format!("{e:#}"))),
@@ -300,9 +379,7 @@ fn run() -> Result<()> {
             WORKER_GRACE.as_secs()
         );
     });
-    // The window's own failure (no such monitor, no window) comes first: the
-    // worker then only saw the abort that followed it.
-    if let Some(reason) = window_failed {
+    if let Some(reason) = window_failure(window_failed, &worker) {
         bail!(reason);
     }
     // Relaxed: a pure signal from the worker.
@@ -320,7 +397,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tobii-calibrate: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(exit_status(&e))
         }
     }
 }
@@ -377,8 +454,110 @@ mod tests {
             "{discarding}"
         );
         assert!(outcome(Ok(Ok(())), true, true, None).is_ok());
-        let failed = outcome(Ok(Err("refused".into())), false, true, None).expect_err("failed");
+        let failed = outcome(Ok(Err(Failure::new("refused".into()))), false, true, None)
+            .expect_err("failed");
         assert_eq!(failed.to_string(), "refused");
+        assert_eq!(exit_status(&failed), EXIT_FAILURE);
+        assert_eq!(
+            exit_status(&saving),
+            EXIT_FAILURE,
+            "the save is not confirmed"
+        );
+    }
+
+    /// A session run to its end whose calibration the device computed.
+    fn summary() -> Summary {
+        Summary {
+            id: 0x1234_5678,
+            points: 14,
+            mean_error: None,
+            blob: vec![1, 2, 3],
+        }
+    }
+
+    /// What the worker makes of a session whose stop failed after tobiid
+    /// saved its calibration.
+    fn saved_not_taken(export: Option<&str>) -> Result<(), Failure> {
+        let not_taken = SavedNotTaken {
+            summary: summary(),
+            status: tobii_ipc::request::status::OPERATION_FAILED,
+        };
+        report(&Err(not_taken.into()), export)
+    }
+
+    /// A calibration tobiid saved, though the tracker may not have taken it
+    /// at the stop, is told as saved and exits with a status of its own; any
+    /// other failure exits 1.
+    #[test]
+    fn a_calibration_saved_but_not_taken_has_an_exit_status_of_its_own() {
+        let worker = Ok(saved_not_taken(None));
+
+        let err = outcome(worker, false, true, None).expect_err("not taken");
+
+        assert_eq!(exit_status(&err), EXIT_SAVED_NOT_TAKEN);
+        assert_eq!(
+            err.to_string(),
+            "the calibration was saved and the tracker takes it at its next start; it may not \
+             have taken it now: the tracker refused (status 13)"
+        );
+        let refused = report(&Err(anyhow::anyhow!("refused")), None);
+        assert_eq!(refused, Err(Failure::new("refused".into())));
+        let refused = outcome(Ok(refused), false, true, None).expect_err("failed");
+        assert_eq!(exit_status(&refused), EXIT_FAILURE);
+        assert_eq!(report(&Ok(summary()), None), Ok(()));
+    }
+
+    /// The window takes the worker's failure for its own; the terminal
+    /// still says what the worker said of a saved calibration, with its exit
+    /// status. The window's own failure comes first otherwise.
+    #[test]
+    fn a_saved_calibration_is_not_hidden_by_the_windows_copy_of_it() {
+        let saved = Ok(saved_not_taken(None));
+        let refused = Ok(Err(Failure::new("refused".into())));
+        let failed = || Some("could not draw into the window".to_owned());
+
+        assert_eq!(window_failure(failed(), &saved), None);
+        assert_eq!(window_failure(failed(), &refused), failed());
+        assert_eq!(window_failure(failed(), &Ok(Ok(()))), failed());
+        assert_eq!(window_failure(None, &saved), None);
+    }
+
+    /// `--export` writes a calibration tobiid saved though the tracker may
+    /// not have taken it: it is the user's from the tracker's next start. A
+    /// write that fails is said too, and the exit status stays the save's.
+    #[test]
+    fn a_calibration_saved_but_not_taken_is_exported() {
+        let dir =
+            std::env::temp_dir().join(format!("tobii-calibrate-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("cal.bin");
+        let path = path.to_str().expect("a UTF-8 path");
+        let unwritable = dir.to_str().expect("a UTF-8 path");
+
+        let exported = saved_not_taken(Some(path));
+        let written = std::fs::read(path);
+        let not_exported = saved_not_taken(Some(unwritable));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let Err(exported) = exported else {
+            panic!("not taken");
+        };
+        assert!(exported.saved);
+        assert!(!exported.reason.contains("export"), "{}", exported.reason);
+        assert_eq!(written.expect("exported"), summary().blob);
+        let Err(not_exported) = not_exported else {
+            panic!("not taken");
+        };
+        assert!(not_exported.saved, "the exit status stays the save's");
+        assert!(
+            not_exported.reason.starts_with("the calibration was saved")
+                && not_exported.reason.contains(&format!(
+                    "; the calibration could not be exported to {unwritable}: "
+                )),
+            "{}",
+            not_exported.reason
+        );
     }
 
     #[test]
@@ -409,7 +588,7 @@ mod tests {
     #[test]
     fn a_worker_still_busy_past_the_notice_is_waited_on_aloud() {
         // The worker holds its end open without reporting.
-        let (_done, worker_done) = mpsc::channel::<Result<(), String>>();
+        let (_done, worker_done) = mpsc::channel::<Result<(), Failure>>();
         let mut told = 0;
 
         let worker = wait_for_worker(&worker_done, Duration::ZERO, Duration::ZERO, || {
@@ -423,7 +602,7 @@ mod tests {
     #[test]
     fn a_worker_that_is_gone_is_not_waited_on_aloud() {
         // --list-monitors: no worker at all.
-        let (done, worker_done) = mpsc::channel::<Result<(), String>>();
+        let (done, worker_done) = mpsc::channel::<Result<(), Failure>>();
         drop(done);
         let mut told = false;
 
