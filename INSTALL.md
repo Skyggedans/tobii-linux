@@ -558,11 +558,26 @@ reports the failure, but the tracker loads the saved calibration and display
 area at its next init. The result screen shows the targets and your live
 gaze to check it.
 
+Each step waits for the tracker as long as the daemon may take over it, so
+that `tobii-calibrate` never gives up on a step the daemon still carries
+out. That is usually a second or two, but a tracker starting up or
+re-opened after a stall can hold a step for a minute or more (a start up to
+about 3). The start, the display-area write and the save or discard then
+say they are waiting for the tracker; a point or a compute keeps its
+spinner turning. Esc closes the window at once; `tobii-calibrate` then
+waits up to 25 s for the step under way (saying so in the terminal when it
+takes more than a second), and if it has not finished by then, says
+whether the daemon still saves the calibration (the save was under way;
+`--export` then writes nothing) or discards it.
+
 - `--rounds 1` for a quick 7-point pass (half the tracker's 14 stored points
   stay from the previous calibration); `--dwell-ms` to linger longer per point.
 - `--reset` goes back to the built-in calibration; or delete the file, or set
-  `TOBII_CALIBRATION=embedded`. `mv calibration.bin.prev calibration.bin` (and
-  a daemon restart) restores the previous one.
+  `TOBII_CALIBRATION=embedded`. The daemon deletes the file before it
+  writes the built-in calibration to the tracker, so should the tracker not
+  take the write (it times out, or the tracker goes away), it still gets the
+  built-in one at its next start. `mv calibration.bin.prev calibration.bin`
+  (and a daemon restart) restores the previous one.
 - `--dry-run --windowed` shows the screens without a tracker (`--windowed`
   only goes with `--dry-run`: a calibration needs the whole monitor).
 - Only one client can calibrate at a time; a second one is told the tracker is

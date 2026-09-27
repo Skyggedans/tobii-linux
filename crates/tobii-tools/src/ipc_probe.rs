@@ -15,10 +15,7 @@ use tobii_ipc::request::{
     decode_hardware_configuration, decode_stream_types, decode_timesync, decode_track_box,
     encode_display_area, encode_request, kind, state,
 };
-use tobii_ipc::{ServerMsg, decode_server, encode_subscribe, read_frame, write_frame};
-
-/// How long the daemon may take to answer (a cold device start included).
-const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+use tobii_ipc::{ServerMsg, decode_server, encode_subscribe, read_frame, timeout, write_frame};
 
 struct Probe {
     stream: UnixStream,
@@ -49,13 +46,15 @@ impl Probe {
         })
     }
 
-    /// Send a request and wait for its reply; samples that arrive first are
-    /// kept for the stream report.
-    fn ask(&mut self, k: u8, payload: &[u8]) -> Result<(u8, Vec<u8>)> {
+    /// Send a request and wait for its reply for up to `wait`, its
+    /// request's in [`tobii_ipc::timeout`] (which outlasts what the daemon
+    /// may take over it); samples that arrive first are kept for the stream
+    /// report.
+    fn ask(&mut self, k: u8, payload: &[u8], wait: Duration) -> Result<(u8, Vec<u8>)> {
         self.next_id += 1;
         let id = self.next_id;
         write_frame(&mut self.stream, &encode_request(id, k, payload))?;
-        let deadline = Instant::now() + REPLY_TIMEOUT;
+        let deadline = Instant::now() + wait;
         loop {
             match self
                 .rx
@@ -67,7 +66,7 @@ impl Probe {
                     payload,
                 }) if request_id == id => return Ok((status, payload)),
                 Ok(other) => self.early.push(other),
-                Err(_) => bail!("no reply to request kind {k} within {REPLY_TIMEOUT:?}"),
+                Err(_) => bail!("no reply to request kind {k} within {wait:?}"),
             }
         }
     }
@@ -104,21 +103,21 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
     let mut p = Probe::connect()?;
     write_frame(&mut p.stream, &encode_subscribe(streams))?;
 
-    let info = p.ask(kind::DEVICE_INFO, &[])?;
+    let info = p.ask(kind::DEVICE_INFO, &[], timeout::FACTS)?;
     show("device info", &info, |b| {
         format!("{:?}", decode_device_info(b))
     });
-    let track_box = p.ask(kind::TRACK_BOX, &[])?;
+    let track_box = p.ask(kind::TRACK_BOX, &[], timeout::FACTS)?;
     show("track box", &track_box, |b| {
         decode_track_box(b).map_or("?".into(), |t| {
             format!("front {:?} back {:?}", t.corners_mm[0], t.corners_mm[4])
         })
     });
-    let mounting = p.ask(kind::GEOMETRY_MOUNTING, &[])?;
+    let mounting = p.ask(kind::GEOMETRY_MOUNTING, &[], timeout::FACTS)?;
     show("mounting", &mounting, |b| {
         format!("{:?}", decode_geometry_mounting(b))
     });
-    let area = p.ask(kind::DISPLAY_AREA_GET, &[])?;
+    let area = p.ask(kind::DISPLAY_AREA_GET, &[], timeout::FACTS)?;
     show("display area", &area, |b| {
         decode_display_area(b).map_or("?".into(), |a| {
             format!(
@@ -132,7 +131,7 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
             )
         })
     });
-    let catalogue = p.ask(kind::STREAM_TYPES, &[])?;
+    let catalogue = p.ask(kind::STREAM_TYPES, &[], timeout::FACTS)?;
     show("stream types", &catalogue, |b| {
         decode_stream_types(b).map_or("?".into(), |types| {
             types
@@ -142,7 +141,7 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
                 .join(", ")
         })
     });
-    let hardware = p.ask(kind::HARDWARE_CONFIGURATION, &[])?;
+    let hardware = p.ask(kind::HARDWARE_CONFIGURATION, &[], timeout::FACTS)?;
     show("hardware config", &hardware, |b| {
         decode_hardware_configuration(b).map_or("?".into(), |h| {
             format!(
@@ -153,27 +152,47 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
             )
         })
     });
-    let name = p.ask(kind::DEVICE_NAME_GET, &[])?;
+    let name = p.ask(kind::DEVICE_NAME_GET, &[], timeout::FACTS)?;
     show("device name", &name, |b| {
         format!("{:?}", String::from_utf8_lossy(b))
     });
-    let id = p.ask(kind::STATE, &request::encode_u32(state::CALIBRATION_ID))?;
+    let id = p.ask(
+        kind::STATE,
+        &request::encode_u32(state::CALIBRATION_ID),
+        timeout::STATE,
+    )?;
     show("calibration id", &id, |b| {
         format!("{:?}", request::decode_u32(b))
     });
-    let active = p.ask(kind::STATE, &request::encode_u32(state::CALIBRATION_ACTIVE))?;
+    let active = p.ask(
+        kind::STATE,
+        &request::encode_u32(state::CALIBRATION_ACTIVE),
+        timeout::STATE,
+    )?;
     show("calibrating", &active, |b| {
         format!("{}", b.first().is_some_and(|v| *v != 0))
     });
-    let paused = p.ask(kind::STATE, &request::encode_u32(state::DEVICE_PAUSED))?;
+    let paused = p.ask(
+        kind::STATE,
+        &request::encode_u32(state::DEVICE_PAUSED),
+        timeout::STATE,
+    )?;
     show("paused", &paused, |b| {
         format!("{}", b.first().is_some_and(|v| *v != 0))
     });
-    let faults = p.ask(kind::STATE, &request::encode_u32(state::FAULT))?;
+    let faults = p.ask(
+        kind::STATE,
+        &request::encode_u32(state::FAULT),
+        timeout::FACTS,
+    )?;
     show("faults", &faults, |b| {
         format!("{:?}", String::from_utf8_lossy(b))
     });
-    let warnings = p.ask(kind::STATE, &request::encode_u32(state::WARNING))?;
+    let warnings = p.ask(
+        kind::STATE,
+        &request::encode_u32(state::WARNING),
+        timeout::FACTS,
+    )?;
     show("warnings", &warnings, |b| {
         format!("{:?}", String::from_utf8_lossy(b))
     });
@@ -186,11 +205,15 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
             bail!("the daemon did not report the mounting; cannot compute a display area");
         };
         let area = display_area_basic(w, h, x, &m);
-        let reply = p.ask(kind::DISPLAY_AREA_SET, &encode_display_area(&area))?;
+        let reply = p.ask(
+            kind::DISPLAY_AREA_SET,
+            &encode_display_area(&area),
+            timeout::DISPLAY_AREA_SET,
+        )?;
         show("set display", &reply, |_| {
             format!("{w} x {h} mm, offset {x}")
         });
-        let area = p.ask(kind::DISPLAY_AREA_GET, &[])?;
+        let area = p.ask(kind::DISPLAY_AREA_GET, &[], timeout::FACTS)?;
         show("display area now", &area, |b| {
             format!("{:?}", decode_display_area(b))
         });
@@ -219,7 +242,7 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
     {
         record(msg);
     }
-    let sync = p.ask(kind::TIMESYNC, &[])?;
+    let sync = p.ask(kind::TIMESYNC, &[], timeout::TIMESYNC)?;
     show("timesync", &sync, |b| format!("{:?}", decode_timesync(b)));
     for (k, n) in &counts {
         #[allow(clippy::cast_precision_loss)] // reason: a rate for display

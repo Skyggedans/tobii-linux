@@ -1,7 +1,7 @@
 //! How long the daemon may take over a request: the deadlines on its way to
 //! an answer, which a client must wait out rather than give up first and
-//! leave the daemon carrying the request out (libtobii checks its own
-//! timeouts against these at compile time).
+//! leave the daemon carrying the request out (the clients' timeouts, in
+//! [`timeout`](crate::timeout), are checked against these at compile time).
 //!
 //! A request answered from what the device reported at its last init waits
 //! at most [`FACTS`] for the first one. A request that needs the device live

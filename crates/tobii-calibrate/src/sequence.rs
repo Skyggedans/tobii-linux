@@ -12,6 +12,14 @@
 //! monitor's size and the tracker's offset, and the display area computed
 //! from them is written, since a calibration holds only for the display area
 //! it was made on.
+//!
+//! Each request waits for the daemon's answer as long as the daemon may take
+//! over it ([`tobii_ipc::timeout`]), so that the tool never gives up on a
+//! step the daemon still carries out (a calibration saved while the tool
+//! says it was not). A cold or stalled tracker can hold a step for minutes
+//! (a start up to about 3): the start, the display-area write and the save
+//! or discard say on screen that they wait for the tracker, and a point or a
+//! compute keeps its spinner turning.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -25,6 +33,7 @@ use tobii_ipc::request::{
     STOP_DISCARD, STOP_KEEP, decode_display_area, decode_geometry_mounting, encode_display_area,
     encode_point_2d, kind, status,
 };
+use tobii_ipc::timeout;
 
 use crate::ipc::{Connection, Reply};
 use crate::setup::Choice;
@@ -70,6 +79,8 @@ pub(crate) enum UiEvent {
     },
     /// The tracker is computing.
     Computing,
+    /// The session is being kept: the stop that saves it is under way.
+    Saving,
     /// The session finished.
     Finished(Summary),
     /// The latest gaze sample: normalised position and validity.
@@ -107,7 +118,8 @@ pub(crate) struct Summary {
 pub(crate) trait Backend: Send {
     /// Wait until the tracker streams, or `abort` is set.
     fn wait_ready(&mut self, abort: &AtomicBool) -> Result<()>;
-    /// Send a request and wait for the reply.
+    /// Send a request and wait for the reply, for up to `timeout` (its
+    /// request's in [`tobii_ipc::timeout`]).
     fn request(&mut self, kind: u8, payload: &[u8], timeout: Duration) -> Result<Reply>;
 }
 
@@ -161,9 +173,15 @@ const DRY_RUN_MOUNTING: GeometryMounting = GeometryMounting {
     internal_offset_mm: [0.0, 5.38, 9.86],
 };
 
-/// How long device requests made by the display setup may take (the
-/// daemon may still be starting the tracker).
-const SETUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// What the window shows while the display area is written.
+pub(crate) const SETTING_DISPLAY_AREA: &str =
+    "setting the display area: waiting for the tracker...";
+
+/// What the window shows while the session is kept.
+pub(crate) const SAVING: &str = "saving the calibration: waiting for the tracker...";
+
+/// What the window shows while a session that failed is discarded.
+const DISCARDING: &str = "discarding the calibration: waiting for the tracker...";
 
 /// How often the setup, waiting for the window's answer, looks at `abort`.
 const SETUP_POLL: Duration = Duration::from_millis(100);
@@ -180,7 +198,7 @@ fn display_setup(
     abort: &AtomicBool,
     emit: &dyn Fn(UiEvent),
 ) -> Result<bool> {
-    let mounting = match backend.request(kind::GEOMETRY_MOUNTING, &[], SETUP_REQUEST_TIMEOUT)? {
+    let mounting = match backend.request(kind::GEOMETRY_MOUNTING, &[], timeout::FACTS)? {
         (status::OK, payload) => decode_geometry_mounting(&payload),
         (code, _) => {
             tracing::warn!(status = code, "the tracker does not say how it is mounted");
@@ -193,7 +211,7 @@ fn display_setup(
         tracing::warn!("no pair of guide marks to line up with: skipping the display setup");
         return Ok(false);
     };
-    let current = match backend.request(kind::DISPLAY_AREA_GET, &[], SETUP_REQUEST_TIMEOUT)? {
+    let current = match backend.request(kind::DISPLAY_AREA_GET, &[], timeout::FACTS)? {
         (status::OK, payload) => decode_display_area(&payload),
         _ => None,
     };
@@ -215,11 +233,11 @@ fn display_setup(
         choice.offset_x_mm,
         &mounting,
     );
-    emit(UiEvent::Status("setting the display area...".into()));
+    emit(UiEvent::Status(SETTING_DISPLAY_AREA.into()));
     let reply = backend.request(
         kind::DISPLAY_AREA_SET,
         &encode_display_area(&area),
-        SETUP_REQUEST_TIMEOUT,
+        timeout::DISPLAY_AREA_SET,
     )?;
     expect_ok(reply, "could not set the display area")?;
     tracing::info!(
@@ -315,7 +333,8 @@ const PLACEMENT_POLL: Duration = Duration::from_millis(100);
 /// while `placed` (the window fullscreen on its monitor). `abort` (Esc)
 /// stops the session between steps. Only a session that runs to its end is
 /// kept; any other ends discarded, and the daemon puts back the calibration
-/// and display area it started from.
+/// and display area it started from. [`UiEvent::Saving`] tells that the stop
+/// that keeps it is under way.
 ///
 /// # Errors
 /// Fails when the tracker refuses a step, stops answering, or `abort` is set.
@@ -328,10 +347,12 @@ pub(crate) fn run(
     abort: &AtomicBool,
     emit: &dyn Fn(UiEvent),
 ) -> Result<Summary> {
+    // Also what shows while the start waits: up to about 3 minutes when the
+    // tracker is re-opened meanwhile.
     emit(UiEvent::Status("waiting for the tracker...".into()));
     backend.wait_ready(abort).context(NOT_CALIBRATED)?;
     backend
-        .request(kind::CALIBRATION_START, &[2], Duration::from_secs(25))
+        .request(kind::CALIBRATION_START, &[2], timeout::CALIBRATION_START)
         .and_then(|r| expect_ok(r, "could not start"))
         .context(NOT_CALIBRATED)?;
 
@@ -355,13 +376,14 @@ pub(crate) fn run(
         Ok(summary)
     })();
     let stop = if result.is_ok() {
-        emit(UiEvent::Status("saving the calibration...".into()));
+        emit(UiEvent::Saving);
         STOP_KEEP
     } else {
+        emit(UiEvent::Status(DISCARDING.into()));
         STOP_DISCARD
     };
     let stopped = backend
-        .request(kind::CALIBRATION_STOP, stop, Duration::from_secs(20))
+        .request(kind::CALIBRATION_STOP, stop, timeout::CALIBRATION_STOP)
         .and_then(|r| expect_ok(r, "could not stop"));
     let summary = result.context(NOT_CALIBRATED)?;
     // Nothing is kept unless the stop went through.
@@ -442,7 +464,7 @@ fn collect_and_compute(
             let reply = backend.request(
                 kind::CALIBRATION_COLLECT_2D,
                 &encode_point_2d(at[0], at[1]),
-                Duration::from_secs(8),
+                timeout::CALIBRATION_COLLECT_2D,
             )?;
             expect_ok(reply, "could not collect a point")?;
             previous = at;
@@ -453,11 +475,16 @@ fn collect_and_compute(
             }
         }
         emit(UiEvent::Computing);
-        let reply = backend.request(kind::CALIBRATION_COMPUTE, &[], Duration::from_secs(20))?;
+        let reply =
+            backend.request(kind::CALIBRATION_COMPUTE, &[], timeout::CALIBRATION_COMPUTE)?;
         let payload = expect_ok(reply, "could not compute")?;
         id = tobii_ipc::request::decode_u32(&payload).unwrap_or(id);
     }
-    let reply = backend.request(kind::CALIBRATION_RETRIEVE, &[], Duration::from_secs(8))?;
+    let reply = backend.request(
+        kind::CALIBRATION_RETRIEVE,
+        &[],
+        timeout::CALIBRATION_RETRIEVE,
+    )?;
     let blob = expect_ok(reply, "could not read the calibration back")?;
     Ok(Summary {
         id,
@@ -465,6 +492,33 @@ fn collect_and_compute(
         mean_error: mean_error(&blob),
         blob,
     })
+}
+
+/// Go back to the calibration built into the driver: the daemon forgets the
+/// saved one and has the tracker take the built-in one.
+///
+/// # Errors
+/// Fails when the daemon refuses or stops answering. Only a refusal for
+/// another client's session (`CALIBRATION_BUSY`) is certain to change
+/// nothing: the daemon forgets the saved calibration before the tracker
+/// takes the built-in one, so after most other failures the tracker takes
+/// the built-in one at its next start anyway.
+pub(crate) fn reset(backend: &mut dyn Backend) -> Result<()> {
+    match backend.request(kind::CALIBRATION_APPLY, &[], timeout::CALIBRATION_APPLY)? {
+        (status::OK, _) => Ok(()),
+        (code @ status::CALIBRATION_BUSY, _) => {
+            bail!(
+                "could not go back to the built-in calibration: {}",
+                describe(code)
+            )
+        }
+        (code, _) => bail!(
+            "the tracker did not take the built-in calibration: {}; the saved one may already \
+             be gone, and the tracker then takes the built-in one at its next start (--reset \
+             again makes sure)",
+            describe(code)
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -569,7 +623,13 @@ mod tests {
             ]
         );
         assert_eq!(summary.points, 0, "an empty blob has no points");
-        assert!(events.lock().expect("events").contains(&UiEvent::Computing));
+        let events = events.into_inner().expect("events");
+        assert!(events.contains(&UiEvent::Computing));
+        assert_eq!(
+            events.last(),
+            Some(&UiEvent::Saving),
+            "told before the stop"
+        );
     }
 
     #[test]
@@ -594,9 +654,11 @@ mod tests {
         );
     }
 
-    /// Answers like a tracker would; records every request with its payload.
+    /// Answers like a tracker would; records every request with its payload,
+    /// and how long it waits for the answer.
     struct SetupDevice {
         log: Vec<(u8, Vec<u8>)>,
+        waits: Vec<(u8, Duration)>,
         /// What `CALIBRATION_START` answers.
         start: u8,
         /// What `GEOMETRY_MOUNTING` answers.
@@ -611,6 +673,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 log: Vec::new(),
+                waits: Vec::new(),
                 start: status::OK,
                 mounting: status::OK,
                 collect: status::OK,
@@ -637,8 +700,9 @@ mod tests {
             Ok(())
         }
 
-        fn request(&mut self, kind: u8, payload: &[u8], _timeout: Duration) -> Result<Reply> {
+        fn request(&mut self, kind: u8, payload: &[u8], timeout: Duration) -> Result<Reply> {
             self.log.push((kind, payload.to_vec()));
+            self.waits.push((kind, timeout));
             if let Some((on, abort)) = &self.abort_on
                 && *on == kind
             {
@@ -1078,5 +1142,142 @@ mod tests {
             .count();
         assert_eq!(first_travels, 2, "the first point was shown again");
         assert_eq!(device.count(kind::CALIBRATION_COLLECT_2D), 7);
+    }
+
+    /// How long tobiid may take over each request this tool sends, at worst
+    /// ([`tobii_ipc::deadline::worst`]).
+    fn daemon_worst_case(k: u8) -> Duration {
+        use tobii_ipc::deadline::worst;
+
+        match k {
+            kind::GEOMETRY_MOUNTING | kind::DISPLAY_AREA_GET => worst::FACTS,
+            kind::DISPLAY_AREA_SET => worst::DISPLAY_AREA_SET,
+            kind::CALIBRATION_START => worst::CALIBRATION_START,
+            kind::CALIBRATION_STOP => worst::CALIBRATION_STOP,
+            kind::CALIBRATION_COLLECT_2D => worst::CALIBRATION_COLLECT_2D,
+            kind::CALIBRATION_COMPUTE => worst::CALIBRATION_COMPUTE,
+            kind::CALIBRATION_RETRIEVE => worst::CALIBRATION_RETRIEVE,
+            kind::CALIBRATION_APPLY => worst::CALIBRATION_APPLY,
+            other => panic!("request kind {other} has no worst case here"),
+        }
+    }
+
+    /// Every request, on every path (a session with the display setup that
+    /// is kept, one that fails and is discarded, a reset), waits for tobiid
+    /// longer than tobiid may take over it: a request given up on first
+    /// would still be carried out (a calibration saved that the tool says
+    /// was not kept).
+    #[test]
+    fn each_request_outlasts_the_daemons_worst_case_for_its_kind() {
+        let run_with = |device: &mut SetupDevice| {
+            let rx = answered(CHOICE);
+            let _ = run(
+                device,
+                1,
+                QUICK,
+                Some(&rx),
+                &PLACED,
+                &AtomicBool::new(false),
+                &|_| {},
+            );
+        };
+        let mut kept = SetupDevice::new();
+        let mut failed = SetupDevice {
+            collect: status::OPERATION_FAILED,
+            ..SetupDevice::new()
+        };
+        let mut reverted = SetupDevice::new();
+
+        run_with(&mut kept);
+        run_with(&mut failed);
+        reset(&mut reverted).expect("reset");
+
+        let waits: Vec<(u8, Duration)> = [kept, failed, reverted]
+            .into_iter()
+            .flat_map(|d| d.waits)
+            .collect();
+        let mut kinds: Vec<u8> = waits.iter().map(|(k, _)| *k).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(
+            kinds,
+            [
+                kind::DISPLAY_AREA_GET,
+                kind::DISPLAY_AREA_SET,
+                kind::GEOMETRY_MOUNTING,
+                kind::CALIBRATION_START,
+                kind::CALIBRATION_STOP,
+                kind::CALIBRATION_COLLECT_2D,
+                kind::CALIBRATION_COMPUTE,
+                kind::CALIBRATION_RETRIEVE,
+                kind::CALIBRATION_APPLY,
+            ],
+            "every kind the tool sends"
+        );
+        for (k, waited) in waits {
+            let worst = daemon_worst_case(k);
+            assert!(
+                timeout::outlasts(waited, worst),
+                "request {k} waits {waited:?}; tobiid may take {worst:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_applies_the_built_in_calibration() {
+        let mut device = SetupDevice::new();
+        reset(&mut device).expect("reset");
+        assert_eq!(device.log, [(kind::CALIBRATION_APPLY, Vec::new())]);
+    }
+
+    /// A reset refused for another client's session changed nothing; one the
+    /// tracker did not take may come after the daemon forgot the saved
+    /// calibration, and the tracker then takes the built-in one at its next
+    /// start.
+    #[test]
+    fn a_failed_reset_says_whether_the_saved_calibration_may_be_gone() {
+        let failure = |code| {
+            let mut backend = Recorder(Mutex::new(Vec::new()), code);
+            format!("{:#}", reset(&mut backend).expect_err("refused"))
+        };
+
+        let busy = failure(status::CALIBRATION_BUSY);
+        let late = failure(status::TIMED_OUT);
+
+        assert_eq!(
+            busy,
+            "could not go back to the built-in calibration: another client is calibrating the \
+             tracker"
+        );
+        assert!(late.contains("did not answer in time"), "{late}");
+        assert!(late.contains("may already be gone"), "{late}");
+        assert!(late.contains("at its next start"), "{late}");
+    }
+
+    #[test]
+    fn a_session_that_failed_says_it_waits_on_the_tracker_to_discard() {
+        let mut device = SetupDevice {
+            collect: status::OPERATION_FAILED,
+            ..SetupDevice::new()
+        };
+        let events = Mutex::new(Vec::new());
+        let _ = run(
+            &mut device,
+            1,
+            QUICK,
+            None,
+            &PLACED,
+            &AtomicBool::new(false),
+            &|e| {
+                events.lock().expect("events").push(e);
+            },
+        );
+        let events = events.into_inner().expect("events");
+        assert_eq!(
+            events.last(),
+            Some(&UiEvent::Status(DISCARDING.into())),
+            "told before the stop"
+        );
+        assert!(!events.contains(&UiEvent::Saving));
     }
 }

@@ -139,8 +139,10 @@ Where the answers come from, and where they differ from Windows:
   cold) and answer, and at worst for the daemon's own deadlines: 30 s for
   the tracker to take each command, plus the command's, which comes to 35 s
   for `tobii_calibration_retrieve` and about 3 min for a
-  `tobii_calibration_start` that fails and puts the calibration back (the
-  table in `crates/tobii-ffi/src/timeouts.rs` has every call).
+  `tobii_calibration_start` that fails and puts the calibration back
+  (`crates/tobii-ipc/src/timeout.rs` has every request's timeout, which
+  `tobii-calibrate` and `ipc-probe` wait too, and
+  `crates/tobii-ffi/src/timeouts.rs` which call waits which).
 - **Lost daemon.** When the connection to `tobiid` is lost (the daemon
   stopped, crashed or was restarted), `tobii_device_process_callbacks`
   delivers what had arrived and then returns `TOBII_ERROR_CONNECTION_FAILED`

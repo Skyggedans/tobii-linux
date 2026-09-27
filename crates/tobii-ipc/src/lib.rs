@@ -17,7 +17,8 @@
 //! to finish (only a backlog of dozens of them holds it up): a SUBSCRIBED
 //! may arrive ahead of the REPLYs to earlier requests, so a client matches
 //! a REPLY to its REQUEST by id. How long the daemon may take to answer a
-//! REQUEST follows from the deadlines in [`deadline`].
+//! REQUEST follows from the deadlines in [`deadline`], and how long a client
+//! waits for the answer is in [`timeout`].
 //!
 //! Sample timestamps are the host clock, [`host_clock_us`] in microseconds,
 //! which is also what `tobii_system_clock` returns: the daemon maps the
@@ -56,6 +57,7 @@ pub mod deadline;
 pub mod geometry;
 pub mod request;
 mod sample;
+pub mod timeout;
 mod wire;
 
 pub use clock::host_clock_us;

@@ -20,7 +20,7 @@ use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::draw::{Canvas, rgb};
-use crate::sequence::{Phase, Summary, Timing, UiEvent};
+use crate::sequence::{Phase, SAVING, SETTING_DISPLAY_AREA, Summary, Timing, UiEvent};
 use crate::setup::{Choice, Start, Ticks};
 
 const BACKGROUND: u32 = rgb(22, 22, 26);
@@ -528,7 +528,7 @@ impl Ui {
         if self.answers.send(choice).is_err() {
             tracing::warn!("the calibration worker is gone");
         }
-        self.show(Screen::Status("setting the display area...".into()));
+        self.show(Screen::Status(SETTING_DISPLAY_AREA.into()));
     }
 
     /// Ask for a frame as soon as the backend allows.
@@ -975,6 +975,7 @@ impl ApplicationHandler<UiEvent> for Ui {
                 total,
             }),
             UiEvent::Computing => Some(Screen::Computing),
+            UiEvent::Saving => Some(Screen::Status(SAVING.into())),
             UiEvent::Finished(summary) => Some(Screen::Finished(summary)),
             UiEvent::Failed(text) => {
                 self.failed = Some(text.clone());

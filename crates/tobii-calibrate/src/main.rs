@@ -20,13 +20,12 @@ mod ui;
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tobii_ipc::request::{kind, status};
 use winit::event_loop::EventLoop;
 
 use crate::sequence::{Backend, DryRun, Timing, UiEvent};
@@ -123,17 +122,83 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options> {
 /// saved one.
 fn reset() -> Result<()> {
     let mut conn = ipc::Connection::open(Box::new(|_, _, _| {}))?;
-    let (code, _) = conn.request(kind::CALIBRATION_APPLY, &[], Duration::from_secs(20))?;
-    if code != status::OK {
-        bail!("the daemon refused (status {code})");
-    }
+    // A cold tracker takes ~12 s to start, a stalled one longer.
+    println!("going back to the built-in calibration: waiting for the tracker...");
+    sequence::reset(&mut conn)?;
     println!("back to the built-in calibration");
     Ok(())
 }
 
 /// How long closing the window waits for the worker to wind the session
-/// down (a pending collect or compute answers within seconds).
+/// down. A pending step usually answers within seconds; one the tracker
+/// holds up may take minutes, and tobiid then carries it out after this
+/// exits (see [`outcome`]).
 const WORKER_GRACE: Duration = Duration::from_secs(25);
+
+/// How long closing the window waits for the worker before the terminal says
+/// it waits: when the tracker answers at once, the worker notices the abort
+/// and stops the session within about a second.
+const WORKER_NOTICE: Duration = Duration::from_secs(1);
+
+/// How the worker ended the session, waited for up to `grace` once the
+/// window has closed. Past `notice`, `tell` says that the wait goes on, so
+/// that a step the tracker holds up does not leave the terminal silent.
+fn wait_for_worker(
+    worker_done: &mpsc::Receiver<Result<(), String>>,
+    notice: Duration,
+    grace: Duration,
+    tell: impl FnOnce(),
+) -> Result<Result<(), String>, mpsc::RecvTimeoutError> {
+    match worker_done.recv_timeout(notice.min(grace)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tell();
+            worker_done.recv_timeout(grace.saturating_sub(notice))
+        }
+        done => done,
+    }
+}
+
+/// What the terminal says once the window has closed: `worker` is how the
+/// session ended, or that it had not within [`WORKER_GRACE`]; `escaped`
+/// whether Esc or the window's close ended it; `saving` whether the stop
+/// that keeps the session had been sent; `export` where `--export` would
+/// have written the calibration. tobiid carries out the requests a client
+/// sent even after it hangs up, and only then discards a session the client
+/// still holds: a stop under way that keeps the session still keeps it.
+/// That is still a failure here: this exits before the stop answers, so
+/// the save is not confirmed (the stop may yet fail), and the calibration
+/// is not exported.
+fn outcome(
+    worker: Result<Result<(), String>, mpsc::RecvTimeoutError>,
+    escaped: bool,
+    saving: bool,
+    export: Option<&str>,
+) -> Result<()> {
+    match worker {
+        Ok(Err(reason)) => bail!(reason),
+        Ok(Ok(())) => {
+            if escaped {
+                println!("the calibration was kept: it was saved before the window closed");
+            }
+            Ok(())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Timeout) if saving => {
+            let exported = export.map_or_else(String::new, |path| {
+                format!("; it was not exported to {path}")
+            });
+            bail!(
+                "the calibration was still being saved when the window closed; tobiid finishes \
+                 the save after this exits{exported}"
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            bail!(
+                "the calibration did not wind down in time; the daemon discards it when this exits"
+            )
+        }
+    }
+}
 
 fn run() -> Result<()> {
     let o = parse_args(std::env::args().skip(1))?;
@@ -161,14 +226,21 @@ fn run() -> Result<()> {
     // The worker reports how the session ended, so that closing the window
     // waits for it to stop the session, and the outcome reaches the terminal.
     let (done, worker_done) = mpsc::channel::<Result<(), String>>();
+    // Whether the stop that keeps the session has been sent.
+    let saving = Arc::new(AtomicBool::new(false));
     if !o.list_monitors {
         let proxy = event_loop.create_proxy();
         let gaze_proxy = event_loop.create_proxy();
         let abort = Arc::clone(&abort);
         let placed = Arc::clone(&placed);
+        let saving = Arc::clone(&saving);
         let (rounds, dry_run, export) = (o.rounds, o.dry_run, o.export.clone());
         thread::spawn(move || {
             let emit = |e: UiEvent| {
+                if matches!(e, UiEvent::Saving) {
+                    // Relaxed: a pure signal, read once the window has closed.
+                    saving.store(true, Ordering::Relaxed);
+                }
                 let _ = proxy.send_event(e);
             };
             let backend: Result<Box<dyn Backend>> = if dry_run {
@@ -221,28 +293,25 @@ fn run() -> Result<()> {
     drop(app);
     // Esc or a closed window: have the worker stop the session (it checks
     // between steps) and wait for it, within reason.
-    abort.store(true, std::sync::atomic::Ordering::Relaxed);
-    let worker = worker_done.recv_timeout(WORKER_GRACE);
+    abort.store(true, Ordering::Relaxed);
+    let worker = wait_for_worker(&worker_done, WORKER_NOTICE, WORKER_GRACE, || {
+        println!(
+            "waiting up to {} s for the calibration to wind down...",
+            WORKER_GRACE.as_secs()
+        );
+    });
     // The window's own failure (no such monitor, no window) comes first: the
     // worker then only saw the abort that followed it.
     if let Some(reason) = window_failed {
         bail!(reason);
     }
-    match worker {
-        Ok(Err(reason)) => bail!(reason),
-        Ok(Ok(())) => {
-            if escaped {
-                println!("the calibration was kept: it was saved before the window closed");
-            }
-            Ok(())
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            bail!(
-                "the calibration did not wind down in time; the daemon discards it when this exits"
-            )
-        }
-    }
+    // Relaxed: a pure signal from the worker.
+    outcome(
+        worker,
+        escaped,
+        saving.load(Ordering::Relaxed),
+        o.export.as_deref(),
+    )
 }
 
 fn main() -> ExitCode {
@@ -292,5 +361,77 @@ mod tests {
         assert!(parse(&["--export"]).is_err());
         assert!(parse(&["--windowed"]).is_err());
         assert!(parse(&["--windowed", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn a_window_closed_on_a_save_under_way_says_the_save_goes_on() {
+        let late = || Err(mpsc::RecvTimeoutError::Timeout);
+
+        let saving = outcome(late(), true, true, None).expect_err("not confirmed");
+        let discarding = outcome(late(), true, false, None).expect_err("not wound down");
+
+        assert!(saving.to_string().contains("finishes the save"), "{saving}");
+        assert!(!saving.to_string().contains("exported"), "{saving}");
+        assert!(
+            discarding.to_string().contains("discards it"),
+            "{discarding}"
+        );
+        assert!(outcome(Ok(Ok(())), true, true, None).is_ok());
+        let failed = outcome(Ok(Err("refused".into())), false, true, None).expect_err("failed");
+        assert_eq!(failed.to_string(), "refused");
+    }
+
+    #[test]
+    fn a_save_cut_short_by_the_grace_says_the_export_was_not_written() {
+        let late = Err(mpsc::RecvTimeoutError::Timeout);
+
+        let err = outcome(late, true, true, Some("cal.bin")).expect_err("not confirmed");
+
+        let err = err.to_string();
+        assert!(err.contains("finishes the save"), "{err}");
+        assert!(err.contains("not exported to cal.bin"), "{err}");
+    }
+
+    #[test]
+    fn a_worker_that_already_reported_is_not_waited_on_aloud() {
+        let (done, worker_done) = mpsc::channel();
+        done.send(Ok(())).expect("send");
+        let mut told = false;
+
+        let worker = wait_for_worker(&worker_done, Duration::ZERO, Duration::ZERO, || {
+            told = true;
+        });
+
+        assert_eq!(worker, Ok(Ok(())));
+        assert!(!told);
+    }
+
+    #[test]
+    fn a_worker_still_busy_past_the_notice_is_waited_on_aloud() {
+        // The worker holds its end open without reporting.
+        let (_done, worker_done) = mpsc::channel::<Result<(), String>>();
+        let mut told = 0;
+
+        let worker = wait_for_worker(&worker_done, Duration::ZERO, Duration::ZERO, || {
+            told += 1;
+        });
+
+        assert_eq!(worker, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(told, 1);
+    }
+
+    #[test]
+    fn a_worker_that_is_gone_is_not_waited_on_aloud() {
+        // --list-monitors: no worker at all.
+        let (done, worker_done) = mpsc::channel::<Result<(), String>>();
+        drop(done);
+        let mut told = false;
+
+        let worker = wait_for_worker(&worker_done, Duration::ZERO, Duration::ZERO, || {
+            told = true;
+        });
+
+        assert_eq!(worker, Err(mpsc::RecvTimeoutError::Disconnected));
+        assert!(!told);
     }
 }
