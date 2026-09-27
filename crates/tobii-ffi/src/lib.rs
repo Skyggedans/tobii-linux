@@ -140,7 +140,12 @@
 //! finished: the reconnect waits for them before its round trip, and until
 //! it has swapped connections or failed a process call on another thread
 //! returns at once, delivering nothing, so no sample tobiid sends both
-//! connections is delivered twice.
+//! connections is delivered twice. Of what the old connection brought and
+//! was not delivered, the samples are dropped, so a reconnect of a live
+//! connection may lose those tobiid sent it alone, but the notifications are
+//! kept, ahead of the new connection's (tobiid sends each once), and one sent
+//! to both may be delivered again, after later ones: the last delivered is
+//! current.
 //! It restores the subscriptions, not a calibration session or pause the
 //! lost connection held.
 //!

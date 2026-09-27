@@ -333,10 +333,13 @@ impl<T> DerefMut for TicketGuard<'_, T> {
 ///
 /// One per device, kept across reconnects and rung by every link's reader,
 /// a failed reconnect's included: while a reconnect runs, the old link's
-/// reader and the new one's both ring it, and the old one rings last as
-/// the old link goes. That is what lets a wait sleeping on a lost link wake
-/// for the samples of the link a reconnect on another thread puts in its
-/// place.
+/// reader and the new one's both ring it. The old one rings as the old
+/// link goes, which is inside the reconnect's hold of the dispatch lock,
+/// so a wait it wakes finds the lock taken and sleeps again, and the new
+/// one's first rings may come during the hold too. What wakes a wait
+/// sleeping through a reconnect on another thread, on a lost link or a
+/// live one, for the samples of the link put in its place is the ring the
+/// reconnect makes once that link is in place.
 #[derive(Debug, Default)]
 struct Doorbell {
     rings: Mutex<u64>,
@@ -654,8 +657,9 @@ impl Command {
 }
 
 /// What the dispatch lock guards: the samples channel, the samples a look
-/// of `wait` took from it ahead of `process`, and whether the connection is
-/// up. A reconnect swaps it for its new link's.
+/// of `wait` took from it ahead of `process` (and, after a reconnect, the
+/// old link's notifications), and whether the connection is up. A reconnect
+/// swaps it for its new link's (see [`Dispatch::swap_samples`]).
 struct Dispatch {
     samples: Receiver<ServerMsg>,
     pending: VecDeque<ServerMsg>,
@@ -697,6 +701,43 @@ impl Dispatch {
     /// Move every queued sample into `pending`.
     fn take_all(&mut self) {
         while self.take_one() {}
+    }
+
+    /// Take `samples`, a new link's channel, in place of the old link's,
+    /// and start up. Of what the old link brought and nothing delivered
+    /// (what `pending` holds, then what its channel still does), the
+    /// notifications stay queued, in the order they came, ahead of what the
+    /// new link brings; the samples are dropped.
+    ///
+    /// tobiid writes each tick to every connection subscribed to its
+    /// streams, so from the tick that acks the new link on, the old one
+    /// brings the samples the new one does, and delivering both would
+    /// repeat samples, their stamps stepping back; those tobiid sent the old
+    /// link alone before go with them. A notification cannot go: tobiid
+    /// sends one to the connections subscribed when it comes, and a new
+    /// subscriber is not told the state again, so the application would
+    /// hold a stale state until the next change. Kept, those tobiid sent
+    /// both links (from the tick that acks the new one until the old one is
+    /// closed) come twice, the old link's copies ahead of all the new
+    /// link's: a copy may come again after later ones, so a state may be
+    /// seen to step back before it settles, and the last delivered is
+    /// current. Telling the copies apart would take a stamp that
+    /// notifications do not carry.
+    ///
+    /// Only what the old channel holds now is taken, so the old link's
+    /// reader must have been joined first, as the reconnect does by closing
+    /// the old link: then the reader has put in everything it was sent, and
+    /// hung up. A debug build checks that the channel is hung up.
+    fn swap_samples(&mut self, samples: Receiver<ServerMsg>) {
+        let old = mem::replace(&mut self.samples, samples);
+        let notification = |msg: &ServerMsg| matches!(msg, ServerMsg::Notification(_));
+        self.pending.retain(notification);
+        self.pending.extend(old.try_iter().filter(notification));
+        debug_assert!(
+            matches!(old.try_recv(), Err(TryRecvError::Disconnected)),
+            "the old link's reader must be joined before the swap"
+        );
+        self.state = LinkState::Up;
     }
 
     /// Whether `process` has something to do among what has been taken: a
@@ -1087,30 +1128,48 @@ impl Device {
     /// start the tracker cold again. A device with no subscription has
     /// nothing to send first, so the daemon may still drop an engine that
     /// only the old connection's requests kept, until the next request.
-    /// Samples queued from the old link are dropped, and nothing the old
-    /// link brings once the new one has asked for the streams is delivered:
-    /// tobiid writes each tick to every connection subscribed to its
-    /// streams, so from the tick that acks the new link on, the old one
-    /// brings what the new one does, and delivering from both would repeat
-    /// samples, their stamps stepping back. The new link starts up, so its
-    /// loss is reported again, and owes no acks. Once it is in place this
-    /// rings the device's doorbell (see [`Doorbell`]): the new link's reader
-    /// rings it too, but its first samples may come while this still waits
-    /// for the ack, and a wait they woke then was turned away by the
-    /// dispatch lock and slept again. The device info is fetched again: a
-    /// restarted daemon may serve another tracker.
+    ///
+    /// Of what the old link brought and nothing has delivered, the samples
+    /// are dropped and the notifications kept, ahead of the new link's (see
+    /// [`Dispatch::swap_samples`]). tobiid writes each tick to every
+    /// connection subscribed to its streams, so from the tick that acks the
+    /// new link on, the old one brings the samples the new one does:
+    /// delivering from both would repeat samples, their stamps stepping
+    /// back, so no sample is delivered from the old link once the new one
+    /// has asked for the streams (and nothing at all is delivered from then
+    /// until the swap, below), and the samples tobiid sent the old link
+    /// alone before are lost. Its notifications are not: tobiid sends each
+    /// once, and does not repeat it to a new subscriber, so they are kept,
+    /// and those it sent both links come twice, the old link's copies ahead
+    /// of the new link's. For them the old link is closed before its
+    /// channel is read out, which lets its reader read to the end what
+    /// tobiid wrote it. That is all tobiid sent it alone: tobiid's pump
+    /// writes its connections in the order they were made, each its queued
+    /// frames first, so what it sent the old one before it took the new
+    /// one's subscriptions was in the old socket before the ack left for
+    /// the new one.
+    ///
+    /// The new link starts up, so its loss is reported again, and owes no
+    /// acks. Once it is in place this rings the device's doorbell (see
+    /// [`Doorbell`]): the new link's reader rings it too, but its first
+    /// samples may come while this still waits for the ack, and a wait they
+    /// woke then was turned away by the dispatch lock and slept again. The
+    /// device info is fetched again: a restarted daemon may serve another
+    /// tracker.
     ///
     /// It runs under the command lock, after the round trips other threads
     /// have under way or queued ahead of it. Before it asks for the
     /// subscriptions back it takes the dispatch lock, once a process another
     /// thread runs has finished its callbacks, as the DLL's waits for its
     /// process mutex (0x18000eb88), and it holds that lock until it has
-    /// swapped the samples channel, or failed: for up to
-    /// [`RECONNECT_ACK_TIMEOUT`], a process on another thread returns at
-    /// once, delivering nothing, a wait sleeps until this rings or its own
-    /// timeout ends, and a clear waits. It reads the subscriptions under the
-    /// callbacks lock, which is free by then. Each failure is logged at
-    /// ERROR, a success at INFO, once the locks are let go.
+    /// closed the old link and swapped the samples channel, or failed: for
+    /// up to [`RECONNECT_ACK_TIMEOUT`], and then the moment its old link's
+    /// reader takes to read what that link still holds, a process on
+    /// another thread returns at once, delivering nothing, a wait sleeps
+    /// until this rings or its own timeout ends, and a clear waits. It reads
+    /// the subscriptions under the callbacks lock, which is free by then.
+    /// Each failure is logged at ERROR, a success at INFO, once the locks
+    /// are let go.
     pub(crate) fn reconnect(&self) -> Status {
         match self.replace_link() {
             Ok(()) => {
@@ -1154,14 +1213,18 @@ impl Device {
                 return Err(ReconnectError::Subscribe { mask, why });
             }
         }
-        dispatch.samples = samples;
-        dispatch.pending.clear();
-        dispatch.state = LinkState::Up;
+        // Closed before the swap reads out its channel: a socket shut down
+        // still reads what it holds, and tobiid can write it no more, so the
+        // join leaves all the old link was sent in its channel, and none of
+        // the notifications among it is lost. Its reader takes no lock but
+        // the doorbell's, and has at most a socket buffer left to read.
+        let mut old = mem::replace(&mut command.link, link);
+        old.close();
+        dispatch.swap_samples(samples);
         self.reported.store(false, Ordering::Relaxed);
         drop(dispatch);
         // Also wakes a wait whose look the hold turned away.
         self.doorbell.ring();
-        let old = mem::replace(&mut command.link, link);
         command.device_info = None;
         drop(command);
         drop(old);
@@ -1182,7 +1245,7 @@ impl Device {
     /// and leaves the rest queued (read from the code, not observed).
     /// libtobii's waits for the dispatch instead: never for a request, but
     /// for a reconnect too, which holds the dispatch lock while it waits for
-    /// its new link's ack.
+    /// its new link's ack and closes the old link.
     pub(crate) fn clear_buffers(&self) {
         self.in_dispatch(lock(&self.dispatch), |dispatch| {
             dispatch.take_all();
@@ -2295,6 +2358,74 @@ pub(crate) mod tests {
 
     fn c_char_of(b: u8) -> std::ffi::c_char {
         std::ffi::c_char::from_ne_bytes([b])
+    }
+
+    /// A `CALIBRATION_ID_CHANGED` notification frame naming calibration `id`.
+    fn calibration_id(id: u32) -> Vec<u8> {
+        tobii_ipc::encode_notification(&tobii_ipc::Notification {
+            kind: tobii_ipc::notification::CALIBRATION_ID_CHANGED,
+            value: WireValue::Uint(id),
+        })
+    }
+
+    /// The calibration ids `seen`, gathered by [`keep_notification`], names,
+    /// in the order they came; every one must be a `CALIBRATION_ID_CHANGED`.
+    fn calibration_ids(seen: &[Notification]) -> Vec<u32> {
+        let kind = u32::from(tobii_ipc::notification::CALIBRATION_ID_CHANGED);
+        let uint = crate::types::TOBII_NOTIFICATION_VALUE_TYPE_UINT;
+        seen.iter()
+            .map(|n| {
+                assert_eq!((n.type_, n.value_type), (kind, uint));
+                // SAFETY: `value_type` says `uint_` is the active field.
+                unsafe { n.value.uint_ }
+            })
+            .collect()
+    }
+
+    /// A reconnect's swap keeps, of what the old link brought, the
+    /// notifications, in the order they came (those a look of `wait` took,
+    /// then those still in the channel), ahead of the new link's, and drops
+    /// its samples. It fails should the swap drop the old link's
+    /// notifications, as a swap that clears does, as every swap did before
+    /// (3bbcd3e only widened what it dropped to all the old link brought
+    /// during the new one's subscription), or keep a sample. The old link's
+    /// sender is dropped first, as its reader's is once the reconnect has
+    /// closed that link.
+    #[test]
+    fn a_swap_keeps_the_old_links_notifications_ahead_of_the_new_links() {
+        let msg = |body: Vec<u8>| decode_server(&body).expect("decodes");
+        let (old, old_samples) = mpsc::channel();
+        let mut dispatch = Dispatch::new(old_samples);
+        dispatch
+            .pending
+            .extend([msg(calibration_id(1)), gaze_origin_sample()]);
+        for body in [
+            sample(STREAM_GAZE_ORIGIN, 1),
+            calibration_id(2),
+            sample(STREAM_PRESENCE, 2),
+        ] {
+            old.send(msg(body)).expect("the old link's");
+        }
+        drop(old);
+        let (new, new_samples) = mpsc::channel();
+        for body in [calibration_id(3), sample(STREAM_GAZE_ORIGIN, 3)] {
+            new.send(msg(body)).expect("the new link's");
+        }
+
+        dispatch.swap_samples(new_samples);
+        dispatch.take_all();
+
+        assert_eq!(
+            dispatch.pending,
+            [
+                msg(calibration_id(1)),
+                msg(calibration_id(2)),
+                msg(calibration_id(3)),
+                msg(sample(STREAM_GAZE_ORIGIN, 3)),
+            ]
+        );
+        assert_eq!(dispatch.state, LinkState::Up);
+        drop(new);
     }
 
     #[test]
@@ -4136,6 +4267,95 @@ pub(crate) mod tests {
         assert_eq!(deliveries.calls(), 2, "each tick once");
         deliveries.assert_in_turn();
         drop((d, old, new));
+    }
+
+    /// The samples the old link of
+    /// [`a_reconnect_of_a_live_link_keeps_the_notifications_the_old_link_alone_got`]
+    /// is sent ahead of its last notifications, some 80 KB of frames. They
+    /// fit in the socket's buffer, so their write returns at once and the
+    /// new link's ack follows it, however slowly the old link's reader
+    /// reads them (a backlog the buffer cannot hold would keep the ack back
+    /// until the reader had read the excess, inside the ack's timeout). The
+    /// reader then has most of them still to read when the ack comes, far
+    /// more than it reads in the moment the reconnect takes to swap.
+    const BACKLOG: i64 = 2_000;
+
+    /// A reconnect of a live link keeps the notifications tobiid sent the
+    /// old link alone, before it took the new link's subscriptions, which
+    /// tobiid does not repeat to the new one: one a look of `wait` had
+    /// taken, one the old link's reader had queued, and one it still had to
+    /// read, behind a backlog of samples, when the new link's ack came. The
+    /// next process delivers them in the order they came, ahead of the new
+    /// link's, the acking tick's twice, as that tick reaches both links;
+    /// of the samples, the new link's alone. It fails should the swap drop
+    /// the old link's notifications, as a swap that clears does, as every
+    /// swap did before (only the new link's come; 3bbcd3e only widened what
+    /// it dropped to all the old link brought during the new one's
+    /// subscription), and should the swap read the old link's channel out
+    /// before closing it: the swap's check fails in a debug build, and in a
+    /// release build, but for a run whose old reader catches up in that
+    /// moment, the last is lost.
+    #[test]
+    fn a_reconnect_of_a_live_link_keeps_the_notifications_the_old_link_alone_got() {
+        let (connect, daemons) = scripted_daemon(vec![vec![]]);
+        let d = Device::new(connect, 1, 1).expect("device");
+        let mut old = daemons.recv().expect("daemon end");
+        let mut hits = 0u32;
+        let mut seen: Vec<Notification> = Vec::new();
+        {
+            let mut callbacks = lock(&d.callbacks);
+            callbacks.gaze_origin = Some((count_pair as EyePairFn, (&raw mut hits).cast()));
+            callbacks.notifications =
+                Some((keep_notification as NotificationsFn, (&raw mut seen).cast()));
+        }
+        d.queue(decode_server(&calibration_id(1)).expect("decodes"));
+        d.queue(gaze_origin_sample());
+        let device = &d;
+
+        let (reconnected, (old, new)) = thread::scope(|s| {
+            let daemon = s.spawn(move || {
+                let mut new = daemons.recv_timeout(LONG_WAIT).expect("new daemon end");
+                assert_eq!(
+                    subscription(&mut new),
+                    Some(STREAM_GAZE_ORIGIN | STREAM_NOTIFICATIONS)
+                );
+                // Sent the old link alone, and queued by its reader.
+                let rung = device.doorbell.rings();
+                write_frame(&mut old, &calibration_id(2)).expect("the old link's");
+                let until = Instant::now() + LONG_WAIT;
+                while device.doorbell.rings() == rung && Instant::now() < until {
+                    thread::sleep(TICK);
+                }
+                // Sent the old link alone too, behind samples its reader
+                // has yet to read; then the acking tick, which reaches the
+                // old link first.
+                let behind = (0..BACKLOG).map(|ts_us| sample(STREAM_GAZE_ORIGIN, ts_us));
+                old.write_all(&frames(
+                    behind.chain([calibration_id(3), calibration_id(4)]),
+                ))
+                .expect("the old link's backlog and its copy of the tick");
+                new.write_all(&frames([
+                    encode_subscribed(true),
+                    calibration_id(4),
+                    sample(STREAM_GAZE_ORIGIN, BACKLOG),
+                ]))
+                .expect("the ack and the new link's copy of the tick");
+                (old, new)
+            });
+            let reconnected = device.reconnect();
+            (reconnected, joined(daemon))
+        });
+        let until = Instant::now() + LONG_WAIT;
+        while hits == 0 && Instant::now() < until {
+            d.wait(SHORT_WAIT);
+            assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        }
+        drop(d);
+
+        assert_eq!(reconnected, TOBII_ERROR_NO_ERROR);
+        assert_eq!(hits, 1, "the new link's sample alone");
+        assert_eq!(calibration_ids(&seen), [1, 2, 3, 4, 4]);
+        drop((old, new));
     }
 
     /// A guard: a reconnect on one thread waits for a device-info fetch

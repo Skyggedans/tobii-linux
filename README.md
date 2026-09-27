@@ -154,14 +154,21 @@ Where the answers come from, and where they differ from Windows:
   spawns one, unlike `tobii_device_create`), gives up with
   `TOBII_ERROR_CONNECTION_FAILED` within ~500 ms when it cannot, and
   restores the subscriptions, not a calibration session or a pause the lost
-  connection held. A tracker unplug is not a lost connection and never shows
-  in `tobii_device_process_callbacks`: the daemon keeps every connection, and
-  the samples resume on it once the tracker is back. Requests that need the
-  tracker get `TOBII_ERROR_CONNECTION_FAILED` meanwhile (above), but that is
-  the daemon's answer over a live connection, and a reconnect then succeeds
-  without bringing the tracker back. OpenTrack's `tracker-tobii` plugin
-  needs a reconnect call to recover by itself; as it stands, stopping and
-  starting tracking recovers it (INSTALL.md §8).
+  connection held. Reconnecting a live connection drops the samples the old
+  one brought that were not delivered yet, which may lose those tobiid sent
+  it alone just before (from the new one's first tick on it sends both the
+  same, and each is delivered once), but keeps its notifications, which
+  tobiid sends once and does not repeat to a new connection: they come ahead
+  of the new connection's, and one sent to both may be delivered again, after
+  later ones, so a state may be seen to step back before it settles (the last
+  delivered is current). A tracker unplug is not a lost connection and never
+  shows in `tobii_device_process_callbacks`: the daemon keeps every
+  connection, and the samples resume on it once the tracker is back. Requests
+  that need the tracker get `TOBII_ERROR_CONNECTION_FAILED` meanwhile
+  (above), but that is the daemon's answer over a live connection, and a
+  reconnect then succeeds without bringing the tracker back. OpenTrack's
+  `tracker-tobii` plugin needs a reconnect call to recover by itself; as it
+  stands, stopping and starting tracking recovers it (INSTALL.md §8).
 - **Pause.** One state for the tracker, shared by every client, as in the
   Stream Engine: the last call wins and any client may resume.
   `TOBII_STATE_DEVICE_PAUSED` and a `DEVICE_PAUSED_STATE_CHANGED`
@@ -255,13 +262,14 @@ Where the answers come from, and where they differ from Windows:
   a pause a minute: *Waiting for the daemon*), so one thread's calls made
   back to back hold another thread's up for one of them at most. They do not
   hold up its callbacks, processing or waiting, but for a reconnect's round
-  trip (~500 ms at most), and a recenter, a write with no reply, waits for
-  those under way or called before it; a reconnect's ~500 ms counts from
-  when the calls ahead of it, and then a process call another thread is
-  making, have finished. Its callbacks run one at a time, on whichever
-  thread processes it, and a subscribe, an unsubscribe, a clear or a
-  reconnect waits for one running on another thread; once an unsubscribe
-  returns, its callback is not running and never runs again.
+  trip (~500 ms at most) and its close of the old connection, and a
+  recenter, a write with no reply, waits for those under way or called
+  before it; a reconnect's ~500 ms counts from when the calls ahead of it,
+  and then a process call another thread is making, have finished. Its
+  callbacks run one at a time, on whichever thread processes it, and a
+  subscribe, an unsubscribe, a clear or a reconnect waits for one running on
+  another thread; once an unsubscribe returns, its callback is not running
+  and never runs again.
   `tobii_device_destroy` and `tobii_api_destroy` take no lock, as in the
   Stream Engine (whose documentation says so for `tobii_device_destroy`): no
   other thread may be inside a call on the handle, or use it afterwards.
@@ -289,7 +297,8 @@ Where the answers come from, and where they differ from Windows:
   `TOBII_ERROR_CONNECTION_FAILED` once the loss has been reported, and
   delivers nothing (the DLL first delivers the device's queued
   notifications); a clear waits for another thread's processing, never for a
-  request (both wait for a reconnect's round trip);
+  request (both wait for a reconnect's round trip and its close of the old
+  connection);
   `tobii_calibration_retrieve` calls its receiver with no lock held, where
   the DLL holds the device's API mutex; and the logger is never called under
   a lock of the call that logs.

@@ -466,6 +466,16 @@ pub unsafe extern "C" fn tobii_device_clear_callback_buffers(device: *mut Device
 /// it sends the old one from its ack on, so delivering from the old one
 /// meanwhile would deliver those samples twice, their stamps stepping back.
 ///
+/// Of what the old connection brought and was not delivered, the samples are
+/// dropped, so a reconnect of a live connection may lose those tobiid sent
+/// the old one alone, just before it took the new one's subscriptions. The
+/// notifications are kept, and delivered ahead of the new connection's:
+/// tobiid sends each once and does not repeat it to a new connection, so
+/// dropping one would leave the application with a stale state (a
+/// calibration, a pause, the faults) until the next change. One tobiid sent
+/// both connections may be delivered again, after later ones, so a state may
+/// be seen to step back before it settles: the last delivered is current.
+///
 /// # Safety
 /// As `tobii_device_process_callbacks`.
 #[unsafe(no_mangle)]
