@@ -10,3 +10,6 @@ tobii_stream*.bin
 # Unrelated third-party download that landed in the repo root; left on
 # disk untouched, just not tracked.
 /gameshell*
+
+# Python bytecode from running tools/abi/dll_abi.py
+__pycache__/
