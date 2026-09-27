@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::Shutdown;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1129,7 +1129,14 @@ fn run_requests(state: &Mutex<State>, id: u64, requests: &Receiver<Vec<u8>>) {
 /// stops under its requests. A subscription change takes effect at once,
 /// ahead of the client's requests still to run: an unsubscribe before one
 /// of them pins the device (see [`State::device_for`]) may stop an engine
-/// that it then starts again.
+/// that it then starts again. A subscription change is skipped if the
+/// client has hung up by the time it would take effect (see
+/// [`handle_subscribe`]): nobody reads its ack, and an engine it started
+/// would only stop again at the cleanup. That is a libtobii reconnect that
+/// gave up on its ack: while systemd held the socket for a daemon restart
+/// (the daemon that comes up finds the connection in the backlog, the
+/// subscription in it and the hang-up behind), or while its reader waited
+/// for the state lock.
 fn client_reader(state: &Arc<Mutex<State>>, id: u64, mut stream: UnixStream) {
     if let Some(worker) = read_frames(state, id, &mut stream) {
         worker.finish(id);
@@ -1147,18 +1154,36 @@ fn client_reader(state: &Arc<Mutex<State>>, id: u64, mut stream: UnixStream) {
 /// Read client `id`'s frames until it hangs up (EOF or a read error), or
 /// its request worker dies, which hangs up on it. The worker starts at the
 /// client's first request (a client that only streams needs none) and is
-/// handed back to be waited for.
+/// handed back to be waited for. A subscription change is skipped once the
+/// client has hung up, and the frames after it are still read: requests
+/// the client sent before it hung up still run.
 fn read_frames(
     state: &Arc<Mutex<State>>,
     id: u64,
     stream: &mut UnixStream,
 ) -> Option<RequestWorker> {
     let mut worker: Option<RequestWorker> = None;
+    // Whether a subscription change was skipped yet: said once at info.
+    let mut skipped = false;
     while let Ok(Some(body)) = read_frame(stream) {
         match body.first().copied() {
             Some(tobii_ipc::TAG_SUBSCRIBE) => {
-                if let Some(streams) = decode_subscribe(&body) {
-                    handle_subscribe(state, id, streams);
+                if let Some(streams) = decode_subscribe(&body)
+                    && !handle_subscribe(state, id, streams, || has_peer_hung_up(id, stream))
+                {
+                    if std::mem::replace(&mut skipped, true) {
+                        debug!(
+                            client = id,
+                            streams = %format_args!("{streams:#x}"),
+                            "skipping another subscription from a client that has hung up"
+                        );
+                    } else {
+                        info!(
+                            client = id,
+                            streams = %format_args!("{streams:#x}"),
+                            "skipping a subscription from a client that has hung up"
+                        );
+                    }
                 }
             }
             Some(tobii_ipc::TAG_RECENTER) => {
@@ -1193,13 +1218,60 @@ fn read_frames(
     worker
 }
 
+/// Whether client `id`, on `stream`, has hung up: closed its end, or shut
+/// down its sending, or the pump hung up on it (see [`Client::hang_up`]).
+/// What the client sent before may still wait to be read. Asked of the
+/// kernel with a `poll` for `POLLRDHUP`, which a Unix socket reports as
+/// soon as its peer is gone, however much of what it sent is still unread;
+/// a peek would see the hang-up only once all of that was read. The poll
+/// does not block, so it may be taken under the state lock. `false` should
+/// the socket not be polled: the client is served as if it were still
+/// there.
+fn has_peer_hung_up(id: u64, stream: &UnixStream) -> bool {
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `fd` is a live local, valid for the kernel to read and
+        // write for the one entry the count gives, and its descriptor is
+        // `stream`'s, open while `stream` is borrowed. With a zero timeout
+        // the call does not block.
+        let ready = unsafe { libc::poll(&raw mut fd, 1, 0) };
+        if ready >= 0 {
+            return ready > 0
+                && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            debug!(client = id, error = %e, "could not poll a client's socket for its hang-up");
+            return false;
+        }
+    }
+}
+
 /// Register the client's streams, starting the engine if it isn't running
 /// (and the tracker is on the bus; otherwise the watchdog starts it once the
 /// tracker is plugged in), and acknowledge. Always succeeds (the one engine
-/// serves every stream); `streams == 0` unsubscribes.
-fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
+/// serves every stream); `streams == 0` unsubscribes. `true` once done.
+///
+/// Skipped, with nothing changed and nothing acked (`false`), if the client
+/// has hung up (`gone`, see [`has_peer_hung_up`]). That is asked before the
+/// bus is scanned and again once the state lock is held, just before
+/// anything changes: the scan and the wait for the lock (held while another
+/// client's engine is dropped and its thread joined) are where a libtobii
+/// reconnect's 500 ms go, and one that gave up there would get an engine
+/// started for nobody, dropped again at its cleanup under the lock.
+fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32, gone: impl Fn() -> bool) -> bool {
+    if gone() {
+        return false;
+    }
     let on_bus = streams != 0 && look_for_tracker(state);
     let mut st = lock_state(state);
+    if gone() {
+        return false;
+    }
     let before = st
         .clients
         .iter()
@@ -1216,6 +1288,7 @@ fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32) {
     }
     st.send_to(id, encode_subscribed(true));
     replay_presence(&mut st, id, before, streams);
+    true
 }
 
 /// A new presence subscriber is told the current presence straight away,
@@ -1301,6 +1374,12 @@ pub(crate) mod tests {
             .find(|c| c.id == id)
             .map(|c| c.outbox.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Client `id` changes its subscription to `streams` and stays
+    /// connected: the change is acted on.
+    fn subscribe(state: &Mutex<State>, id: u64, streams: u32) {
+        assert!(handle_subscribe(state, id, streams, || false), "acted on");
     }
 
     #[test]
@@ -1422,7 +1501,7 @@ pub(crate) mod tests {
     fn a_subscription_starts_an_engine_only_for_a_tracker_on_the_bus() {
         let state = Mutex::new(state_with_client(1));
 
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
         {
             let st = lock_state(&state);
             assert_eq!(outbox(&st, 1), [encode_subscribed(true)]);
@@ -1434,7 +1513,7 @@ pub(crate) mod tests {
         }
 
         lock_state(&state).fake_present = true;
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
 
         let st = lock_state(&state);
         assert_eq!(st.engines_started.len(), 1);
@@ -1593,11 +1672,11 @@ pub(crate) mod tests {
     fn an_armed_engine_dropped_as_unwanted_does_not_hide_the_next_ones_failure() {
         let state = Mutex::new(state_with_client(1));
         lock_state(&state).fake_present = true;
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
         lock_state(&state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
         // The client unsubscribes: the armed engine stops.
-        handle_subscribe(&state, 1, 0);
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, 0);
+        subscribe(&state, 1, STREAM_PRESENCE);
         assert_eq!(engines_started(&state), 2);
 
         end_engine(&state, Some(OpenRefusal::NoPermission));
@@ -1610,7 +1689,7 @@ pub(crate) mod tests {
     fn a_dead_engine_a_request_finds_adds_a_step_and_is_replaced_at_once() {
         let state = Mutex::new(state_with_client(1));
         lock_state(&state).fake_present = true;
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
         end_engine(&state, Some(OpenRefusal::InUse));
 
         let _ = lock_state(&state).device_for(1, true);
@@ -1629,12 +1708,12 @@ pub(crate) mod tests {
             st.clients.push(Client::new(2, out));
             st.fake_present = true;
         }
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
-        handle_subscribe(&state, 2, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 2, STREAM_PRESENCE);
         end_engine(&state, Some(OpenRefusal::InUse));
         let started = engines_started(&state);
 
-        handle_subscribe(&state, 2, 0);
+        subscribe(&state, 2, 0);
 
         let st = lock_state(&state);
         assert!(st.dead_engine.is_none(), "dropped");
@@ -1646,7 +1725,7 @@ pub(crate) mod tests {
     fn no_engine_wanted_any_more_ends_the_backoff() {
         let state = Mutex::new(state_with_client(1));
         lock_state(&state).fake_present = true;
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
         let t0 = Instant::now();
         for _ in 0..5 {
             let _ = lock_state(&state).restarts.engine_failed(t0);
@@ -1654,7 +1733,7 @@ pub(crate) mod tests {
         end_engine(&state, Some(OpenRefusal::NoPermission));
 
         // The last client leaves.
-        handle_subscribe(&state, 1, 0);
+        subscribe(&state, 1, 0);
 
         let st = lock_state(&state);
         assert!(st.dead_engine.is_none(), "dropped");
@@ -1724,7 +1803,7 @@ pub(crate) mod tests {
             let _ = st.restarts.engine_failed(t0);
         }
 
-        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        subscribe(&state, 1, STREAM_PRESENCE);
         assert_eq!(engines_started(&state), 1, "a subscription");
         let _ = lock_state(&state).device_for(1, true);
         assert_eq!(engines_started(&state), 2, "a request");
@@ -2615,6 +2694,173 @@ pub(crate) mod tests {
             matches!(read_frame(peer), Ok(None)),
             "the connection is closed"
         );
+    }
+
+    /// The client is found gone once it closes its end or shuts down its
+    /// sending, or once the pump hangs up on it, with the frame it sent
+    /// still there to be read; not while it is connected, frame or none.
+    #[test]
+    fn a_client_is_found_hung_up_with_its_frames_still_unread() {
+        let subscribe = tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE);
+        let (mut ours, mut peer) = UnixStream::pair().expect("socket pair");
+        assert!(!has_peer_hung_up(1, &ours), "connected");
+        write_frame(&mut peer, &subscribe).expect("frame written");
+        assert!(
+            !has_peer_hung_up(1, &ours),
+            "connected, with a frame unread"
+        );
+        drop(peer);
+        assert!(has_peer_hung_up(1, &ours), "closed, with a frame unread");
+        assert_eq!(read_frame(&mut ours).expect("a frame"), Some(subscribe));
+
+        let (ours, peer) = UnixStream::pair().expect("socket pair");
+        peer.shutdown(Shutdown::Write).expect("half-close");
+        assert!(has_peer_hung_up(1, &ours), "done sending");
+
+        let (ours, _peer) = UnixStream::pair().expect("socket pair");
+        let mut client = Client::new(1, ours.try_clone().expect("socket clone"));
+        client.hang_up();
+        assert!(has_peer_hung_up(1, &ours), "hung up on by the pump");
+    }
+
+    /// Serve, as the accept loop does, client 1's connection over which it
+    /// sent `frames` and hung up before the daemon read any of them. The
+    /// reader runs here, and has cleaned up after the client on return.
+    fn serve_abandoned(state: &Arc<Mutex<State>>, frames: &[Vec<u8>]) {
+        let (mut peer, stream) = UnixStream::pair().expect("socket pair");
+        for body in frames {
+            write_frame(&mut peer, body).expect("frame written");
+        }
+        drop(peer);
+        let out = stream.try_clone().expect("socket clone");
+        lock_state(state).clients.push(Client::new(1, out));
+        client_reader(state, 1, stream);
+    }
+
+    /// A daemon with its tracker on the bus: a subscription it acts on
+    /// starts an engine.
+    fn with_tracker() -> Arc<Mutex<State>> {
+        let mut st = State::new(false);
+        st.fake_present = true;
+        Arc::new(Mutex::new(st))
+    }
+
+    /// Noted in d8c6a35: a libtobii reconnect that gave up on its ack while
+    /// systemd held the socket for a restart leaves its subscription in the
+    /// backlog, and the hang-up behind it. The daemon that comes up neither
+    /// looks for the tracker nor starts an engine for it, only to drop the
+    /// engine again under the state lock a live reconnect's ack waits on.
+    #[test]
+    fn a_subscription_from_a_client_that_has_hung_up_starts_no_engine() {
+        let state = with_tracker();
+
+        serve_abandoned(
+            &state,
+            &[tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE)],
+        );
+
+        let st = lock_state(&state);
+        assert!(st.engines_started.is_empty(), "no engine started");
+        assert_eq!(st.presence_probes, 0, "nor the tracker looked for");
+        assert!(st.clients.is_empty(), "cleaned up after");
+    }
+
+    /// A client that hangs up while its subscription waits, for the bus
+    /// scan or for the state lock another reader holds while it drops an
+    /// engine, is looked at again under the lock, and nothing changes: no
+    /// engine starts for it and no ack is queued.
+    #[test]
+    fn a_client_that_hangs_up_while_its_subscription_waits_gets_no_engine() {
+        use std::cell::RefCell;
+        use tobii_ipc::STREAM_GAZE;
+        let state = Mutex::new(state_with_client(1));
+        lock_state(&state).fake_present = true;
+        // Each look at the client: whether the state lock was held then.
+        let looks = RefCell::new(Vec::new());
+        let gone = || {
+            let mut looks = looks.borrow_mut();
+            looks.push(state.try_lock().is_err());
+            // Connected at the first look, gone by the next.
+            looks.len() > 1
+        };
+
+        assert!(!handle_subscribe(&state, 1, STREAM_GAZE, gone), "skipped");
+
+        assert_eq!(
+            *looks.borrow(),
+            [false, true],
+            "looked at again under the lock"
+        );
+        let st = lock_state(&state);
+        assert!(st.engines_started.is_empty(), "no engine started");
+        assert!(outbox(&st, 1).is_empty(), "nor an ack queued");
+        assert_eq!(st.clients[0].streams, 0, "nor the streams registered");
+        assert_eq!(
+            st.presence_probes, 1,
+            "the bus was looked at while it was there"
+        );
+    }
+
+    /// The frames after a skipped subscription are still read: a request
+    /// the client sent before it hung up still runs.
+    #[test]
+    fn a_request_behind_a_skipped_subscription_still_runs() {
+        use tobii_ipc::request::{encode_request, kind};
+        let state = with_tracker();
+
+        serve_abandoned(
+            &state,
+            &[
+                tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE),
+                encode_request(1, kind::DEVICE_NAME_SET, b"desk"),
+            ],
+        );
+
+        let st = lock_state(&state);
+        assert_eq!(st.device_name.as_deref(), Some(&b"desk"[..]));
+        assert!(st.engines_started.is_empty(), "the subscription skipped");
+        assert!(st.clients.is_empty());
+    }
+
+    /// Only the subscription is skipped: a request behind it that needs the
+    /// device (a calibration stop that keeps the result, sent just before
+    /// the client hung up, among them) still gets an engine started for it.
+    #[test]
+    fn a_device_request_behind_a_skipped_subscription_still_starts_its_engine() {
+        use tobii_ipc::request::{encode_display_area, encode_request, kind};
+        let state = with_tracker();
+
+        serve_abandoned(
+            &state,
+            &[
+                tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE),
+                encode_request(
+                    1,
+                    kind::DISPLAY_AREA_SET,
+                    &encode_display_area(&area(600.0)),
+                ),
+            ],
+        );
+
+        let st = lock_state(&state);
+        assert_eq!(st.engines_started.len(), 1, "one engine, the request's");
+        assert_eq!(st.presence_probes, 1, "one look at the bus, the request's");
+        assert!(st.clients.is_empty());
+    }
+
+    /// A client that subscribes and stays connected is served: acked, with
+    /// an engine started for it.
+    #[test]
+    fn a_subscription_from_a_connected_client_is_acked() {
+        let mut c = Connection::open(Arc::new(crate::requests::tests::Answering(0)));
+
+        c.send(&tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE));
+
+        assert_eq!(c.wait_for_frames(1), [ACK]);
+        assert_eq!(engines_started(&c.state), 1);
+        c.hang_up();
+        c.wait_until_served();
+        assert!(lock_state(&c.state).clients.is_empty());
     }
 
     fn file_id(dev: u64, ino: u64) -> FileId {

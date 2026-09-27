@@ -63,12 +63,13 @@ const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// its frame loop.
 ///
 /// An attempt that gives up closes a connection that already carries its
-/// subscription, and the daemon still reads it (under socket activation,
-/// once it starts and accepts it from systemd's backlog): it starts the
-/// engine for it, then sees the hang-up and drops the engine again unless
-/// another client wants it, under the state lock a later attempt's ack
-/// waits on. Skipping a subscription whose peer has hung up is the
-/// daemon's to do.
+/// subscription, and the daemon still reads it: under socket activation,
+/// once it starts and accepts it from systemd's backlog, or while the
+/// connection's reader waits for the state lock. It skips a subscription
+/// whose client has hung up by the time it would act on it, though (it
+/// looks again once it holds the lock, just before it would start an
+/// engine and ack), so it starts no engine for the attempt only to drop it
+/// again under the state lock a later attempt's ack waits on.
 const RECONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 thread_local! {

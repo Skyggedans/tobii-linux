@@ -271,13 +271,17 @@ connection:
 
 After a crash under 4c, systemd waits `RestartSec=2` before it starts the
 daemon again. A reconnect with subscriptions meanwhile connects into the
-socket's backlog, gets no answer within its ~500 ms and gives up. The
-restarted daemon still serves each such abandoned connection (it starts the
-tracker's engine for it, then drops it again unless another client wants
-it), which can make the first attempts after it is up miss their ~500 ms
-too. Expect a few seconds and some retries before samples resume. A
-reconnect with no subscriptions has nothing to wait for and succeeds as soon
-as it connects; the application's first requests then wait for the daemon to
+socket's backlog, gets no answer within its ~500 ms and gives up, closing
+the connection. The restarted daemon still reads each such abandoned
+connection, but skips a subscription whose client has hung up by the time it
+would act on it (the journal says "skipping a subscription from a client
+that has hung up", once per connection): it starts no engine for it, so a
+later attempt's answer does not wait while one starts and stops again. The
+same holds for an attempt that gives up while a running daemon is busy.
+Expect a few seconds and some retries before samples resume: attempts fail
+until the daemon is up, and the tracker then has to start. A reconnect with
+no subscriptions has nothing to wait for and succeeds as soon as it
+connects; the application's first requests then wait for the daemon to
 start, and can time out.
 
 ## 6. Logs & debug
