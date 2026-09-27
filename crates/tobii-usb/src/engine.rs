@@ -56,6 +56,8 @@ use tobii_proto::image83::ImageFrame;
 use tobii_proto::protocol::{RESPONSE_STATUS_OK, ttp_error};
 use tracing::error;
 
+use crate::device::OpenRefusal;
+
 /// One 6DOF head-pose estimate from the IR image stream.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -306,12 +308,16 @@ pub struct Engine {
     commands: Commands,
     rx: Receiver<Sample>,
     pending: VecDeque<Sample>,
-    handle: Option<JoinHandle<()>>,
+    /// The device thread; it hands back why it gave up when the tracker
+    /// refused to be opened (see [`Engine::finish`]).
+    handle: Option<JoinHandle<Option<OpenRefusal>>>,
 }
 
 impl Engine {
     /// Spawn the device thread and start streaming. Failures inside the thread
-    /// are logged once; [`Engine::is_alive`] turns false when it has exited.
+    /// are logged once; [`Engine::is_alive`] turns false when it has exited,
+    /// and [`Engine::finish`] then says whether the tracker refused to be
+    /// opened.
     #[must_use]
     pub fn start() -> Self {
         Self::start_with(None)
@@ -329,9 +335,7 @@ impl Engine {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let thread_shared = Arc::clone(&shared);
         let handle = thread::spawn(move || {
-            if let Err(e) = crate::device::run_gaze_engine(&thread_shared, &cmd_rx, &tx) {
-                error!(error = %format_args!("{e:#}"), "tobii engine stopped");
-            }
+            ended(crate::device::run_gaze_engine(&thread_shared, &cmd_rx, &tx))
         });
         Engine {
             shared,
@@ -394,6 +398,24 @@ impl Engine {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
+    /// Stop the engine as dropping it does, and say why it gave up if the
+    /// tracker refused to be opened: `None` for any other end, a stop
+    /// included. It waits for the device thread, which is at once for an
+    /// engine no longer [alive](Engine::is_alive).
+    #[must_use]
+    pub fn finish(mut self) -> Option<OpenRefusal> {
+        self.stop_and_join()
+    }
+
+    /// Tell the device thread to stop and wait for it; what it handed back,
+    /// the first time (see [`Engine::finish`]).
+    fn stop_and_join(&mut self) -> Option<OpenRefusal> {
+        // Relaxed: a pure signal; the join below is the synchronisation point.
+        self.shared.stop.store(true, Ordering::Relaxed);
+        // A panicked device thread has already logged; nothing to recover.
+        self.handle.take().and_then(|h| h.join().ok().flatten())
+    }
+
     /// Block up to `timeout` until at least one sample is available.
     pub fn wait(&mut self, timeout: Duration) -> bool {
         if !self.pending.is_empty() {
@@ -427,11 +449,36 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Relaxed: a pure signal; the join below is the synchronisation point.
-        self.shared.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            // A panicked device thread has already logged; nothing to recover.
-            let _ = h.join();
-        }
+        let _ = self.stop_and_join();
+    }
+}
+
+/// Log how the device thread's `result` ended, once, and hand back why it
+/// gave up if the tracker refused to be opened (an [`OpenRefusal`] context,
+/// see [`crate::device::run_gaze_engine`]).
+fn ended(result: anyhow::Result<()>) -> Option<OpenRefusal> {
+    let e = result.err()?;
+    error!(error = %format_args!("{e:#}"), "tobii engine stopped");
+    e.downcast_ref::<OpenRefusal>().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_engine_given_up_on_a_refusal_says_why() {
+        let e = || anyhow::anyhow!("open 5");
+        assert_eq!(
+            ended(Err(e().context(OpenRefusal::NoPermission))),
+            Some(OpenRefusal::NoPermission)
+        );
+        assert_eq!(
+            ended(Err(e().context(OpenRefusal::InUse).context("engine"))),
+            Some(OpenRefusal::InUse),
+            "wrapped further"
+        );
+        assert_eq!(ended(Err(e())), None);
+        assert_eq!(ended(Ok(())), None, "a stop");
     }
 }

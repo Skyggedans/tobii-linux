@@ -60,7 +60,8 @@ pub const READ_BUF: usize = 128 * 1024;
 /// accepts the init but does not stream (a cold-start quirk), is not one. An
 /// open whose stream armed and then died within 30 s is one; a stream that
 /// ran longer starts the count again. (That is the engine's count: `replay
-/// --reconnect` spends it as plain opens, prime included.)
+/// --reconnect` spends it as plain opens, prime included.) A tracker that
+/// may not be opened ([`OpenRefusal`]) ends the engine sooner.
 pub const MAX_REPLAY_ATTEMPTS: usize = 5;
 
 /// Bulk-flag parsing shared by the `TOBII_*` opt-out variables: set and
@@ -110,6 +111,79 @@ impl fmt::Display for StreamLost {
     }
 }
 
+/// Why the tracker on the bus cannot be opened, when opening it again soon
+/// would not help: the engine gives up on it sooner than on other failed
+/// opens and without the USB reset, which can fix neither. As a context on
+/// the engine's error, it says why the engine stopped (see
+/// [`Engine::finish`](crate::engine::Engine::finish)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenRefusal {
+    /// libusb may not open the device (`LIBUSB_ERROR_ACCESS`): the udev
+    /// rule is missing or did not apply to this device, or, with the
+    /// shipped `uaccess` rule, this user's session is not the active one
+    /// on the seat (after a logout, say).
+    NoPermission,
+    /// Another process has claimed interface 0 (`LIBUSB_ERROR_BUSY`):
+    /// another `tobiid`, or a research command.
+    InUse,
+}
+
+impl OpenRefusal {
+    /// The refusal `e` carries, if it is the error of the libusb call that
+    /// opens the tracker or claims its interface in [`open_tobii`] (an
+    /// [`OpenStep`] context) and says the tracker may not be opened: an
+    /// `Access` or `Busy` there. Such an error elsewhere, or any other error
+    /// of those calls (the tracker unplugged meanwhile, …), is none.
+    fn of(e: &anyhow::Error) -> Option<Self> {
+        e.downcast_ref::<OpenStep>()?;
+        match e.downcast_ref::<rusb::Error>()? {
+            rusb::Error::Access => Some(Self::NoPermission),
+            rusb::Error::Busy => Some(Self::InUse),
+            _ => None,
+        }
+    }
+
+    /// How many more opens the engine tries, [`REOPEN_PAUSE`] apart, while
+    /// the tracker keeps refusing, before it gives up (see [`FailedOpens`]).
+    const fn retries(self) -> usize {
+        match self {
+            Self::NoPermission => NO_PERMISSION_RETRIES,
+            Self::InUse => BUSY_RETRIES,
+        }
+    }
+}
+
+impl fmt::Display for OpenRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoPermission => {
+                "no permission to open the tracker; check the udev rule (INSTALL §3) \
+                 and that this user's session is the active one"
+            }
+            Self::InUse => "the tracker is in use by another process",
+        })
+    }
+}
+
+/// Context on the error of a libusb call in [`open_tobii`] whose failure
+/// may say the tracker cannot be opened at all (see [`OpenRefusal::of`]).
+/// It reads as the plain message it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenStep(&'static str);
+
+impl fmt::Display for OpenStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// [`open_tobii`] opening the device.
+const OPEN_DEVICE: OpenStep = OpenStep("failed to open Tobii device; try sudo");
+
+/// [`open_tobii`] claiming interface 0.
+const CLAIM_INTERFACE: OpenStep = OpenStep("failed to claim interface 0");
+
 /// Find the tracker on the bus, open it and claim interface 0.
 ///
 /// # Errors
@@ -131,9 +205,7 @@ pub fn open_tobii(ctx: &UsbContext) -> Result<rusb::DeviceHandle<UsbContext>> {
     }
 
     let dev = found.context("Tobii 2104:0313 not found by libusb")?;
-    let h = dev
-        .open()
-        .context("failed to open Tobii device; try sudo")?;
+    let h = dev.open().context(OPEN_DEVICE)?;
 
     if let Err(e) = h.set_auto_detach_kernel_driver(true) {
         debug!(error = ?e, "auto detach kernel driver not available");
@@ -150,8 +222,7 @@ pub fn open_tobii(ctx: &UsbContext) -> Result<rusb::DeviceHandle<UsbContext>> {
         let _ = h.detach_kernel_driver(IFACE);
     }
 
-    h.claim_interface(IFACE)
-        .context("failed to claim interface 0")?;
+    h.claim_interface(IFACE).context(CLAIM_INTERFACE)?;
 
     debug!(interface = IFACE, "claimed interface");
     Ok(h)
@@ -318,25 +389,51 @@ fn reset_device_baseline(ctx: &UsbContext) {
     }
 }
 
+/// Where a device sits on the USB bus. The kernel gives a device the next
+/// free address on its bus each time it enumerates (a USB reset normally
+/// keeps the one it has), so the tracker at another address than before was
+/// unplugged and plugged back in meanwhile, or re-enumerated, however
+/// briefly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BusAddress {
+    /// The bus number.
+    pub bus: u8,
+    /// The device's address on that bus.
+    pub address: u8,
+}
+
 /// Is the Tobii plugged in right now? (Cheap check for the daemon watchdog.)
 #[must_use]
 pub fn is_device_present() -> bool {
-    UsbContext::new()
-        .map(|ctx| is_tobii_present(&ctx))
-        .unwrap_or(false)
+    find_device().is_some()
+}
+
+/// Where the Tobii is on the bus right now, if it is plugged in (without
+/// opening or claiming it; a cheap check for the daemon watchdog).
+#[must_use]
+pub fn find_device() -> Option<BusAddress> {
+    UsbContext::new().ok().and_then(|ctx| tobii_address(&ctx))
 }
 
 /// Is the Tobii on the bus right now (without opening/claiming it)?
 fn is_tobii_present(ctx: &UsbContext) -> bool {
+    tobii_address(ctx).is_some()
+}
+
+/// Where the Tobii is on the bus right now, if it is on it (without
+/// opening or claiming it).
+fn tobii_address(ctx: &UsbContext) -> Option<BusAddress> {
     ctx.devices()
-        .map(|devs| {
-            devs.iter().any(|d| {
-                d.device_descriptor()
-                    .map(|x| x.vendor_id() == VID && x.product_id() == PID)
-                    .unwrap_or(false)
-            })
+        .ok()?
+        .iter()
+        .find(|d| {
+            d.device_descriptor()
+                .is_ok_and(|x| x.vendor_id() == VID && x.product_id() == PID)
         })
-        .unwrap_or(false)
+        .map(|d| BusAddress {
+            bus: d.bus_number(),
+            address: d.address(),
+        })
 }
 
 /// A cold gaze start normally arms on the *second* fresh open (the first accepts
@@ -383,6 +480,25 @@ const _: () = assert!(
 /// How long the engine waits after a failed open before the next.
 const REOPEN_PAUSE: Duration = Duration::from_millis(700);
 
+/// How many times the engine opens the tracker again, [`REOPEN_PAUSE`]
+/// apart, while it may not open it ([`OpenRefusal::NoPermission`]), before
+/// it gives up. A tracker just plugged in (or re-enumerated) refuses for a
+/// moment even with the udev rule in place: its device node starts out
+/// root's, until udev applies the rule, while libusb already lists it. One
+/// more open covers that; a missing rule costs one [`REOPEN_PAUSE`] more.
+/// No USB reset comes in between: it would open the tracker first, which
+/// fails the same way, and it cannot fix a permission.
+const NO_PERMISSION_RETRIES: usize = 1;
+
+/// How many times the engine opens the tracker again, [`REOPEN_PAUSE`]
+/// apart, while another process holds its interface
+/// ([`OpenRefusal::InUse`]), before it gives up: about 1.4 s. That covers a
+/// `tobiid` handing the tracker over, one stopping as another starts; a
+/// holder that keeps it (a research command, a second daemon) is left to
+/// the owner of the engine, whose restarts back off (tobiid's watchdog).
+/// No USB reset comes in between, as for [`NO_PERMISSION_RETRIES`].
+const BUSY_RETRIES: usize = 2;
+
 /// What the engine does after an open failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterFailedOpen {
@@ -405,6 +521,9 @@ enum OpenFailure {
     /// The gaze stream armed, ran this long, then died (a [`StreamLost`]
     /// context).
     Lost(Duration),
+    /// The tracker is on the bus but may not be opened (see
+    /// [`OpenRefusal`]), which a reset cannot fix.
+    Refused(OpenRefusal),
     /// Anything else: no device, or an init that failed (a write timeout, …).
     Failed,
 }
@@ -413,12 +532,15 @@ impl OpenFailure {
     /// Classify the error an open failed with. The [`StreamLost`] tag is
     /// checked first, defensively: a failure after arming is a lost stream
     /// whatever its cause. No tagged chain holds a [`StreamStartupTimeout`]
-    /// today, which fails an open only before it arms.
+    /// today, which fails an open only before it arms, nor an
+    /// [`OpenRefusal`], which fails it before the init.
     fn of(e: &anyhow::Error) -> Self {
         if let Some(lost) = e.downcast_ref::<StreamLost>() {
             Self::Lost(lost.ran)
         } else if e.downcast_ref::<StreamStartupTimeout>().is_some() {
             Self::NotArmed
+        } else if let Some(refusal) = OpenRefusal::of(e) {
+            Self::Refused(refusal)
         } else {
             Self::Failed
         }
@@ -435,6 +557,14 @@ impl OpenFailure {
 /// [`MAX_REPLAY_ATTEMPTS`]. An open whose gaze stream ran for
 /// [`HEALTHY_STREAM`] ends the run, and its own loss starts none: the re-open
 /// that follows gets the whole budget, prime included, as a new engine would.
+///
+/// An open the tracker refuses ([`OpenFailure::Refused`]) is none of those
+/// failures and leaves their count and the prime alone: the engine gives up
+/// once the tracker has refused [`OpenRefusal::retries`] more opens in a row
+/// (either refusal counts toward the streak; the last one says how long it
+/// may be), without permission after [`NO_PERMISSION_RETRIES`], on an
+/// interface another process holds after [`BUSY_RETRIES`]. None gets a
+/// reset.
 #[derive(Debug, Default)]
 struct FailedOpens {
     /// Failures counted since the engine started or a stream last ran.
@@ -442,13 +572,24 @@ struct FailedOpens {
     /// An open accepted the init but did not arm (the prime) since the engine
     /// started or a stream last armed: the next such open is counted.
     prime_spent: bool,
+    /// Opens in a row the tracker refused.
+    refused_in_a_row: usize,
 }
 
 impl FailedOpens {
     /// Count an open that failed with `failure`, and say what comes next.
     #[must_use]
     fn record(&mut self, failure: OpenFailure) -> AfterFailedOpen {
+        let refused_before = std::mem::take(&mut self.refused_in_a_row);
         match failure {
+            OpenFailure::Refused(refusal) => {
+                self.refused_in_a_row = refused_before + 1;
+                return if self.refused_in_a_row > refusal.retries() {
+                    AfterFailedOpen::GiveUp
+                } else {
+                    AfterFailedOpen::Reopen
+                };
+            }
             OpenFailure::NotArmed if !self.prime_spent => {
                 self.prime_spent = true;
                 return AfterFailedOpen::ReopenPrimed;
@@ -477,6 +618,11 @@ impl FailedOpens {
     fn in_a_row(&self) -> usize {
         self.in_a_row
     }
+
+    /// Opens in a row the tracker refused.
+    fn refused_in_a_row(&self) -> usize {
+        self.refused_in_a_row
+    }
 }
 
 /// Own the device for the daemon engine and stream samples into `tx` until
@@ -489,8 +635,10 @@ impl FailedOpens {
 /// # Errors
 ///
 /// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
-/// row are counted, or at once when libusb cannot be initialised. A stop is
-/// not a failure, even one that cuts an open short.
+/// row are counted, or at once when libusb cannot be initialised. A tracker
+/// that may not be opened ends it sooner, with an [`OpenRefusal`] context
+/// saying why (see [`run_opens`]). A stop is not a failure, even one that
+/// cuts an open short.
 pub(crate) fn run_gaze_engine(
     shared: &Arc<Shared>,
     commands: &Receiver<QueuedCommand>,
@@ -533,13 +681,19 @@ pub(crate) fn run_gaze_engine(
 
 /// The engine's open loop: call `open` until an open returns `Ok` (a clean
 /// stop) or `stop` is set, waiting `pause` after each failed open. Every
-/// error is retried. [`FailedOpens`] counts the failures in a row by their
-/// [`OpenFailure`], which decides when `reset` runs (once
-/// [`RESET_AFTER_FAILURES`] are counted) and when to give up; the prime is
-/// not counted, and a failure whose [`StreamLost`] context says the stream
-/// ran for [`HEALTHY_STREAM`] ends the run instead of adding to it. With no
-/// `reset` (`TOBII_NO_RESET=1`) the escalation says it skipped the reset and
-/// the opens go on as they would after one.
+/// error but a refusal to open (below) is retried. [`FailedOpens`] counts
+/// the failures in a row by their [`OpenFailure`], which decides when
+/// `reset` runs (once [`RESET_AFTER_FAILURES`] are counted) and when to give
+/// up; the prime is not counted, and a failure whose [`StreamLost`] context
+/// says the stream ran for [`HEALTHY_STREAM`] ends the run instead of adding
+/// to it. With no `reset` (`TOBII_NO_RESET=1`) the escalation says it
+/// skipped the reset and the opens go on as they would after one.
+///
+/// A tracker that may not be opened ([`OpenRefusal`]) is not retried that
+/// way, since neither many more opens nor a reset fix it: the loop gives up
+/// after a few more opens in a row that it refuses, without permission
+/// after [`NO_PERMISSION_RETRIES`], on an interface another process holds
+/// after [`BUSY_RETRIES`], with no reset in between.
 ///
 /// A stop is not a failure: an open that fails once `stop` is set, as one
 /// whose arming wait the stop cut short does, ends the loop `Ok` and its
@@ -548,7 +702,8 @@ pub(crate) fn run_gaze_engine(
 /// # Errors
 ///
 /// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
-/// row are counted.
+/// row are counted, or once the tracker refused to be opened as above, then
+/// with the [`OpenRefusal`] as its context.
 fn run_opens(
     stop: &AtomicBool,
     mut open: impl FnMut() -> Result<()>,
@@ -591,12 +746,23 @@ fn run_opens(
         let failure = OpenFailure::of(&e);
         let after = failed.record(failure);
         reset_first = match after {
-            AfterFailedOpen::GiveUp => return Err(e),
+            AfterFailedOpen::GiveUp => {
+                return Err(match failure {
+                    OpenFailure::Refused(refusal) => e.context(refusal),
+                    _ => e,
+                });
+            }
             AfterFailedOpen::Reopen | AfterFailedOpen::ReopenPrimed => false,
             AfterFailedOpen::ResetAndReopen => true,
         };
         let in_a_row = failed.in_a_row();
         match failure {
+            OpenFailure::Refused(refusal) => warn!(
+                reason = %refusal,
+                refused_in_a_row = failed.refused_in_a_row(),
+                error = format_args!("{e:#}"),
+                "gaze: the tracker refused to open; re-opening"
+            ),
             OpenFailure::Lost(ran) => warn!(
                 ?ran,
                 in_a_row,
@@ -1939,7 +2105,8 @@ fn pump_streams(
 mod tests {
     use super::*;
     use AfterFailedOpen::{GiveUp, Reopen, ReopenPrimed, ResetAndReopen};
-    use OpenFailure::{Failed, Lost, NotArmed};
+    use OpenFailure::{Failed, Lost, NotArmed, Refused};
+    use OpenRefusal::{InUse, NoPermission};
     use Seen::{Between, Try};
     use Step::{Open, Reset};
     use std::cell::RefCell;
@@ -2422,6 +2589,139 @@ mod tests {
     }
 
     #[test]
+    fn an_open_without_permission_is_retried_once_without_a_reset_then_given_up() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(&mut failed, &[Refused(NoPermission); 2]),
+            [Reopen, GiveUp]
+        );
+        assert_eq!(NO_PERMISSION_RETRIES, 1);
+        assert_eq!(failed.in_a_row(), 0, "not counted as failed opens");
+
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(
+                &mut failed,
+                &[
+                    NotArmed,
+                    Failed,
+                    Refused(NoPermission),
+                    Failed,
+                    Refused(NoPermission),
+                    Refused(NoPermission),
+                ]
+            ),
+            [ReopenPrimed, Reopen, Reopen, ResetAndReopen, Reopen, GiveUp],
+            "another failure ends the streak; the refusal is not the reset's second failure"
+        );
+    }
+
+    #[test]
+    fn a_busy_interface_is_retried_twice_without_a_reset_then_given_up() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(&mut failed, &[Refused(InUse); 3]),
+            [Reopen, Reopen, GiveUp]
+        );
+        assert_eq!(BUSY_RETRIES, 2);
+        assert_eq!(failed.in_a_row(), 0, "not counted as failed opens");
+    }
+
+    #[test]
+    fn refusals_of_either_kind_in_a_row_make_one_streak() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(&mut failed, &[Refused(InUse), Refused(NoPermission)]),
+            [Reopen, GiveUp],
+            "the second refusal in a row, one past a missing permission's retry"
+        );
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(
+                &mut failed,
+                &[Refused(NoPermission), Refused(InUse), Refused(InUse)]
+            ),
+            [Reopen, Reopen, GiveUp],
+            "never more than the longest streak"
+        );
+    }
+
+    #[test]
+    fn a_busy_interface_leaves_the_failure_count_and_the_prime_alone() {
+        let mut failed = FailedOpens::default();
+        assert_eq!(
+            after_each(
+                &mut failed,
+                &[
+                    Refused(InUse),
+                    Refused(InUse),
+                    NotArmed,
+                    Refused(InUse),
+                    NotArmed,
+                    Refused(InUse),
+                    Refused(InUse),
+                    NotArmed,
+                ]
+            ),
+            [
+                Reopen,
+                Reopen,
+                ReopenPrimed,
+                Reopen,
+                Reopen,
+                Reopen,
+                Reopen,
+                ResetAndReopen
+            ],
+            "another failure ends a busy streak; the prime and the reset come as without it"
+        );
+    }
+
+    #[test]
+    fn an_open_refused_by_libusb_is_classified_by_its_error_in_the_open_step() {
+        let refused = |step: OpenStep, error: rusb::Error| {
+            Err::<(), _>(error).context(step).expect_err("refused")
+        };
+
+        let access = refused(OPEN_DEVICE, rusb::Error::Access);
+        assert_eq!(OpenRefusal::of(&access), Some(NoPermission));
+        assert_eq!(OpenFailure::of(&access), Refused(NoPermission));
+        assert_eq!(
+            format!("{access:#}"),
+            "failed to open Tobii device; try sudo: Access denied (insufficient permissions)",
+            "the message open_tobii always gave"
+        );
+        let busy = refused(CLAIM_INTERFACE, rusb::Error::Busy);
+        assert_eq!(OpenFailure::of(&busy), Refused(InUse));
+        assert_eq!(
+            OpenFailure::of(&busy.context("open 3")),
+            Refused(InUse),
+            "wrapped further"
+        );
+
+        // Other errors of those calls, and those errors anywhere else.
+        assert_eq!(
+            OpenFailure::of(&refused(OPEN_DEVICE, rusb::Error::NoDevice)),
+            Failed
+        );
+        assert_eq!(
+            OpenFailure::of(&refused(CLAIM_INTERFACE, rusb::Error::NotFound)),
+            Failed
+        );
+        assert_eq!(OpenFailure::of(&rusb::Error::Access.into()), Failed);
+        let control = Err::<(), _>(rusb::Error::Busy)
+            .context("control OUT 48")
+            .expect_err("control");
+        assert_eq!(OpenFailure::of(&control), Failed);
+        let armed_at = Instant::now();
+        let lost = after_arming(Err(access), armed_at).expect_err("lost");
+        assert!(
+            matches!(OpenFailure::of(&lost), Lost(_)),
+            "the lost tag wins"
+        );
+    }
+
+    #[test]
     fn a_failed_open_is_classified_by_its_lost_tag_then_its_cause() {
         let armed_at = Instant::now()
             .checked_sub(HEALTHY_STREAM)
@@ -2625,6 +2925,86 @@ mod tests {
         );
         assert_eq!(steps, [Open; 5], "no reset, nor an open in its place");
         assert_eq!(result.expect_err("gave up").to_string(), "open 5");
+    }
+
+    /// An open the tracker refused with `error` at `step`.
+    fn refused_at(step: OpenStep, error: rusb::Error) -> Result<()> {
+        Err(error).context(step)
+    }
+
+    #[test]
+    fn the_open_loop_gives_up_on_a_second_open_without_permission_and_resets_nothing() {
+        let (steps, result) = drive(vec![
+            refused_at(OPEN_DEVICE, rusb::Error::Access),
+            refused_at(OPEN_DEVICE, rusb::Error::Access),
+        ]);
+        assert_eq!(steps, [Open, Open], "no reset, no third open");
+        let e = result.expect_err("gave up");
+        assert_eq!(e.downcast_ref::<OpenRefusal>(), Some(&NoPermission));
+        assert_eq!(
+            format!("{e:#}"),
+            "no permission to open the tracker; check the udev rule (INSTALL §3) and that \
+             this user's session is the active one: \
+             failed to open Tobii device; try sudo: Access denied (insufficient permissions)"
+        );
+
+        // A tracker just plugged in, or back from the reset, refuses for a
+        // moment until udev applies the rule: the next open goes on as usual.
+        let (steps, result) = drive(vec![
+            refused_at(OPEN_DEVICE, rusb::Error::Access),
+            never_armed(),
+            Ok(()),
+        ]);
+        assert_eq!(steps, [Open; 3]);
+        assert!(result.is_ok(), "a clean stop");
+        let (steps, result) = drive(vec![
+            Err(anyhow::anyhow!("open 1")),
+            Err(anyhow::anyhow!("open 2")),
+            refused_at(OPEN_DEVICE, rusb::Error::Access),
+            Ok(()),
+        ]);
+        assert_eq!(steps, [Open, Open, Reset, Open, Open]);
+        assert!(result.is_ok(), "a clean stop");
+
+        // Past a run of failures that already reset the tracker.
+        let (steps, result) = drive(vec![
+            Err(anyhow::anyhow!("open 1")),
+            Err(anyhow::anyhow!("open 2")),
+            refused_at(OPEN_DEVICE, rusb::Error::Access),
+            refused_at(OPEN_DEVICE, rusb::Error::Access),
+        ]);
+        assert_eq!(steps, [Open, Open, Reset, Open, Open]);
+        assert_eq!(
+            result.expect_err("gave up").downcast_ref::<OpenRefusal>(),
+            Some(&NoPermission)
+        );
+    }
+
+    #[test]
+    fn the_open_loop_tries_a_busy_interface_three_times_without_a_reset() {
+        let (steps, result) = drive(
+            (0..3)
+                .map(|_| refused_at(CLAIM_INTERFACE, rusb::Error::Busy))
+                .collect(),
+        );
+        assert_eq!(steps, [Open; 3]);
+        let e = result.expect_err("gave up");
+        assert_eq!(e.downcast_ref::<OpenRefusal>(), Some(&InUse));
+        assert_eq!(
+            format!("{e:#}"),
+            "the tracker is in use by another process: failed to claim interface 0: \
+             Resource busy"
+        );
+
+        // Released while the loop retries: the next open goes on as usual.
+        let (steps, result) = drive(vec![
+            refused_at(CLAIM_INTERFACE, rusb::Error::Busy),
+            refused_at(CLAIM_INTERFACE, rusb::Error::Busy),
+            never_armed(),
+            Ok(()),
+        ]);
+        assert_eq!(steps, [Open; 4]);
+        assert!(result.is_ok(), "a clean stop");
     }
 
     #[test]

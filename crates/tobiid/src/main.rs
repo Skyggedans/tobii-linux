@@ -11,6 +11,7 @@ mod frames;
 mod name;
 mod pause;
 mod requests;
+mod restart;
 
 fn main() {
     tobii_log::init();

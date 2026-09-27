@@ -31,9 +31,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tobii_ipc::geometry::DisplayArea;
 use tobii_ipc::request::decode_request;
@@ -42,11 +42,13 @@ use tobii_ipc::{
     encode_subscribed, read_frame, write_frame,
 };
 use tobii_proto::facts::{DeviceFacts, DeviceNotification};
+use tobii_usb::device::{BusAddress, OpenRefusal};
 use tobii_usb::engine::{Engine, PresenceSample, Sample};
 
 use crate::calibration::Calibration;
 use crate::device::DeviceCommands;
 use crate::frames::{presence_frame, push_sample_frames};
+use crate::restart::Backoff;
 
 /// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
 static RECENTER_SIGNAL: AtomicBool = AtomicBool::new(false);
@@ -192,6 +194,14 @@ pub(crate) struct State {
     /// The log said the tracker is off the bus since an engine last
     /// started: it says so once per absence, not at every request.
     tracker_absence_logged: bool,
+    /// The engine running, or the last one, got the tracker ready: its
+    /// init went through (`DeviceReady`) or a gaze frame came.
+    engine_armed: bool,
+    /// When the engine running, or the last one, started.
+    engine_started_at: Option<Instant>,
+    /// When the watchdog may start an engine again after engines that
+    /// ended before the tracker was ready (see [`crate::restart`]).
+    restarts: Backoff,
     /// Stand-in for the engine's command queue in tests.
     #[cfg(test)]
     pub(crate) fake_device: Option<Arc<dyn DeviceCommands>>,
@@ -209,6 +219,15 @@ pub(crate) struct State {
     /// so.
     #[cfg(test)]
     pub(crate) fake_present: bool,
+    /// The address of that tracker on bus 1, in tests: another one is a
+    /// re-plug.
+    #[cfg(test)]
+    pub(crate) fake_address: u8,
+    /// Stand-in for an engine that has ended, in tests, where none really
+    /// starts: what [`Engine::finish`] says of it. It is dropped as a dead
+    /// engine is, and its end noted (see [`State::drop_engine_unless_alive`]).
+    #[cfg(test)]
+    pub(crate) dead_engine: Option<Option<OpenRefusal>>,
     /// How many times the bus was looked at for the tracker, in tests.
     #[cfg(test)]
     pub(crate) presence_probes: u32,
@@ -242,6 +261,9 @@ impl State {
             engine_losses: 0,
             device_inits: 0,
             tracker_absence_logged: false,
+            engine_armed: false,
+            engine_started_at: None,
+            restarts: Backoff::default(),
             #[cfg(test)]
             fake_device: None,
             #[cfg(test)]
@@ -250,6 +272,10 @@ impl State {
             lose_engine_on_fetch: false,
             #[cfg(test)]
             fake_present: false,
+            #[cfg(test)]
+            fake_address: 1,
+            #[cfg(test)]
+            dead_engine: None,
             #[cfg(test)]
             presence_probes: 0,
             #[cfg(test)]
@@ -279,16 +305,20 @@ impl State {
                 .any(|c| c.streams != 0 || c.holds_device)
     }
 
-    /// Stop the engine once nobody needs it, unless pre-warm is configured.
-    /// Also drops a dead engine. Starting another, for pre-warm too, is left
-    /// to the watchdog, which looks for the tracker without the state lock
-    /// (the pump runs this under it).
+    /// Stop the engine once nobody needs it, unless pre-warm is configured,
+    /// and end the watchdog's backoff then (see [`crate::restart`]): it
+    /// restarts no engine that is not wanted, and a client that wants one
+    /// later starts it itself. Also drops a dead engine. Starting another,
+    /// for pre-warm too, is left to the watchdog, which looks for the
+    /// tracker without the state lock (the pump runs this under it).
     fn reconcile(&mut self) {
-        if self.engine.is_some() {
-            self.drop_engine_unless_alive();
-        }
         if !self.is_engine_wanted() {
             self.drop_engine();
+            if self.restarts.reset() {
+                info!("no engine is wanted any more; the restart backoff is over");
+            }
+        } else if self.has_engine() {
+            self.drop_engine_unless_alive(false);
         }
         self.sync_wanted();
     }
@@ -302,21 +332,44 @@ impl State {
     /// first init writes the display area the session started from; a
     /// session whose stop saves is left to that stop, and the init writes
     /// the area it saves (see [`crate::calibration::on_engine_lost`]).
+    ///
+    /// The watchdog's backoff (see [`crate::restart`]) does not hold this
+    /// start back: a client's subscription or request gets an engine at
+    /// once even while the watchdog waits. An engine the tracker refuses
+    /// gives up within about a second (0.7 s without permission, 1.4 s on
+    /// an interface another process holds), and a tracker fixed meanwhile
+    /// (the udev rule installed, the other process gone) is taken at once
+    /// rather than after up to a minute. An engine started so that ends
+    /// before the tracker is ready adds a step to the backoff all the same.
     pub(crate) fn ensure_engine(&mut self, tracker_on_bus: bool) {
-        if !self.drop_engine_unless_alive() {
+        if !self.drop_engine_unless_alive(tracker_on_bus) {
             return;
         }
         if tracker_on_bus {
             self.start_engine();
-        } else if !std::mem::replace(&mut self.tracker_absence_logged, true) {
-            info!("no tracker on the bus; the engine starts once it is plugged in");
+        } else {
+            // Only a look at the bus says `false`; one that says `true`
+            // starts an engine, whose end forgets where the tracker was.
+            self.restarts.saw_bus(None);
+            if !std::mem::replace(&mut self.tracker_absence_logged, true) {
+                info!("no tracker on the bus; the engine starts once it is plugged in");
+            }
         }
     }
 
-    /// Start an engine. In tests none starts, whatever the bus says: the
-    /// display area it would start with is recorded instead.
+    /// Start an engine now (see [`Self::start_engine_at`]).
     fn start_engine(&mut self) {
+        self.start_engine_at(Instant::now());
+    }
+
+    /// Start an engine at `now`, from when the watchdog's backoff counts
+    /// should it end before the tracker is ready. In tests none starts,
+    /// whatever the bus says: the display area it would start with is
+    /// recorded instead.
+    fn start_engine_at(&mut self, now: Instant) {
         self.tracker_absence_logged = false;
+        self.engine_armed = false;
+        self.engine_started_at = Some(now);
         #[cfg(not(test))]
         {
             self.engine = Some(Engine::start_with(self.display_override));
@@ -338,16 +391,81 @@ impl State {
         self.engine.as_ref().is_some_and(Engine::is_alive)
     }
 
+    /// Whether there is an engine, running or dead but not dropped yet. In
+    /// tests, the stand-in for a dead one counts.
+    fn has_engine(&self) -> bool {
+        #[cfg(test)]
+        if self.dead_engine.is_some() {
+            return true;
+        }
+        self.engine.is_some()
+    }
+
     /// Drop the engine unless it is running (see [`Self::drop_engine`]).
     /// Whether none runs now: the step [`Self::ensure_engine`] takes before
     /// it starts one, and the one [`Self::reconcile`] and the watchdog take
-    /// for a dead engine.
-    fn drop_engine_unless_alive(&mut self) -> bool {
+    /// for a dead engine, whose end they note (see
+    /// [`Self::note_engine_end`]); `restart_now` if the caller starts
+    /// another at once.
+    fn drop_engine_unless_alive(&mut self, restart_now: bool) -> bool {
         if self.engine.as_ref().is_some_and(Engine::is_alive) {
             return false;
         }
+        if let Some(refusal) = self.finish_engine() {
+            self.note_engine_end(refusal, Instant::now(), restart_now);
+        }
         self.drop_engine();
         true
+    }
+
+    /// Take the engine, which has ended, and say why it gave up if the
+    /// tracker refused to be opened (see [`Engine::finish`]); `None` without
+    /// one. In tests, the stand-in for a dead engine is taken.
+    fn finish_engine(&mut self) -> Option<Option<OpenRefusal>> {
+        #[cfg(test)]
+        if let Some(end) = self.dead_engine.take() {
+            return Some(end);
+        }
+        self.engine.take().map(Engine::finish)
+    }
+
+    /// The engine ended by itself, found at `now`, having given up on the
+    /// tracker for `refusal` if it refused to be opened. One that never got
+    /// the tracker ready backs the watchdog off a step (see
+    /// [`crate::restart`]), logged once with the reason, and when the
+    /// watchdog may start the next unless `restart_now` (the caller starts
+    /// one at once); one that did had the backoff reset when it got it
+    /// ready (see [`Self::note_engine_armed`]).
+    fn note_engine_end(&mut self, refusal: Option<OpenRefusal>, now: Instant, restart_now: bool) {
+        let started = self.engine_started_at.take().unwrap_or(now);
+        if std::mem::take(&mut self.engine_armed) {
+            return;
+        }
+        self.restarts.engine_failed(started);
+        let in_a_row = self.restarts.in_a_row();
+        let reason = refusal.as_ref().map(tracing::field::display);
+        if restart_now {
+            warn!(
+                reason,
+                in_a_row, "engine ended before the tracker was ready; a client starts another"
+            );
+        } else {
+            let retry_in = self.restarts.wait_left(now).unwrap_or_default();
+            warn!(
+                reason,
+                in_a_row,
+                retry_in = %format_args!("{retry_in:.1?}"),
+                "engine ended before the tracker was ready; backing off its restarts"
+            );
+        }
+    }
+
+    /// The engine got the tracker ready: its init went through, or a gaze
+    /// frame came. The watchdog's backoff starts afresh.
+    fn note_engine_armed(&mut self) {
+        if !std::mem::replace(&mut self.engine_armed, true) && self.restarts.reset() {
+            info!("the tracker is ready; the restart backoff is over");
+        }
     }
 
     /// Drop the engine, with what lasts only as long as it runs: a started
@@ -356,6 +474,10 @@ impl State {
     /// [`crate::pause::on_engine_lost`]) and the clock pair.
     pub(crate) fn drop_engine(&mut self) {
         self.engine = None;
+        #[cfg(test)]
+        {
+            self.dead_engine = None;
+        }
         self.clock = None;
         crate::calibration::on_engine_lost(self);
         crate::pause::on_engine_lost(self);
@@ -464,6 +586,7 @@ impl State {
     pub(crate) fn observe(&mut self, sample: &Sample) {
         match sample {
             Sample::DeviceReady(facts) => {
+                self.note_engine_armed();
                 let mut facts = (**facts).clone();
                 keep_unreported(&mut facts, self.facts.as_deref());
                 if let Some(area) = self.display_override {
@@ -481,9 +604,12 @@ impl State {
                 crate::pause::on_device_ready(self);
             }
             Sample::Presence(p) if !self.paused => self.last_presence = Some(*p),
-            Sample::Gaze(g) if !self.paused => {
-                let device = i64::try_from(g.frame.device_ts_us).unwrap_or(i64::MAX);
-                self.note_clock(device, g.host_rx_us);
+            Sample::Gaze(g) => {
+                self.note_engine_armed();
+                if !self.paused {
+                    let device = i64::try_from(g.frame.device_ts_us).unwrap_or(i64::MAX);
+                    self.note_clock(device, g.host_rx_us);
+                }
             }
             Sample::Notification(DeviceNotification::DisplayAreaChanged(area)) => {
                 if let Some(facts) = &self.facts {
@@ -557,22 +683,30 @@ fn keep_unreported(facts: &mut DeviceFacts, previous: Option<&DeviceFacts>) {
     }
 }
 
-/// Whether the tracker is on the bus (see
-/// [`tobii_usb::device::is_device_present`]), for a caller that does not
-/// hold the state lock: libusb scans the bus (a few milliseconds) without
-/// it.
-#[cfg(not(test))]
-pub(crate) fn is_tracker_present(_state: &Mutex<State>) -> bool {
-    tobii_usb::device::is_device_present()
+/// Whether the tracker is on the bus (see [`find_tracker`]), for a caller
+/// that does not hold the state lock.
+pub(crate) fn is_tracker_present(state: &Mutex<State>) -> bool {
+    find_tracker(state).is_some()
 }
 
-/// Whether the tracker is on the bus: in tests, what the state's stand-in
+/// Where the tracker is on the bus, if on it (see
+/// [`tobii_usb::device::find_device`]), for a caller that does not hold the
+/// state lock: libusb scans the bus (a few milliseconds) without it.
+#[cfg(not(test))]
+fn find_tracker(_state: &Mutex<State>) -> Option<BusAddress> {
+    tobii_usb::device::find_device()
+}
+
+/// Where the tracker is on the bus: in tests, what the state's stand-in
 /// says, counted.
 #[cfg(test)]
-pub(crate) fn is_tracker_present(state: &Mutex<State>) -> bool {
+fn find_tracker(state: &Mutex<State>) -> Option<BusAddress> {
     let mut st = lock_state(state);
     st.presence_probes += 1;
-    st.fake_present
+    st.fake_present.then_some(BusAddress {
+        bus: 1,
+        address: st.fake_address,
+    })
 }
 
 /// Whether the tracker is on the bus, for [`State::ensure_engine`] and
@@ -774,7 +908,8 @@ pub fn run() -> Result<()> {
 
     // Watchdog: if the device thread died (a cold start that exhausted its
     // internal retries, an unplug, etc.), or none was started while the
-    // tracker was unplugged, but it's still wanted, restart it.
+    // tracker was unplugged, but it's still wanted, restart it, backing off
+    // while engines end before the tracker is ready (see `restart`).
     {
         let state = Arc::clone(&state);
         thread::spawn(move || {
@@ -845,23 +980,46 @@ pub fn run() -> Result<()> {
 /// engine is wanted, so that nothing spins (reloading the model) on an
 /// unplugged tracker, and once a pass, without the state lock.
 fn watch_engine(state: &Mutex<State>) {
+    watch_engine_at(state, Instant::now());
+}
+
+/// [`watch_engine`] at `now`: an engine is started only once the backoff
+/// after engines that ended before the tracker was ready has passed (see
+/// [`crate::restart`]), or at once when the tracker was plugged back in
+/// (another address than the last pass found, or back after a pass found
+/// it gone), which starts the backoff afresh.
+fn watch_engine_at(state: &Mutex<State>, now: Instant) {
     let wanted = {
         let mut st = lock_state(state);
         // Dropped even while unplugged, so that clients hear of it.
-        if st.engine.is_some() {
-            st.drop_engine_unless_alive();
+        if st.has_engine() {
+            st.drop_engine_unless_alive(false);
         }
-        st.engine.is_none() && st.is_engine_wanted()
+        !st.has_engine() && st.is_engine_wanted()
     };
-    if !wanted || !is_tracker_present(state) {
+    if !wanted {
         return;
     }
+    let found = find_tracker(state);
     let mut st = lock_state(state);
-    // A request may have started one meanwhile.
-    if st.engine.is_none() && st.is_engine_wanted() {
-        warn!("engine not running but wanted; restarting");
-        st.start_engine();
+    if st.restarts.saw_bus(found) {
+        info!("the tracker was plugged back in; the restart backoff is over");
     }
+    // A request may have started one meanwhile.
+    if found.is_none() || st.has_engine() || !st.is_engine_wanted() {
+        return;
+    }
+    if let Some(wait) = st.restarts.wait_left(now) {
+        // The step was logged once, at the engine's end (`note_engine_end`).
+        debug!(?wait, "engine wanted; backing off before restarting it");
+        return;
+    }
+    match st.restarts.in_a_row() {
+        0 => warn!("engine not running but wanted; restarting"),
+        // Warned of at the engine's end already.
+        in_a_row => info!(in_a_row, "restarting the engine after backing off"),
+    }
+    st.start_engine_at(now);
 }
 
 /// How long the pump may sit in a write to a client, with `state` locked,
@@ -1331,6 +1489,248 @@ pub(crate) mod tests {
         watch_engine(&state);
 
         assert_eq!(lock_state(&state).engines_started.len(), 1);
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// A pre-warmed daemon (it wants an engine with no client) whose
+    /// tracker is on the bus.
+    fn pre_warmed_with_tracker() -> Mutex<State> {
+        let mut st = State::new(true);
+        st.fake_present = true;
+        Mutex::new(st)
+    }
+
+    fn engines_started(state: &Mutex<State>) -> usize {
+        lock_state(state).engines_started.len()
+    }
+
+    fn in_a_row(state: &Mutex<State>) -> u32 {
+        lock_state(state).restarts.in_a_row()
+    }
+
+    /// The engine last started ends by itself, giving up on the tracker for
+    /// `refusal` if it refused to be opened: the next look finds it dead.
+    fn end_engine(state: &Mutex<State>, refusal: Option<OpenRefusal>) {
+        lock_state(state).dead_engine = Some(refusal);
+    }
+
+    #[test]
+    fn engines_that_end_before_the_tracker_is_ready_space_the_watchdogs_starts_out() {
+        let state = pre_warmed_with_tracker();
+        let t0 = Instant::now();
+        watch_engine_at(&state, t0);
+        assert_eq!(engines_started(&state), 1);
+
+        // It may not open the tracker: the next pass, 3 s after it started,
+        // drops it and starts another.
+        end_engine(&state, Some(OpenRefusal::NoPermission));
+        watch_engine_at(&state, t0 + 3 * SECOND);
+        assert_eq!(engines_started(&state), 2);
+        assert_eq!(in_a_row(&state), 1);
+
+        // That one ends the same way: the next starts 6 s after it did.
+        end_engine(&state, Some(OpenRefusal::NoPermission));
+        watch_engine_at(&state, t0 + 6 * SECOND);
+        assert_eq!(engines_started(&state), 2, "dropped, not replaced");
+        watch_engine_at(&state, t0 + 8 * SECOND);
+        assert_eq!(engines_started(&state), 2);
+        watch_engine_at(&state, t0 + 9 * SECOND);
+        assert_eq!(engines_started(&state), 3);
+
+        // One that stopped without a refusal counts the same.
+        end_engine(&state, None);
+        watch_engine_at(&state, t0 + 20 * SECOND);
+        assert_eq!(engines_started(&state), 3);
+        watch_engine_at(&state, t0 + 21 * SECOND);
+        assert_eq!(engines_started(&state), 4);
+        assert_eq!(in_a_row(&state), 3);
+    }
+
+    #[test]
+    fn an_engine_that_got_the_tracker_ready_leaves_no_backoff() {
+        let state = pre_warmed_with_tracker();
+        let t0 = Instant::now();
+        watch_engine_at(&state, t0);
+        end_engine(&state, Some(OpenRefusal::InUse));
+        watch_engine_at(&state, t0 + 3 * SECOND);
+        assert_eq!(in_a_row(&state), 1);
+
+        // The next engine's init goes through, then it ends.
+        lock_state(&state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+        assert_eq!(in_a_row(&state), 0, "reset as it got ready");
+        end_engine(&state, None);
+        watch_engine_at(&state, t0 + 4 * SECOND);
+
+        assert_eq!(engines_started(&state), 3, "restarted at once");
+        assert_eq!(in_a_row(&state), 0);
+    }
+
+    #[test]
+    fn a_gaze_frame_starts_the_backoff_afresh() {
+        let state = pre_warmed_with_tracker();
+        let t0 = Instant::now();
+        watch_engine_at(&state, t0);
+        end_engine(&state, None);
+        watch_engine_at(&state, t0 + 3 * SECOND);
+        {
+            let mut st = lock_state(&state);
+            st.paused = true;
+            let frame = tobii_proto::gaze83::GazeFrame::default();
+            st.observe(&Sample::Gaze(Box::new(tobii_usb::engine::GazeSample::new(
+                frame, 100, 90,
+            ))));
+            assert_eq!(st.restarts.in_a_row(), 0, "even while paused");
+        }
+        end_engine(&state, None);
+
+        watch_engine_at(&state, t0 + 4 * SECOND);
+
+        assert_eq!(engines_started(&state), 3);
+    }
+
+    #[test]
+    fn an_armed_engine_dropped_as_unwanted_does_not_hide_the_next_ones_failure() {
+        let state = Mutex::new(state_with_client(1));
+        lock_state(&state).fake_present = true;
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        lock_state(&state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+        // The client unsubscribes: the armed engine stops.
+        handle_subscribe(&state, 1, 0);
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        assert_eq!(engines_started(&state), 2);
+
+        end_engine(&state, Some(OpenRefusal::NoPermission));
+        watch_engine_at(&state, Instant::now());
+
+        assert_eq!(in_a_row(&state), 1);
+    }
+
+    #[test]
+    fn a_dead_engine_a_request_finds_adds_a_step_and_is_replaced_at_once() {
+        let state = Mutex::new(state_with_client(1));
+        lock_state(&state).fake_present = true;
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        end_engine(&state, Some(OpenRefusal::InUse));
+
+        let _ = lock_state(&state).device_for(1, true);
+
+        assert_eq!(engines_started(&state), 2);
+        assert_eq!(in_a_row(&state), 1);
+        assert!(lock_state(&state).dead_engine.is_none(), "dropped");
+    }
+
+    #[test]
+    fn a_dead_engine_found_as_another_client_leaves_adds_a_step() {
+        let state = Mutex::new(state_with_client(1));
+        {
+            let mut st = lock_state(&state);
+            let (out, _peer) = UnixStream::pair().expect("socket pair");
+            st.clients.push(Client::new(2, out));
+            st.fake_present = true;
+        }
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        handle_subscribe(&state, 2, STREAM_PRESENCE);
+        end_engine(&state, Some(OpenRefusal::InUse));
+        let started = engines_started(&state);
+
+        handle_subscribe(&state, 2, 0);
+
+        let st = lock_state(&state);
+        assert!(st.dead_engine.is_none(), "dropped");
+        assert_eq!(st.restarts.in_a_row(), 1);
+        assert_eq!(st.engines_started.len(), started, "left to the watchdog");
+    }
+
+    #[test]
+    fn no_engine_wanted_any_more_ends_the_backoff() {
+        let state = Mutex::new(state_with_client(1));
+        lock_state(&state).fake_present = true;
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            let _ = lock_state(&state).restarts.engine_failed(t0);
+        }
+        end_engine(&state, Some(OpenRefusal::NoPermission));
+
+        // The last client leaves.
+        handle_subscribe(&state, 1, 0);
+
+        let st = lock_state(&state);
+        assert!(st.dead_engine.is_none(), "dropped");
+        assert_eq!(st.restarts.in_a_row(), 0);
+        assert_eq!(st.restarts.wait_left(t0), None);
+    }
+
+    #[test]
+    fn the_tracker_back_on_the_bus_restarts_the_engine_without_the_backoff() {
+        let state = pre_warmed_with_tracker();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            let _ = lock_state(&state).restarts.engine_failed(t0);
+        }
+        watch_engine_at(&state, t0);
+        assert_eq!(engines_started(&state), 0, "held off for 12 s");
+
+        lock_state(&state).fake_present = false;
+        watch_engine_at(&state, t0 + SECOND);
+        lock_state(&state).fake_present = true;
+        watch_engine_at(&state, t0 + 2 * SECOND);
+
+        assert_eq!(engines_started(&state), 1);
+        assert_eq!(in_a_row(&state), 0);
+    }
+
+    #[test]
+    fn a_replug_between_two_passes_restarts_the_engine_without_the_backoff() {
+        let state = pre_warmed_with_tracker();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            let _ = lock_state(&state).restarts.engine_failed(t0);
+        }
+        watch_engine_at(&state, t0);
+        watch_engine_at(&state, t0 + SECOND);
+        assert_eq!(engines_started(&state), 0, "held off for 12 s");
+
+        // Unplugged and plugged back in within a pass: another address.
+        lock_state(&state).fake_address = 2;
+        watch_engine_at(&state, t0 + 2 * SECOND);
+
+        assert_eq!(engines_started(&state), 1);
+        assert_eq!(in_a_row(&state), 0);
+    }
+
+    #[test]
+    fn a_request_that_found_the_tracker_gone_counts_as_an_absence() {
+        let state = Mutex::new(state_with_client(1));
+        let t0 = Instant::now();
+        let _ = lock_state(&state).restarts.engine_failed(t0);
+        // The request finds no tracker: its client holds the device.
+        assert!(lock_state(&state).device_for(1, false).is_none());
+
+        lock_state(&state).fake_present = true;
+        watch_engine_at(&state, t0);
+
+        assert_eq!(engines_started(&state), 1, "plugged back in");
+    }
+
+    #[test]
+    fn a_client_gets_an_engine_at_once_while_the_watchdog_backs_off() {
+        let state = Mutex::new(state_with_client(1));
+        let t0 = Instant::now();
+        {
+            let mut st = lock_state(&state);
+            st.fake_present = true;
+            let _ = st.restarts.engine_failed(t0);
+        }
+
+        handle_subscribe(&state, 1, STREAM_PRESENCE);
+        assert_eq!(engines_started(&state), 1, "a subscription");
+        let _ = lock_state(&state).device_for(1, true);
+        assert_eq!(engines_started(&state), 2, "a request");
+
+        watch_engine_at(&state, t0);
+        assert_eq!(engines_started(&state), 2, "not the watchdog");
     }
 
     #[test]

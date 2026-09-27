@@ -74,7 +74,10 @@ const TIMESYNC_POLL: Duration = Duration::from_millis(5);
 /// How long a TIMESYNC lets no engine run before it looks for the tracker
 /// on the bus: the watchdog restarts an engine lost while the tracker is
 /// still there, and a re-plug or a re-enumeration takes the tracker off the
-/// bus for a moment.
+/// bus for a moment. After engines that ended before the tracker was ready
+/// (it refuses to be opened, say) the watchdog backs off for up to a minute
+/// (see [`crate::restart`]), so that a TIMESYNC may wait out its whole
+/// deadline and end `TIMED_OUT`.
 #[cfg(not(test))]
 const ENGINE_LOST_GRACE: Duration = Duration::from_secs(1);
 #[cfg(test)]
@@ -225,8 +228,8 @@ fn timesync(state: &Mutex<State>, client: u64) -> Reply {
             lost_since = None;
         } else if lost_since.get_or_insert_with(Instant::now).elapsed() >= ENGINE_LOST_GRACE {
             // The watchdog restarts an engine only for a tracker on the
-            // bus; the request does not start one itself. The bus is
-            // scanned without the state lock.
+            // bus, and only once its backoff allows; the request does not
+            // start one itself. The bus is scanned without the state lock.
             if !is_tracker_present(state) {
                 return Reply::err(status::CONNECTION_FAILED);
             }

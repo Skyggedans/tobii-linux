@@ -636,7 +636,16 @@ gaze has no rest pose.)
   failure: the tracker arms only on the open after it (a firmware quirk).
   After two failures in a row the tracker is USB-reset, and after five the
   engine stops; the daemon starts a new one if a client still needs the
-  tracker (or pre-warm is on) and it is plugged in.
+  tracker (or pre-warm is on) and it is plugged in. An engine that stops
+  before the tracker was ever ready (no init went through) is replaced no
+  sooner than 3 s after it started, the next one that does the same 6 s
+  after it started, then 12, 24, 48 s and at most once a minute (the daemon
+  checks every 3 s); the journal says so once per step, with the reason
+  when there is one. A tracker ready again, a re-plug (the daemon finds the
+  tracker at a new USB address, or back after it found it gone), no client
+  wanting the tracker any more, or a daemon restart ends the backoff, and a
+  client that subscribes or makes a request gets an engine at once whatever
+  the backoff.
 - **A tracker starting its sensor is waited out.** For about 3.6 s after it
   starts its sensor (on a cold start, or in the open after a USB reset) the
   tracker takes no commands, which lands inside the init's calibration
@@ -660,8 +669,35 @@ gaze has no rest pose.)
   still has the previous code/units. Restart it (§5).
 - **"Rotations slide."** Tune `TOBII_PIVOT_DOWN` / `TOBII_PIVOT_BACK` (§7).
 - **Tracking after logout.** User services stop at logout unless you enable
-  lingering: `loginctl enable-linger $USER`.
-- **Permission denied on the device.** Re-check §3 (udev rule + re-plug).
+  lingering: `loginctl enable-linger $USER`. The shipped udev rule grants
+  the tracker through `uaccess`, to the user of the active local session
+  only: after logout the daemon keeps a tracker it has open, but a re-open
+  (a stall, a re-plug) is refused (`no permission …`, below) until you log
+  back in. Tracking that must survive that needs a rule granting the device
+  to a group you are in instead.
+- **Permission denied on the device.** The journal says `no permission to
+  open the tracker; check the udev rule (INSTALL §3) and that this user's
+  session is the active one`: the engine tries once more 0.7 s later (a
+  tracker just plugged in refuses for a moment, until udev applies the
+  rule), then stops, without a USB reset (it cannot fix a permission), and
+  the daemon retries as above. Re-check §3 (udev rule, then `udevadm
+  trigger` or a re-plug), and that your session is the active one on the
+  seat (not another user's, not an SSH-only login): `uaccess` grants the
+  device to that session's user alone. The tracker is taken at the next
+  retry, or sooner: within 3 s of a re-plug, when a client next subscribes
+  or asks for something (reconnect the application), or on
+  `systemctl --user restart tobiid`. While the tracker still refuses,
+  requests that need it live wait out their timeouts (a clock pair 25 s,
+  ending `TOBII_ERROR_TIMED_OUT`).
+- **"The tracker is in use by another process".** Something else has
+  claimed the tracker's interface 0: usually a second `tobiid` (one started
+  by hand while the service runs: `pgrep -a tobiid`), or a
+  `tobii5-init-replay` command that opens the tracker (the replay, run
+  without a subcommand, `track`, `camera`, `image83`, `probe`, …). The
+  engine tries twice more, 0.7 s apart, in case it is a daemon handing
+  over, then stops, and the daemon retries as above; stop the other process
+  and the tracker is taken at the next retry, or at once when a client next
+  subscribes or asks for something.
 - **Checking the daemon end to end.** `target/release/tobii5-init-replay
   ipc-probe` asks the running daemon for everything (device info, track box,
   mounting, display area, stream types, hardware configuration, device name,
