@@ -177,10 +177,10 @@ fn resume(state: &Mutex<State>, client: u64) -> Reply {
     reply
 }
 
-/// `client` went away: if its pause is in effect, resume the device. Keyed
-/// on the holder rather than the client list, so it works after the pump has
-/// dropped the client too. Only the running engine is asked; none is
-/// started for this.
+/// `client` went away: if its pause is in effect, resume the device. Its
+/// reader calls this before it unlists the client, whether or not the pump
+/// has hung up on it, which only leaves it out of the notification. Only
+/// the running engine is asked; none is started for this.
 pub(crate) fn release(state: &Mutex<State>, client: u64) {
     // No request of the client's runs any more (its reader waits for its
     // request worker before calling this), so the holder cannot become
@@ -634,15 +634,26 @@ mod tests {
         assert_eq!(hint(&s), Some(false));
     }
 
+    /// A holder the pump hung up on is resumed for all the same, and told
+    /// nothing even as a notification subscriber.
     #[test]
-    fn the_holder_is_resumed_for_after_the_pump_dropped_it() {
+    fn a_holder_the_pump_hung_up_on_is_resumed_for_and_told_nothing() {
         let s = paused_by_2();
-        lock_state(&s.state).clients.retain(|c| c.id != 2);
+        {
+            let mut st = lock_state(&s.state);
+            st.clients[1].streams = STREAM_NOTIFICATIONS;
+            st.clients[1].hang_up();
+        }
 
         release(&s.state, 2);
 
         assert_eq!(sent(&s), [(cmd::DEVICE_PAUSE, device_pause_payload(false))]);
         assert_eq!(is_paused(&s), Reply::ok(vec![0]));
+        assert_eq!(notified(&s, 1), [true, false]);
+        assert!(
+            outbox(&lock_state(&s.state), 2).is_empty(),
+            "hung up on: told nothing"
+        );
     }
 
     #[test]

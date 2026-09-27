@@ -80,10 +80,57 @@ pub(crate) struct Client {
     /// Made a request: keep the device up while it is connected, as an open
     /// `tobii_device_t` does.
     pub(crate) holds_device: bool,
+    /// The pump found the connection dead and hung up on it (see
+    /// [`Self::hang_up`]): nothing more is written or queued for it.
+    hung_up: bool,
+}
+
+impl Client {
+    /// Client `id`, connected over `out`, as the accept loop registers it.
+    fn new(id: u64, out: UnixStream) -> Self {
+        Self {
+            id,
+            streams: 0,
+            out,
+            outbox: VecDeque::new(),
+            holds_device: false,
+            hung_up: false,
+        }
+    }
+
+    /// Stop serving a connection a write failed on: shut its socket down,
+    /// which ends its reader's reads once it has read what the client sent,
+    /// even if the peer keeps the socket open without reading, and drop
+    /// what waits in its outbox. The client stays listed, with the streams
+    /// and the device it holds: its reader cleans up after it once its
+    /// requests have run (see [`client_reader`]).
+    pub(crate) fn hang_up(&mut self) {
+        // Nothing to do if it fails: the socket is being given up on.
+        let _ = self.out.shutdown(Shutdown::Both);
+        self.outbox = VecDeque::new();
+        self.hung_up = true;
+    }
+
+    /// Write the outbox, then those of `frames` (bodies tagged with the
+    /// stream they carry) this client subscribes to. False once a write
+    /// fails: what is left is not written.
+    fn write_out(&mut self, frames: &[(u32, Vec<u8>)]) -> bool {
+        while let Some(body) = self.outbox.pop_front() {
+            if write_frame(&mut self.out, &body).is_err() {
+                return false;
+            }
+        }
+        frames
+            .iter()
+            .filter(|(stream, _)| self.streams & stream != 0)
+            .all(|(_, body)| write_frame(&mut self.out, body).is_ok())
+    }
 }
 
 pub(crate) struct State {
     pub(crate) engine: Option<Engine>,
+    /// Every connection, from its accept until its reader has cleaned up
+    /// after it; one the pump hung up on stays listed until then.
     pub(crate) clients: Vec<Client>,
     /// Keep the engine running even with no clients, so the device stays warm
     /// and client connects are instant (`TOBII_PREWARM`).
@@ -210,13 +257,20 @@ impl State {
         }
     }
 
-    /// Every stream some client subscribes to.
+    /// Every stream some client subscribes to, but those only clients the
+    /// pump hung up on subscribe to: nothing is written to them, so nothing
+    /// is encoded or computed for them.
     fn wanted_mask(&self) -> u32 {
-        self.clients.iter().fold(0, |m, c| m | c.streams)
+        self.clients
+            .iter()
+            .filter(|c| !c.hung_up)
+            .fold(0, |m, c| m | c.streams)
     }
 
     /// True if some client consumes a stream or holds the device, or
-    /// pre-warm is set.
+    /// pre-warm is set. A client the pump hung up on counts until its
+    /// reader has cleaned up after it: its requests may still need the
+    /// engine (see [`client_reader`]).
     fn is_engine_wanted(&self) -> bool {
         self.prewarm
             || self
@@ -374,16 +428,25 @@ impl State {
         }
     }
 
-    /// Queue `body` for one client.
+    /// Queue `body` for one client, unless the pump hung up on it.
     pub(crate) fn send_to(&mut self, client: u64, body: Vec<u8>) {
-        if let Some(c) = self.clients.iter_mut().find(|c| c.id == client) {
+        if let Some(c) = self
+            .clients
+            .iter_mut()
+            .find(|c| c.id == client && !c.hung_up)
+        {
             c.outbox.push_back(body);
         }
     }
 
-    /// Queue `body` for every client subscribed to `stream`.
+    /// Queue `body` for every client subscribed to `stream`, but those the
+    /// pump hung up on.
     pub(crate) fn broadcast(&mut self, stream: u32, body: &[u8]) {
-        for c in self.clients.iter_mut().filter(|c| c.streams & stream != 0) {
+        for c in self
+            .clients
+            .iter_mut()
+            .filter(|c| c.streams & stream != 0 && !c.hung_up)
+        {
             c.outbox.push_back(body.to_vec());
         }
     }
@@ -801,6 +864,10 @@ fn watch_engine(state: &Mutex<State>) {
     }
 }
 
+/// How long the pump may sit in a write to a client, with `state` locked,
+/// before it hangs up on the client (see [`Client::hang_up`]).
+const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Accept client connections forever, registering each with `state`.
 fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<State>>) {
     // Only the accept loop hands out ids, so a plain counter suffices.
@@ -811,18 +878,12 @@ fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<State>>) {
             continue;
         };
         // Bound how long pump() can sit in write_frame() with `state` locked:
-        // a client that stops reading is dropped instead of wedging fan-out
-        // (and the SIGTERM teardown, which needs the same lock).
-        let _ = out.set_write_timeout(Some(Duration::from_millis(250)));
+        // a client that stops reading is hung up on instead of wedging
+        // fan-out (and the SIGTERM teardown, which needs the same lock).
+        let _ = out.set_write_timeout(Some(WRITE_TIMEOUT));
         let id = next_id;
         next_id = next_id.wrapping_add(1);
-        lock_state(state).clients.push(Client {
-            id,
-            streams: 0,
-            out,
-            outbox: VecDeque::new(),
-            holds_device: false,
-        });
+        lock_state(state).clients.push(Client::new(id, out));
         let state = Arc::clone(state);
         thread::spawn(move || client_reader(&state, id, stream));
     }
@@ -903,10 +964,14 @@ fn run_requests(state: &Mutex<State>, id: u64, requests: &Receiver<Vec<u8>>) {
 /// through the client's outbox. The requests a client sent before it hung
 /// up still run (a calibration stop that keeps the result, sent without
 /// waiting for the answer, still keeps it); only then is the client
-/// cleaned up after. A subscription change takes effect at once, ahead of
-/// the client's requests still to run: an unsubscribe before one of them
-/// pins the device (see [`State::device_for`]) may stop an engine that it
-/// then starts again.
+/// cleaned up after, here and once. The pump, which may find the hang-up
+/// first (at its next write to the client, a reply or a sample), only
+/// hangs up on the client in turn (see [`Client::hang_up`]): it stays
+/// listed with the streams and the device it holds, so that no engine
+/// stops under its requests. A subscription change takes effect at once,
+/// ahead of the client's requests still to run: an unsubscribe before one
+/// of them pins the device (see [`State::device_for`]) may stop an engine
+/// that it then starts again.
 fn client_reader(state: &Arc<Mutex<State>>, id: u64, mut stream: UnixStream) {
     if let Some(worker) = read_frames(state, id, &mut stream) {
         worker.finish(id);
@@ -1007,59 +1072,54 @@ fn replay_presence(st: &mut State, id: u64, before: u32, streams: u32) {
     }
 }
 
-/// Fan-out loop: every 8 ms flush each client's outbox, then drain the
-/// engine, encode each sample once and write it to every client subscribed
-/// to that stream. The buffers live across ticks so the per-frame path does
-/// not reallocate.
+/// Fan-out loop: every 8 ms, a pass of [`pump_once`]. The buffers live
+/// across ticks so the per-frame path does not reallocate.
 fn pump(state: &Mutex<State>) {
     let mut samples: Vec<Sample> = Vec::new();
     let mut frames: Vec<(u32, Vec<u8>)> = Vec::new();
-    let mut dead: Vec<u64> = Vec::new();
     loop {
-        samples.clear();
-        frames.clear();
-        dead.clear();
-        {
-            let mut st = lock_state(state);
-            if let Some(engine) = st.engine.as_mut() {
-                engine.drain_into(&mut samples);
-            }
-            let wanted = st.wanted_mask();
-            for s in &samples {
-                st.observe(s);
-            }
-            for s in &samples {
-                push_sample_frames(s, wanted, &mut frames);
-            }
-            for client in &mut st.clients {
-                let mut ok = true;
-                while ok && let Some(body) = client.outbox.pop_front() {
-                    ok = write_frame(&mut client.out, &body).is_ok();
-                }
-                for (need, body) in &frames {
-                    if !ok {
-                        break;
-                    }
-                    if client.streams & need != 0 {
-                        ok = write_frame(&mut client.out, body).is_ok();
-                    }
-                }
-                if !ok {
-                    dead.push(client.id);
-                }
-            }
-            if !dead.is_empty() {
-                // Its reader sees the end of the stream and cleans up after
-                // it (a pause it holds, its calibration session), even if
-                // the peer keeps the socket open without reading.
-                for c in st.clients.iter().filter(|c| dead.contains(&c.id)) {
-                    let _ = c.out.shutdown(Shutdown::Both);
-                }
-                st.clients.retain(|c| !dead.contains(&c.id));
-                st.reconcile();
-            }
-        }
+        pump_once(&mut lock_state(state), &mut samples, &mut frames);
         thread::sleep(Duration::from_millis(8));
+    }
+}
+
+/// One pass of the pump, under the state lock: drain the engine into
+/// `samples`, fold them into the state, encode each once into `frames`, and
+/// write them out (see [`write_clients`]).
+fn pump_once(st: &mut State, samples: &mut Vec<Sample>, frames: &mut Vec<(u32, Vec<u8>)>) {
+    samples.clear();
+    frames.clear();
+    if let Some(engine) = st.engine.as_mut() {
+        engine.drain_into(samples);
+    }
+    let wanted = st.wanted_mask();
+    for s in samples.iter() {
+        st.observe(s);
+    }
+    for s in samples.iter() {
+        push_sample_frames(s, wanted, frames);
+    }
+    write_clients(st, frames);
+}
+
+/// Write each client its outbox, then those of `frames` (bodies tagged
+/// with the stream they carry) it subscribes to. A client a write fails for
+/// (it hung up, or stopped reading for longer than [`WRITE_TIMEOUT`]) is
+/// hung up on and written nothing more (see [`Client::hang_up`]), and the
+/// engine is told the work only it wanted is no longer (see
+/// [`State::wanted_mask`]). It stays listed: its reader cleans up after it
+/// once the requests it sent before have run, and only then may the engine
+/// stop (see [`client_reader`]).
+fn write_clients(st: &mut State, frames: &[(u32, Vec<u8>)]) {
+    let mut hung_up = false;
+    for client in st.clients.iter_mut().filter(|c| !c.hung_up) {
+        if !client.write_out(frames) {
+            client.hang_up();
+            hung_up = true;
+        }
+    }
+    if hung_up {
+        st.sync_wanted();
     }
 }
 
@@ -1068,18 +1128,12 @@ pub(crate) mod tests {
     use super::*;
     use crate::calibration::tests::device_blob;
 
-    /// A state with one connected client (its socket's peer is dropped; the
-    /// pump never runs in these tests).
+    /// A state with one connected client (its socket's peer is dropped, so
+    /// a pump pass finds the connection dead).
     pub(crate) fn state_with_client(id: u64) -> State {
         let (out, _peer) = UnixStream::pair().expect("socket pair");
         let mut st = State::new(false);
-        st.clients.push(Client {
-            id,
-            streams: 0,
-            out,
-            outbox: VecDeque::new(),
-            holds_device: false,
-        });
+        st.clients.push(Client::new(id, out));
         st
     }
 
@@ -1554,6 +1608,64 @@ pub(crate) mod tests {
         );
     }
 
+    /// The pump hangs up on a client it cannot write to (here at a sample
+    /// of the stream it subscribes to), and neither writes nor queues
+    /// anything for it any more, nor encodes what only it subscribes to,
+    /// but leaves it listed with the streams and the device it holds, for
+    /// its reader to clean up after: no engine stops meanwhile. The clients
+    /// after it are still written their outbox, then the samples of the
+    /// streams they subscribe to, and only those.
+    #[test]
+    fn the_pump_hangs_up_on_a_client_it_cannot_write_to_and_leaves_it_listed() {
+        use tobii_ipc::{STREAM_GAZE, STREAM_NOTIFICATIONS};
+        // Client 1's peer is gone.
+        let mut st = state_with_client(1);
+        st.clients[0].streams = STREAM_NOTIFICATIONS;
+        st.clients[0].holds_device = true;
+        let (out, mut peer) = UnixStream::pair().expect("socket pair");
+        st.clients.push(Client::new(2, out));
+        st.clients[1].streams = STREAM_GAZE;
+        st.send_to(2, encode_subscribed(true));
+        let frames = [
+            (STREAM_GAZE, b"gaze".to_vec()),
+            (STREAM_NOTIFICATIONS, b"notification".to_vec()),
+        ];
+        let losses = st.engine_losses;
+
+        write_clients(&mut st, &frames);
+
+        assert_eq!(
+            st.clients
+                .iter()
+                .map(|c| (c.id, c.hung_up))
+                .collect::<Vec<_>>(),
+            [(1, true), (2, false)]
+        );
+        assert!(st.is_engine_wanted(), "client 1 still counts");
+        assert_eq!(st.engine_losses, losses, "no engine dropped");
+        assert_eq!(
+            st.wanted_mask(),
+            STREAM_GAZE,
+            "client 1's stream is not encoded"
+        );
+        st.send_to(1, encode_subscribed(true));
+        st.broadcast(STREAM_NOTIFICATIONS, b"notification");
+        assert!(outbox(&st, 1).is_empty(), "nothing queued for client 1");
+        // Client 2's end closes with the state: what it was written is
+        // followed by the end of the stream.
+        drop(st);
+        peer.set_read_timeout(Some(WAIT)).expect("read timeout");
+        let mut written = Vec::new();
+        while let Some(body) = read_frame(&mut peer).expect("a frame or the end") {
+            written.push(body);
+        }
+        assert_eq!(
+            written,
+            [encode_subscribed(true), b"gaze".to_vec()],
+            "client 2's outbox, then its stream's sample"
+        );
+    }
+
     /// How long a test waits for what must happen.
     const WAIT: Duration = Duration::from_secs(5);
     /// How long a test gives what must not happen the time to.
@@ -1631,9 +1743,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Client 1's connection, served by [`client_reader`] as the accept
-    /// loop serves one, with `device` standing in for the engine. The pump
-    /// does not run: what the daemon sends the client stays in its outbox.
+    /// Client 1's connection, registered (with the pump's write timeout)
+    /// and served by [`client_reader`] as the accept loop does, with
+    /// `device` standing in for the engine. The pump does not run: what the
+    /// daemon sends the client stays in its outbox, unless a test runs a
+    /// pass of it ([`pump_once`]) or hangs up on the client as one does
+    /// ([`Client::hang_up`]), on the socket the reader reads.
     struct Connection {
         state: Arc<Mutex<State>>,
         /// The client's end, until it hangs up.
@@ -1644,12 +1759,16 @@ pub(crate) mod tests {
 
     impl Connection {
         fn open(device: Arc<dyn DeviceCommands>) -> Self {
-            let mut st = state_with_client(1);
+            let (peer, stream) = UnixStream::pair().expect("socket pair");
+            let out = stream.try_clone().expect("socket clone");
+            out.set_write_timeout(Some(WRITE_TIMEOUT))
+                .expect("write timeout");
+            let mut st = State::new(false);
+            st.clients.push(Client::new(1, out));
             st.fake_device = Some(device);
             // No calibration file is read or saved.
             st.calibration.location = tobii_calib::store::Location::Embedded;
             let state = Arc::new(Mutex::new(st));
-            let (peer, stream) = UnixStream::pair().expect("socket pair");
             let (served_tx, served) = mpsc::channel::<()>();
             let reader_state = Arc::clone(&state);
             thread::spawn(move || {
@@ -1906,6 +2025,90 @@ pub(crate) mod tests {
             tobii_calib::blob::calibration_id(&device_blob())
         );
         assert!(st.clients.is_empty());
+    }
+
+    /// As above for a client that streams gaze, with the pump finding the
+    /// hang-up first: it writes to the client while the collect runs. The
+    /// client stays listed until its requests have run, so no engine stops
+    /// under them and the stop still commits; the engine stops once the
+    /// client is cleaned up after.
+    #[test]
+    fn a_kept_stop_sent_before_a_hang_up_the_pump_finds_first_keeps_the_session() {
+        use tobii_ipc::request::{STOP_KEEP, kind};
+        use tobii_proto::calibration::{cmd, write_payload};
+        let (device, keys, mut c) = calibrating_with_a_collect_held();
+        // A client the pump writes to at every pass. Incidental to what is
+        // shown: the device the client holds keeps it counted either way.
+        lock_state(&c.state).clients[0].streams = tobii_ipc::STREAM_GAZE;
+        c.request(4, kind::CALIBRATION_STOP, STOP_KEEP);
+        c.hang_up();
+        let losses = lock_state(&c.state).engine_losses;
+
+        // It writes the replies waiting in the outbox to a peer that is gone.
+        pump_once(&mut lock_state(&c.state), &mut Vec::new(), &mut Vec::new());
+
+        {
+            let st = lock_state(&c.state);
+            assert!(
+                st.clients.iter().any(|c| c.id == 1 && c.hung_up),
+                "hung up on, and still listed"
+            );
+            assert_eq!(st.engine_losses, losses, "no engine stopped");
+            assert!(st.calibration.is_active(), "the session is not discarded");
+        }
+        keys.release.send(()).expect("let go");
+        c.wait_until_served();
+        assert_eq!(
+            after_the_collect(&device),
+            [
+                (cmd::STOP, Vec::new()),
+                (cmd::WRITE, write_payload(&device_blob())),
+            ],
+            "stopped once, keeping what the session computed"
+        );
+        let st = lock_state(&c.state);
+        assert!(!st.calibration.is_active());
+        assert_eq!(
+            st.calibration.id,
+            tobii_calib::blob::calibration_id(&device_blob())
+        );
+        assert_eq!(
+            st.engine_losses,
+            losses.wrapping_add(1),
+            "stopped once, after the requests"
+        );
+        assert!(st.clients.is_empty());
+    }
+
+    /// A client the pump hangs up on while its peer keeps the connection
+    /// open without reading (a write that timed out) is cleaned up after
+    /// all the same: the hang-up ends its reader's reads.
+    #[test]
+    fn a_client_the_pump_hangs_up_on_is_cleaned_up_after_while_its_peer_stays_open() {
+        let (device, _keys) = gate();
+        let mut c = Connection::open(device);
+        c.send(&tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE));
+        assert_eq!(c.wait_for_frames(1), [ACK]);
+        let losses = lock_state(&c.state).engine_losses;
+
+        lock_state(&c.state).clients[0].hang_up();
+
+        c.wait_until_served();
+        {
+            let st = lock_state(&c.state);
+            assert!(st.clients.is_empty());
+            assert_eq!(
+                st.engine_losses,
+                losses.wrapping_add(1),
+                "the engine stopped once"
+            );
+        }
+        let peer = c.peer.as_mut().expect("still connected");
+        peer.set_read_timeout(Some(WAIT)).expect("read timeout");
+        assert!(
+            matches!(read_frame(peer), Ok(None)),
+            "the connection is closed"
+        );
     }
 
     /// The session of a client that hangs up during a request of it is
