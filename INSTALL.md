@@ -59,7 +59,7 @@ embedded assets (it is ~0.45 MB rather than ~20 MB).
 | `tobii-proto` | wire formats: framing, TLV, commands and responses, the 0x500/0x504/0x50e streams, device facts, the `TBI5LOG1` log | none |
 | `tobii-pose` | face landmarks and the head-pose fit; owns `models/` | `ort` |
 | `tobii-usb` | USB transport and the live 0x83 engine; owns `init_packets_ep.txt` | `rusb` |
-| `tobii-ipc` | the daemon protocol, the display geometry and the host clock | none (`libc` only) |
+| `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
 | `tobii-log` | shared `tracing` subscriber setup | — |
 | `tobiid` | the daemon binary | — |
@@ -442,10 +442,13 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
 
   Threads may share a device, as the Stream Engine promises: calls on it from
   several threads at once are safe. Its requests, subscription changes and
-  reconnects run one at a time, in the order they are called (a slow one,
-  such as a pause, delays the others), its callbacks run one at a time on
-  whichever thread processes it, and a process call made while another thread
-  processes or reconnects it returns at once.
+  reconnects run one at a time, in the order they are called (a slow one
+  delays the others: a calibration start may take ~3 min at worst, a pause
+  a minute), its callbacks run one at a time on whichever thread processes
+  it, and a process call that finds another thread at it (processing it, a
+  wait or a clear at its queue for a moment, or a reconnect waiting for
+  tobiid to take the subscriptions back, then closing the old connection)
+  returns at once, delivering nothing.
   `tobii_device_destroy` and `tobii_api_destroy` must not overlap any other
   call on the handle, and nothing may use it afterwards: join the thread
   that processes a device before destroying it. Threads that create devices
