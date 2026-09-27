@@ -371,11 +371,13 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   bit-identical to what the Windows Stream Engine delivers), gaze origin
   (display frame, mm), eye position and user position guide (track-box
   normalised), gaze data (per eye, tracker frame, with the pupil diameter),
-  presence (on change), head pose (mm, radians about x/y/z), the IR
-  image (280×280, `tobii_image_subscribe`), notifications (display area,
-  calibration, pause, faults and warnings), device info, track box, display
-  area (get and set — kept across re-inits and, like the Stream Engine,
-  across sessions), mounting, states, capabilities, 2-D calibration
+  raw gaze (the Stream Engine's own record of each gaze frame, every value
+  as the tracker sent it, `tobii_gaze_raw_subscribe`), presence (on change),
+  head pose (mm, radians about x/y/z), the IR image (280×280,
+  `tobii_image_subscribe`), notifications (display area, calibration,
+  pause, faults and warnings), device info, track box, display area (get
+  and set — kept across re-inits and, like the Stream Engine, across
+  sessions), mounting, states, capabilities, 2-D calibration
   (discarding a point too), a device/host clock pair (`tobii_timesync`), the
   tracker's stream catalogue (`tobii_enumerate_stream_types`), pause and
   resume, and the device name. `tobii_hardware_configuration_get` is
@@ -384,7 +386,8 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   Timestamps are the host clock `tobii_system_clock` reads (`CLOCK_MONOTONIC`),
   onto which the daemon maps the tracker's with an offset it estimates from
   the arrivals, afresh at every tracker init (README.md, Architecture,
-  "Timestamps"); gaze data and `tobii_timesync` keep the tracker's time too.
+  "Timestamps"); gaze data and `tobii_timesync` keep the tracker's time too,
+  and raw gaze has only the tracker's time.
   Everything the ET5 was never observed doing (wearable, face id,
   illumination, power, firmware, diagnostics, 3-D and per-eye calibration,
   calibration stimulus points, the internal low-frequency head, multiple
@@ -395,7 +398,11 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   and its answer behind the service was never captured. No licence is
   checked: what the Stream Engine reserves for its professional, config or
   internal feature groups, or for an additional-features licence (the IR
-  image), works too.
+  image), works too. Raw gaze is one such: the Stream Engine serves it only
+  to its internal feature group, and only without Tobii's service (for any
+  URL, libtobii's `tobii-ffi://` included, but `tobii-prp://` and
+  `tprp-tcp://`). A `tobiid` built before raw gaze takes the subscription
+  and never sends the stream: restart the daemon after installing (§5).
 
   A name set with `tobii_set_device_name` is kept by the daemon, not the
   tracker, in `~/.config/tobii/device-name` (`$XDG_CONFIG_HOME/tobii`): the

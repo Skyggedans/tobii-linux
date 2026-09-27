@@ -9,12 +9,13 @@
 //! - **Implemented** — device lifetime and callbacks, device info, track box,
 //!   display area and mounting (read and write), states, capabilities, the
 //!   gaze point, gaze origin, eye position, user position guide, presence,
-//!   head pose, gaze data, IR image and notification streams, 2-D
-//!   calibration (a session's result is saved as the user's calibration only
-//!   when its owner calls `tobii_calibration_stop`) and discarding a 2-D
-//!   point, the device/host clock pair (`tobii_timesync`), the tracker's
-//!   stream catalogue, device pause and resume, and the device name (kept by
-//!   the host, not the tracker). The hardware configuration is implemented
+//!   head pose, gaze data, raw gaze (the Stream Engine's own record of each
+//!   gaze frame), IR image and notification streams, 2-D calibration (a
+//!   session's result is saved as the user's calibration only when its owner
+//!   calls `tobii_calibration_stop`) and discarding a 2-D point, the
+//!   device/host clock pair (`tobii_timesync`), the tracker's stream
+//!   catalogue, device pause and resume, and the device name (kept by the
+//!   host, not the tracker). The hardware configuration is implemented
 //!   provisionally; the ET5 has reported none on Linux, so it answers
 //!   `TOBII_ERROR_NOT_SUPPORTED` there.
 //! - **Answered locally** — API version (4.1.0.3), error texts (the DLL's),
@@ -36,8 +37,8 @@
 //!
 //! Nothing is gated by a licence. What the Stream Engine reserves for a
 //! higher feature group or an extra licence (gaze data, timesync,
-//! calibration, display-area and name writes, the IR image, the stream
-//! catalogue, pause) works here under the consumer group this library
+//! calibration, display-area and name writes, the IR image, raw gaze, the
+//! stream catalogue, pause) works here under the consumer group this library
 //! reports (see `licensing`).
 //!
 //! A call from inside a callback is `TOBII_ERROR_CALLBACK_IN_PROGRESS`, as in
@@ -112,14 +113,14 @@
 //! `tobii_wait_for_callbacks` + `tobii_device_process_callbacks` exactly like
 //! the Stream Engine. Every sample's timestamp is on the host clock
 //! `tobii_system_clock` reads, as the daemon sends it (gaze data's tracker
-//! time aside): libtobii passes the daemon's values through. The daemon's
-//! engine maps the tracker's clock onto the host's by the smallest
-//! receipt-minus-tracker time of the gaze frames and IR images of the last
-//! 120 s, started afresh at every tracker init (which may restart the
-//! tracker's clock), so it follows the drift and every client gets the same
-//! stamps. Tracker time is left only in gaze data's `timestamp_tracker_us`
-//! and `tobii_timesync`'s `tracker_us`, and `tobii_update_timesync` has no
-//! offset to refresh.
+//! time and raw gaze's aside): libtobii passes the daemon's values through.
+//! The daemon's engine maps the tracker's clock onto the host's by the
+//! smallest receipt-minus-tracker time of the gaze frames and IR images of
+//! the last 120 s, started afresh at every tracker init (which may restart
+//! the tracker's clock), so it follows the drift and every client gets the
+//! same stamps. Tracker time is left only in gaze data's and raw gaze's
+//! `timestamp_tracker_us` and `tobii_timesync`'s `tracker_us`, and
+//! `tobii_update_timesync` has no offset to refresh.
 //!
 //! When the daemon connection is lost (tobiid stopped, crashed or was
 //! restarted, or dropped a client that stopped reading),

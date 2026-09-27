@@ -377,7 +377,8 @@ TOBII_API tobii_error_t TOBII_CALL tobii_device_reconnect( tobii_device_t* devic
 TOBII_API tobii_error_t TOBII_CALL tobii_update_timesync( tobii_device_t* device );
 /* CLOCK_MONOTONIC microseconds, whose epoch is undefined (the DLL reads
  * QueryPerformanceCounter): the clock of every callback timestamp (bar gaze
- * data's timestamp_tracker_us) and of tobii_timesync's system times. */
+ * data's and raw gaze's timestamp_tracker_us) and of tobii_timesync's system
+ * times. */
 TOBII_API tobii_error_t TOBII_CALL tobii_system_clock( tobii_api_t* api, int64_t* timestamp_us );
 
 /* Serial, model, generation, firmware and integration type, as the tracker

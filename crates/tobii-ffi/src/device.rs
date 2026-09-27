@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use tobii_ipc::request::{DeviceInfo as DeviceInfoMsg, decode_device_info, encode_request, kind};
 use tobii_ipc::{
     self, NotificationValue as WireValue, STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA,
-    STREAM_GAZE_ORIGIN, STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
-    ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
+    STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS,
+    STREAM_PRESENCE, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
 };
 
 use crate::logger::{self, Level, Logger, SharedLogger};
@@ -43,9 +43,9 @@ use crate::status::{
 use crate::timeouts;
 use crate::types::{
     DisplayArea, EyePair, EyePairFn, FieldOfUse, FieldOfUseFn, GazeData, GazeDataEye, GazeDataFn,
-    GazePoint, GazePointFn, HeadPose, HeadPoseFn, Image, ImageFn, Notification, NotificationValue,
-    NotificationsFn, PresenceFn, PresenceStatus, TOBII_VALIDITY_INVALID, TOBII_VALIDITY_VALID,
-    Validity, copy_c_string,
+    GazePoint, GazePointFn, GazeRaw, GazeRawEye, GazeRawFn, HeadPose, HeadPoseFn, Image, ImageFn,
+    Notification, NotificationValue, NotificationsFn, PresenceFn, PresenceStatus,
+    TOBII_VALIDITY_INVALID, TOBII_VALIDITY_VALID, Validity, copy_c_string,
 };
 
 /// How long a subscription change waits for the daemon's acknowledgement.
@@ -719,6 +719,7 @@ pub(crate) struct Callbacks {
     pub(crate) eye_position: Slot<EyePairFn>,
     pub(crate) user_position_guide: Slot<EyePairFn>,
     pub(crate) gaze_data: Slot<GazeDataFn>,
+    pub(crate) gaze_raw: Slot<GazeRawFn>,
     pub(crate) image: Slot<ImageFn>,
     pub(crate) notifications: Slot<NotificationsFn>,
     /// Registered but never called: the field of use cannot change.
@@ -753,6 +754,7 @@ impl Callbacks {
             STREAM_EYE_POSITION,
         );
         need(self.gaze_data.is_some(), STREAM_GAZE_DATA);
+        need(self.gaze_raw.is_some(), STREAM_GAZE_RAW);
         need(self.image.is_some(), STREAM_IMAGE);
         need(self.notifications.is_some(), STREAM_NOTIFICATIONS);
         mask
@@ -1301,8 +1303,8 @@ impl Device {
 
     /// Deliver one daemon message to the matching callbacks, if any, under
     /// the callbacks lock. The timestamps go through as the daemon sent
-    /// them, on the host clock already (gaze data's tracker time aside):
-    /// nothing is converted here.
+    /// them, on the host clock already (gaze data's tracker time and raw
+    /// gaze's aside): nothing is converted here.
     fn deliver(&self, msg: &ServerMsg) {
         let cb = lock(&self.callbacks);
         match msg {
@@ -1375,6 +1377,14 @@ impl Device {
                 };
                 if let Some((f, ud)) = cb.gaze_data {
                     // SAFETY: registered through `tobii_gaze_data_subscribe`;
+                    // `c` outlives the call.
+                    call(|| unsafe { f(&raw const c, ud) });
+                }
+            }
+            ServerMsg::GazeRaw(record) => {
+                let c = gaze_raw(record);
+                if let Some((f, ud)) = cb.gaze_raw {
+                    // SAFETY: registered through `tobii_gaze_raw_subscribe`;
                     // `c` outlives the call.
                     call(|| unsafe { f(&raw const c, ud) });
                 }
@@ -1454,6 +1464,60 @@ fn gaze_data_eye(e: &tobii_ipc::GazeDataEye) -> GazeDataEye {
         eyeball_center_from_eye_tracker_mm_xyz: e.eyeball_center_mm,
         pupil_validity: validity(e.pupil_valid),
         pupil_diameter_mm: e.pupil_diameter_mm,
+    }
+}
+
+fn gaze_raw_eye(e: &tobii_ipc::GazeRawEye) -> GazeRawEye {
+    GazeRawEye {
+        gaze_origin_from_eye_tracker_mm_xyz: e.gaze_origin_mm,
+        gaze_origin_in_track_box_normalized_xyz: e.gaze_origin_in_track_box,
+        gaze_point_from_eye_tracker_mm_xyz: e.gaze_point_mm,
+        gaze_point_on_display_normalized_xy: e.gaze_point_on_display,
+        pupil_diameter_mm: e.pupil_diameter_mm,
+        status: e.status,
+    }
+}
+
+/// A raw gaze sample in the 232-byte C layout, as the DLL's dispatch copies
+/// its record (0x180171b81..0x180171db8): every value as the daemon sent it,
+/// a flagged key's validity 1 when the frame had the key, and 0 (with a
+/// value of 0) when it did not; the slots the record never fills, 0.
+fn gaze_raw(r: &tobii_ipc::GazeRaw) -> GazeRaw {
+    let sent = |word: Option<u32>| (validity(word.is_some()), word.unwrap_or(0));
+    let (key_0e_validity, key_0e) = sent(r.key_0e);
+    let (key_11_validity, key_11) = sent(r.key_11);
+    let (frame_counter_validity, frame_counter) = sent(r.frame_counter);
+    let (left_origin_flag_validity, left_origin_flag) = sent(r.left_origin_flag);
+    let (right_origin_flag_validity, right_origin_flag) = sent(r.right_origin_flag);
+    GazeRaw {
+        timestamp_tracker_us: r.timestamp_tracker_us,
+        left: gaze_raw_eye(&r.left),
+        right: gaze_raw_eye(&r.right),
+        combined_gaze_point_on_display_normalized_xy: r.combined_gaze_point_on_display,
+        combined_gaze_validity: r.combined_gaze_validity,
+        key_0e_validity,
+        key_0e,
+        reserved_84: TOBII_VALIDITY_INVALID,
+        reserved_88: 0.0,
+        reserved_8c: TOBII_VALIDITY_INVALID,
+        reserved_90: 0.0,
+        key_11_validity,
+        key_11,
+        reserved_9c: TOBII_VALIDITY_INVALID,
+        reserved_a0: 0.0,
+        reserved_a4: TOBII_VALIDITY_INVALID,
+        reserved_a8: 0.0,
+        frame_counter_validity,
+        frame_counter,
+        left_origin_flag_validity,
+        left_origin_flag,
+        right_origin_flag_validity,
+        right_origin_flag,
+        left_eyeball_center_validity: validity(r.left_eyeball_center_mm.is_some()),
+        left_eyeball_center_from_eye_tracker_mm_xyz: r.left_eyeball_center_mm.unwrap_or_default(),
+        right_eyeball_center_validity: validity(r.right_eyeball_center_mm.is_some()),
+        right_eyeball_center_from_eye_tracker_mm_xyz: r.right_eyeball_center_mm.unwrap_or_default(),
+        reserved_e4: 0,
     }
 }
 
@@ -1952,6 +2016,8 @@ pub(crate) mod tests {
         pub(crate) user_position_guide: i64,
         /// `(timestamp_tracker_us, timestamp_system_us)`.
         pub(crate) gaze_data: (i64, i64),
+        /// `timestamp_tracker_us`.
+        pub(crate) gaze_raw: i64,
         pub(crate) image: i64,
     }
 
@@ -1996,6 +2062,11 @@ pub(crate) mod tests {
         }
     }
 
+    unsafe extern "C" fn stamp_gaze_raw(p: *const GazeRaw, ud: *mut c_void) {
+        // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
+        unsafe { (*ud.cast::<Stamps>()).gaze_raw = (*p).timestamp_tracker_us };
+    }
+
     unsafe extern "C" fn stamp_image(p: *const Image, ud: *mut c_void) {
         // SAFETY: `ud` is a live `Stamps`, `p` a live sample (see above).
         unsafe { (*ud.cast::<Stamps>()).image = (*p).timestamp_us };
@@ -2003,7 +2074,8 @@ pub(crate) mod tests {
 
     /// libtobii hands each callback the timestamp its frame carried, which
     /// the daemon sends on the host clock, and gaze data's tracker time
-    /// beside it: nothing is converted on this side.
+    /// beside it; raw gaze carries the tracker time alone: nothing is
+    /// converted on this side.
     #[test]
     fn every_callback_gets_the_timestamps_its_frame_carried() {
         let pair = |ts_us| tobii_ipc::EyePair {
@@ -2022,6 +2094,10 @@ pub(crate) mod tests {
                 ..tobii_ipc::GazeData::default()
             }),
             tobii_ipc::encode_image(17, 1, 1, 8, &[0]),
+            tobii_ipc::encode_gaze_raw(&tobii_ipc::GazeRaw {
+                timestamp_tracker_us: 8,
+                ..tobii_ipc::GazeRaw::default()
+            }),
         ];
         // Sends them all ahead of every subscription ack, so that they wait
         // for `process`.
@@ -2044,6 +2120,7 @@ pub(crate) mod tests {
             eye_position: Some((stamp_eye_position as EyePairFn, ud)),
             user_position_guide: Some((stamp_user_position_guide as EyePairFn, ud)),
             gaze_data: Some((stamp_gaze_data as GazeDataFn, ud)),
+            gaze_raw: Some((stamp_gaze_raw as GazeRawFn, ud)),
             image: Some((stamp_image as ImageFn, ud)),
             ..Callbacks::default()
         };
@@ -2062,6 +2139,7 @@ pub(crate) mod tests {
                 eye_position: 15,
                 user_position_guide: 15,
                 gaze_data: (7, 16),
+                gaze_raw: 8,
                 image: 17,
             }
         );
@@ -2950,6 +3028,7 @@ pub(crate) mod tests {
     unsafe extern "C" fn ignore_gaze(_p: *const GazePoint, _ud: *mut c_void) {}
     unsafe extern "C" fn ignore_presence(_s: PresenceStatus, _ts: i64, _ud: *mut c_void) {}
     unsafe extern "C" fn ignore_gaze_data(_p: *const GazeData, _ud: *mut c_void) {}
+    unsafe extern "C" fn ignore_gaze_raw(_p: *const GazeRaw, _ud: *mut c_void) {}
     unsafe extern "C" fn ignore_image(_p: *const Image, _ud: *mut c_void) {}
     unsafe extern "C" fn ignore_notification(_p: *const Notification, _ud: *mut c_void) {}
 
@@ -2989,6 +3068,7 @@ pub(crate) mod tests {
             gaze_origin: Some((ignore_pair as EyePairFn, ud)),
             user_position_guide: Some((ignore_pair as EyePairFn, ud)),
             gaze_data: Some((ignore_gaze_data as GazeDataFn, ud)),
+            gaze_raw: Some((ignore_gaze_raw as GazeRawFn, ud)),
             image: Some((ignore_image as ImageFn, ud)),
             notifications: Some((ignore_notification as NotificationsFn, ud)),
             ..Callbacks::default()
@@ -3005,6 +3085,7 @@ pub(crate) mod tests {
             | STREAM_GAZE_ORIGIN
             | STREAM_EYE_POSITION
             | STREAM_GAZE_DATA
+            | STREAM_GAZE_RAW
             | STREAM_IMAGE
             | STREAM_NOTIFICATIONS;
         assert_eq!(*masks.lock().expect("log"), [Some(every)]);

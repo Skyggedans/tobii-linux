@@ -497,9 +497,9 @@ pub unsafe extern "C" fn tobii_update_timesync(device: *mut Device) -> Status {
 
 /// The host clock, `CLOCK_MONOTONIC` in microseconds
 /// ([`tobii_ipc::host_clock_us`], which the daemon reads too): the clock of
-/// every callback timestamp (bar gaze data's `timestamp_tracker_us`) and of
-/// `tobii_timesync`'s host times. Its epoch is undefined, as that of the
-/// DLL's `QueryPerformanceCounter` is.
+/// every callback timestamp (bar gaze data's and raw gaze's
+/// `timestamp_tracker_us`) and of `tobii_timesync`'s host times. Its epoch is
+/// undefined, as that of the DLL's `QueryPerformanceCounter` is.
 ///
 /// # Safety
 /// `api` must be null or a live handle; `timestamp_us` must be null or valid

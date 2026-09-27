@@ -18,6 +18,7 @@ from USB captures of the Windows Stream Engine.
 |---|---|---|
 | Gaze point + validity | 33 Hz | the device's processed `0x500` stream |
 | Per-eye gaze origin, eye position, gaze data | 33 Hz | the same stream |
+| Raw gaze: the Stream Engine's own record of each gaze frame | 33 Hz | the same stream, every value as sent |
 | User presence | on change | the `0x504` stream |
 | Head pose, 6 DOF | 33 Hz | face landmarks on the device's own IR frames |
 | IR camera image, 280×280 | 33 Hz | the `0x50e` stream |
@@ -92,7 +93,7 @@ the archived 4.1.0 reference. What stands behind the entry points:
 
 | | Entry points |
 |---|---|
-| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data and IR image streams; notifications (display area, calibration state and id, pause, faults and warnings); device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
+| Implemented (daemon-backed) | device lifetime and callbacks; gaze point, gaze origin, eye position, user position guide, presence, head pose, gaze data, raw gaze (the Stream Engine's own record of each gaze frame, `tobii_gaze_raw_subscribe`) and IR image streams; notifications (display area, calibration state and id, pause, faults and warnings); device info, track box, display area (get/set), mounting, states; 2-D calibration, including discarding a point; the device/host clock pair (`tobii_timesync`); the tracker's stream catalogue; device pause and resume; the device name (kept by the host); the hardware configuration (provisional, see below) |
 | Answered locally | API version, error texts (the DLL's), system clock, output frequency (33 Hz), enabled eye, capabilities, feature group, license validation, display-area calculation, calibration parsing, internal-stream support (the IR image only), internal-capability support (eyeball centres only), lens-configuration writability (never) |
 | `TOBII_ERROR_NOT_SUPPORTED` | what the ET5 was never observed doing: wearable, face id, illumination, power, firmware, diagnostics, extensions, custom streams, 3-D and per-eye calibration, calibration stimulus points, the internal low-frequency head rotation and position, multiple faces position, wearable limited image and secondary camera image streams (for the stimulus points and those five streams, the DLL's own answer for a tracker it drives itself through its in-process legacy TTP module; behind Tobii's service, never captured) |
 
@@ -100,9 +101,10 @@ Where the answers come from, and where they differ from Windows:
 
 - **No licences.** Every key validates and the feature group is consumer, but
   nothing checks it: gaze data, timesync, calibration, display-area and name
-  writes, the IR image, the stream catalogue and pause all work, though the
-  Stream Engine reserves them for higher feature groups or, for the IR
-  image, an additional-features licence.
+  writes, the IR image, raw gaze, the stream catalogue and pause all work,
+  though the Stream Engine reserves them for higher feature groups (raw gaze,
+  the stream catalogue and, in its own service, pause for its internal one)
+  or, for the IR image, an additional-features licence.
 - **Facts from the last init.** Device info, track box, display area,
   mounting, the stream catalogue, the hardware configuration and the fault
   and warning lists (`tobii_get_state_string`) are what the tracker reported
@@ -209,9 +211,10 @@ Where the answers come from, and where they differ from Windows:
   blob says so, and returns `TOBII_ERROR_NO_ERROR` (8 zero bytes are an
   empty calibration there). Both report an eye whose status word is -1 as
   `FAILED_OR_INVALID` and pass its mapping on as the blob holds it.
-- **Timestamps.** Every callback timestamp is on `tobii_system_clock`'s
-  clock, as in the Stream Engine; the tracker's clock is left only in gaze
-  data's `timestamp_tracker_us` and `tobii_timesync`'s `tracker_us`. A head
+- **Timestamps.** Every callback timestamp but the tracker times below is on
+  `tobii_system_clock`'s clock, as in the Stream Engine; the tracker's clock
+  is left only in gaze data's and raw gaze's `timestamp_tracker_us` (raw
+  gaze has no other time) and `tobii_timesync`'s `tracker_us`. A head
   pose carries the time of the IR image it was made from, as there. The
   Stream Engine adds one offset per connection, from round trips to its
   service, and refreshes it only in `tobii_update_timesync` and

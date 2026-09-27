@@ -216,6 +216,37 @@ prototype declares or a float/integer position disagrees.
   service's, and nothing in the DLL produces or decimates the values.
   libtobii answers as the DLL does for a tracker it drives itself and does
   not re-publish its head pose.
+- When the DLL serves raw gaze, and what it hands out.
+  `tobii_gaze_raw_subscribe` (0x18014e310) answers
+  `TOBII_ERROR_INVALID_PARAMETER` for a null device (unlogged) or callback,
+  then `TOBII_ERROR_CALLBACK_IN_PROGRESS` inside a callback, then, under
+  dev+0x4e0, `TOBII_ERROR_NOT_SUPPORTED` when the device runs no tracker
+  module of its own (`[device+0x4e8]` null, as behind Tobii's service;
+  0x18014e3e8). The module's subscribe (0x180175d00,
+  `platmod_legacy_ttp.cpp`) answers `TOBII_ERROR_INSUFFICIENT_LICENSE` while
+  its licence level `[+0xdac8]` is below 3 (0x180175d15). That level is the
+  device's feature group less one (written at 0x180158844 from the switch
+  at 0x180158771, which maps 2..5 to 0..3, the values
+  `tobii_get_feature_group` reports as consumer, config, professional and
+  internal), so only the internal group passes. The subscribe then refuses
+  an occupied slot (`ALREADY_SUBSCRIBED`), starts TTP stream 0x500, the gaze
+  stream tobiid always runs, for the first subscriber, and stores the
+  callback and user data at `+0xeb50` and `+0xeb58`. The unsubscribe
+  (0x18014e190, module 0x1801739e0) checks the same level, then that
+  something is subscribed (`NOT_SUBSCRIBED`). `process_gaze` (0x18018d9a0)
+  zeroes a 0xe8-byte record (0x18018dadd) and fills it by key through the
+  jump table at RVA 0x18f5a8: 0x01 at +0, the eye blocks 0x02..0x07 and
+  0x08..0x0d at +8 and +0x3c, 0x1c and 0x1b at +0x70 and +0x78, and a flag
+  and a value each for 0x0e, 0x11, 0x14, 0x16, 0x15, 0x17 and 0x18 at +0x7c,
+  +0x94, +0xac, +0xb4, +0xbc, +0xc4 and +0xd4. It ignores 0x0f, 0x10, 0x12,
+  0x13, 0x19, 0x1a and every key above 0x1c, and never writes the pairs at
+  +0x84, +0x8c, +0x9c and +0xa4. The record goes into a 256-entry ring
+  (0x18016f7af..0x18016f83b), which `tobii_device_process_callbacks` drains
+  (0x180171400). The raw callback's dispatch copies each entry as it is,
+  each flag as `flag == 1`, zeroes +0xe4 (0x180171b7b..0x180171db8), and
+  calls the callback with the copy and the user data (0x180171dce). The
+  timestamp is key 0x01 copied unchanged, on the tracker's clock. libtobii
+  serves the same record from tobiid with no licence check.
 - Which notifications the DLL delivers for an ET5, and which libtobii
   sends. On the DLL's own tracker module (`[device+0x4e8]`, above),
   `tobii_notifications_subscribe` (0x180151440) stores the application's
@@ -447,18 +478,19 @@ Layouts, and where each comes from:
 | `tobii_timesync_data_t` | 24 | DLL (`tobii_timesync` writes three qwords at +0/+8/+16); which field is which, and the names, inferred |
 | `tobii_stream_type_t` | 136 | DLL (offsets 0/4/8/72 in `tobii_enumerate_stream_types`); size inferred, field names ours |
 | `tobii_hardware_configuration_t` | 2472, align 8 | DLL (its copy at 0x18014abe0 and the PRP deserialiser at 0x180045056); **provisional**: the values decoded from one Windows 2120 answer, field names and units ours |
+| `tobii_gaze_raw_t` | 232, align 8 | DLL (`process_gaze` 0x18018d9a0's key-to-offset switch, the raw gaze dispatch's copy at 0x180171b81..0x180171db8); field names ours |
 | `tobii_calibration_stimulus_points_t` | 1156, align 4 | DLL (the copier at 0x180001800, the PRP serialiser at 0x180042517 and deserialiser at 0x18004563e, the property cache copy at 0x180031c44); record contents unknown, names ours |
 | everything else in `tobii_streams.h` / `tobii_wearable.h` | — | 4.1 docs, unchanged since 1.x |
 
 Undocumented exports are declared in `tobii_internal.h` with the arity the DLL
-shows. The 12 implemented ones (field of use, IR image, internal-stream
-and internal-capability support, timesync, the stream catalogue, pause and
-resume, hardware configuration) have real types, and so does
-`tobii_calibration_stimulus_points_get`, which checks its arguments and then
-answers `TOBII_ERROR_NOT_SUPPORTED` as the DLL's in-process tracker module
-does for an ET5. The 10 subscribes and unsubscribes of internal streams 3,
-4, 5, 7 and 8 answer the same way, as the DLL does for a tracker it drives
+shows. The 14 implemented ones (field of use, IR image, raw gaze,
+internal-stream and internal-capability support, timesync, the stream
+catalogue, pause and resume, hardware configuration) have real types, and so
+does `tobii_calibration_stimulus_points_get`, which checks its arguments and
+then answers `TOBII_ERROR_NOT_SUPPORTED` as the DLL's in-process tracker
+module does for an ET5. The 10 subscribes and unsubscribes of internal streams
+3, 4, 5, 7 and 8 answer the same way, as the DLL does for a tracker it drives
 itself; they only compare their device and callback with null, so the
-callback's `void const*` cannot matter. The other 50 return
+callback's `void const*` cannot matter. The other 48 return
 `TOBII_ERROR_NOT_SUPPORTED` without reading their arguments, so their
 best-effort parameter types cannot matter at runtime.

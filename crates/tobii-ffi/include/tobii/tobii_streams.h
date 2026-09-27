@@ -13,8 +13,9 @@
  * the host clock instead of jumping back. A presence reported again on
  * subscribe or tobii_device_reconnect keeps the stamp it was last reported
  * with. A head pose has the time of the IR image it was made from. Tracker
- * time is left only in gaze data's timestamp_tracker_us (tobii_advanced.h)
- * and tobii_timesync's tracker_us (tobii_internal.h).
+ * time is left only in gaze data's timestamp_tracker_us (tobii_advanced.h),
+ * raw gaze's timestamp_tracker_us and tobii_timesync's tracker_us
+ * (tobii_internal.h).
  * Callbacks run on the thread that calls tobii_device_process_callbacks, one
  * at a time per device, whichever thread that is: a callback and its
  * user_data must be sound to use on any thread that processes the device.

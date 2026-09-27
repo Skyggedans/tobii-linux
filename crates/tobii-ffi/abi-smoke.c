@@ -207,6 +207,8 @@ int main( void )
     tobii_supported_t supported = TOBII_SUPPORTED;
     assert( tobii_internal_stream_supported( NULL, 0, &supported ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_internal_capability_supported( NULL, 0, &supported ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_gaze_raw_subscribe( NULL, NULL, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
+    assert( tobii_gaze_raw_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     /* Refused internal streams: any non-null callback, as it is never called. */
     assert( tobii_low_frequency_head_rotation_subscribe( NULL, &supported, NULL ) == TOBII_ERROR_INVALID_PARAMETER );
     assert( tobii_low_frequency_head_rotation_unsubscribe( NULL ) == TOBII_ERROR_INVALID_PARAMETER );
@@ -295,6 +297,19 @@ int main( void )
     assert( offsetof( tobii_notification_t, value ) == 8 );
     assert( sizeof( tobii_image_t ) == 32 );
     assert( offsetof( tobii_image_t, data ) == 24 );
+    assert( sizeof( tobii_gaze_raw_eye_t ) == 52 );
+    assert( offsetof( tobii_gaze_raw_eye_t, status ) == 48 );
+    assert( sizeof( tobii_gaze_raw_t ) == 232 );
+    assert( _Alignof( tobii_gaze_raw_t ) == 8 );
+    assert( offsetof( tobii_gaze_raw_t, right ) == 0x3c );
+    assert( offsetof( tobii_gaze_raw_t, combined_gaze_validity ) == 0x78 );
+    assert( offsetof( tobii_gaze_raw_t, key_0e_validity ) == 0x7c );
+    assert( offsetof( tobii_gaze_raw_t, key_11 ) == 0x98 );
+    assert( offsetof( tobii_gaze_raw_t, frame_counter ) == 0xb0 );
+    assert( offsetof( tobii_gaze_raw_t, right_origin_flag ) == 0xc0 );
+    assert( offsetof( tobii_gaze_raw_t, left_eyeball_center_validity ) == 0xc4 );
+    assert( offsetof( tobii_gaze_raw_t, right_eyeball_center_from_eye_tracker_mm_xyz ) == 0xd8 );
+    assert( offsetof( tobii_gaze_raw_t, reserved_e4 ) == 0xe4 );
     assert( sizeof( tobii_timesync_data_t ) == 24 );
     assert( offsetof( tobii_timesync_data_t, system_end_us ) == 8 );
     assert( offsetof( tobii_timesync_data_t, tracker_us ) == 16 );

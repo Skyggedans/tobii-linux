@@ -2,7 +2,7 @@
  * that the Stream Engine never documented, as provided by libtobii.so.
  *
  * Argument counts are those the DLL's code reads (tools/abi/dll_abi.py);
- * argument types are best guesses. Only the field-of-use, image,
+ * argument types are best guesses. Only the field-of-use, image, raw gaze,
  * internal-stream, internal-capability, timesync, stream-type, pause and
  * hardware-configuration functions are implemented, and
  * tobii_calibration_stimulus_points_get and the subscribes and unsubscribes of
@@ -10,7 +10,7 @@
  * TOBII_ERROR_NOT_SUPPORTED; every other entry point here returns
  * TOBII_ERROR_NOT_SUPPORTED without reading its arguments, so the guessed
  * types cannot matter at runtime.
- * Companion to tobii/tobii.h.
+ * Companion to tobii/tobii.h and tobii/tobii_streams.h.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -19,6 +19,7 @@
 #define TOBII_INTERNAL_H
 
 #include "tobii.h"
+#include "tobii_streams.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,90 @@ typedef void ( *tobii_image_callback_t )( tobii_image_t const* image, void* user
 TOBII_API tobii_error_t TOBII_CALL tobii_image_subscribe( tobii_device_t* device,
     tobii_image_callback_t callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_image_unsubscribe( tobii_device_t* device );
+
+/* Raw gaze: the Stream Engine's own record of each gaze frame, one per frame
+ * (~33 Hz on the ET5). The layout is the record the DLL's process_gaze
+ * (0x18018d9a0) fills from the frame's keys, as its raw gaze dispatch copies
+ * it (0x180171b81..0x180171db8; 232 bytes); the names are ours, after
+ * tobii_gaze_data_t's (tobii_advanced.h) where the DLL fills those from the
+ * same keys. Points are mm in the tracker frame (origin at the tracker, z
+ * towards the user); the track box and display positions are normalised and
+ * unclamped; pupil_diameter_mm is the value gaze data's pupil diameter comes
+ * from. timestamp_tracker_us is on the tracker's clock, as gaze data's, which
+ * may restart when the tracker re-initialises; there is no system time
+ * (tobii_timesync pairs the clocks).
+ *
+ * Every value is passed as the tracker sent it, whatever its validity, a
+ * lost eye's included. The eye blocks are keys 0x02..0x07 (left) and
+ * 0x08..0x0d (right) in field order, and the combined gaze point key 0x1c.
+ * status is the eye's status as sent: the ET5 sends 0 for a tracked eye and
+ * 4 for a lost one, and the DLL's gaze data takes an eye's values as valid
+ * while it is below 2. Each tobii_validity_t *_validity field says only that
+ * the frame had the key (the record's flag, set by process_gaze when the key
+ * is there), not that the value is usable: every ET5 frame captured has each
+ * of those keys but 0x0e, so an eyeball centre (keys 0x17, 0x18) is valid
+ * here while its eye is lost. A key the frame lacks reads 0, with a validity
+ * of 0. key_0e and key_11 are keys 0x0e and 0x11, of unknown meaning (the
+ * ET5 never sends 0x0e and sends 4 for 0x11); frame_counter is key 0x14.
+ * combined_gaze_validity (key 0x1b) is no such flag but, like the left and
+ * right origin flags (keys 0x16 and 0x15), the tracker's own word, 1 when
+ * valid. The reserved fields, named by their offsets, are slots the record
+ * never fills: always 0.
+ *
+ * The DLL serves raw gaze only from its in-process tracker module, which it
+ * runs for any URL, this library's tobii-ffi:// included, but tobii-prp://
+ * and tprp-tcp://, and only with the internal feature group:
+ * TOBII_ERROR_INSUFFICIENT_LICENSE below it, and TOBII_ERROR_NOT_SUPPORTED
+ * behind the Tobii service. This library checks no licence and serves it to
+ * every client. A daemon older than this library acknowledges the
+ * subscription and never sends the stream. */
+typedef struct tobii_gaze_raw_eye_t
+{
+    float gaze_origin_from_eye_tracker_mm_xyz[ 3 ];
+    float gaze_origin_in_track_box_normalized_xyz[ 3 ];
+    float gaze_point_from_eye_tracker_mm_xyz[ 3 ];
+    float gaze_point_on_display_normalized_xy[ 2 ];
+    float pupil_diameter_mm;
+    uint32_t status;
+} tobii_gaze_raw_eye_t;
+
+typedef struct tobii_gaze_raw_t
+{
+    int64_t timestamp_tracker_us;
+    tobii_gaze_raw_eye_t left;
+    tobii_gaze_raw_eye_t right;
+    float combined_gaze_point_on_display_normalized_xy[ 2 ];
+    uint32_t combined_gaze_validity;
+    tobii_validity_t key_0e_validity;
+    uint32_t key_0e;
+    tobii_validity_t reserved_84;
+    float reserved_88;
+    tobii_validity_t reserved_8c;
+    float reserved_90;
+    tobii_validity_t key_11_validity;
+    uint32_t key_11;
+    tobii_validity_t reserved_9c;
+    float reserved_a0;
+    tobii_validity_t reserved_a4;
+    float reserved_a8;
+    tobii_validity_t frame_counter_validity;
+    uint32_t frame_counter;
+    tobii_validity_t left_origin_flag_validity;
+    uint32_t left_origin_flag;
+    tobii_validity_t right_origin_flag_validity;
+    uint32_t right_origin_flag;
+    tobii_validity_t left_eyeball_center_validity;
+    float left_eyeball_center_from_eye_tracker_mm_xyz[ 3 ];
+    tobii_validity_t right_eyeball_center_validity;
+    float right_eyeball_center_from_eye_tracker_mm_xyz[ 3 ];
+    uint32_t reserved_e4;
+} tobii_gaze_raw_t;
+
+typedef void ( *tobii_gaze_raw_callback_t )( tobii_gaze_raw_t const* gaze_raw, void* user_data );
+
+TOBII_API tobii_error_t TOBII_CALL tobii_gaze_raw_subscribe( tobii_device_t* device,
+    tobii_gaze_raw_callback_t callback, void* user_data );
+TOBII_API tobii_error_t TOBII_CALL tobii_gaze_raw_unsubscribe( tobii_device_t* device );
 
 /* Internal stream ids (the names of 0..2 are inferred): 0 image, 1 clean IR,
  * 2 custom, 3 low-frequency head rotation, 4 low-frequency head position,
@@ -274,8 +359,6 @@ TOBII_API tobii_error_t TOBII_CALL tobii_face_id_state_subscribe( tobii_device_t
 TOBII_API tobii_error_t TOBII_CALL tobii_face_id_state_unsubscribe( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_foveated_rendering_gaze_point_subscribe( tobii_device_t* device, void const* callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_foveated_rendering_gaze_point_unsubscribe( tobii_device_t* device );
-TOBII_API tobii_error_t TOBII_CALL tobii_gaze_raw_subscribe( tobii_device_t* device, void const* callback, void* user_data );
-TOBII_API tobii_error_t TOBII_CALL tobii_gaze_raw_unsubscribe( tobii_device_t* device );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_combined_gaze_hid_track_box( tobii_device_t* device, void* track_box );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_configuration_key( tobii_device_t* device, void* key, void* value );
 TOBII_API tobii_error_t TOBII_CALL tobii_get_device_info_internal( tobii_device_t* device, void* info );

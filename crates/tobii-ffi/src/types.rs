@@ -329,6 +329,107 @@ pub struct GazeData {
     pub right: GazeDataEye,
 }
 
+/// One eye's block of [`GazeRaw`], `tobii_gaze_raw_eye_t` (undocumented; the
+/// names are ours, after the fields of [`GazeDataEye`] the DLL fills from
+/// the same keys): the eye's values as the tracker sent them, whatever their
+/// validity, and 0 for a key the frame lacks.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GazeRawEye {
+    /// Gaze origin, tracker frame, mm (key `0x02`, right eye `0x08`).
+    pub gaze_origin_from_eye_tracker_mm_xyz: [f32; 3],
+    /// Gaze origin, track-box-normalised (key `0x03`, `0x09`).
+    pub gaze_origin_in_track_box_normalized_xyz: [f32; 3],
+    /// Gaze point, tracker frame, mm (key `0x04`, `0x0a`).
+    pub gaze_point_from_eye_tracker_mm_xyz: [f32; 3],
+    /// Gaze point, display-normalised, unclamped (key `0x05`, `0x0b`).
+    pub gaze_point_on_display_normalized_xy: [f32; 2],
+    /// Pupil diameter, mm (key `0x06`, `0x0c`).
+    pub pupil_diameter_mm: f32,
+    /// The eye's status as sent (key `0x07`, `0x0d`): 0 tracked, 4 lost on
+    /// the ET5. The DLL's gaze data takes the eye's values as valid while it
+    /// is below 2.
+    pub status: u32,
+}
+
+/// `tobii_gaze_raw_t` (undocumented; 232 bytes, the record the DLL's
+/// `process_gaze`, 0x18018d9a0, builds from each gaze frame, as its raw gaze
+/// dispatch copies it, 0x180171b81..0x180171db8; the names are ours).
+///
+/// Each [`Validity`] `*_validity` field says only that the frame had the
+/// key: the DLL sets it from its record's flag, which `process_gaze` sets
+/// when the key is there. It does not say the value is usable, which for an
+/// eye is its `status` below 2. `combined_gaze_validity` is no such flag but
+/// the tracker's own word for the combined point, as sent. The `reserved_*`
+/// fields, named by their offsets, are record slots `process_gaze` never
+/// fills (four validity and value pairs, and the tail the dispatch zeroes):
+/// always 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GazeRaw {
+    /// When the frame was taken, microseconds on the tracker's clock (key
+    /// `0x01`, copied unchanged), the clock of [`GazeData`]'s
+    /// `timestamp_tracker_us`.
+    pub timestamp_tracker_us: i64,
+    /// Left eye.
+    pub left: GazeRawEye,
+    /// Right eye.
+    pub right: GazeRawEye,
+    /// Combined gaze point, display-normalised, unclamped (key `0x1c`).
+    pub combined_gaze_point_on_display_normalized_xy: [f32; 2],
+    /// Combined gaze validity as sent (key `0x1b`): 1 when the point is
+    /// valid.
+    pub combined_gaze_validity: u32,
+    /// Whether the frame had key `0x0e`.
+    pub key_0e_validity: Validity,
+    /// Key `0x0e`, of unknown meaning; the ET5 never sends it.
+    pub key_0e: u32,
+    /// Never filled.
+    pub reserved_84: Validity,
+    /// Never filled.
+    pub reserved_88: f32,
+    /// Never filled.
+    pub reserved_8c: Validity,
+    /// Never filled.
+    pub reserved_90: f32,
+    /// Whether the frame had key `0x11`.
+    pub key_11_validity: Validity,
+    /// Key `0x11`, of unknown meaning; the ET5 sends 4.
+    pub key_11: u32,
+    /// Never filled.
+    pub reserved_9c: Validity,
+    /// Never filled.
+    pub reserved_a0: f32,
+    /// Never filled.
+    pub reserved_a4: Validity,
+    /// Never filled.
+    pub reserved_a8: f32,
+    /// Whether the frame had its frame counter.
+    pub frame_counter_validity: Validity,
+    /// The tracker's frame counter (key `0x14`).
+    pub frame_counter: u32,
+    /// Whether the frame had the left eye's gaze-origin flag.
+    pub left_origin_flag_validity: Validity,
+    /// The left eye's gaze-origin validity as sent (key `0x16`): 1 when
+    /// valid.
+    pub left_origin_flag: u32,
+    /// Whether the frame had the right eye's gaze-origin flag.
+    pub right_origin_flag_validity: Validity,
+    /// The right eye's gaze-origin validity as sent (key `0x15`).
+    pub right_origin_flag: u32,
+    /// Whether the frame had the left eyeball's centre.
+    pub left_eyeball_center_validity: Validity,
+    /// Left eyeball centre, tracker frame, mm (key `0x17`).
+    pub left_eyeball_center_from_eye_tracker_mm_xyz: [f32; 3],
+    /// Whether the frame had the right eyeball's centre.
+    pub right_eyeball_center_validity: Validity,
+    /// Right eyeball centre, tracker frame, mm (key `0x18`).
+    pub right_eyeball_center_from_eye_tracker_mm_xyz: [f32; 3],
+    /// Zeroed by the DLL's dispatch (0x180171b7b); declared so the struct
+    /// has no padding.
+    pub reserved_e4: u32,
+}
+
 /// The value union of [`Notification`].
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -564,6 +665,9 @@ pub type PresenceFn = unsafe extern "C" fn(PresenceStatus, i64, *mut c_void);
 pub type EyePairFn = unsafe extern "C" fn(*const EyePair, *mut c_void);
 /// `tobii_gaze_data_callback_t`.
 pub type GazeDataFn = unsafe extern "C" fn(*const GazeData, *mut c_void);
+/// `tobii_gaze_raw_callback_t` (the DLL's call at 0x180171dce: the record,
+/// then the user data).
+pub type GazeRawFn = unsafe extern "C" fn(*const GazeRaw, *mut c_void);
 /// `tobii_image_callback_t`.
 pub type ImageFn = unsafe extern "C" fn(*const Image, *mut c_void);
 /// `tobii_notifications_callback_t`.
@@ -627,6 +731,50 @@ mod tests {
         assert_eq!(size_of::<GazeData>(), 168);
         assert_eq!(offset_of!(GazeData, left), 16);
         assert_eq!(offset_of!(GazeData, right), 92);
+
+        // The raw gaze dispatch's copy (0x180171b81..0x180171db8) into a
+        // 0xe8-byte record on its stack.
+        assert_eq!(size_of::<GazeRawEye>(), 52);
+        assert_eq!(
+            offset_of!(GazeRawEye, gaze_point_from_eye_tracker_mm_xyz),
+            24
+        );
+        assert_eq!(offset_of!(GazeRawEye, pupil_diameter_mm), 44);
+        assert_eq!(offset_of!(GazeRawEye, status), 48);
+        assert_eq!(size_of::<GazeRaw>(), 232);
+        assert_eq!(align_of::<GazeRaw>(), 8);
+        assert_eq!(offset_of!(GazeRaw, left), 0x08);
+        assert_eq!(offset_of!(GazeRaw, right), 0x3c);
+        assert_eq!(
+            offset_of!(GazeRaw, combined_gaze_point_on_display_normalized_xy),
+            0x70
+        );
+        assert_eq!(offset_of!(GazeRaw, combined_gaze_validity), 0x78);
+        assert_eq!(offset_of!(GazeRaw, key_0e_validity), 0x7c);
+        assert_eq!(offset_of!(GazeRaw, key_0e), 0x80);
+        assert_eq!(offset_of!(GazeRaw, reserved_84), 0x84);
+        assert_eq!(offset_of!(GazeRaw, reserved_90), 0x90);
+        assert_eq!(offset_of!(GazeRaw, key_11_validity), 0x94);
+        assert_eq!(offset_of!(GazeRaw, key_11), 0x98);
+        assert_eq!(offset_of!(GazeRaw, reserved_9c), 0x9c);
+        assert_eq!(offset_of!(GazeRaw, reserved_a8), 0xa8);
+        assert_eq!(offset_of!(GazeRaw, frame_counter_validity), 0xac);
+        assert_eq!(offset_of!(GazeRaw, frame_counter), 0xb0);
+        assert_eq!(offset_of!(GazeRaw, left_origin_flag_validity), 0xb4);
+        assert_eq!(offset_of!(GazeRaw, left_origin_flag), 0xb8);
+        assert_eq!(offset_of!(GazeRaw, right_origin_flag_validity), 0xbc);
+        assert_eq!(offset_of!(GazeRaw, right_origin_flag), 0xc0);
+        assert_eq!(offset_of!(GazeRaw, left_eyeball_center_validity), 0xc4);
+        assert_eq!(
+            offset_of!(GazeRaw, left_eyeball_center_from_eye_tracker_mm_xyz),
+            0xc8
+        );
+        assert_eq!(offset_of!(GazeRaw, right_eyeball_center_validity), 0xd4);
+        assert_eq!(
+            offset_of!(GazeRaw, right_eyeball_center_from_eye_tracker_mm_xyz),
+            0xd8
+        );
+        assert_eq!(offset_of!(GazeRaw, reserved_e4), 0xe4);
 
         assert_eq!(size_of::<Notification>(), 520);
         assert_eq!(align_of::<Notification>(), 4);

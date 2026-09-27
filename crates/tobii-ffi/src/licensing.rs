@@ -3,8 +3,8 @@
 //! What the Stream Engine reserves for a higher group is served anyway: gaze
 //! data and `tobii_timesync` (professional), calibration and the
 //! display-area and device-name writes (config or professional), the IR
-//! image (additional features), the stream catalogue (internal) and, in the
-//! DLL's own service, pause (internal).
+//! image (additional features), raw gaze and the stream catalogue
+//! (internal) and, in the DLL's own service, pause (internal).
 
 use std::ffi::{c_char, c_void};
 
