@@ -255,3 +255,57 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use tobii_ipc::{EyePair, HeadPose, Notification, NotificationValue, PRESENCE_PRESENT};
+
+    /// The frames of every stream, and the subscription ack, have a name
+    /// of their own in the report, so no two streams share a count and
+    /// none is lumped in with "other"; a REPLY, which is no stream, is.
+    #[test]
+    fn every_stream_has_a_name_of_its_own() {
+        let head_pose = ServerMsg::HeadPose(HeadPose::default());
+        let msgs = [
+            ServerMsg::Subscribed { ok: true },
+            ServerMsg::Head {
+                ts_us: 1,
+                pos_mm: [0.0; 3],
+                rot_rad: [0.0; 3],
+            },
+            head_pose.clone(),
+            ServerMsg::Gaze {
+                ts_us: 1,
+                valid: true,
+                xy: [0.5; 2],
+                pupil_mm: [3.0; 2],
+            },
+            ServerMsg::Presence {
+                ts_us: 1,
+                status: PRESENCE_PRESENT,
+            },
+            ServerMsg::GazeOrigin(EyePair::default()),
+            ServerMsg::EyePosition(EyePair::default()),
+            ServerMsg::GazeData(Box::default()),
+            ServerMsg::GazeRaw(Box::default()),
+            ServerMsg::Image(Box::default()),
+            ServerMsg::Notification(Notification {
+                kind: tobii_ipc::notification::FRAMERATE_CHANGED,
+                value: NotificationValue::Float(33.0),
+            }),
+        ];
+        let names: BTreeSet<&str> = msgs.iter().map(kind_of).collect();
+        let reply = ServerMsg::Reply {
+            request_id: 1,
+            status: 0,
+            payload: Vec::new(),
+        };
+
+        assert_eq!(names.len(), msgs.len(), "{names:?}");
+        assert!(!names.contains("other"), "{names:?}");
+        assert_eq!(kind_of(&head_pose), "head_pose");
+        assert_eq!(kind_of(&reply), "other");
+    }
+}

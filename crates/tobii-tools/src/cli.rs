@@ -1081,3 +1081,19 @@ pub(crate) fn parse_log_input(arg: &str) -> Result<LogInput> {
         path: path.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tobii_ipc::STREAM_IMAGE;
+
+    /// Without `--streams`, `ipc-probe` watches every stream the daemon has
+    /// but the IR images, the Stream Engine's head pose included.
+    #[test]
+    fn ipc_probe_watches_every_stream_but_the_images_by_default() {
+        let every_stream = (STREAM_HEAD_POSE << 1) - 1;
+
+        assert_eq!(DEFAULT_IPC_PROBE_STREAMS, every_stream & !STREAM_IMAGE);
+        assert_eq!(DEFAULT_IPC_PROBE_STREAMS, 0x3bf);
+    }
+}
