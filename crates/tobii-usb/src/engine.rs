@@ -50,6 +50,15 @@
 //! that, each 1450. [`Sample::DeviceReady`] reports that area, and every
 //! [`ImageSample`] carries its display frame. The area handed to
 //! [`Engine::set_display_area_override`] is only what the next inits write.
+//!
+//! Each gaze frame read after an init is checked against that display
+//! frame: the device sends its gaze origins in both the tracker frame and
+//! the display frame of the area it holds, and the display frame in effect
+//! must turn the one into the other (it does to 0.00016 mm on every frame
+//! recorded). When three frames in a row miss by more than 0.01 mm, the
+//! device's display frame is not the engine's, and the engine logs a
+//! warning, once for each [display
+//! generation](ImageSample::display_generation).
 
 use std::collections::VecDeque;
 use std::fmt;

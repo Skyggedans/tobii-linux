@@ -1505,7 +1505,8 @@ impl AreaInEffect {
 }
 
 /// What the engine's USB thread keeps from one open of the tracker to the
-/// next: how many it made, and the display area in effect.
+/// next: how many it made, the display area in effect, and the check of the
+/// device's display frame against that area's.
 #[derive(Debug, Default)]
 struct Opens {
     /// Opens whose init replay ran to its end, the one under way included:
@@ -1513,6 +1514,9 @@ struct Opens {
     count: u64,
     /// The display area in effect on the device.
     display: AreaInEffect,
+    /// Whether the device converts its gaze origins as the display frame of
+    /// that area does.
+    check: DisplayFrameCheck,
 }
 
 impl Opens {
@@ -1521,6 +1525,102 @@ impl Opens {
         self.count = self.count.wrapping_add(1);
         self.display.set(area);
     }
+}
+
+/// How far, mm, the device's display-frame gaze origin may lie from where
+/// the display frame in effect puts its tracker-frame one for the two
+/// frames to be the same (see [`DisplayFrameCheck`]). On every gaze frame
+/// recorded so far the two lie within 0.00016 mm with the area the device
+/// held, and 0.847 mm apart with the other area recorded.
+const ORIGIN_TOLERANCE_MM: f64 = 0.01;
+
+/// How many gaze frames in a row must miss the display frame in effect by
+/// more than [`ORIGIN_TOLERANCE_MM`] to say that the device's display frame
+/// is not ours. A frame either side of a change of area may miss alone: one
+/// the device converted with the new area before the pump routed its 1450,
+/// or with the old area after. (In the one change recorded, change-display,
+/// none did: the 1450 came between the last frame of the old area and the
+/// first of the new.)
+const MISSES_TO_WARN: u32 = 3;
+
+/// The check that the device converts its gaze origins into the display
+/// frame of the area in effect, as [`DisplayFrame`] builds it.
+///
+/// A 0x500 frame carries each eye's gaze origin (cornea centre) in the
+/// tracker frame (keys 0x02/0x08) and in the display frame of the area the
+/// device holds (0x22/0x24). An eye that has both, each valid, is judged by
+/// how far the second lies from where the display frame in effect puts the
+/// first, and a frame by its eye that lies further. A frame that misses by
+/// more than [`ORIGIN_TOLERANCE_MM`] says the device's display frame is not
+/// ours: the device holds an area the engine was not told of, or it builds
+/// its frame from the area otherwise (every area seen so far was a
+/// rectangle tilted 20 degrees about x; how it frames a rolled or sheared
+/// one is not known). Anything the engine reports in its own display frame
+/// is then off from the device's gaze origins by about as much.
+///
+/// The check counts the frames in a row, of one open and one display
+/// generation, that miss; a frame with no eye to judge neither counts nor
+/// breaks the run. The [`MISSES_TO_WARN`]th is to be warned of, once for
+/// each display generation.
+#[derive(Debug, Default, PartialEq)]
+struct DisplayFrameCheck {
+    /// The open and the display generation of the frames counted in
+    /// `misses`.
+    run_of: (u64, u64),
+    /// Frames in a row, of that open and generation, whose origins missed.
+    misses: u32,
+    /// The last display generation that was to be warned of.
+    warned: Option<u64>,
+}
+
+impl DisplayFrameCheck {
+    /// Judge `frame`, read in open `open` while the display area of
+    /// generation `generation`, whose display frame is `display`, was in
+    /// effect. The error, mm, when this frame is the [`MISSES_TO_WARN`]th in
+    /// a row to miss and the generation is not warned of yet; `None`
+    /// otherwise.
+    #[must_use]
+    fn judge(
+        &mut self,
+        frame: &GazeFrame,
+        display: DisplayFrame,
+        open: u64,
+        generation: u64,
+    ) -> Option<f64> {
+        let error_mm = origin_error_mm(frame, display)?;
+        if self.run_of != (open, generation) {
+            self.run_of = (open, generation);
+            self.misses = 0;
+        }
+        if error_mm > ORIGIN_TOLERANCE_MM {
+            self.misses = self.misses.saturating_add(1);
+        } else {
+            self.misses = 0;
+        }
+        if self.misses < MISSES_TO_WARN || self.warned == Some(generation) {
+            return None;
+        }
+        self.warned = Some(generation);
+        Some(error_mm)
+    }
+}
+
+/// How far the device's display-frame gaze origins in `frame` lie from
+/// where `display` puts its tracker-frame ones, mm: the larger distance of
+/// the eyes that have both origins valid; `None` when neither eye has.
+fn origin_error_mm(frame: &GazeFrame, display: DisplayFrame) -> Option<f64> {
+    [&frame.left, &frame.right]
+        .into_iter()
+        .filter(|eye| eye.origin_tracker_mm.valid && eye.origin_display_mm.valid)
+        .map(|eye| {
+            let ours = display.to_display(eye.origin_tracker_mm.value);
+            ours.iter()
+                .zip(eye.origin_display_mm.value)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+                .sqrt()
+        })
+        .reduce(f64::max)
 }
 
 /// Read 0x83 for up to `dur`, returning true as soon as a decodable GAZE
@@ -1860,8 +1960,12 @@ struct Pump<'a> {
     /// tracker's clock, and a new pump starts a new map.
     time: TimeMap,
     /// This open's number and the display area in effect, which every image
-    /// carries; a 1450 the pump routes changes the area.
+    /// carries; a 1450 the pump routes changes the area. Each gaze frame is
+    /// checked against its display frame.
     opens: &'a mut Opens,
+    /// Set while the messages the init replay read are delivered (see
+    /// [`Pump::deliver_init_side`]), whose gaze frames are not checked.
+    in_init_side: bool,
 }
 
 impl Pump<'_> {
@@ -1884,8 +1988,12 @@ impl Pump<'_> {
     /// them. A display-area notification (1450) among them is passed on but
     /// changes nothing here: the init took the area of the last one already
     /// (see [`init_display_area`]), and routing any before it would make
-    /// the area in effect go back and forth.
+    /// the area in effect go back and forth. A gaze frame among them is
+    /// passed on but not checked against the area in effect (see
+    /// [`Pump::check_display_frame`]): the device may have converted it with
+    /// the area it held before the init wrote its own.
     fn deliver_init_side(&mut self, side: &[Vec<u8>]) {
+        self.in_init_side = true;
         for msg in side {
             match classify(msg) {
                 Incoming::Notification(n @ DeviceNotification::DisplayAreaChanged(_)) => {
@@ -1895,6 +2003,7 @@ impl Pump<'_> {
                 incoming => self.deliver(incoming),
             }
         }
+        self.in_init_side = false;
     }
 
     /// Deliver the messages read while the stream armed, each with the host
@@ -1936,12 +2045,16 @@ impl Pump<'_> {
     /// carries the display area in effect when it is routed, which a
     /// display-area notification (1450) changes as it is routed: messages
     /// are routed in the order they were read, so an image read after a
-    /// 1450 carries the area it gave.
+    /// 1450 carries the area it gave, and a gaze frame is checked against
+    /// it (see [`Pump::check_display_frame`]).
     fn route(&mut self, incoming: Incoming, rx_us: i64) {
         match incoming {
             Incoming::Gaze(frame) => {
                 self.last_gaze = Instant::now();
                 self.resume.on_gaze();
+                if !self.in_init_side {
+                    self.check_display_frame(&frame);
+                }
                 let host_us = self
                     .time
                     .stamp(Stream::Gaze, to_i64_us(frame.device_ts_us), rx_us);
@@ -2028,6 +2141,29 @@ impl Pump<'_> {
                 }
             }
             Incoming::Other => {}
+        }
+    }
+
+    /// Check the gaze origins of `frame` against the display frame of the
+    /// area in effect (see [`DisplayFrameCheck`]), and warn once for each
+    /// display generation when the device's display frame is not ours. A
+    /// few dozen flops; nothing to check without a display frame.
+    fn check_display_frame(&mut self, frame: &GazeFrame) {
+        let Opens {
+            count,
+            display: in_effect,
+            check,
+        } = &mut *self.opens;
+        let Some(display) = in_effect.frame else {
+            return;
+        };
+        let generation = in_effect.generation;
+        if let Some(error_mm) = check.judge(frame, display, *count, generation) {
+            warn!(
+                error_mm,
+                generation,
+                "gaze: the device's gaze origins are not in the display frame in effect"
+            );
         }
     }
 
@@ -2195,6 +2331,7 @@ fn gaze_stream_loop(
         resume: ResumeWatch::default(),
         time: TimeMap::default(),
         opens,
+        in_init_side: false,
     };
     pump.deliver_init_side(&capture.side);
 
@@ -2424,6 +2561,7 @@ mod tests {
                 resume: ResumeWatch::default(),
                 time: TimeMap::default(),
                 opens,
+                in_init_side: false,
             }
         }
 
@@ -3048,6 +3186,335 @@ mod tests {
             })
             .collect();
         assert_eq!(delivered, ["A", "presence", "B"], "all passed on, in order");
+    }
+
+    /// The session-1 gaze frame, which the device converted with the
+    /// captured area A (the init's 1430): both eyes have both origins valid.
+    fn session1_frame() -> GazeFrame {
+        let msg = fixture("session1-gaze-frame");
+        decode_gaze_frame(&parse_message(&msg).expect("a message")).expect("a gaze frame")
+    }
+
+    /// `frame` as the device holding `area` would send it: its display-frame
+    /// origins converted from its tracker-frame ones with that area's frame.
+    fn converted_with(mut frame: GazeFrame, area: &DisplayArea) -> GazeFrame {
+        let display = DisplayFrame::new(area).expect("a display frame");
+        for eye in [&mut frame.left, &mut frame.right] {
+            eye.origin_display_mm.value = display.to_display(eye.origin_tracker_mm.value);
+        }
+        frame
+    }
+
+    fn gaze(frame: GazeFrame) -> Incoming {
+        Incoming::Gaze(Box::new(frame))
+    }
+
+    /// The square the tracker starts each open with, whose frame is the
+    /// tracker frame itself: the session-1 origins miss it by some 75 mm.
+    fn start_square() -> DisplayArea {
+        DisplayArea {
+            top_left_mm: [-2.0, 2.0, 0.0],
+            top_right_mm: [2.0, 2.0, 0.0],
+            bottom_left_mm: [-2.0, -2.0, 0.0],
+        }
+    }
+
+    /// A warning logged: its message, and its other fields as `Debug`
+    /// formats them.
+    #[derive(Debug, Default)]
+    struct Logged {
+        message: String,
+        fields: Vec<(&'static str, String)>,
+    }
+
+    impl Logged {
+        fn field(&self, name: &str) -> &str {
+            self.fields
+                .iter()
+                .find_map(|(n, v)| (*n == name).then_some(v.as_str()))
+                .unwrap_or_else(|| panic!("no field {name} in {self:?}"))
+        }
+
+        /// The error and generation of a warning that the device's display
+        /// frame is not ours.
+        fn mismatch(&self) -> (f64, u64) {
+            assert!(self.message.contains("display frame"), "{self:?}");
+            (
+                self.field("error_mm").parse().expect("error_mm"),
+                self.field("generation").parse().expect("generation"),
+            )
+        }
+    }
+
+    impl tracing::field::Visit for Logged {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push((field.name(), format!("{value:?}")));
+            }
+        }
+    }
+
+    /// Collects what is logged at warn level on a thread that has it as its
+    /// default subscriber.
+    #[derive(Debug, Default)]
+    struct Warnings(Mutex<Vec<Logged>>);
+
+    impl Warnings {
+        /// Collect the warnings logged on this thread while the guard lives.
+        fn collect() -> (Arc<Self>, tracing::subscriber::DefaultGuard) {
+            let warnings = Arc::new(Self::default());
+            let guard = tracing::subscriber::set_default(Arc::clone(&warnings));
+            (warnings, guard)
+        }
+
+        /// The error and generation of each warning so far that the
+        /// device's display frame is not ours, taking them.
+        fn mismatches(&self) -> Vec<(f64, u64)> {
+            let mut logged = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            logged.drain(..).map(|w| w.mismatch()).collect()
+        }
+
+        /// The generations of [`Warnings::mismatches`].
+        fn generations(&self) -> Vec<u64> {
+            self.mismatches().into_iter().map(|(_, g)| g).collect()
+        }
+    }
+
+    impl tracing::Subscriber for Warnings {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            // Asked at every event, as other tests log on their own threads.
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut logged = Logged::default();
+            event.record(&mut logged);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(logged);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The device converts its gaze origins as the display frame of the
+    /// area it holds does, to 0.00016 mm (here 0.00013), and that of the
+    /// other area recorded misses them by 0.847 mm.
+    #[test]
+    fn the_device_converts_its_gaze_origins_with_the_frame_of_its_area() {
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-cmd-1440");
+        let frame_of = |area: &DisplayArea| DisplayFrame::new(area).expect("a display frame");
+        let frame = session1_frame();
+
+        let on_a = origin_error_mm(&frame, frame_of(&a)).expect("eyes to judge");
+        let on_b = origin_error_mm(&frame, frame_of(&b)).expect("eyes to judge");
+
+        assert!(on_a < 0.000_16, "{on_a}");
+        assert!((on_b - 0.847).abs() < 0.001, "{on_b}");
+        let as_b = converted_with(frame, &b);
+        assert!(origin_error_mm(&as_b, frame_of(&b)).expect("eyes") < 1e-12);
+    }
+
+    #[test]
+    fn gaze_frames_that_miss_the_area_in_effect_three_times_in_a_row_warn_once() {
+        let (warnings, _guard) = Warnings::collect();
+        let rig = Rig::new();
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-cmd-1440");
+
+        let mut opens = Opens::default();
+        opens.opened(Some(a));
+        let mut pump = rig.pump(&mut opens);
+        for _ in 0..5 {
+            pump.deliver(gaze(session1_frame()));
+        }
+        assert_eq!(warnings.mismatches(), [], "the area the device held");
+        assert_eq!(pump.opens.check.misses, 0);
+
+        let mut opens = Opens::default();
+        opens.opened(Some(b));
+        let mut pump = rig.pump(&mut opens);
+        pump.deliver(gaze(session1_frame()));
+        pump.deliver(gaze(session1_frame()));
+        assert_eq!(warnings.mismatches(), [], "two frames");
+        pump.deliver(gaze(session1_frame()));
+        let [(error_mm, generation)] = warnings.mismatches()[..] else {
+            panic!("one warning on the third frame");
+        };
+        assert!((error_mm - 0.847).abs() < 0.001, "{error_mm}");
+        assert_eq!(generation, 1);
+        for _ in 0..5 {
+            pump.deliver(gaze(session1_frame()));
+        }
+        assert_eq!(warnings.mismatches(), [], "once for the area");
+        let gazes = rig
+            .samples()
+            .iter()
+            .filter(|s| matches!(s, Sample::Gaze(_)))
+            .count();
+        assert_eq!(gazes, 13, "every frame passed on");
+    }
+
+    #[test]
+    fn gaze_frames_the_init_replay_read_are_not_checked() {
+        let (warnings, _guard) = Warnings::collect();
+        let rig = Rig::new();
+        let (b, _) = area_of("change-display-cmd-1440");
+        let mut opens = Opens::default();
+        opens.opened(Some(b));
+        let mut pump = rig.pump(&mut opens);
+
+        // The device may have converted these with the area it held before
+        // the init wrote B.
+        pump.deliver_init_side(&vec![fixture("session1-gaze-frame"); 4]);
+        assert_eq!(pump.opens.check, DisplayFrameCheck::default());
+        pump.deliver(gaze(session1_frame()));
+        pump.deliver(gaze(session1_frame()));
+        assert_eq!(warnings.mismatches(), [], "two frames after the init");
+        pump.deliver(gaze(session1_frame()));
+        assert_eq!(warnings.mismatches().len(), 1, "the third");
+        assert_eq!(rig.samples().len(), 7, "the init's frames passed on");
+    }
+
+    /// A frame that fits breaks a run of misses, and a frame misses when
+    /// either eye does; a frame with no eye to judge neither breaks a run
+    /// nor counts, and one eye is enough to judge.
+    #[test]
+    fn a_frame_that_fits_breaks_a_run_and_one_without_origins_does_not() {
+        let (b, _) = area_of("change-display-cmd-1440");
+        let display = DisplayFrame::new(&b).expect("a display frame");
+        let miss = session1_frame();
+        let fit = converted_with(miss, &b);
+        // The left eye fits, the right one misses.
+        let mut right_misses = fit;
+        right_misses.right.origin_display_mm.value = miss.right.origin_display_mm.value;
+        // Each eye has one of its origins valid, not both.
+        let mut no_origins = miss;
+        no_origins.left.origin_tracker_mm.valid = false;
+        no_origins.right.origin_display_mm.valid = false;
+        // Only the right eye has both, and it misses.
+        let mut right_alone = right_misses;
+        right_alone.left.origin_display_mm.valid = false;
+        let mut check = DisplayFrameCheck::default();
+        let mut judge = |frame: &GazeFrame| check.judge(frame, display, 1, 1).is_some();
+
+        assert!(!judge(&miss) && !judge(&miss));
+        assert!(!judge(&fit), "fits");
+        assert!(!judge(&miss) && !judge(&right_misses), "a new run");
+        assert!(!judge(&no_origins), "no eye to judge");
+        assert!(judge(&right_alone), "the third miss");
+        assert!(!judge(&miss) && !judge(&miss) && !judge(&miss), "warned of");
+    }
+
+    /// A frame misses when an eye's origin lies more than 0.01 mm from
+    /// where the frame in effect puts it.
+    #[test]
+    fn a_frame_misses_by_more_than_a_hundredth_of_a_millimetre() {
+        let (b, _) = area_of("change-display-cmd-1440");
+        let display = DisplayFrame::new(&b).expect("a display frame");
+        let off_by = |mm: f64| {
+            let mut frame = converted_with(session1_frame(), &b);
+            frame.left.origin_display_mm.value[2] += mm;
+            frame
+        };
+
+        for (mm, warns) in [(0.0099, false), (0.0101, true), (-0.0101, true)] {
+            let mut check = DisplayFrameCheck::default();
+            let frame = off_by(mm);
+            let warned = (0..3).any(|_| check.judge(&frame, display, 1, 1).is_some());
+            assert_eq!(warned, warns, "{mm} mm");
+        }
+    }
+
+    /// A new display generation, or a new open, starts a run over, and each
+    /// generation is warned of once whatever the opens.
+    #[test]
+    fn each_display_generation_is_warned_of_once_and_each_open_starts_a_run() {
+        let (warnings, _guard) = Warnings::collect();
+        let rig = Rig::new();
+        let (b, _) = area_of("change-display-cmd-1440");
+        let mut opens = Opens::default();
+        let miss = || gaze(session1_frame());
+
+        // Generation 1, B: two misses, then a 1450 of the start square.
+        opens.opened(Some(b));
+        let mut pump = rig.pump(&mut opens);
+        pump.deliver(miss());
+        pump.deliver(miss());
+        pump.deliver(classify(&notification_of(&start_square())));
+        pump.deliver(miss());
+        assert_eq!(warnings.generations(), [], "a new run at the 1450");
+        pump.deliver(miss());
+        pump.deliver(miss());
+        assert_eq!(warnings.generations(), [2]);
+        // B again, twice: generation 3, a generation of its own.
+        pump.deliver(classify(&notification_of(&b)));
+        pump.deliver(classify(&notification_of(&b)));
+        for _ in 0..3 {
+            pump.deliver(miss());
+        }
+        assert_eq!(warnings.generations(), [3]);
+
+        // A re-open that leaves B in effect keeps generation 3.
+        opens.opened(Some(b));
+        for _ in 0..3 {
+            rig.pump(&mut opens).deliver(miss());
+        }
+        assert_eq!(warnings.generations(), [], "generation 3 again");
+        // Generation 4, over two opens.
+        opens.opened(Some(start_square()));
+        let mut pump = rig.pump(&mut opens);
+        pump.deliver(miss());
+        pump.deliver(miss());
+        opens.opened(Some(start_square()));
+        rig.pump(&mut opens).deliver(miss());
+        assert_eq!(warnings.generations(), [], "a new run at the open");
+        let mut pump = rig.pump(&mut opens);
+        pump.deliver(miss());
+        pump.deliver(miss());
+        assert_eq!(warnings.generations(), [4]);
+    }
+
+    #[test]
+    fn nothing_is_checked_without_a_display_frame() {
+        let (warnings, _guard) = Warnings::collect();
+        let rig = Rig::new();
+        let narrow = DisplayArea {
+            top_right_mm: [-1.5, 2.0, 0.0],
+            ..start_square()
+        };
+
+        for area in [None, Some(narrow)] {
+            let mut opens = Opens::default();
+            opens.opened(area);
+            let mut pump = rig.pump(&mut opens);
+            for _ in 0..5 {
+                pump.deliver(gaze(session1_frame()));
+            }
+            assert_eq!(pump.opens.check, DisplayFrameCheck::default(), "{area:?}");
+        }
+        assert_eq!(warnings.mismatches(), []);
     }
 
     #[test]
