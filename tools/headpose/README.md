@@ -10,7 +10,7 @@ tests' vectors. Python 3 with NumPy and SciPy, nothing else.
 
 | file | what it is |
 |---|---|
-| `reference.py` | The executable specification of `head.rs`: validity, rotation, position, filters, one call per image. A port of the head pose study's reference: the same operations, so the same numbers bit for bit. Also the study's constants (`PROTOTYPE`), the shipped choice of them (`FITTED`) and the conversion to and from `HeadParams`' field names. |
+| `reference.py` | The executable specification of `head.rs`: validity, rotation, position, filters, one call per image. A port of the head pose study's reference: the same operations, so the same numbers bit for bit. Also the study's constants (`PROTOTYPE`), the same with the choices `head.rs` ships (`FITTED`, which `HeadParams::FITTED` holds until the constants are fitted again) and the conversion to and from `HeadParams`' field names. |
 | `make_vectors.py` | Writes the synthetic test vectors `head.rs`'s tests carry, from `reference.py` and the canonical mesh of `canonical.rs`. No session data. |
 | `common.py` | Reads a session: the TBI5LOG1 log, the DLL's JSONL, the face fits; finds the clock offset, pairs every DLL pose with its image, fits the display frame. Vectorised twins of `reference.py` for whole sessions. |
 | `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON. |
