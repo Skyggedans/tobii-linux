@@ -2476,27 +2476,29 @@ mod tests {
         let left = detection([160.0, 140.0], 80.0, 0.8);
         let right = detection([240.0, 140.0], 80.0, 0.7);
         assert_eq!(pick(&[left, right], Some(&last)), Some(0.8));
-        // A box that is not finite is never the nearest.
-        let bad = Detection {
-            x: f64::NAN,
-            ..near
-        };
-        assert_eq!(pick(&[bad, other], Some(&last)), Some(0.9));
+        // A box that is not finite is never the nearest, whatever the sign
+        // of its NaN: f64::total_cmp puts a negative NaN before every
+        // number, and x86 hands one back for 0/0 or inf - inf.
+        for x in [f64::NAN, -f64::NAN] {
+            let bad = Detection { x, ..near };
+            assert_eq!(pick(&[bad, other], Some(&last)), Some(0.9), "{x}");
+        }
         assert_eq!(pick(&[], Some(&last)), None);
     }
 
     #[test]
     fn a_lost_face_is_looked_for_at_the_detection_nearest_where_it_was() {
         let face = seen_through(&START, [0.0, 0.0, 60.0]);
-        // 1: the start crop misses; no face has been found yet, so the
-        // landmark model tries the best detection, on the right, and finds
-        // the face there.
-        let right = detection([200.0, 140.0], 80.0, 0.9);
+        // 1: the start crop, centred at (280, 280), misses. No face has
+        // been found yet, so the landmark model tries the best-scoring
+        // detection, whose crop is centred 160 px right of the start crop's,
+        // not the one 120 px left of it; it finds the face there.
+        let right = detection([220.0, 140.0], 80.0, 0.9);
         let left = detection([80.0, 140.0], 80.0, 0.6);
         // 2: the crop that followed it loses the face; the detector finds a
         // better-scoring face on the left, and one near where it was.
         let left_again = detection([80.0, 140.0], 80.0, 0.9);
-        let right_again = detection([190.0, 150.0], 80.0, 0.6);
+        let right_again = detection([210.0, 150.0], 80.0, 0.6);
         let script = Script::new(
             &face,
             [-1.0, 2.0, -1.0, 3.0],
