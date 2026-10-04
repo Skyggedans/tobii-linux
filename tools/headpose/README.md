@@ -68,6 +68,9 @@ face.
 
    It prints each fold's constants and the beta grid it chose from, then every session's errors
    with the constants fitted without it (LOSO) and, with `--in-sample`, with those fitted on all.
+   Last comes the study's search of the G3 thresholds: each fold's, tested on the session it
+   leaves out, and the optimum on all the sessions next to the thresholds `head_params` keep
+   (FITTED's, 6 and -4 px), which the fit does not change.
    `fit.json`'s `head_params` are the constants fitted on all the sessions, with the choices
    `head.rs` ships: the PnP branch alone (eye weight 0; `--blend` keeps the weight found) and
    one one-euro filter for the three angles (`--rotation-filters per-axis` for the study's).

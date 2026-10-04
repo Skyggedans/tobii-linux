@@ -16,16 +16,23 @@ give a pose). In each fold (one per session, fitted on the others; and one on al
             the largest in BETA_GRID whose jitter on the training sessions (second-difference RMS,
             ours / DLL, mean over x, y, z and the sessions) is at most 1.05 x the PnP branch's
             alone. Accuracy hardly depends on it; jitter does.
+  G3        the validity rule's thresholds, the centroid's edge a and the nose tip's b, searched as
+            the head pose study did (its a04_validity.py): a in -4..14 px and b in -14..4 px by
+            1 px, the fewest FV + gated FI on the training sessions (images whose DLL pose is
+            invalid that G3 passes, DLL-valid images with a face that it gates: the errors the
+            thresholds control), ties to the larger a, then the larger b; each fold's then tested
+            on the session it leaves out. A check, not a fit: head_params keep FITTED's (6, -4).
 The one-euro filters and the position's time constant are not fitted here (the filter study chose
-them); nor are the G3 thresholds.
+them).
 
 Prints each fold's constants and its beta grid, then every session's errors against the DLL with
-the constants fitted on the others (with --in-sample also with those fitted on all). Writes
+the constants fitted on the others (with --in-sample also with those fitted on all), and the G3
+thresholds of each fold and of all, with their errors there and on the session left out. Writes
 FIT.json: "head_params", the all-session constants under the field names of head.rs's HeadParams,
 with the choices it ships (the PnP branch alone, w = 0, unless --blend; one one-euro filter shared
 by the three angles unless --rotation-filters per-axis): what HeadParams::FITTED takes. "fit" has
-the fit's own numbers (the eye weight found, beta, the costs), "folds" the same per held-out
-session.
+the fit's own numbers (the eye weight found, beta, the costs, the G3 thresholds found), "folds"
+the same per held-out session.
 """
 
 import argparse
@@ -43,6 +50,11 @@ import reference as ref  # noqa: E402
 
 BETA_GRID = (0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7, 1.0)
 JIT_TOL = 1.05
+# The G3 thresholds searched (px): the centroid's edge a and the nose tip's b; and those that
+# head_params keep.
+G3_CENTROID_GRID = np.arange(-4, 15, 1.0)
+G3_NOSE_GRID = np.arange(-14, 5, 1.0)
+G3_KEPT = (ref.FITTED["g3_centroid_min_px"], ref.FITTED["g3_nose_min_px"])
 
 
 # ------------------------------------------------------------------ the fits
@@ -148,8 +160,34 @@ def score(o, pT):
     return np.median(np.abs(e), 0), C.d2rms(pT, m) / C.d2rms(o["dll_pos"], m)
 
 
+def g3_errors(o, a, b):
+    """G3 with thresholds (a, b) on session o: (FV, gated FI), the images whose DLL pose is
+    invalid that it passes and the DLL-valid images with a face (score >= 0) that it gates."""
+    face = o["face"] & (o["score"] >= 0)
+    ce = np.nan_to_num(o["g3_ce"], nan=-1e9)
+    ne = np.nan_to_num(o["g3_ne"], nan=-1e9)
+    pred = face & (ce >= a) & (ne >= b)
+    fv = int((pred & o["dll_have"] & ~o["dll_valid"]).sum())
+    fi = int((~pred & face & o["dll_valid"]).sum())
+    return fv, fi
+
+
+def fit_g3(S):
+    """The G3 thresholds of the grid with the fewest FV + gated FI on the sessions S (ties: the
+    larger a, then the larger b), as dict(thresholds_px=[a, b], errors)."""
+    best = None
+    for a in G3_CENTROID_GRID:
+        for b in G3_NOSE_GRID:
+            e = sum(sum(g3_errors(o, a, b)) for o in S)
+            key = (e, -a, -b)
+            if best is None or key < best[0]:
+                best = (key, a, b)
+    return dict(thresholds_px=[float(best[1]), float(best[2])], errors=int(best[0][0]))
+
+
 def fit_fold(S):
-    """One fold: Q, the position constants and beta, fitted on the sessions S."""
+    """One fold: Q, the position constants and beta, fitted on the sessions S, and the G3
+    thresholds' search."""
     Q = fit_Q(S)
     pos = fit_position(S, Q)
     grid = []
@@ -173,6 +211,7 @@ def fit_fold(S):
         pnp_only_jit=j0.tolist(),
         beta_grid=grid,
         n_frames=int(sum((o["dll_valid"] & o["g3"]).sum() for o in S)),
+        g3=fit_g3(S),
     )
 
 
@@ -281,7 +320,62 @@ def fold_json(fold, blend, per_axis):
             fit_cost_pnp=p["fit_cost_pnp"],
             pnp_only_jitter=fold["pnp_only_jit"],
             beta_grid=fold["beta_grid"],
+            g3_thresholds_px=fold["g3"]["thresholds_px"],
+            g3_errors=fold["g3"]["errors"],
+            **(
+                dict(g3_held_out=fold["g3"]["held_out"])
+                if "held_out" in fold["g3"]
+                else dict(g3_kept_errors=fold["g3"]["kept_errors"])
+            ),
         ),
+    )
+
+
+def print_g3(sessions, folds, every):
+    """The G3 thresholds each fold and all the sessions found, and their errors."""
+    a0, b0 = G3_KEPT
+    ga, gb = G3_CENTROID_GRID, G3_NOSE_GRID
+    grid = f"a {ga[0]:g}..{ga[-1]:g}, b {gb[0]:g}..{gb[-1]:g}"
+    print(
+        f"\n## G3 thresholds (px), the study's grid ({grid}): the fewest FV + gated FI where "
+        f"fitted, ties to the larger a, then b; head_params keep ({a0:g}, {b0:g})"
+    )
+
+    def errs(fv_fi):
+        return f"{fv_fi[0]} + {fv_fi[1]} = {sum(fv_fi)}"
+
+    rows = []
+    for name, fold in folds.items():
+        g = fold["g3"]
+        h = g["held_out"]
+        rows.append(
+            [f"fold {name}", ", ".join(fold["train"])]
+            + ["{:g}, {:g}".format(*g["thresholds_px"]), str(g["errors"])]
+            + [errs(h["found"]), errs(h["kept"])]
+        )
+    g = every["g3"]
+    rows.append(
+        ["all", ", ".join(every["train"]), "{:g}, {:g}".format(*g["thresholds_px"])]
+        + [f"{g['errors']} (with ({a0:g}, {b0:g}): {g['kept_errors']})", "-", "-"]
+    )
+    C.table(
+        [
+            "fold",
+            "fitted on",
+            "a, b",
+            "FV + gated FI there",
+            "left out: FV + gated FI",
+            f"left out, ({a0:g}, {b0:g})",
+        ],
+        rows,
+    )
+    a, b = g["thresholds_px"]
+    print(
+        f"per session, FV + gated FI with all's ({a:g}, {b:g}) / with ({a0:g}, {b0:g}): "
+        + "; ".join(
+            f"{o['name']} {errs(g3_errors(o, a, b))} / {errs(g3_errors(o, a0, b0))}"
+            for o in sessions
+        )
     )
 
 
@@ -344,9 +438,13 @@ def main():
     if len(sessions) > 1:
         for o in sessions:
             train = [t for t in sessions if t is not o]
-            folds[o["name"]] = fit_fold(train)
-            print_fold(f"fold {o['name']}", folds[o["name"]])
+            fold = folds[o["name"]] = fit_fold(train)
+            fold["g3"]["held_out"] = dict(
+                found=g3_errors(o, *fold["g3"]["thresholds_px"]), kept=g3_errors(o, *G3_KEPT)
+            )
+            print_fold(f"fold {o['name']}", fold)
     every = fit_fold(sessions)
+    every["g3"]["kept_errors"] = sum(sum(g3_errors(o, *G3_KEPT)) for o in sessions)
     print_fold("all", every)
     fold_of, labels = {}, []
     if folds:
@@ -356,6 +454,7 @@ def main():
         fold_of["in-sample"] = lambda o: every
         labels.append("in-sample")
     held_out_tables(sessions, fold_of, labels, per_axis)
+    print_g3(sessions, folds, every)
     if args.out:
         doc = dict(
             about="Head pose constants fitted by tools/headpose/fit.py to the Stream Engine's "
