@@ -37,9 +37,9 @@ the `.tflite` and symbolic in the ONNX; `track.rs` passes 1.
 
 | Tensor | Shape | Content and use |
 |---|---|---|
-| `input_12` | N x 256 x 256 x 3, float32 (NHWC) | the face crop, RGB in [0, 1] (the `.tflite`'s metadata: mean 0, std 255). `FaceModel::landmarks` resamples a square crop of the grey frame bilinearly and puts each value in all three channels |
+| `input_12` | N x 256 x 256 x 3, float32 (NHWC) | the face crop, RGB in [0, 1] (the `.tflite`'s metadata: mean 0, std 255). `FaceModel::landmarks` resamples a square crop of the grey frame, turned by the face's eye line, bilinearly and puts each value in all three channels |
 | `Identity` | N x 1 x 1 x 1434 | 478 landmarks x (x, y, z): x and y in pixels of the 256x256 input, z relative to the face's centre of mass and scaled with the face's width (model card). The code keeps the first 468 (`NLM`, the points of the canonical mesh) and drops the 10 iris points |
-| `Identity_1` | N x 1 x 1 x 1 | face presence as a logit (no sigmoid in the graph). The code reads below 0, a probability below the model card's default threshold of 0.5, as no face |
+| `Identity_1` | N x 1 x 1 x 1 | face presence as a logit (no sigmoid in the graph). The code reads below 0, a probability below the model card's default threshold of 0.5, as no face, and a NaN too |
 | `Identity_2` | N x 1 | tongue-out score, after a sigmoid; unused |
 
 ### ONNX metadata
