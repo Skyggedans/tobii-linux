@@ -320,6 +320,37 @@ mod tests {
         }
     }
 
+    /// A disk with room for `room` more bytes: it takes them, then fails
+    /// every write. It has nothing of its own to flush.
+    struct Full {
+        room: usize,
+    }
+
+    impl Write for Full {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `result`'s error: its message, and whether a full disk caused it.
+    fn failure(result: Result<()>) -> (String, bool) {
+        let error = result.expect_err("the write must fail");
+        let disk_full = error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::StorageFull);
+        (error.to_string(), disk_full)
+    }
+
     /// Landmarks no two of which are alike, none a short decimal: landmark
     /// k at (k / 3 + 0.1, 280 - k / 7).
     fn landmarks() -> Box<[[f64; 2]; LANDMARKS]> {
@@ -586,5 +617,57 @@ mod tests {
         assert!((0..LANDMARKS).all(|k| value(1, k, 0).is_nan() && value(1, k, 1).is_nan()));
         // Landmark 3 is (1.1, 279.571...): u's f32 0x3f8ccccd, low byte first.
         assert_eq!(bytes[24..28], [0xcd, 0xcc, 0x8c, 0x3f]);
+    }
+
+    /// The rows still buffered at the end reach the disk in `finish`, which
+    /// reports a disk that cannot take them: dropping the writer instead
+    /// would write them as well, but lose the error, and image83-replay
+    /// would succeed with a short file.
+    #[test]
+    fn finish_fails_when_the_last_rows_cannot_be_written() {
+        let lm = landmarks();
+        let fit = fit(&lm);
+
+        let mut csv = FitsCsv::with_header(Full { room: 100 }).expect("header buffered");
+        csv.write_image(0, 100, Some(&fit)).expect("row buffered");
+        csv.write_image(1, 133, None).expect("row buffered");
+        assert_eq!(
+            failure(csv.finish()),
+            ("failed to write the face fits CSV".to_string(), true)
+        );
+
+        let mut file = LandmarksF32::new(Full { room: 100 });
+        file.write_image(Some(&lm)).expect("record buffered");
+        assert_eq!(
+            failure(file.finish()),
+            ("failed to write the landmarks file".to_string(), true)
+        );
+    }
+
+    /// A row that no longer fits the buffer sends it to the disk at once:
+    /// on a full disk that row's write fails, before `finish`.
+    #[test]
+    fn a_write_that_spills_onto_a_full_disk_fails_at_once() {
+        let lm = landmarks();
+        let mut file = LandmarksF32::new(Full { room: 0 });
+        // Two records of 3744 bytes fit the 8 KiB buffer; the third does not.
+        file.write_image(Some(&lm)).expect("first record buffered");
+        file.write_image(None).expect("second record buffered");
+        assert_eq!(
+            failure(file.write_image(Some(&lm))),
+            ("failed to write the landmarks file".to_string(), true)
+        );
+
+        // Rows of some 500 bytes: one of the first 100 overflows the buffer.
+        let fit = fit(&lm);
+        let mut csv = FitsCsv::with_header(Full { room: 0 }).expect("header buffered");
+        let spilled = (0..100)
+            .map(|image| csv.write_image(image, 100 + image, Some(&fit)))
+            .position(|row| row.is_err());
+        assert!(spilled.is_some_and(|row| row > 0), "{spilled:?}");
+        assert_eq!(
+            failure(csv.write_image(100, 200, None)),
+            ("failed to write the face fits CSV".to_string(), true)
+        );
     }
 }
