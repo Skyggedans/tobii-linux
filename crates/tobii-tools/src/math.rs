@@ -213,3 +213,167 @@ pub(crate) fn solve_3x3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3
 
     Some(b)
 }
+
+/// Most sweeps [`symmetric_eigen`] makes. Its rotations converge
+/// quadratically: a 4x4 takes a handful.
+const JACOBI_MAX_SWEEPS: usize = 64;
+
+/// The eigenvalues and eigenvectors of the symmetric matrix `a`, by cyclic
+/// Jacobi rotations: `(values, vectors)`, the eigenvector of `values[k]`
+/// being column `k` of `vectors` (`vectors[i][k]` for each `i`), in no
+/// particular order. The vectors are orthonormal. The rotations go on until
+/// what is left off the diagonal is within `f64::EPSILON` of the matrix's
+/// norm, so the eigenvalues are as exact as the matrix and each eigenvector
+/// as exact as the gap to the next eigenvalue allows.
+///
+/// `None` for a matrix with an element that is not finite, or should the
+/// rotations not converge within [`JACOBI_MAX_SWEEPS`] sweeps.
+#[must_use]
+pub(crate) fn symmetric_eigen<const N: usize>(
+    mut a: [[f64; N]; N],
+) -> Option<([f64; N], [[f64; N]; N])> {
+    let mut vectors: [[f64; N]; N] =
+        std::array::from_fn(|i| std::array::from_fn(|j| f64::from(u8::from(i == j))));
+    let norm_sq: f64 = a.iter().flatten().map(|v| v * v).sum();
+    if !norm_sq.is_finite() {
+        return None;
+    }
+    let tolerance = f64::EPSILON * f64::EPSILON * norm_sq;
+    for _ in 0..JACOBI_MAX_SWEEPS {
+        let off: f64 = a
+            .iter()
+            .enumerate()
+            .flat_map(|(p, row)| row.iter().skip(p + 1))
+            .map(|v| v * v)
+            .sum();
+        if off <= tolerance {
+            return Some((std::array::from_fn(|k| a[k][k]), vectors));
+        }
+        for p in 0..N {
+            for q in p + 1..N {
+                let apq = a[p][q];
+                if apq == 0.0 {
+                    continue;
+                }
+                // The rotation J (c and s at (p, p), (p, q); -s and c at
+                // (q, p), (q, q)) that zeroes a[p][q] in J^T A J, of the
+                // smaller angle (Golub and Van Loan, sym.schur2).
+                let tau = (a[q][q] - a[p][p]) / (2.0 * apq);
+                let t = tau.signum() / (tau.abs() + tau.hypot(1.0));
+                let c = 1.0 / t.hypot(1.0);
+                let s = t * c;
+                for row in &mut a {
+                    let (x, y) = (row[p], row[q]);
+                    row[p] = c * x - s * y;
+                    row[q] = s * x + c * y;
+                }
+                let (row_p, row_q) = (a[p], a[q]);
+                a[p] = std::array::from_fn(|k| c * row_p[k] - s * row_q[k]);
+                a[q] = std::array::from_fn(|k| s * row_p[k] + c * row_q[k]);
+                a[p][q] = 0.0;
+                a[q][p] = 0.0;
+                for row in &mut vectors {
+                    let (x, y) = (row[p], row[q]);
+                    row[p] = c * x - s * y;
+                    row[q] = s * x + c * y;
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `a b`.
+    fn matmul<const N: usize>(a: &[[f64; N]; N], b: &[[f64; N]; N]) -> [[f64; N]; N] {
+        std::array::from_fn(|i| std::array::from_fn(|j| (0..N).map(|k| a[i][k] * b[k][j]).sum()))
+    }
+
+    /// `aᵀ`.
+    fn transpose<const N: usize>(a: &[[f64; N]; N]) -> [[f64; N]; N] {
+        std::array::from_fn(|i| std::array::from_fn(|j| a[j][i]))
+    }
+
+    /// An orthonormal 4x4: the rotation of the unit quaternion `q`
+    /// (w, x, y, z) as a left-multiplication matrix.
+    fn orthonormal(q: [f64; 4]) -> [[f64; 4]; 4] {
+        let n = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let [w, x, y, z] = q.map(|v| v / n);
+        [[w, -x, -y, -z], [x, w, -z, y], [y, z, w, -x], [z, -y, x, w]]
+    }
+
+    /// `values` and `vectors` decompose `a`: `a v = λ v` for each pair, the
+    /// vectors orthonormal, and the values `want` in some order.
+    fn assert_decomposes<const N: usize>(
+        a: &[[f64; N]; N],
+        (values, vectors): &([f64; N], [[f64; N]; N]),
+        want: &[f64; N],
+    ) {
+        let scale = a.iter().flatten().map(|v| v.abs()).fold(1.0, f64::max);
+        for (k, value) in values.iter().enumerate() {
+            let v: [f64; N] = std::array::from_fn(|i| vectors[i][k]);
+            for (row, vi) in a.iter().zip(&v) {
+                let av: f64 = row.iter().zip(&v).map(|(x, y)| x * y).sum();
+                assert!((av - value * vi).abs() <= 1e-13 * scale, "{a:?}: λ {value}");
+            }
+        }
+        let gram = matmul(&transpose(vectors), vectors);
+        for (i, row) in gram.iter().enumerate() {
+            for (j, g) in row.iter().enumerate() {
+                assert!((g - f64::from(u8::from(i == j))).abs() <= 1e-14, "{gram:?}");
+            }
+        }
+        let mut got = *values;
+        got.sort_by(f64::total_cmp);
+        let mut want = *want;
+        want.sort_by(f64::total_cmp);
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= 1e-13 * scale, "{got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn a_symmetric_matrix_decomposes_into_its_eigenvalues_and_vectors() {
+        // V D Vᵀ of a known D: distinct values of both signs; a repeated one;
+        // two that differ by one part in 10^9.
+        let v = orthonormal([0.9, -0.3, 0.2, 0.25]);
+        for d in [
+            [4.0, -1.5, 0.25, 9.0],
+            [5.0, 5.0, -1.0, 2.0],
+            [1.0, 1.0 + 1e-9, -3.0, 0.5],
+        ] {
+            let diag: [[f64; 4]; 4] =
+                std::array::from_fn(|i| std::array::from_fn(|j| if i == j { d[i] } else { 0.0 }));
+            let a = matmul(&matmul(&v, &diag), &transpose(&v));
+            let a: [[f64; 4]; 4] =
+                std::array::from_fn(|i| std::array::from_fn(|j| 0.5 * (a[i][j] + a[j][i])));
+            let eigen = symmetric_eigen(a).expect("converges");
+            assert_decomposes(&a, &eigen, &d);
+        }
+        // A 3x3, a diagonal one, the zero matrix.
+        let a = [[2.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 2.0]];
+        let root2 = 2f64.sqrt();
+        let eigen = symmetric_eigen(a).expect("converges");
+        assert_decomposes(&a, &eigen, &[2.0 - root2, 2.0, 2.0 + root2]);
+        let diagonal = [[3.0, 0.0], [0.0, -7.0]];
+        assert_eq!(
+            symmetric_eigen(diagonal),
+            Some(([3.0, -7.0], [[1.0, 0.0], [0.0, 1.0]]))
+        );
+        assert_eq!(
+            symmetric_eigen([[0.0; 2]; 2]),
+            Some(([0.0; 2], [[1.0, 0.0], [0.0, 1.0]]))
+        );
+    }
+
+    #[test]
+    fn a_matrix_with_an_element_that_is_not_finite_has_no_decomposition() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            let a = [[1.0, bad], [bad, 2.0]];
+            assert_eq!(symmetric_eigen(a), None);
+        }
+    }
+}

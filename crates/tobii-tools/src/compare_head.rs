@@ -15,10 +15,13 @@
 //! default it comes from the log: the area of its display-area
 //! notifications (1450), else of its display-area writes (1440), else a
 //! rigid fit of the gaze origins the device sent in both frames (keys
-//! 0x02/0x08 in the tracker frame, 0x22/0x24 in the display frame). Any
-//! area is checked against those origins, one given on the command line
-//! too: the device's own area maps the one onto the other to 0.0002 mm,
-//! any other area misses by 0.85 mm or more.
+//! 0x02/0x08 in the tracker frame, 0x22/0x24 in the display frame). The
+//! fit takes origins that stray from the line between the eyes
+//! ([`MIN_SPREAD_MM`]): those of a head held quite still may not, and the
+//! tool then asks for `--display-area`. Any area is checked against those
+//! origins, one given on the command line too: the device's own area maps
+//! the one onto the other to 0.0002 mm, any other area misses by 0.85 mm or
+//! more.
 //!
 //! The report follows the head-pose study's acceptance tables: the DLL's
 //! validity against ours and its losses of the face, the errors of the
@@ -36,7 +39,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
 use tobii_pose::head::{FaceSeen, FrameContext, HeadParams, HeadPose, HeadStep, compose_yxz};
-use tobii_pose::track::kabsch;
 use tobii_proto::facts::parse_display_area;
 use tobii_proto::gaze83::{GazeFrame, decode_gaze_frame};
 use tobii_proto::image83::decode_image_payload;
@@ -48,13 +50,22 @@ use tobii_proto::protocol::{
 
 use crate::compare_dll::{ClockOffset, DllHeadPose, DllRecord, clock_offset, read_dll_records};
 use crate::gates::{Checked, Gates};
-use crate::math::norm3;
+use crate::math::{norm3, symmetric_eigen};
 
 /// How far the display frame in use may put a gaze origin from where the
 /// device put it, mm, for the frame to be the device's. The device's own
 /// area misses by 0.00016 mm at most on every frame recorded, another area
 /// by 0.85 mm or more.
 const AREA_TOLERANCE_MM: f64 = 0.001;
+
+/// The least RMS distance of a log's gaze origins (tracker frame) from the
+/// line through them for a rigid fit of them to fix the display frame, mm.
+/// The origins of a head held still lie near the line between its eyes,
+/// and only how far they stray from it fixes the frame's turn about that
+/// line. At 0.1 mm the device's float rounding of the origins turns the
+/// fitted frame by 0.005° at most over 50 gaze frames, less over more (200
+/// simulated sessions each).
+const MIN_SPREAD_MM: f64 = 0.1;
 
 /// Half the side of the square display area a rigid fit of the gaze
 /// origins stands for, mm: the origins fix the display frame, not the size
@@ -267,37 +278,118 @@ fn origin_pairs(frames: &[GazeFrame]) -> Vec<OriginPair> {
         .collect()
 }
 
+/// The rotation `R` that takes points `p` closest to points `q`, `q ≈ R p`
+/// in the least-squares sense, of their cross-covariance `cross`,
+/// `Σ (p − p̄)(q − q̄)ᵀ`: Horn's unit quaternion, the eigenvector of the
+/// largest eigenvalue of his symmetric 4x4 matrix, solved for to convergence
+/// ([`symmetric_eigen`]). `None` should the eigen-solve not converge.
+fn horn_rotation(cross: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let [[sxx, sxy, sxz], [syx, syy, syz], [szx, szy, szz]] = *cross;
+    let horn = [
+        [sxx + syy + szz, syz - szy, szx - sxz, sxy - syx],
+        [syz - szy, sxx - syy - szz, sxy + syx, szx + sxz],
+        [szx - sxz, sxy + syx, -sxx + syy - szz, syz + szy],
+        [sxy - syx, szx + sxz, syz + szy, -sxx - syy + szz],
+    ];
+    let (values, vectors) = symmetric_eigen(horn)?;
+    let top = (0..4).max_by(|&i, &j| values[i].total_cmp(&values[j]))?;
+    let q = vectors.map(|row| row[top]);
+    let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let [w, x, y, z] = q.map(|v| v / norm);
+    Some([
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ])
+}
+
 /// A rigid map from the tracker frame to the display frame:
 /// `p_T = R p_S + t`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RigidMap {
     rotation: [[f64; 3]; 3],
     translation_mm: [f64; 3],
+    /// How far the tracker-frame points it was fitted to lie from the line
+    /// through them, mm (RMS): how well they fixed its turn about that line.
+    spread_mm: f64,
 }
 
 impl RigidMap {
     /// The rigid map that takes the tracker-frame point of each pair
     /// closest to its display-frame point in the least-squares sense: the
-    /// rotation of the centred points ([`kabsch`]), then the translation of
-    /// the centroids. `None` for fewer than three pairs.
-    fn fit(pairs: &[OriginPair]) -> Option<Self> {
-        if pairs.len() < 3 {
-            return None;
-        }
-        let (tracker, display): (Vec<[f64; 3]>, Vec<[f64; 3]>) = pairs.iter().copied().unzip();
-        let rotation = kabsch(&tracker, &display);
-        let centroid = |points: &[[f64; 3]]| {
-            // cast: a count of points, far below 2^53
-            #[allow(clippy::cast_precision_loss)]
-            let n = points.len() as f64;
-            points
+    /// rotation of the centred points ([`horn_rotation`]), then the
+    /// translation of the centroids. Not the tracker's
+    /// [`kabsch`](tobii_pose::track::kabsch): its fixed
+    /// 200 power steps stop short when the points lie near one line, and
+    /// the gaze origins of a head held still do, along the line between
+    /// the eyes.
+    ///
+    /// # Errors
+    /// Fails for fewer than three pairs, a point that is not finite, points
+    /// that lie within [`MIN_SPREAD_MM`] (RMS) of one line, which leave the
+    /// turn about it open, and should an eigen-solve not converge.
+    fn fit(pairs: &[OriginPair]) -> Result<Self> {
+        ensure!(
+            pairs.len() >= 3,
+            "{} gaze origins: too few to fit a frame to",
+            pairs.len()
+        );
+        ensure!(
+            pairs
                 .iter()
-                .fold([0.0; 3], |s, p| add(s, *p))
+                .all(|(s, t)| s.iter().chain(t).all(|v| v.is_finite())),
+            "a gaze origin that is not finite"
+        );
+        // cast: a count of points, far below 2^53
+        #[allow(clippy::cast_precision_loss)]
+        let n = pairs.len() as f64;
+        let centroid = |pick: fn(&OriginPair) -> [f64; 3]| {
+            pairs
+                .iter()
+                .fold([0.0; 3], |s, p| add(s, pick(p)))
                 .map(|c| c / n)
         };
-        Some(Self {
+        let (from, to) = (centroid(|p| p.0), centroid(|p| p.1));
+        let zero = [[0.0; 3]; 3];
+        let (cross, scatter) = pairs.iter().fold((zero, zero), |(cross, scatter), (s, t)| {
+            let (ds, dt) = (sub(*s, from), sub(*t, to));
+            (
+                std::array::from_fn(|a| std::array::from_fn(|b| cross[a][b] + ds[a] * dt[b])),
+                std::array::from_fn(|a| std::array::from_fn(|b| scatter[a][b] + ds[a] * ds[b])),
+            )
+        });
+        // The tracker-frame points' squared distances from the line along
+        // their principal axis sum to the scatter's trace less its largest
+        // eigenvalue.
+        let (spread, _) =
+            symmetric_eigen(scatter).context("the eigen-solve of the origins' spread")?;
+        let largest = spread.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        let trace = scatter[0][0] + scatter[1][1] + scatter[2][2];
+        let spread_mm = ((trace - largest).max(0.0) / n).sqrt();
+        ensure!(
+            spread_mm >= MIN_SPREAD_MM,
+            "the {} gaze origins lie {spread_mm:.4} mm (rms) off one line, as those of a head \
+             held still lie along the line between its eyes: they leave the turn about it open \
+             (it takes {MIN_SPREAD_MM} mm)",
+            pairs.len()
+        );
+        let rotation = horn_rotation(&cross).context("the eigen-solve of the rotation")?;
+        Ok(Self {
             rotation,
-            translation_mm: sub(centroid(&display), mat_vec(&rotation, centroid(&tracker))),
+            translation_mm: sub(to, mat_vec(&rotation, from)),
+            spread_mm,
         })
     }
 
@@ -367,8 +459,12 @@ enum AreaSource {
     Notified(usize),
     /// The log's display-area writes (1440), this many, all alike.
     Written(usize),
-    /// A rigid fit of the log's gaze origins.
-    Fitted,
+    /// A rigid fit of the log's gaze origins ([`RigidMap::fit`]), which lie
+    /// this far off the line through them, mm (RMS).
+    Fitted {
+        /// [`RigidMap::spread_mm`].
+        spread_mm: f64,
+    },
     /// The command line.
     Given,
 }
@@ -450,8 +546,8 @@ fn one_area(areas: &[DisplayArea], what: &str) -> Result<Option<DisplayArea>> {
 ///
 /// # Errors
 /// Fails when the log's display-area messages disagree, when an area fixes
-/// no display frame, and when the area must be fitted and the log has no
-/// gaze origins to fit it to.
+/// no display frame, and when the area must be fitted and the log's gaze
+/// origins fix none ([`RigidMap::fit`]).
 fn display_frame(
     choice: AreaChoice,
     scan: &LogScan,
@@ -470,13 +566,52 @@ fn display_frame(
             } else if let Some(area) = one_area(&scan.written, "display-area writes (1440)")? {
                 of_area(area, AreaSource::Written(scan.written.len()))
             } else {
-                let frame = RigidMap::fit(pairs).and_then(|map| map.frame()).context(
-                    "the log has no display area and too few gaze origins to fit one to; \
-                         give --display-area",
+                let fitted = RigidMap::fit(pairs).and_then(|map| {
+                    let frame = map
+                        .frame()
+                        .context("the fitted frame fixes no display area")?;
+                    Ok((frame, map.spread_mm))
+                });
+                let (frame, spread_mm) = fitted.context(
+                    "the log has no display-area message (1450 or 1440), and its gaze origins \
+                     fix no display frame; give --display-area",
                 )?;
-                Ok((frame, AreaSource::Fitted))
+                Ok((frame, AreaSource::Fitted { spread_mm }))
             }
         }
+    }
+}
+
+/// Whether a replay may run in the display frame of an area from `source`,
+/// which puts the log's gaze origins as `check` says (`None`: the log has
+/// none): an area of the log's, or the fit, must put each within
+/// [`AREA_TOLERANCE_MM`] of where the device put it. One given on the
+/// command line is used whatever it misses by: the note to print, if any.
+///
+/// # Errors
+/// Fails for an area of the log's messages that misses, which is not the
+/// one the device held, and for a fit that misses: no one display frame
+/// maps the origins.
+fn judge_area(source: AreaSource, check: Option<&OriginCheck>) -> Result<Option<String>> {
+    let Some(check) = check.filter(|c| !c.fits()) else {
+        return Ok(None);
+    };
+    match source {
+        AreaSource::Given => Ok(Some(format!(
+            "the given area misses the gaze origins by more than {AREA_TOLERANCE_MM} mm: it is \
+             not the area the device held"
+        ))),
+        AreaSource::Fitted { .. } => bail!(
+            "no one display frame maps the log's gaze origins to within {AREA_TOLERANCE_MM} mm \
+             (the best rigid fit misses one by {:.6} mm): did the display area change during the \
+             session? give --display-area",
+            check.max_mm
+        ),
+        AreaSource::Notified(_) | AreaSource::Written(_) => bail!(
+            "the display area does not map the log's gaze origins to within {AREA_TOLERANCE_MM} \
+             mm (it misses one by {:.6} mm): it is not the session's; give --display-area",
+            check.max_mm
+        ),
     }
 }
 
@@ -1406,9 +1541,10 @@ pub(crate) fn compare_head(log_path: &str, jsonl_path: &str, options: &HeadOptio
     let from = match source {
         AreaSource::Notified(n) => format!("the log's display-area notification (1450; {n} alike)"),
         AreaSource::Written(n) => format!("the log's display-area write (1440; {n} alike)"),
-        AreaSource::Fitted => {
-            "a rigid fit of the log's gaze origins (0x02/0x08 -> 0x22/0x24)".to_string()
-        }
+        AreaSource::Fitted { spread_mm } => format!(
+            "a rigid fit of the log's gaze origins (0x02/0x08 -> 0x22/0x24), which lie \
+             {spread_mm:.4} mm (rms) off the line through them"
+        ),
         AreaSource::Given => "the command line".to_string(),
     };
     let vector = |v: [f64; 3]| format!("({:.6}, {:.6}, {:.6})", v[0], v[1], v[2]);
@@ -1425,18 +1561,8 @@ pub(crate) fn compare_head(log_path: &str, jsonl_path: &str, options: &HeadOptio
         ),
         None => println!("  gaze origins it maps: none in the log, unchecked"),
     }
-    let fits = check.is_none_or(|c| c.fits());
-    match options.area {
-        AreaChoice::Auto => ensure!(
-            fits,
-            "the display area does not map the log's gaze origins to within {AREA_TOLERANCE_MM} \
-             mm: it is not the session's; give --display-area"
-        ),
-        AreaChoice::Given(_) if !fits => println!(
-            "  note: the given area misses the gaze origins by more than {AREA_TOLERANCE_MM} mm: \
-             it is not the area the device held"
-        ),
-        AreaChoice::Given(_) => {}
+    if let Some(note) = judge_area(source, check.as_ref())? {
+        println!("  note: {note}");
     }
 
     let mut replay = replay(&payloads, &display)?;
@@ -1865,13 +1991,12 @@ mod tests {
             .collect()
     }
 
-    /// A rigid fit of the gaze origins area A maps gives area A's frame,
-    /// and maps them to a micrometre's thousandth; area B's do not fit it.
-    #[test]
-    fn a_rigid_fit_of_the_origins_gives_the_display_frame() {
+    /// The display frame a rigid fit of `pairs` gives, which must be area
+    /// A's: its axes to 1e-9 and its centre to 1e-6 mm.
+    fn assert_fits_area_a(pairs: &[OriginPair]) -> DisplayFrame {
         let frame_a = DisplayFrame::new(&AREA_A).expect("area A fixes a frame");
-        let pairs = pairs_of(&frame_a, &origins());
-        let fitted = RigidMap::fit(&pairs)
+        let fitted = RigidMap::fit(pairs)
+            .ok()
             .and_then(|map| map.frame())
             .expect("a frame");
         for (row, want) in fitted.rotation().iter().zip(frame_a.rotation()) {
@@ -1887,6 +2012,16 @@ mod tests {
                 .zip(frame_a.centre())
                 .all(|(a, b)| close(*a, b, 1e-6))
         );
+        fitted
+    }
+
+    /// A rigid fit of the gaze origins area A maps gives area A's frame,
+    /// and maps them to a micrometre's thousandth; area B's do not fit it.
+    #[test]
+    fn a_rigid_fit_of_the_origins_gives_the_display_frame() {
+        let frame_a = DisplayFrame::new(&AREA_A).expect("area A fixes a frame");
+        let pairs = pairs_of(&frame_a, &origins());
+        let fitted = assert_fits_area_a(&pairs);
         let check = OriginCheck::of(&fitted, &pairs).expect("pairs");
         assert_eq!(check.pairs, 400);
         assert!(check.fits() && check.max_mm < 1e-6, "{check:?}");
@@ -1904,8 +2039,115 @@ mod tests {
             !check.fits() && close(check.max_mm, 0.85, 1e-9),
             "{check:?}"
         );
-        assert!(RigidMap::fit(&pairs[..2]).is_none());
+        assert!(RigidMap::fit(&pairs[..2]).is_err());
         assert!(OriginCheck::of(&frame_a, &[]).is_none());
+        let mut broken = pairs;
+        broken[7].1[2] = f64::NAN;
+        assert!(RigidMap::fit(&broken).is_err());
+    }
+
+    /// The gaze origins of a head held still about 600 mm out: both eyes,
+    /// the head swaying by a few tenths of a millimetre, 0.229 mm (rms)
+    /// across the line between the eyes.
+    fn still_origins() -> Vec<[f64; 3]> {
+        (0..300)
+            .flat_map(|i| {
+                let t = f64::from(i) * 0.1;
+                let head = [
+                    0.3 * (1.3 * t).sin(),
+                    150.0 + 0.2 * (0.7 * t).cos(),
+                    600.0 + 0.25 * (0.45 * t + 1.0).sin(),
+                ];
+                [add(head, [-31.0, 0.0, 0.0]), add(head, [31.0, 0.0, 0.0])]
+            })
+            .collect()
+    }
+
+    /// The origins of a head held still lie near one line, which the fit
+    /// still turns the frame about as the device did; the tracker's kabsch,
+    /// 200 power steps, stops some 40 degrees short on these.
+    #[test]
+    fn a_rigid_fit_fixes_the_frame_of_a_head_held_still() {
+        let frame_a = DisplayFrame::new(&AREA_A).expect("area A fixes a frame");
+        let pairs = pairs_of(&frame_a, &still_origins());
+        let map = RigidMap::fit(&pairs).expect("a fit");
+        // NumPy's eigvalsh of the same points: 0.228 730 326 233 mm.
+        assert!(
+            close(map.spread_mm, 0.228_730_326, 1e-9),
+            "{}",
+            map.spread_mm
+        );
+        let fitted = assert_fits_area_a(&pairs);
+        let check = OriginCheck::of(&fitted, &pairs).expect("pairs");
+        assert!(check.fits() && check.max_mm < 1e-6, "{check:?}");
+    }
+
+    /// Origins that lie along one line leave the turn about it open, and
+    /// fix no frame: a head that never moves, and origins `d` mm off the
+    /// line on either side, just within and just past the 0.1 mm a fit
+    /// takes.
+    #[test]
+    fn origins_along_one_line_fix_no_frame() {
+        let frame_a = DisplayFrame::new(&AREA_A).expect("area A fixes a frame");
+        let frozen: Vec<[f64; 3]> = (0..100)
+            .flat_map(|_| [[-31.0, 150.0, 600.0], [31.0, 150.0, 600.0]])
+            .collect();
+        let pairs = pairs_of(&frame_a, &frozen);
+        let error = RigidMap::fit(&pairs).expect_err("a line");
+        assert!(error.to_string().contains("off one line"), "{error}");
+        let error = display_frame(AreaChoice::Auto, &LogScan::default(), &pairs)
+            .expect_err("nothing to take the area from");
+        assert!(
+            format!("{error:#}").contains("give --display-area"),
+            "{error:#}"
+        );
+
+        let off_line = |d: f64| -> Vec<[f64; 3]> {
+            [-31.0, -10.0, 10.0, 31.0]
+                .into_iter()
+                .flat_map(|x| [[x, 150.0 + d, 600.0], [x, 150.0 - d, 600.0]])
+                .collect()
+        };
+        assert!(RigidMap::fit(&pairs_of(&frame_a, &off_line(0.0999))).is_err());
+        let pairs = pairs_of(&frame_a, &off_line(0.1001));
+        let map = RigidMap::fit(&pairs).expect("a fit");
+        assert!(close(map.spread_mm, 0.1001, 1e-9), "{}", map.spread_mm);
+        assert_fits_area_a(&pairs);
+    }
+
+    /// The fit, or an area of the log's, that misses the gaze origins stops
+    /// the replay, each with its own reason; an area given on the command
+    /// line comes with a note; one that maps them passes.
+    #[test]
+    fn an_area_that_misses_the_gaze_origins_is_judged_by_its_source() {
+        let check = |max_mm| OriginCheck {
+            pairs: 10,
+            max_mm,
+            rms_mm: max_mm / 2.0,
+        };
+        let fitted = AreaSource::Fitted { spread_mm: 5.0 };
+        let sources = [
+            fitted,
+            AreaSource::Notified(1),
+            AreaSource::Written(2),
+            AreaSource::Given,
+        ];
+        for source in sources {
+            assert_eq!(judge_area(source, Some(&check(0.000_2))).ok(), Some(None));
+            assert_eq!(judge_area(source, None).ok(), Some(None));
+        }
+        let missed = check(0.85);
+        let error = judge_area(fitted, Some(&missed)).expect_err("a fit that misses");
+        assert!(
+            error.to_string().contains("no one display frame"),
+            "{error}"
+        );
+        for source in [AreaSource::Notified(1), AreaSource::Written(2)] {
+            let error = judge_area(source, Some(&missed)).expect_err("an area that misses");
+            assert!(error.to_string().contains("not the session's"), "{error}");
+        }
+        let note = judge_area(AreaSource::Given, Some(&missed)).expect("a note");
+        assert!(note.is_some_and(|n| n.contains("not the area the device held")));
     }
 
     /// The log's display-area messages give the area, a notification
