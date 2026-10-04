@@ -84,7 +84,9 @@ face.
        tools/headpose/make_vectors.py $OUT/vectors.json --params $OUT/fit.json \
            --eye-weight fitted --rotation-filters per-axis
 
-   Without options it writes the study's vectors, the ones the tests carry now, byte for byte.
+   Without options it writes the study's vectors, the ones the tests carry now, byte for byte
+   (checked with Python 3.14 and NumPy 2.4.6; the inputs the study drew at random are written out
+   in the script, as NumPy's random streams may change between versions).
 5. Accept: replay every session through the daemon's own pipeline (`HeadStep` with the new
    `HeadParams::FITTED`), which checks the gates it can (G1-G14) and writes its pose of every
    image with a DLL pose, for each N:
@@ -160,3 +162,6 @@ checked against the broken pipelines, which fail at least one gate in every sess
   passed: 1 when a gate fails (a lag or a jitter that could not be measured on one of the axes
   fails it too), 3 when none fails but some were not checked (G15-G18 without
   `--reference-fits`, or a session `gates.json` has no thresholds for). The last line says which.
+- **Lint.** The scripts are kept formatted with `ruff format --line-length 100` and clean under
+  `ruff check --line-length 100 --select F,E,W,B --target-version py39` (with a newer target,
+  bugbear's B905 asks for `zip(strict=True)`, which Python 3.9 does not have).

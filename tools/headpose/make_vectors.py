@@ -33,8 +33,43 @@ import reference as ref  # noqa: E402
 CANONICAL_RS = os.path.join(HERE, "..", "..", "crates", "tobii-pose", "src", "canonical.rs")
 # The Windows sessions' display area: area A of the study.
 AREA_A = ref.WINDOWS_AREA
-SEED = 20260929
 DT = 30208  # us, the 0x50e image interval
+# Made-up inputs the study drew from np.random.default_rng(20260929), written out because NumPy
+# does not promise the same stream from one version to the next: four more angle triples for the
+# yxz vectors (deg, rounded to 0.001; x, y, z) and six poses for the position model ((pitch, yaw,
+# roll) deg about the usual pose under the tilted camera, then the translation, mm).
+EULER_DRAWN_DEG = [
+    [-17.97, 34.167, 1.72],
+    [-49.203, -59.895, 4.728],
+    [-16.431, 18.737, 22.29],
+    [-25.466, -21.65, 1.816],
+]
+POSITION_POSES = [
+    (
+        (8.491327844467689, 9.806499420607821, 2.901115771815313),
+        (-27.524850807863743, -16.81878251724813, 573.497310874498),
+    ),
+    (
+        (3.9528252701317497, -17.361478593378493, 14.4616798078793),
+        (19.59008322953075, -13.900598287519477, 577.9997776123156),
+    ),
+    (
+        (1.5619489193125893, -8.0792100114441, -2.4628542086325025),
+        (55.1954939229997, 2.384865646955536, 602.2696806150905),
+    ),
+    (
+        (15.191364435524271, -2.4664280660131332, -4.2536552910970435),
+        (-25.093009705258464, -22.040093297034492, 631.5743791297155),
+    ),
+    (
+        (4.5506868124740425, -1.938292752559224, 9.135021943708843),
+        (-35.22009439555708, -3.1235538232141344, 591.7268269139147),
+    ),
+    (
+        (4.280924717853239, -23.530308059521587, 6.79811528349492),
+        (-11.839186504535812, -26.169900675208407, 598.9327045298605),
+    ),
+]
 
 
 def canonical_mm(path):
@@ -67,7 +102,6 @@ def jparams(P):
 
 def vectors(P, canon_mm):
     """The vectors' document for constants P."""
-    rng = np.random.default_rng(SEED)
     Q = np.asarray(P["Q"], float)
     R_TS, c = ref.display_frame(*AREA_A)
     cmin, nmin = P["g3_centroid_min_px"], P["g3_nose_min_px"]
@@ -115,7 +149,7 @@ def vectors(P, canon_mm):
         [0, 0, -45],
         [41, 59, -30],
     ]
-    tri += rng.uniform(-60, 60, (4, 3)).round(3).tolist()
+    tri += [list(a) for a in EULER_DRAWN_DEG]
     va = []
     for a in tri:
         x, y, z = (math.radians(v) for v in a)
@@ -180,10 +214,8 @@ def vectors(P, canon_mm):
 
     # D. the position model (one image, unfiltered)
     vd = []
-    for _ in range(6):
-        Rc, tc = cam_pose(
-            *rng.normal(0, 10, 3), [rng.normal(0, 40), rng.normal(-20, 25), 620 + rng.normal(0, 40)]
-        )
+    for angles, t in POSITION_POSES:
+        Rc, tc = cam_pose(*angles, list(t))
         lm = project(Rc, tc)
         ea, eb = ref.eye_points(lm)
         H = ref.head_S(Rc, Q)
