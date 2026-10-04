@@ -31,8 +31,9 @@ thresholds of each fold and of all, with their errors there and on the session l
 FIT.json: "head_params", the all-session constants under the field names of head.rs's HeadParams,
 with the choices it ships (the PnP branch alone, w = 0, unless --blend; one one-euro filter shared
 by the three angles unless --rotation-filters per-axis): what HeadParams::FITTED takes. "fit" has
-the fit's own numbers (the eye weight found, beta, the costs, the G3 thresholds found), "folds"
-the same per held-out session.
+the fit's own numbers (the eye weight found, beta, Q's yxz angles, the costs, the G3 thresholds
+found), "folds" the same per held-out session; "options" the display area given (TL, TR, BL, mm)
+and "sessions" each session's files, clock offset, images and display frame.
 """
 
 import argparse
@@ -315,7 +316,7 @@ def fold_json(fold, blend, per_axis):
         fit=dict(
             eye_weight=p["w"],
             correction_share=fold["beta"],
-            rotation_offset_yxz_deg=fold["Q_yxz_deg_xyz"],
+            rotation_offset_yxz_deg=dict(zip("xyz", fold["Q_yxz_deg_xyz"])),
             fit_cost_eye=p["fit_cost_eye"],
             fit_cost_pnp=p["fit_cost_pnp"],
             pnp_only_jitter=fold["pnp_only_jit"],
@@ -464,7 +465,11 @@ def main():
             options=dict(
                 blend=args.blend,
                 rotation_filters=args.rotation_filters,
-                area="given" if args.area is not None else "fitted to each log's gaze origins",
+                area=(
+                    dict(zip(("TL", "TR", "BL"), (list(p) for p in args.area)))
+                    if args.area is not None
+                    else "fitted to each log's gaze origins"
+                ),
             ),
             sessions={
                 o["name"]: dict(
@@ -474,6 +479,7 @@ def main():
                     clock_offset_us=int(o["k"]),
                     images=int(o["n"]),
                     fit_images=int((o["dll_valid"] & o["g3"]).sum()),
+                    display_frame=o["frame"],
                 )
                 for o in sessions
             },
