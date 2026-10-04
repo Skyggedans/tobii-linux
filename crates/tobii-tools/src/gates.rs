@@ -457,6 +457,21 @@ impl Checked<'_> {
     }
 }
 
+/// The verdict of the gates `checked`: the run passes when none fails.
+///
+/// # Errors
+/// Names every gate that fails, in order; `compare-dll` then exits with a
+/// status other than 0, as design §10 asks.
+pub(crate) fn verdict(checked: &[Checked<'_>]) -> Result<()> {
+    let failed: Vec<&str> = checked
+        .iter()
+        .filter(|c| c.fails())
+        .map(|c| c.gate.id.as_str())
+        .collect();
+    ensure!(failed.is_empty(), "gates failed: {}", failed.join(", "));
+    Ok(())
+}
+
 impl Gates {
     /// Read the gates file at `path`.
     ///
@@ -729,10 +744,34 @@ mod tests {
             ]
         );
         assert_eq!(checked[1].bound, Bound::Max(2.6));
+        let failed = verdict(&checked).expect_err("G4 fails");
+        assert_eq!(failed.to_string(), "gates failed: G4");
 
         // A metric compare-dll does not have is an error, not a pass.
         let partial = |name: &str| (name == "coverage_pct").then_some(99.0);
         assert!(gates.check(&session, partial).is_err());
+    }
+
+    /// The run passes when every gate checked here does, whatever the
+    /// Python gates' metrics; it fails naming each gate that fails.
+    #[test]
+    fn the_verdict_fails_the_run_for_each_failing_gate() {
+        let gates = Gates::parse(FILE).expect("a gates file");
+        let session = gates.session(10_701_480_021).expect("session s2").clone();
+        let at = |coverage: f64, pitch: f64| {
+            move |name: &str| match name {
+                "coverage_pct" => Some(coverage),
+                "rotation_median_abs_x_deg" => Some(pitch),
+                "rotation_median_signed_x_deg" => Some(0.0),
+                _ => None,
+            }
+        };
+        let checked = gates.check(&session, at(96.79, 2.6)).expect("metrics");
+        assert!(verdict(&checked).is_ok());
+        let checked = gates.check(&session, at(95.0, 2.61)).expect("metrics");
+        let failed = verdict(&checked).expect_err("G1 and G4 fail");
+        assert_eq!(failed.to_string(), "gates failed: G1, G4");
+        assert!(verdict(&[]).is_ok());
     }
 
     #[test]

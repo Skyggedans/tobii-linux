@@ -49,7 +49,7 @@ use tobii_proto::protocol::{
 };
 
 use crate::compare_dll::{ClockOffset, DllHeadPose, DllRecord, clock_offset, read_dll_records};
-use crate::gates::{Checked, Gates};
+use crate::gates::{Checked, Gates, Session, verdict};
 use crate::math::{norm3, symmetric_eigen};
 
 /// How far the display frame in use may put a gaze origin from where the
@@ -1466,19 +1466,15 @@ fn print_errors(analysis: &Analysis) {
     }
 }
 
-/// Print the gates checked; returns those that fail.
-fn print_gates(path: &str, status: &str, session: &str, checked: &[Checked<'_>]) -> Vec<String> {
+/// Print the gates checked.
+fn print_gates(path: &str, status: &str, session: &str, checked: &[Checked<'_>]) {
     println!("gates of {path}, session {session}");
     if !status.is_empty() {
         println!("  {status}");
     }
-    let mut failed = Vec::new();
     for c in checked {
         let (value, verdict) = match c.value {
-            Some(v) if c.fails() => {
-                failed.push(c.gate.id.clone());
-                (f2(v), "FAIL")
-            }
+            Some(v) if c.fails() => (f2(v), "FAIL"),
             Some(v) => (f2(v), "PASS"),
             None => ("-".to_string(), "not checked here: Python, from the CSV"),
         };
@@ -1491,22 +1487,34 @@ fn print_gates(path: &str, status: &str, session: &str, checked: &[Checked<'_>])
         );
     }
     let here = checked.iter().filter(|c| c.value.is_some()).count();
+    let failed = checked.iter().filter(|c| c.fails()).count();
     let python: Vec<&str> = checked
         .iter()
         .filter(|c| c.value.is_none())
         .map(|c| c.gate.id.as_str())
         .collect();
     println!(
-        "{here} gates checked: {} PASS, {} FAIL{}",
-        here - failed.len(),
-        failed.len(),
+        "{here} gates checked: {} PASS, {failed} FAIL{}",
+        here - failed,
         if python.is_empty() {
             String::new()
         } else {
             format!("; left to Python: {}", python.join(", "))
         }
     );
-    failed
+}
+
+/// Check the metrics of `analysis` against the gates of `gates`, the gates
+/// file at `path`, for `session`, and print each.
+///
+/// # Errors
+/// Fails when a gate fails, naming each ([`verdict`]): the run then exits
+/// with a status other than 0. Fails too when the file has a gate to check
+/// here whose metric this tool does not compute.
+fn check_gates(path: &str, gates: &Gates, session: &Session, analysis: &Analysis) -> Result<()> {
+    let checked = gates.check(session, |name| analysis.metric(name))?;
+    print_gates(path, &gates.status, &session.name, &checked);
+    verdict(&checked)
 }
 
 /// Replay a captured session's IR images through the daemon's head pose
@@ -1629,11 +1637,7 @@ pub(crate) fn compare_head(log_path: &str, jsonl_path: &str, options: &HeadOptio
     }
 
     if let (Some(gates), Some(session), Some(path)) = (&gates, session, &options.gates) {
-        let checked = gates.check(session, |name| analysis.metric(name))?;
-        let failed = print_gates(path, &gates.status, &session.name, &checked);
-        if !failed.is_empty() {
-            bail!("gates failed: {}", failed.join(", "));
-        }
+        check_gates(path, gates, session, &analysis)?;
     }
     Ok(())
 }
@@ -2642,10 +2646,10 @@ mod tests {
         }
     }
 
-    /// Each gate metric reads its own number: of ALL, or of COMB for the
-    /// gates on combined turns.
-    #[test]
-    fn the_gate_metrics_read_their_numbers() {
+    /// An analysis whose every number tells where it came from: errors
+    /// 1-18 on ALL, 101-118 on COMB, 51-68 on the other subsets; coverage
+    /// 90 %, agreement 87.5 %, two of three losses found.
+    fn numbered_analysis() -> Analysis {
         let errors = |base: f64| Errors {
             subset: 10,
             both_valid: 9,
@@ -2658,7 +2662,7 @@ mod tests {
             position_p95_mm: [base + 15.0, base + 16.0, base + 17.0],
             position_median_3d_mm: base + 18.0,
         };
-        let analysis = Analysis {
+        Analysis {
             confusion: Confusion {
                 both_valid: 90,
                 dll_only: 10,
@@ -2694,7 +2698,14 @@ mod tests {
                 (s, errors(base))
             }),
             reacquired: Vec::new(),
-        };
+        }
+    }
+
+    /// Each gate metric reads its own number: of ALL, or of COMB for the
+    /// gates on combined turns.
+    #[test]
+    fn the_gate_metrics_read_their_numbers() {
+        let analysis = numbered_analysis();
         for (name, value) in [
             ("coverage_pct", 90.0),
             ("agreement_pct", 100.0 * 105.0 / 120.0),
@@ -2715,6 +2726,40 @@ mod tests {
             assert!(close(got, value, 1e-12), "{name}: {got} != {value}");
         }
         assert_eq!(analysis.metric("rotation_lag_max_ms"), None);
+    }
+
+    /// A gate the analysis fails fails the run, naming it; one it passes,
+    /// or a Python gate, does not.
+    #[test]
+    fn a_failing_gate_fails_the_run() {
+        let analysis = numbered_analysis();
+        let file = |coverage_min: f64| {
+            format!(
+                r#"{{
+                "sessions": [{{"name": "s1", "clock_offset_us": 9290110919}}],
+                "gates": [
+                    {{"id": "G1", "name": "coverage", "metric": "coverage_pct", "kind": "min",
+                      "by": "compare-dll", "thresholds": {{"s1": {coverage_min}}}}},
+                    {{"id": "G4", "name": "pitch", "metric": "rotation_median_abs_x_deg",
+                      "kind": "max", "by": "compare-dll", "thresholds": {{"s1": 2.3}}}},
+                    {{"id": "G17", "name": "jitter", "metric": "rotation_rest_jitter_ratio",
+                      "kind": "range", "by": "python", "thresholds": {{"s1": [0.6, 1.5]}}}}
+                ]
+            }}"#
+            )
+        };
+        // The coverage is 90 % exactly.
+        for (coverage_min, passes) in [(90.0, true), (90.01, false)] {
+            let gates = Gates::parse(&file(coverage_min)).expect("a gates file");
+            let result = check_gates("gates.json", &gates, &gates.sessions[0], &analysis);
+            match result {
+                Ok(()) => assert!(passes, "G1 at {coverage_min} passed"),
+                Err(e) => {
+                    assert!(!passes, "G1 at {coverage_min}: {e}");
+                    assert_eq!(e.to_string(), "gates failed: G1");
+                }
+            }
+        }
     }
 
     /// The fingerprint follows every constant.
