@@ -144,11 +144,8 @@ pub fn decode_image_payload(payload: &[u8]) -> Option<ImageFrame> {
     })
 }
 
-/// 2x nearest-neighbour upscale (280x280 -> 560x560), so the frame can go
-/// through the same face crop / landmark pipeline as the UVC camera path.
-///
-/// Allocating convenience wrapper around [`upscale2x_into`], kept for the
-/// tests; the per-frame paths reuse one buffer instead.
+/// 2x nearest-neighbour upscale (280x280 -> 560x560): an allocating
+/// wrapper around [`upscale2x_into`], for the tests.
 ///
 /// # Panics
 ///
@@ -162,10 +159,13 @@ pub fn upscale2x(src: &[u8], w: usize, h: usize) -> Vec<u8> {
 }
 
 /// 2x nearest-neighbour upscale writing into `out`, which is resized to
-/// `w * h * 4` bytes.
+/// `w * h * 4` bytes: each pixel becomes a 2x2 block, and a vector handed
+/// back keeps its allocation.
 ///
-/// A caller in a per-frame loop hands the same vector back every time and
-/// keeps its allocation.
+/// This is how the 0x50e stream's frames used to be enlarged to 560x560 for
+/// the head tracker. No per-frame path calls it any more: `tobii-pose`'s
+/// tracker takes the 280x280 frames as they come and enlarges them itself,
+/// and its tests check that it does so exactly as this function does.
 ///
 /// # Panics
 ///
