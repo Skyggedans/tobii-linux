@@ -13,6 +13,7 @@ frame from the log (a rigid fit of the gaze origins 0x02/0x08 in the tracker fra
 0x22/0x24 in the display frame) unless an area is given. No pixels are read.
 """
 
+import argparse
 import csv
 import json
 import math
@@ -323,13 +324,16 @@ def fit_display_frame(log):
 
 def parse_area(text):
     """--area: 'windows' (the Windows sessions' area) or nine numbers TLx,TLy,TLz,TRx,...,BLz
-    (mm)."""
+    (mm). An ArgumentTypeError's message is what argparse shows (a ValueError's is not)."""
     if text == "windows":
         return ref.WINDOWS_AREA
-    v = [float(x) for x in text.split(",")]
+    try:
+        v = [float(x) for x in text.split(",")]
+    except ValueError:
+        v = []
     if len(v) != 9:
-        raise ValueError(
-            "--area takes 'windows' or 9 comma-separated numbers: TL, TR, BL (x, y, z mm)"
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is neither 'windows' nor 9 comma-separated numbers: TL, TR, BL (x, y, z mm)"
         )
     return tuple(tuple(v[i : i + 3]) for i in (0, 3, 6))
 
@@ -643,16 +647,16 @@ def to_S(o, pT):
     return pT @ o["R_TS"] + o["c"]
 
 
-def filt_series(t_us, valid, X, kind, par, rule="timeaware", reset_gap_s=1.0):
-    """The reference's filters over a whole series: X (n, k); kind 'ema' (par = tau s) or
-    'oneeuro' (par = [(fmin, beta)] per column, dcut 1 Hz). (n, k), NaN where not valid; the same
-    reset rule as reference.Smoother."""
+def ema_series(t_us, valid, X, tau, rule="timeaware", reset_gap_s=1.0):
+    """reference.Ema3 over a whole series, X (n, k), with tau in s: (n, k), NaN where not valid;
+    the reset rule of reference.Smoother, but its reset after a result that is not finite, which
+    the finite inputs here never give."""
     n, k = X.shape
     Y = np.full((n, k), np.nan)
     have = False
     t_last = None
     prev_valid = False
-    y = xp = dx = None
+    y = None
     for i in range(n):
         if not valid[i]:
             prev_valid = False
@@ -662,18 +666,8 @@ def filt_series(t_us, valid, X, kind, par, rule="timeaware", reset_gap_s=1.0):
         reset = dt is None or dt <= 0 or dt > reset_gap_s or (rule == "reset" and not prev_valid)
         if reset:
             y = x.copy()
-            xp = x.copy()
-            dx = np.zeros(k)
-        elif kind == "ema":
-            y = y + dt / (dt + par) * (x - y)
         else:
-            d = wrap_deg(x - xp) / dt
-            ad = 1.0 / (1.0 + 1.0 / (2 * np.pi * 1.0 * dt))
-            dx = dx + ad * (d - dx)
-            fc = np.array([p[0] for p in par]) + np.array([p[1] for p in par]) * np.abs(dx)
-            a = 1.0 / (1.0 + 1.0 / (2 * np.pi * fc * dt))
-            y = wrap_deg(y + a * wrap_deg(x - y))
-            xp = x.copy()
+            y = y + dt / (dt + tau) * (x - y)
         have = True
         t_last = t_us[i]
         prev_valid = True

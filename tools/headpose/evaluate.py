@@ -94,21 +94,14 @@ CHANNELS = [("rot", 0), ("rot", 1), ("rot", 2), ("pos", 0), ("pos", 1), ("pos", 
 
 
 # ------------------------------------------------------------------ lag and rest jitter
-def runs(mask):
-    """[(start, end)] of the runs of True."""
-    m = np.r_[False, np.asarray(mask, bool), False]
-    dd = np.diff(m.astype(np.int8))
-    return list(zip(np.flatnonzero(dd == 1).tolist(), np.flatnonzero(dd == -1).tolist()))
-
-
 def lowpass0(x, fc, ok=None):
     """A zero-phase Butterworth (order 4) low-pass over every finite run longer than 30 images."""
     bb, aa = butter(4, fc / (C.FS / 2))
     out = np.full(x.shape, np.nan)
     ok = np.isfinite(x) if ok is None else ok
-    for a, b in runs(ok):
-        if b - a > 30:
-            out[a:b] = filtfilt(bb, aa, x[a:b])
+    for a, ln in zip(*C.runs_of(ok)):
+        if ln > 30:
+            out[a : a + ln] = filtfilt(bb, aa, x[a : a + ln])
     return out
 
 
@@ -118,7 +111,10 @@ def still_mask(reference, ok):
     sp = np.abs(np.gradient(lp)) * C.FS
     n = len(reference)
     wins = []
-    for a in range(0, n - 32, 32):
+    # Every whole window, the last one included. The study's code stopped short of [n - 32, n)
+    # when n is a multiple of 32, which none of the Windows sessions is (n % 32 = 4, 20, 10): the
+    # gates set from them hold either way.
+    for a in range(0, n - 31, 32):
         if ok[a : a + 32].all() and np.isfinite(sp[a : a + 32]).all():
             wins.append((np.median(sp[a : a + 32]), a))
     wins.sort()
@@ -140,9 +136,9 @@ def seg_ffts(sigs, ok, nseg=128, step=32):
     """The FFTs of the Hann-windowed, linearly detrended 128-image segments in steps of 32 inside
     the runs of ok: X (segments, signals, frequencies), the frequencies, the starts."""
     st = []
-    for a, b in runs(ok):
-        k = a
-        while k + nseg <= b:
+    for a, ln in zip(*C.runs_of(ok)):
+        k = int(a)
+        while k + nseg <= a + ln:
             st.append(k)
             k += step
     w = np.hanning(nseg)

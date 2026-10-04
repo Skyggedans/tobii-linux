@@ -147,10 +147,8 @@ def pos_chain(o, Q, P, beta_a, rule="timeaware"):
             C.eye_geom(o["eye_a"][v], o["eye_b"][v], H[v]), P["K"], P["g_e"], P["ox_e"], P["oy_e"]
         )
         cor = P["w"] * (pe - pp)
-    cl = C.filt_series(
-        o["t_us"], v, np.where(v[:, None], cor, 0.0), "ema", ref.tau_of_a(beta_a), rule
-    )
-    y = C.filt_series(o["t_us"], v, pp + np.nan_to_num(cl), "ema", ref.tau_of_a(0.30), rule)
+    cl = C.ema_series(o["t_us"], v, np.where(v[:, None], cor, 0.0), ref.tau_of_a(beta_a), rule)
+    y = C.ema_series(o["t_us"], v, pp + np.nan_to_num(cl), ref.tau_of_a(0.30), rule)
     return C.to_T(o, y), C.to_T(o, pp + cor)
 
 
