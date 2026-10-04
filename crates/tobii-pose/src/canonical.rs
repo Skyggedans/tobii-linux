@@ -1,4 +1,9 @@
 //! `MediaPipe` canonical face mesh, used as the 3D model for the head-pose fit.
+//!
+//! Third-party data under Apache-2.0 (`models/LICENSE`, `models/NOTICE`):
+//! the vertex positions of `MediaPipe`'s `canonical_face_model.obj`, changed
+//! here (y and z negated, each value rounded to five significant digits).
+//! Source and checksum: `models/README.md`.
 
 /// `MediaPipe` canonical face mesh (468 verts, cm), Y/Z flipped to image coords.
 pub(crate) const CANONICAL_FACE: [[f32; 3]; 468] = [

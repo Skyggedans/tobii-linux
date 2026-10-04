@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::canonical::CANONICAL_FACE;
 
+// MediaPipe Face Mesh V2 converted to ONNX; Apache-2.0, see models/README.md.
 const MODEL: &[u8] = include_bytes!("../models/face_landmarks.onnx");
 const IN: usize = 256; // model input is 256x256x3
 const NLM: usize = 468; // canonical landmarks (model emits 478 incl. iris)

@@ -1,0 +1,24 @@
+tobii-pose: third-party material
+
+This crate (crates/tobii-pose) embeds material from MediaPipe,
+https://github.com/google-ai-edge/mediapipe, Copyright The MediaPipe
+Authors, licensed under the Apache License, Version 2.0: see LICENSE in
+this directory. The MIT licence of the rest of the repository (LICENSE at
+its root) does not cover it.
+
+models/face_landmarks.onnx
+    MediaPipe's Face Mesh V2 face-landmark model (model card "MediaPipe
+    Face Mesh V2", September 15, 2022): face_landmarks_detector.tflite
+    from the MediaPipe Face Landmarker bundle face_landmarker.task,
+    float16, version 1.
+    Changed: converted from TensorFlow Lite to ONNX with tf2onnx 1.17.0,
+    which also stores the float16 weights as float32 (same values).
+
+src/canonical.rs (CANONICAL_FACE)
+    The vertex positions of MediaPipe's canonical face model,
+    mediapipe/modules/face_geometry/data/canonical_face_model.obj.
+    Changed: only the 468 vertex positions are kept, their y and z
+    coordinates are negated, and each value is rounded to five
+    significant digits.
+
+Sources, checksums and what is not known about them: models/README.md.

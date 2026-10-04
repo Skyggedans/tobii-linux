@@ -393,4 +393,11 @@ tools/abi/dll_abi.py headers                                 # headers vs tobii_
 
 ## License
 
-MIT.
+MIT ([LICENSE](LICENSE)), except for the MediaPipe material that `tobii-pose`
+embeds, and that `tobiid` and `tobii5-init-replay` carry with it: the
+face-landmark model (`crates/tobii-pose/models/face_landmarks.onnx`, converted
+from TensorFlow Lite to ONNX) and the canonical face mesh in
+`crates/tobii-pose/src/canonical.rs`. Those are Apache-2.0. The licence text,
+the notice and where they come from are in
+[crates/tobii-pose/models/](crates/tobii-pose/models/) (`LICENSE`, `NOTICE`,
+`README.md`).
