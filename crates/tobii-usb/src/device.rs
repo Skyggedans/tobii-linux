@@ -664,10 +664,9 @@ pub(crate) fn run_gaze_engine(
     });
 
     let reset = (!is_env_flag_set("TOBII_NO_RESET")).then_some(|| reset_device_baseline(&ctx));
-    let mut opens = Opens::default();
     let result = run_opens(
         stop,
-        || gaze_engine_attempt(&ctx, shared, commands, tx, &mailbox, &mut opens),
+        |opens| gaze_engine_attempt(&ctx, shared, commands, tx, &mailbox, opens),
         reset,
         REOPEN_PAUSE,
     );
@@ -703,6 +702,11 @@ pub(crate) fn run_gaze_engine(
 /// whose arming wait the stop cut short does, ends the loop `Ok` and its
 /// error is logged at debug.
 ///
+/// Every open gets the one [`Opens`] the loop keeps, as the opens before it
+/// left it, whatever they failed with and across a reset: the count of
+/// opens, the display area in effect and the check of the device's display
+/// frame go on from one open to the next.
+///
 /// # Errors
 ///
 /// Returns the last open's error once [`MAX_REPLAY_ATTEMPTS`] failures in a
@@ -710,11 +714,12 @@ pub(crate) fn run_gaze_engine(
 /// with the [`OpenRefusal`] as its context.
 fn run_opens(
     stop: &AtomicBool,
-    mut open: impl FnMut() -> Result<()>,
+    mut open: impl FnMut(&mut Opens) -> Result<()>,
     mut reset: Option<impl FnMut()>,
     pause: Duration,
 ) -> Result<()> {
     let mut failed = FailedOpens::default();
+    let mut opens = Opens::default();
     let mut reset_first = false;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -737,7 +742,7 @@ fn run_opens(
                 ),
             }
         }
-        let Err(e) = open() else {
+        let Err(e) = open(&mut opens) else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
@@ -1525,6 +1530,21 @@ impl Opens {
         self.count = self.count.wrapping_add(1);
         self.display.set(area);
     }
+
+    /// Another open's init replay of `packets` ran to its end, reading
+    /// `capture`: count the open, leave in effect the display area the
+    /// device confirmed, and say what the init reports of the device and
+    /// where that area came from (see [`init_facts`]).
+    #[must_use]
+    fn init_done(
+        &mut self,
+        packets: &[InitPacket],
+        capture: &InitCapture,
+    ) -> (DeviceFacts, Option<InitArea>) {
+        let (facts, confirmed) = init_facts(packets, capture);
+        self.opened(confirmed.map(|c| c.area));
+        (facts, confirmed)
+    }
 }
 
 /// How far, mm, the device's display-frame gaze origin may lie from where
@@ -2285,7 +2305,7 @@ const PRESENCE_STATE_PRESENT: u32 = 2;
 /// saying how long the stream ran (see [`after_arming`]).
 ///
 /// An init that runs to its end counts an open in `opens` and leaves the
-/// display area the device confirmed in effect (see [`init_display_area`]);
+/// display area the device confirmed in effect (see [`Opens::init_done`]);
 /// the facts it reports carry that area and its display id.
 fn gaze_stream_loop(
     h: &mut rusb::DeviceHandle<UsbContext>,
@@ -2302,7 +2322,7 @@ fn gaze_stream_loop(
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let (facts, confirmed) = init_facts(&packets, &capture);
+    let (facts, confirmed) = opens.init_done(&packets, &capture);
     // This init's own 1330 answer, so empty after one that lost it; tobiid
     // then keeps the previous init's properties, if there was one, and tells
     // its clients those (`keep_unreported`).
@@ -2318,7 +2338,6 @@ fn gaze_stream_loop(
     );
     let _ = tx.send(Sample::DeviceReady(Arc::new(facts)));
 
-    opens.opened(confirmed.map(|c| c.area));
     let mut pump = Pump {
         shared,
         commands,
@@ -2546,8 +2565,8 @@ mod tests {
         }
 
         /// A pump as a fresh open starts one, after the opens before it left
-        /// `opens` (an open counts itself there first, see
-        /// [`Opens::opened`]).
+        /// `opens` (an open's init counts it there first, see
+        /// [`Opens::init_done`]).
         fn pump<'a>(&'a self, opens: &'a mut Opens) -> Pump<'a> {
             Pump {
                 shared: &self.shared,
@@ -3147,6 +3166,48 @@ mod tests {
         rig.pump(&mut opens)
             .deliver(classify(&fixture("change-display-notify-1450")));
         assert_eq!(image_after_open(&rig, &mut opens, Some(b)), (b_frame, 5, 6));
+    }
+
+    /// What an open does once its init replay has run, as `gaze_stream_loop`
+    /// does it: take the init's facts from [`Opens::init_done`], then pump.
+    /// Each init counts its open, and leaves in effect the area the device
+    /// confirmed, which the images the open reads carry; a re-open does it
+    /// again on the same `Opens`.
+    #[test]
+    fn each_init_counts_its_open_and_leaves_the_area_it_confirmed_in_effect() {
+        let rig = Rig::new();
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-notify-1450");
+        // A replay that reads the area, then writes B.
+        let packets = replay_writing(&b, 77);
+        // The device answered the read with A, took the write and sent B's
+        // 1450.
+        let took_b = InitCapture {
+            responses: vec![fixture("init-rsp-1430"), answer_1440(0x2a, 1, 0)],
+            side: vec![fixture("change-display-notify-1450")],
+        };
+        // Only the read was answered: A.
+        let read_a = InitCapture {
+            responses: vec![fixture("init-rsp-1430")],
+            side: Vec::new(),
+        };
+        let mut opens = Opens::default();
+        let mut open = |capture: &InitCapture| {
+            let init = opens.init_done(&packets, capture);
+            assert_eq!(init, init_facts(&packets, capture), "what the init says");
+            rig.pump(&mut opens).deliver_at(image_at(10 * S), 50 * S);
+            (init.0.display_area, rig.pose_display())
+        };
+
+        let (a_frame, b_frame) = (DisplayFrame::new(&a), DisplayFrame::new(&b));
+        assert_eq!(open(&took_b), (Some(b), (b_frame, 1, 1)));
+        assert_eq!(open(&took_b), (Some(b), (b_frame, 1, 2)), "the same area");
+        assert_eq!(open(&read_a), (Some(a), (a_frame, 2, 3)));
+        assert_eq!(
+            open(&InitCapture::default()),
+            (None, (None, 3, 4)),
+            "an init that confirmed no area"
+        );
     }
 
     #[test]
@@ -3919,7 +3980,7 @@ mod tests {
         let mut outcomes = outcomes.into_iter();
         let result = run_opens(
             &stop,
-            || {
+            |_| {
                 steps.borrow_mut().push(Step::Open);
                 outcomes.next().expect("an open past the script")
             },
@@ -4126,13 +4187,56 @@ mod tests {
         assert!(result.is_ok(), "a clean stop");
     }
 
+    /// Every open gets the `Opens` the ones before it left, across a failed
+    /// open, a reset and a refused one: each init counts its open there, and
+    /// the area it leaves in effect keeps its generation while it stays.
+    #[test]
+    fn the_open_loop_hands_every_open_what_the_opens_before_it_left() {
+        let stop = AtomicBool::new(false);
+        let (b, _) = area_of("change-display-notify-1450");
+        let packets = replay_writing(&b, 77);
+        // The device took the write: B.
+        let took_b = InitCapture {
+            responses: vec![answer_1440(0x2a, 1, 0)],
+            side: Vec::new(),
+        };
+        let steps = RefCell::new(Vec::new());
+        // What each open was handed: the opens counted, and the generation
+        // of the area in effect.
+        let mut handed = Vec::new();
+        let result = run_opens(
+            &stop,
+            |opens| {
+                steps.borrow_mut().push(Step::Open);
+                handed.push((opens.count, opens.display.generation));
+                let n = handed.len();
+                if n == 3 {
+                    // Refused before its init ran: not an open counted.
+                    return refused_at(OPEN_DEVICE, rusb::Error::Access);
+                }
+                let _ = opens.init_done(&packets, &took_b);
+                if n == 4 {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("open {n}"))
+                }
+            },
+            Some(|| steps.borrow_mut().push(Step::Reset)),
+            Duration::ZERO,
+        );
+
+        assert!(result.is_ok(), "a clean stop");
+        assert_eq!(steps.into_inner(), [Open, Open, Reset, Open, Open]);
+        assert_eq!(handed, [(0, 0), (1, 1), (2, 1), (2, 1)]);
+    }
+
     #[test]
     fn a_stop_during_an_open_ends_the_loop_ok_without_another_open() {
         let stop = AtomicBool::new(false);
         let (mut opens, mut resets) = (0, 0);
         let result = run_opens(
             &stop,
-            || {
+            |_| {
                 opens += 1;
                 // Stopped during the open whose failure calls for the reset.
                 if opens == RESET_AFTER_FAILURES {
@@ -4155,7 +4259,7 @@ mod tests {
         let mut opens = 0;
         let result = run_opens(
             &stop,
-            || {
+            |_| {
                 opens += 1;
                 stop.store(true, Ordering::Relaxed);
                 never_armed()
@@ -4173,7 +4277,7 @@ mod tests {
         let mut opens = 0;
         let result = run_opens(
             &stop,
-            || {
+            |_| {
                 opens += 1;
                 Ok(())
             },
