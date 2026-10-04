@@ -821,8 +821,9 @@ struct Pairing {
 }
 
 /// Give each frame the DLL's pose of its image (the one of time `ts` with
-/// `ts + k_us` the image's device time) and the device's eyes at it, of
-/// `gaze` (device time, eyes; ascending).
+/// `ts + k_us` the image's device time; of poses that share a time, the
+/// later) and the device's eyes at it, of `gaze` (device time, eyes;
+/// ascending).
 fn pair(frames: &mut [Frame], poses: &[DllHeadPose], k_us: i64, gaze: &[(i64, Eyes)]) -> Pairing {
     let mut by_ts = HashMap::with_capacity(poses.len());
     let mut duplicate_poses = 0;
@@ -1624,9 +1625,10 @@ pub(crate) fn compare_head(log_path: &str, jsonl_path: &str, options: &HeadOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tobii_proto::decode::STREAM_TLV_OFFSET;
     use tobii_proto::facts::display_area_set_payload;
     use tobii_proto::protocol::chunk_command;
-    use tobii_proto::tlv::TlvWriter;
+    use tobii_proto::tlv::{KEY_FIELD_ID, TlvWriter};
 
     use crate::gates::Checker;
     use DllState::{Invalid as I, Missing as M, Valid as V};
@@ -1819,8 +1821,28 @@ mod tests {
         assert!(close(c.agreement_pct(), 100.0 * 30.0 / 40.0, 1e-12));
     }
 
-    /// Re-acquisitions are the first 10 DLL-valid images after a loss: not
-    /// the start of the session, nor what follows images with no DLL pose.
+    /// A run of our invalid poses that only touches a loss, ending where it
+    /// starts or starting where it ends, does not see it.
+    #[test]
+    fn a_run_that_only_touches_a_loss_does_not_see_it() {
+        // A loss at 5..8; ours invalid at 2..5 and 8..10.
+        let dll = seq(&[(V, 5), (I, 3), (V, 4)]);
+        let ours = seq(&[(true, 2), (false, 3), (true, 3), (false, 2), (true, 2)]);
+        let (events, unmatched) = loss_events(&dll, &ours);
+        assert_eq!(
+            events,
+            [LossEvent {
+                start: 5,
+                len: 3,
+                seen: None,
+            }]
+        );
+        assert_eq!(unmatched, [(2, 3), (8, 2)]);
+    }
+
+    /// Re-acquisitions are the first 10 DLL-valid images after a loss, and
+    /// no more than the valid run has: not the start of the session, nor
+    /// what follows images with no DLL pose.
     #[test]
     fn reacquisitions_follow_a_loss() {
         let dll = seq(&[
@@ -1833,10 +1855,14 @@ mod tests {
             (M, 1),
             (I, 1),
             (V, 3),
+            (I, 2),
+            (V, 3),
+            (M, 1),
+            (V, 4),
         ]);
         let flags = reacquisition(&dll);
         let marked: Vec<usize> = (0..dll.len()).filter(|&i| flags[i]).collect();
-        let expected: Vec<usize> = (19..29).chain(50..53).collect();
+        let expected: Vec<usize> = (19..29).chain(50..53).chain(55..58).collect();
         assert_eq!(marked, expected);
     }
 
@@ -1967,6 +1993,264 @@ mod tests {
         ));
         let none = Errors::of(&[], 0);
         assert!(none.rotation_median_deg[0].is_nan() && none.coverage_pct().is_nan());
+    }
+
+    /// The analysis of a session: which images each subset takes, which of
+    /// them both call valid, and the errors of those alone, never of the
+    /// values our invalid poses hold; the validity table, the losses and
+    /// the re-acquisitions.
+    #[test]
+    fn the_analysis_takes_each_subset_s_images_and_only_our_valid_poses() {
+        let both = Eyes {
+            left: true,
+            right: true,
+        };
+        let one = Eyes {
+            left: true,
+            right: false,
+        };
+        let none = Eyes::default();
+        // Ours valid: the DLL's pose moved `dx` mm along x.
+        let ours = |dx: f64, f: Frame| Frame {
+            ours: HeadPose {
+                valid: true,
+                position_mm: [dx, 0.0, 600.0],
+                rotation_rad: f.dll.map_or([0.0; 3], |p| p.rotation_rad),
+            },
+            ..f
+        };
+        // Ours invalid, holding values far from the DLL's.
+        let held = |f: Frame| Frame {
+            ours: HeadPose {
+                valid: false,
+                position_mm: [300.0, -200.0, 100.0],
+                rotation_rad: [1.0, -1.0, 0.5],
+            },
+            ..f
+        };
+        let invalid = |f: Frame| Frame {
+            dll: f.dll.map(|p| DllHeadPose {
+                position_valid: false,
+                rotation_valid: [false; 3],
+                ..p
+            }),
+            ..f
+        };
+        let missing = |f: Frame| Frame { dll: None, ..f };
+        let level = [0.0; 3];
+        let mut gated = held(frame(level, one));
+        gated.face = Some(Face {
+            score: 2.0,
+            by_detector: false,
+            centroid_edge_px: 3.0,
+            nose_tip_edge_px: 10.0,
+        });
+        let frames = [
+            missing(ours(0.0, frame(level, both))),
+            ours(1.0, frame(level, both)),
+            held(frame(level, none)),
+            ours(2.0, frame([0.0, 25.0, 0.0], one)),
+            // A loss of two images, then a valid run of three, re-acquired.
+            invalid(held(frame(level, none))),
+            invalid(held(frame(level, none))),
+            ours(4.0, frame(level, both)),
+            gated,
+            ours(8.0, frame(level, none)),
+            missing(held(frame(level, one))),
+            ours(16.0, frame(level, one)),
+            ours(32.0, frame([9.0, 16.0, 0.0], both)),
+        ];
+        let analysis = Analysis::of(&frames);
+        let reacquired: Vec<usize> = (0..frames.len())
+            .filter(|&i| analysis.reacquired[i])
+            .collect();
+        assert_eq!(reacquired, [6, 7, 8]);
+        assert_eq!(
+            analysis.confusion,
+            Confusion {
+                both_valid: 6,
+                dll_only: 2,
+                dll_only_no_face: 1,
+                ours_only: 0,
+                neither: 2,
+                neither_no_face: 2,
+            }
+        );
+        assert_eq!(
+            analysis.events,
+            [LossEvent {
+                start: 4,
+                len: 2,
+                seen: Some((0, 0)),
+            }]
+        );
+        assert_eq!(analysis.unmatched_runs, [(2, 1), (7, 1)]);
+        // Each subset: its DLL-valid images, those ours is valid on, and
+        // the median of our x errors there (1, 2, 4, 8, 16 and 32 mm on
+        // the images both call valid; 300 mm on those ours is not).
+        for (subset, images, both_valid, median_x) in [
+            (Subset::All, 8, 6, 6.0),
+            (Subset::BothEyes, 3, 3, 4.0),
+            (Subset::NoEyes, 2, 1, 8.0),
+            (Subset::LargeYaw, 1, 1, 2.0),
+            (Subset::Reacquired, 3, 2, 6.0),
+            (Subset::Combined, 1, 1, 32.0),
+        ] {
+            let e = analysis.errors(subset);
+            assert_eq!((e.subset, e.both_valid), (images, both_valid), "{subset:?}");
+            assert!(
+                close(e.position_median_mm[0], median_x, 1e-12),
+                "{subset:?}: {e:?}"
+            );
+            assert!(e.rotation_p95_deg.iter().all(|&a| a < 1e-9), "{subset:?}");
+        }
+        assert!(close(
+            analysis.metric("coverage_pct").expect("a metric"),
+            75.0,
+            1e-12
+        ));
+        assert!(close(
+            analysis.metric("agreement_pct").expect("a metric"),
+            80.0,
+            1e-12
+        ));
+        assert_eq!(analysis.metric("loss_events_found"), Some(1.0));
+    }
+
+    /// Each image takes the DLL's pose of its time less the clock offset
+    /// (of two that share a time, the later), and the device's eyes at it;
+    /// the report counts the images with a pose, the poses of no image and
+    /// the poses that share a time.
+    #[test]
+    fn the_dll_poses_pair_with_the_images_at_the_clock_offset() {
+        let k = 9_290_110_919;
+        let image = |t_us: i64| Frame {
+            device_ts_us: k + t_us,
+            dll: None,
+            ..frame([0.0; 3], Eyes::default())
+        };
+        let mut frames = [image(100), image(130), image(160), image(190)];
+        let pose = |ts_us: i64, x: f64| DllHeadPose {
+            ts_us,
+            position_valid: true,
+            rotation_valid: [true; 3],
+            position_mm: [x, 0.0, 600.0],
+            rotation_rad: [0.0; 3],
+        };
+        let poses = [
+            pose(100, 1.0),
+            // None for the image at 130; two at 160, the later of which it
+            // takes; one of no image, and one whose time overflows.
+            pose(160, 2.0),
+            pose(160, 3.0),
+            pose(190, 4.0),
+            pose(175, 5.0),
+            pose(i64::MAX, 6.0),
+        ];
+        let both = Eyes {
+            left: true,
+            right: true,
+        };
+        let left = Eyes {
+            left: true,
+            right: false,
+        };
+        let gaze = [(k + 90, both), (k + 150, left)];
+        assert_eq!(
+            pair(&mut frames, &poses, k, &gaze),
+            Pairing {
+                paired: 3,
+                unpaired_poses: 2,
+                duplicate_poses: 1,
+            }
+        );
+        let taken: Vec<Option<f64>> = frames
+            .iter()
+            .map(|f| f.dll.map(|p| p.position_mm[0]))
+            .collect();
+        assert_eq!(taken, [Some(1.0), None, Some(3.0), Some(4.0)]);
+        let eyes: Vec<Eyes> = frames.iter().map(|f| f.eyes).collect();
+        assert_eq!(eyes, [both, both, left, left]);
+    }
+
+    /// A TLV entry: its type, its length (BE u32) and its value.
+    fn tlv(typ: u8, value: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(value.len()).expect("a short value");
+        [&[typ][..], &len.to_be_bytes(), value].concat()
+    }
+
+    /// A message of stream `id` whose TLVs are `body`, as the device sends
+    /// one.
+    fn stream_message(id: u32, body: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(STREAM_TLV_OFFSET + body.len()).expect("a short message");
+        let mut msg = [
+            &[1, 0, 0, 0][..],
+            &len.to_le_bytes(),
+            &MARKER_STREAM.to_be_bytes(),
+            &[0; 8],
+            &id.to_be_bytes(),
+        ]
+        .concat();
+        msg.resize(STREAM_TLV_OFFSET, 0);
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// A 0x50e message of a `side` x `side` image of `pixels` at device
+    /// time `t_us`, as the device lays one out.
+    fn image_message(t_us: u64, side: u32, pixels: &[u8]) -> Vec<u8> {
+        let keyed = |key: u32, entry: Vec<u8>| {
+            [
+                tlv(5, &KEY_FIELD_ID.to_be_bytes()),
+                tlv(2, &key.to_be_bytes()),
+                entry,
+            ]
+            .concat()
+        };
+        let count = u32::try_from(pixels.len()).expect("a short image");
+        let body = [
+            keyed(1, tlv(6, &t_us.to_be_bytes())),
+            keyed(2, tlv(2, &8u32.to_be_bytes())),
+            keyed(3, tlv(2, &side.to_be_bytes())),
+            keyed(4, tlv(2, &side.to_be_bytes())),
+            keyed(5, tlv(2, &side.to_be_bytes())),
+            keyed(6, tlv(0x15, &[&count.to_be_bytes()[..], pixels].concat())),
+        ]
+        .concat();
+        stream_message(STREAM_ID_IMAGE, &body)
+    }
+
+    /// A replay steps every image of the log once, in log order, at its
+    /// device time, each with the model runs of its own step, and passes
+    /// over the other messages. Black images make invalid poses: the first
+    /// runs the landmark model in the tracker's starting crop and then the
+    /// detector; with the face lost, the others run the detector alone.
+    #[test]
+    fn a_replay_steps_every_image_once_with_its_own_model_runs() {
+        let display = DisplayFrame::new(&AREA_A).expect("area A fixes a frame");
+        let black = vec![0u8; 280 * 280];
+        let log = [
+            image_message(1_000_000, 280, &black),
+            stream_message(0x500, &[]),
+            image_message(1_030_208, 280, &black),
+            image_message(1_060_416, 280, &black),
+        ];
+        let replay = replay(&log, &display).expect("the models load");
+        let images: Vec<(usize, i64)> = replay
+            .frames
+            .iter()
+            .map(|f| (f.image, f.device_ts_us))
+            .collect();
+        assert_eq!(images, [(0, 1_000_000), (1, 1_030_208), (2, 1_060_416)]);
+        for (f, runs) in replay.frames.iter().zip([(1, 1), (0, 1), (0, 1)]) {
+            assert!(
+                !f.ours.valid && f.face.is_none() && f.dll.is_none(),
+                "{f:?}"
+            );
+            assert_eq!((f.cost.landmark_runs, f.cost.detector_runs), runs, "{f:?}");
+        }
+        assert_eq!((replay.undecoded, &replay.tracker_errors), (0, &(0, None)));
+        assert_eq!(replay.fingerprint, fingerprint(&HeadParams::FITTED));
     }
 
     /// The tracker-frame and display-frame points of `points` through area
