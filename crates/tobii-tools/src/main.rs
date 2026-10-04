@@ -7,8 +7,10 @@
 mod analysis;
 mod cli;
 mod compare_dll;
+mod compare_head;
 mod dashboard;
 mod devcmd;
+mod gates;
 mod ipc_probe;
 mod math;
 mod opentrack;
@@ -41,7 +43,13 @@ fn run() -> Result<()> {
         Command::CompareDll {
             log_path,
             jsonl_path,
+            head: None,
         } => compare_dll::compare_dll(log_path, jsonl_path),
+        Command::CompareDll {
+            log_path,
+            jsonl_path,
+            head: Some(options),
+        } => compare_head::compare_head(log_path, jsonl_path, options),
         Command::IpcProbe {
             streams,
             secs,

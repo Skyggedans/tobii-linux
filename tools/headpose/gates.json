@@ -1,0 +1,185 @@
+{
+  "about": "Acceptance gates of the head pose against the Windows Stream Engine's (the DLL's), per session: bounds on the metrics of `tobii5-init-replay compare-dll sessionN.bin sessionN.jsonl --head --gates tools/headpose/gates.json`, which replays the session's IR images through the daemon's head pose (HeadStep, HeadParams::FITTED) and pairs each image with the DLL's pose of it. A gate by compare-dll is checked there, and fails the run when it fails. A gate by python bounds the lag or the rest jitter of the filters, which are measured in Python from the run's --csv rows against the head-pose study's stateless reference; compare-dll lists it unchecked. Images: ALL are those on which the DLL's pose and ours are both valid; COMB those of ALL where the DLL's |yaw| is above 15 deg and its |pitch| above 8 deg or its |roll| above 10 deg. Errors: of each yxz angle, |wrap(ours - DLL)|, deg; geodesic, the angle of R_ours^T R_DLL with R = Ry(y) Rx(x) Rz(z), deg; of the position, |ours - DLL| along each axis of the display frame, mm. A median or percentile interpolates linearly between ranks, as NumPy's default does.",
+  "status": "provisional: the head-pose study's gates (acceptance_gates.out, 2026-09-29), its Python pipeline's leave-one-session-out values with headroom for the port to Rust, until the commit that fits the constants again on the Rust tracker sets them from the Rust baseline",
+  "sessions": [
+    {
+      "name": "s1",
+      "clock_offset_us": 9290110919,
+      "about": "session1: 160 s of small natural movement; the DLL never loses the face"
+    },
+    {
+      "name": "s2",
+      "clock_offset_us": 10701480021,
+      "about": "session2: 162 s with large turns; the DLL loses the face 11 times"
+    },
+    {
+      "name": "s3",
+      "clock_offset_us": 12670044474,
+      "about": "session3: 392 s with large turns; the DLL loses the face 3 times"
+    }
+  ],
+  "gates": [
+    {
+      "id": "G1",
+      "name": "coverage of DLL-valid frames (%)",
+      "metric": "coverage_pct",
+      "kind": "min",
+      "by": "compare-dll",
+      "about": "of the images the DLL's pose is valid on, the share ours is valid on too, %",
+      "thresholds": { "s1": 99.5, "s2": 95.5, "s3": 99.5 }
+    },
+    {
+      "id": "G2",
+      "name": "validity agreement (%)",
+      "metric": "agreement_pct",
+      "kind": "min",
+      "by": "compare-dll",
+      "about": "of the images the DLL reported a pose for, valid or not, the share on which ours has the same validity, %",
+      "thresholds": { "s1": 99.5, "s2": 95.5, "s3": 99.5 }
+    },
+    {
+      "id": "G3",
+      "name": "DLL loss events detected",
+      "metric": "loss_events_found",
+      "kind": "min",
+      "by": "compare-dll",
+      "about": "the DLL's losses of the face (runs of images its pose is invalid on) that a run of our invalid poses overlaps; in s3 the 5-image loss at image 2659 is one the study's pipeline does not see either",
+      "thresholds": { "s1": 0, "s2": 8, "s3": 2 }
+    },
+    {
+      "id": "G4",
+      "name": "rotation median |e| pitch (deg)",
+      "metric": "rotation_median_abs_x_deg",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the median over ALL of |wrap(ours - DLL)| of the x angle (pitch), deg",
+      "thresholds": { "s1": 2.3, "s2": 2.6, "s3": 3.3 }
+    },
+    {
+      "id": "G5",
+      "name": "rotation median |e| yaw (deg)",
+      "metric": "rotation_median_abs_y_deg",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the median over ALL of |wrap(ours - DLL)| of the y angle (yaw), deg",
+      "thresholds": { "s1": 1.7, "s2": 2.2, "s3": 2.8 }
+    },
+    {
+      "id": "G6",
+      "name": "rotation median |e| roll (deg)",
+      "metric": "rotation_median_abs_z_deg",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the median over ALL of |wrap(ours - DLL)| of the z angle (roll), deg",
+      "thresholds": { "s1": 0.6, "s2": 1.4, "s3": 1.1 }
+    },
+    {
+      "id": "G7",
+      "name": "|median signed pitch error| (deg)",
+      "metric": "rotation_median_signed_x_deg",
+      "kind": "abs",
+      "by": "compare-dll",
+      "about": "the median over ALL of wrap(ours - DLL) of the x angle (pitch), deg, bounded in magnitude: a constant pitch offset, the mark of a wrong head-frame offset Q",
+      "thresholds": { "s1": 2.1, "s2": 1.6, "s3": 2.1 }
+    },
+    {
+      "id": "G8",
+      "name": "rotation geodesic p95 ALL (deg)",
+      "metric": "rotation_geodesic_p95_deg",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the 95th percentile over ALL of the geodesic angle between the two rotations, deg",
+      "thresholds": { "s1": 5.5, "s2": 12.0, "s3": 10.5 }
+    },
+    {
+      "id": "G9",
+      "name": "COMB pitch p95 |e| (deg)",
+      "metric": "combined_rotation_p95_abs_x_deg",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the 95th percentile over COMB of |wrap(ours - DLL)| of the x angle (pitch), deg: combined turns, where reading the angles in another Euler order shows",
+      "thresholds": { "s1": 4.0, "s2": 10.0, "s3": 9.5 }
+    },
+    {
+      "id": "G10",
+      "name": "COMB geodesic p95 (deg)",
+      "metric": "combined_rotation_geodesic_p95_deg",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the 95th percentile over COMB of the geodesic angle between the two rotations, deg",
+      "thresholds": { "s1": 6.0, "s2": 13.5, "s3": 11.0 }
+    },
+    {
+      "id": "G11",
+      "name": "position median |e| x (mm)",
+      "metric": "position_median_abs_x_mm",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the median over ALL of |ours - DLL| along the display frame's x axis, mm",
+      "thresholds": { "s1": 1.5, "s2": 3.2, "s3": 2.2 }
+    },
+    {
+      "id": "G12",
+      "name": "position median |e| y (mm)",
+      "metric": "position_median_abs_y_mm",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the median over ALL of |ours - DLL| along the display frame's y axis, mm",
+      "thresholds": { "s1": 3.5, "s2": 4.5, "s3": 4.7 }
+    },
+    {
+      "id": "G13",
+      "name": "position median |e| z (mm)",
+      "metric": "position_median_abs_z_mm",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the median over ALL of |ours - DLL| along the display frame's z axis, mm",
+      "thresholds": { "s1": 6.8, "s2": 9.0, "s3": 8.5 }
+    },
+    {
+      "id": "G14",
+      "name": "position p95 |e| z (mm)",
+      "metric": "position_p95_abs_z_mm",
+      "kind": "max",
+      "by": "compare-dll",
+      "about": "the 95th percentile over ALL of |ours - DLL| along the display frame's z axis, mm",
+      "thresholds": { "s1": 18.0, "s2": 55.0, "s3": 32.0 }
+    },
+    {
+      "id": "G15",
+      "name": "max |lag ours - DLL| rotation (ms)",
+      "metric": "rotation_lag_max_ms",
+      "kind": "max",
+      "by": "python",
+      "about": "the largest over the three angles of |lag(ours) - lag(DLL)|, ms; a lag is the coherence-weighted phase delay over 0.4-2.6 Hz (128-image Hann segments in steps of 32, linear detrend, coherence above 0.2) behind the study's stateless image-synchronous reference (three landmark-model passes on each image, mapped as the pipeline maps a fit, unfiltered), the same estimator for both",
+      "thresholds": { "s1": 22.0, "s2": 12.0, "s3": 12.0 }
+    },
+    {
+      "id": "G16",
+      "name": "max |lag ours - DLL| position (ms)",
+      "metric": "position_lag_max_ms",
+      "kind": "max",
+      "by": "python",
+      "about": "the largest over the three axes of |lag(ours) - lag(DLL)| of the position, ms, the lag as for G15",
+      "thresholds": { "s1": 16.0, "s2": 10.0, "s3": 26.0 }
+    },
+    {
+      "id": "G17",
+      "name": "rest jitter ratio rotation, min..max",
+      "metric": "rotation_rest_jitter_ratio",
+      "kind": "range",
+      "by": "python",
+      "about": "each angle's jitter at rest, ours over the DLL's: the SD of the 2 Hz zero-phase high-pass residual pooled over the stillest 25 % of the 1 s windows (by the reference's speed); the smallest and the largest of the three ratios must lie within the range",
+      "thresholds": { "s1": [0.6, 1.5], "s2": [0.6, 1.6], "s3": [0.8, 1.6] }
+    },
+    {
+      "id": "G18",
+      "name": "rest jitter ratio position, min..max",
+      "metric": "position_rest_jitter_ratio",
+      "kind": "range",
+      "by": "python",
+      "about": "the same ratios of the position's three axes",
+      "thresholds": { "s1": [0.8, 2.2], "s2": [0.7, 1.4], "s3": [1.0, 1.9] }
+    }
+  ]
+}

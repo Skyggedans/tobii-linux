@@ -12,6 +12,7 @@ use tobii_ipc::{
     STREAM_HEAD, STREAM_HEAD_POSE, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
 };
 
+use crate::compare_head::{HeadOptions, parse_area_choice};
 use crate::opentrack::{
     AngleComponent, AngleSource, CouplingMode, DEFAULT_OPENTRACK_ANGLE_DEADZONE_DEG,
     DEFAULT_OPENTRACK_ANGLE_MAP, DEFAULT_OPENTRACK_ANGLE_OCC,
@@ -162,12 +163,15 @@ pub(crate) enum Command {
         inputs: Vec<LogInput>,
     },
     /// Replay a captured session through the daemon's gaze decoder and
-    /// compare it with the Windows Stream Engine's log of the same session.
+    /// compare it with the Windows Stream Engine's log of the same session;
+    /// with `--head`, replay its IR images through the daemon's head pose.
     CompareDll {
         /// TBI5LOG1 log of the captured session.
         log_path: String,
         /// The Windows Stream Engine's callback log of the same session.
         jsonl_path: String,
+        /// Compare the head pose, with these options, instead of the gaze.
+        head: Option<HeadOptions>,
     },
     /// Connect to a running tobiid, ask it everything and print what streams.
     IpcProbe {
@@ -471,13 +475,54 @@ impl Options {
     }
 
     fn parse_compare_dll(args: &mut Args) -> Result<Self> {
-        const USAGE: &str = "usage: compare-dll <session.bin> <session.jsonl>";
+        const USAGE: &str = "usage: compare-dll <session.bin> <session.jsonl> [--head \
+             [--display-area auto|TLx,TLy,TLz,TRx,TRy,TRz,BLx,BLy,BLz] [--gates gates.json] \
+             [--csv per-image.csv]]\n\
+             Replays a captured session's gaze frames through the daemon's decoder and compares \
+             them with the Windows Stream Engine's log of it. --head replays its IR images through \
+             the daemon's head pose instead and compares the poses with the Stream Engine's; the \
+             display area is the log's (auto) or the given one (mm, tracker frame); --gates checks \
+             the metrics against a gates file (tools/headpose/gates.json) and fails on a gate that \
+             fails; --csv writes one row per image with a Stream Engine pose.";
+        if matches!(args.peek().map(String::as_str), Some("-h" | "--help")) {
+            print_help_and_exit(USAGE);
+        }
         let log_path = args.next().context(USAGE)?;
         let jsonl_path = args.next().context(USAGE)?;
-        ensure!(args.next().is_none(), USAGE);
+        let mut head = false;
+        let mut options = HeadOptions::default();
+        // The first option that only --head takes, to refuse it without one.
+        let mut head_option = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--head" => head = true,
+                "--display-area" => {
+                    options.area = parse_area_choice(&take_value(
+                        args,
+                        "--display-area",
+                        "auto or nine numbers",
+                    )?)?;
+                    head_option.get_or_insert("--display-area");
+                }
+                "--gates" => {
+                    options.gates = Some(take_value(args, "--gates", "a path")?);
+                    head_option.get_or_insert("--gates");
+                }
+                "--csv" => {
+                    options.csv = Some(take_value(args, "--csv", "a path")?);
+                    head_option.get_or_insert("--csv");
+                }
+                "-h" | "--help" => print_help_and_exit(USAGE),
+                other => bail!("unknown compare-dll argument {other}\n{USAGE}"),
+            }
+        }
+        if let Some(option) = head_option {
+            ensure!(head, "{option} needs --head\n{USAGE}");
+        }
         Ok(Self::for_command(Command::CompareDll {
             log_path,
             jsonl_path,
+            head: head.then_some(options),
         }))
     }
 
@@ -859,7 +904,7 @@ fn parse_log_inputs(args: &mut Args, usage: &str) -> Result<Vec<LogInput>> {
 /// Print the top-level usage text (replay mode plus subcommand one-liners).
 pub(crate) fn print_usage() {
     println!(
-        "usage:\n  cargo run -p tobii-tools -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--dashboard] [--opentrack-host 127.0.0.1] [--opentrack-port 4242] [--opentrack-no-translation] [--opentrack-translation-scale X,Y,Z] [--opentrack-angle-source model|gaze|head] [--opentrack-coupling-mode rotation|translation|hybrid|auto] [--opentrack-auto-decouple] [--opentrack-angle-points A,B] [--opentrack-angle-translation-comp X,Y,Z] [--opentrack-angle-translation-comp-scale N] [--opentrack-angle-translation-deadzone CM] [--opentrack-angle-occ N] [--opentrack-angle-map x,-y,off] [--opentrack-angle-scale N|YAW,PITCH,ROLL] [--opentrack-origin-samples N] [--opentrack-smoothing 0.35] [--opentrack-angle-deadzone 0.35] [--opentrack-rotation-comp X,Y,Z] [--opentrack-roll-points A,B] [--opentrack-no-angles] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -p tobii-tools -- analyze-log tobii_stream.bin\n  cargo run -p tobii-tools -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -p tobii-tools -- decode-stream tobii_stream.bin\n  cargo run -p tobii-tools -- import-tsv tshark.tsv out.bin\n  cargo run -p tobii-tools -- pose-candidates [label:]path.bin [label:]path.bin ...\n  cargo run -p tobii-tools -- compare-decoded [label:]path.bin [label:]path.bin ...\n  cargo run -p tobii-tools -- extract-calibration init_packets_ep.txt [--json calibration.json]\n  cargo run -p tobii-tools -- compare-dll session.bin session.jsonl\n  cargo run -p tobii-tools -- ipc-probe [--streams MASK] [--secs N] [--set-display W,H[,OFFSET_X]]\n  cargo run -p tobii-tools -- camera [init_packets_ep.txt] [--out frame] [--frames 10]"
+        "usage:\n  cargo run -p tobii-tools -- [init_packets_ep.txt] [--log tobii_stream.bin] [--decoded-csv decoded.csv] [--jsonl frames.jsonl] [--print-decoded] [--dashboard] [--opentrack-host 127.0.0.1] [--opentrack-port 4242] [--opentrack-no-translation] [--opentrack-translation-scale X,Y,Z] [--opentrack-angle-source model|gaze|head] [--opentrack-coupling-mode rotation|translation|hybrid|auto] [--opentrack-auto-decouple] [--opentrack-angle-points A,B] [--opentrack-angle-translation-comp X,Y,Z] [--opentrack-angle-translation-comp-scale N] [--opentrack-angle-translation-deadzone CM] [--opentrack-angle-occ N] [--opentrack-angle-map x,-y,off] [--opentrack-angle-scale N|YAW,PITCH,ROLL] [--opentrack-origin-samples N] [--opentrack-smoothing 0.35] [--opentrack-angle-deadzone 0.35] [--opentrack-rotation-comp X,Y,Z] [--opentrack-roll-points A,B] [--opentrack-no-angles] [--max-stream-packets N] [--max-init-packets N] [--no-reconnect]\n  cargo run -p tobii-tools -- analyze-log tobii_stream.bin\n  cargo run -p tobii-tools -- compare-logs [label:]path.bin [label:]path.bin ...\n  cargo run -p tobii-tools -- decode-stream tobii_stream.bin\n  cargo run -p tobii-tools -- import-tsv tshark.tsv out.bin\n  cargo run -p tobii-tools -- pose-candidates [label:]path.bin [label:]path.bin ...\n  cargo run -p tobii-tools -- compare-decoded [label:]path.bin [label:]path.bin ...\n  cargo run -p tobii-tools -- extract-calibration init_packets_ep.txt [--json calibration.json]\n  cargo run -p tobii-tools -- compare-dll session.bin session.jsonl [--head [--display-area auto|TLx,TLy,TLz,TRx,TRy,TRz,BLx,BLy,BLz] [--gates gates.json] [--csv per-image.csv]]\n  cargo run -p tobii-tools -- ipc-probe [--streams MASK] [--secs N] [--set-display W,H[,OFFSET_X]]\n  cargo run -p tobii-tools -- camera [init_packets_ep.txt] [--out frame] [--frames 10]"
     );
 }
 
