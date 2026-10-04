@@ -404,12 +404,14 @@ mod tests {
         let height = length(area.top_left_mm, area.bottom_left_mm);
 
         for eye in [frame.left, frame.right] {
-            let origin = tracker_to_display(&area, eye.origin_tracker_mm.value);
+            let origin =
+                tracker_to_display(&area, eye.origin_tracker_mm.value).expect("a display frame");
             assert!(
                 length(origin, eye.origin_display_mm.value) < 1e-3,
                 "{origin:?}"
             );
-            let [x, y, z] = tracker_to_display(&area, eye.gaze_point_tracker_mm.value);
+            let [x, y, z] = tracker_to_display(&area, eye.gaze_point_tracker_mm.value)
+                .expect("a display frame");
             let [u, v] = eye.gaze_point_norm.value;
             assert!(z.abs() < 1e-3, "{z} mm off the screen");
             assert!((x / width + 0.5 - u).abs() < 1e-4, "{x} vs {u}");

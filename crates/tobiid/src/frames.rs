@@ -473,7 +473,8 @@ mod tests {
         for (eye, k) in [(data.left, 0x04), (data.right, 0x0a)] {
             assert!(eye.gaze_point_valid);
             assert_eq!(eye.gaze_point_mm, key_point(&keys, k));
-            let [x, y, z] = tracker_to_display(&area, eye.gaze_point_mm.map(f64::from));
+            let [x, y, z] = tracker_to_display(&area, eye.gaze_point_mm.map(f64::from))
+                .expect("a display frame");
             let [u, v] = eye.gaze_point_on_display.map(f64::from);
             assert!(z.abs() < 0.01, "{z} mm off the screen");
             assert!((x / width + 0.5 - u).abs() < 1e-4, "{x} vs {u}");

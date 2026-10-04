@@ -205,19 +205,19 @@ impl DisplayFrame {
 }
 
 /// Map a point from the display frame (T) of `area` to the tracker frame (S):
-/// [`DisplayFrame::to_tracker`]. Every coordinate is NaN when the area fixes
-/// no frame.
+/// [`DisplayFrame::to_tracker`], with a frame built for this call (build
+/// one to map many points). `None` when the area fixes no frame.
 #[must_use]
-pub fn display_to_tracker(area: &DisplayArea, p: [f64; 3]) -> [f64; 3] {
-    DisplayFrame::new(area).map_or([f64::NAN; 3], |frame| frame.to_tracker(p))
+pub fn display_to_tracker(area: &DisplayArea, p: [f64; 3]) -> Option<[f64; 3]> {
+    DisplayFrame::new(area).map(|frame| frame.to_tracker(p))
 }
 
 /// Map a point from the tracker frame (S) to the display frame (T) of `area`:
-/// [`DisplayFrame::to_display`]. Every coordinate is NaN when the area fixes
-/// no frame.
+/// [`DisplayFrame::to_display`], with a frame built for this call (build
+/// one to map many points). `None` when the area fixes no frame.
 #[must_use]
-pub fn tracker_to_display(area: &DisplayArea, p: [f64; 3]) -> [f64; 3] {
-    DisplayFrame::new(area).map_or([f64::NAN; 3], |frame| frame.to_display(p))
+pub fn tracker_to_display(area: &DisplayArea, p: [f64; 3]) -> Option<[f64; 3]> {
+    DisplayFrame::new(area).map(|frame| frame.to_display(p))
 }
 
 #[cfg(test)]
@@ -519,14 +519,18 @@ mod tests {
     fn display_and_tracker_frames_are_inverse() {
         let area = display_area_basic(597.0, 336.0, 1.0, &captured_mounting());
         let p = [-57.9, 112.5, 618.3];
-        let back = tracker_to_display(&area, display_to_tracker(&area, p));
-        assert!(close(back, p, 1e-9), "{back:?}");
+        let back = display_to_tracker(&area, p).and_then(|q| tracker_to_display(&area, q));
+        assert!(back.is_some_and(|back| close(back, p, 1e-9)), "{back:?}");
         // The screen centre is the display frame's origin.
         let centre = scale(add(area.bottom_left_mm, area.top_right_mm), 0.5);
-        assert!(close(tracker_to_display(&area, centre), [0.0; 3], 1e-9));
+        let origin = tracker_to_display(&area, centre);
+        assert!(
+            origin.is_some_and(|o| close(o, [0.0; 3], 1e-9)),
+            "{origin:?}"
+        );
         // An area that fixes no frame maps nowhere.
         let none = DisplayArea::default();
-        assert!(tracker_to_display(&none, p).iter().all(|v| v.is_nan()));
-        assert!(display_to_tracker(&none, p).iter().all(|v| v.is_nan()));
+        assert!(tracker_to_display(&none, p).is_none());
+        assert!(display_to_tracker(&none, p).is_none());
     }
 }
