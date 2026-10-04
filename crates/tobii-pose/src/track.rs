@@ -844,6 +844,9 @@ struct FaceFitter<M> {
     /// Whether the last frame had no face: the next one goes to the face
     /// detector first.
     lost: bool,
+    /// Whether a face has been found since the fitter was made, so that
+    /// `crop` is the last face's region rather than the start crop.
+    seen: bool,
 }
 
 /// The two models as the tracker runs them: the landmark model on a crop of
@@ -1025,8 +1028,9 @@ impl Tracker {
     /// and sized from its landmarks. When the landmark model finds no face in
     /// it, or the last frame had none, the face detector looks for one in the
     /// whole frame, and the landmark model tries once more in a crop around
-    /// the best detection (`Crop::from_detection`): at most two landmark runs
-    /// and one detector run per frame.
+    /// one detection (`Crop::from_detection`): the one nearest the last face
+    /// found, or the best-scoring one before any was (`choose_detection`).
+    /// At most two landmark runs and one detector run per frame.
     ///
     /// The fit borrows the tracker until the next frame. It leaves the legacy
     /// pose alone: `process` is `fit` followed by the tracker's [`RestPose`].
@@ -1063,18 +1067,51 @@ struct Found {
     by_detector: bool,
 }
 
+/// The detection to look for the face in, of `detections` (best first) in a
+/// `geometry` frame. Before any face has been found, the best-scoring one.
+/// After that, `last` is the last face's region, and the detection is the
+/// one whose crop (`Crop::from_detection`) is centred nearest it; of two as
+/// near, the better-scoring one. So with someone else in view, a face lost
+/// for a frame (a quick turn, a hand) is looked for where it was, rather
+/// than on whichever face the detector scores higher, which is where the
+/// best score alone took the tracker. The Python prototype the tracker was
+/// validated with took the best-scoring detection every time.
+fn choose_detection(
+    detections: &[Detection],
+    last: Option<&Crop>,
+    geometry: &Geometry,
+) -> Option<Detection> {
+    let Some(last) = last else {
+        return detections.first().copied();
+    };
+    // The squared distance of a detection's crop from the last face's; a
+    // NaN one (a box that is not finite) as far as can be.
+    let distance = |d: &Detection| {
+        let crop = Crop::from_detection(d, geometry);
+        let dd = (crop.cx - last.cx).powi(2) + (crop.cy - last.cy).powi(2);
+        if dd.is_nan() { f64::INFINITY } else { dd }
+    };
+    // min_by keeps the first of equal ones, so the better-scoring.
+    detections
+        .iter()
+        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+        .copied()
+}
+
 impl<M: FaceModels> Models<M> {
     /// Look for the face in one frame (see [`Tracker::fit`]): the landmark
     /// model in `follow`, the crop that follows the face, unless the face
     /// was lost; then, if that found nothing, the detector on the camera's
-    /// `frame` and the landmark model in a crop around the best detection.
-    /// `big` is the frame enlarged for the landmark model. `None` when
-    /// neither found a face; a NaN presence score (never seen) counts as no
-    /// face, like a negative one.
+    /// `frame` and the landmark model in a crop around the detection nearest
+    /// `last`, the last face's region (`choose_detection`). `big` is the
+    /// frame enlarged for the landmark model. `None` when neither found a
+    /// face; a NaN presence score (never seen) counts as no face, like a
+    /// negative one.
     fn locate(
         &mut self,
         geometry: &Geometry,
         follow: Option<Crop>,
+        last: Option<&Crop>,
         frame: &[u8],
         big: &[u8],
     ) -> Result<Option<Found>> {
@@ -1092,7 +1129,7 @@ impl<M: FaceModels> Models<M> {
         }
         self.runs.detector += 1;
         let detections = self.inner.detect(frame, geometry.native_size)?;
-        let Some(detection) = detections.first().copied() else {
+        let Some(detection) = choose_detection(detections, last, geometry) else {
             return Ok(None);
         };
         let crop = Crop::from_detection(&detection, geometry);
@@ -1133,6 +1170,7 @@ impl<M: FaceModels> FaceFitter<M> {
             geometry,
             crop: Crop::upright(side / 2.0, side * geometry.cy_frac, geometry.start_half),
             lost: false,
+            seen: false,
         }
     }
 
@@ -1158,7 +1196,8 @@ impl<M: FaceModels> FaceFitter<M> {
             self.upscaled.as_slice()
         };
         let follow = (!self.lost).then_some(self.crop);
-        let found = self.models.locate(&geometry, follow, frame, big)?;
+        let last = self.seen.then_some(&self.crop);
+        let found = self.models.locate(&geometry, follow, last, frame, big)?;
         let Some(Found {
             crop,
             score,
@@ -1210,6 +1249,7 @@ impl<M: FaceModels> FaceFitter<M> {
         let next = Crop::around(image2d, geometry.min_half, geometry.max_half);
         self.crop = if next.is_finite() { next } else { crop };
         self.lost = false;
+        self.seen = true;
         // The fit's landmarks in the pixels of the frame as it came.
         let up = geometry.upscale as f64;
         for (out, p) in self.landmarks.iter_mut().zip(image2d) {
@@ -2339,6 +2379,66 @@ mod tests {
         assert!(fitter.models.inner.is_done());
     }
 
+    #[test]
+    fn the_detection_nearest_the_last_face_is_chosen_once_there_was_one() {
+        let g = Geometry::IMAGE83;
+        // The last face's region at 560; detections in the 280-px frame.
+        let last = Crop::upright(400.0, 280.0, 140.0);
+        let other = detection([80.0, 140.0], 80.0, 0.9); // crop at (160, 280)
+        let near = detection([190.0, 150.0], 80.0, 0.6); // crop at (380, 300)
+        let pick = |ds: &[Detection], last| choose_detection(ds, last, &g).map(|d| d.score);
+        // No face found yet: the best score.
+        assert_eq!(pick(&[other, near], None), Some(0.9));
+        // Then the nearest, whatever the scores.
+        assert_eq!(pick(&[other, near], Some(&last)), Some(0.6));
+        assert_eq!(pick(&[near, other], Some(&last)), Some(0.6));
+        // Of two as near (crops at 320 and 480, 80 px either side), the
+        // better-scoring, which comes first.
+        let left = detection([160.0, 140.0], 80.0, 0.8);
+        let right = detection([240.0, 140.0], 80.0, 0.7);
+        assert_eq!(pick(&[left, right], Some(&last)), Some(0.8));
+        // A box that is not finite is never the nearest.
+        let bad = Detection {
+            x: f64::NAN,
+            ..near
+        };
+        assert_eq!(pick(&[bad, other], Some(&last)), Some(0.9));
+        assert_eq!(pick(&[], Some(&last)), None);
+    }
+
+    #[test]
+    fn a_lost_face_is_looked_for_at_the_detection_nearest_where_it_was() {
+        let face = seen_through(&START, [0.0, 0.0, 60.0]);
+        // 1: the start crop misses; no face has been found yet, so the
+        // landmark model tries the best detection, on the right, and finds
+        // the face there.
+        let right = detection([200.0, 140.0], 80.0, 0.9);
+        let left = detection([80.0, 140.0], 80.0, 0.6);
+        // 2: the crop that followed it loses the face; the detector finds a
+        // better-scoring face on the left, and one near where it was.
+        let left_again = detection([80.0, 140.0], 80.0, 0.9);
+        let right_again = detection([190.0, 150.0], 80.0, 0.6);
+        let script = Script::new(
+            &face,
+            [-1.0, 2.0, -1.0, 3.0],
+            [vec![right, left], vec![left_again, right_again]],
+        );
+        let mut fitter = FaceFitter::new(Geometry::IMAGE83, script);
+        let frame = vec![0u8; 280 * 280];
+        for _ in 0..2 {
+            let by_detector = fitter
+                .fit(&frame, 280, 280)
+                .unwrap()
+                .map(|f| f.found_by_detector);
+            assert_eq!(by_detector, Some(true));
+        }
+        let crops = &fitter.models.inner.crops;
+        let g = Geometry::IMAGE83;
+        assert_eq!(crops[1], Crop::from_detection(&right, &g));
+        assert_eq!(crops[3], Crop::from_detection(&right_again, &g));
+        assert!(fitter.models.inner.is_done());
+    }
+
     /// The 0x50e fixture's frame (`TOBII_IMAGE83_FIXTURE`, a captured
     /// 78609-byte message; the user's face, so it is not committed), if set.
     fn image83_fixture() -> Option<tobii_proto::image83::ImageFrame> {
@@ -2426,6 +2526,64 @@ mod tests {
             .map(|f| f.found_by_detector);
         assert_eq!(next, Some(false), "followed by the crop");
         assert_eq!(t.model_runs(), runs(3, 2));
+    }
+
+    /// `dst`, an `n`x`n` frame, with the fixture's face (the box x 88-217, y
+    /// 55-199 of its `src` frame) pasted in moved by `(dx, dy)`.
+    fn paste_face(dst: &mut [u8], src: &[u8], n: usize, dx: isize, dy: isize) {
+        for y in 55..200usize {
+            for x in 88..218usize {
+                if let (Some(tx), Some(ty)) = (x.checked_add_signed(dx), y.checked_add_signed(dy))
+                    && tx < n
+                    && ty < n
+                {
+                    dst[ty * n + tx] = src[y * n + x];
+                }
+            }
+        }
+    }
+
+    /// Two copies of the fixture's face, side by side; the tracker follows
+    /// the left one. On one frame that face moves out of the crop that
+    /// follows it (a quick move), and the detector finds both faces, the
+    /// right one with the better score (0.85 against 0.82 or 0.83). The
+    /// tracker looks for the face where it was, on the left. Taking the best
+    /// score, it went to the right one.
+    #[test]
+    fn image83_tracker_finds_the_face_it_lost_rather_than_another() {
+        let Some(frame) = image83_fixture() else {
+            return;
+        };
+        let n = frame.width;
+        // The copies at x 2-131 and 148-277, on grey; the left one then
+        // moves 60 px down or 45 px up.
+        let blank = vec![20u8; n * n];
+        let mut left = blank.clone();
+        paste_face(&mut left, &frame.pixels, n, -86, 0);
+        let mut both = left.clone();
+        paste_face(&mut both, &frame.pixels, n, 60, 0);
+        // The landmarks' mean x in the 280-px frame, and how the face was
+        // found.
+        let centre = |t: &mut Tracker, f: &[u8]| {
+            let fit = t.fit(f, n, n).unwrap().unwrap();
+            let x = fit.landmarks.iter().map(|p| p[0]).sum::<f64>() / NLM as f64;
+            (x, fit.found_by_detector)
+        };
+        for dy in [60, -45] {
+            let mut moved = blank.clone();
+            paste_face(&mut moved, &frame.pixels, n, -86, dy);
+            paste_face(&mut moved, &frame.pixels, n, 60, 0);
+            let mut t = Tracker::new_image83().unwrap();
+            for f in [&left, &both, &both] {
+                let (x, _) = centre(&mut t, f);
+                assert!(x < 140.0, "{dy}: following the left face, x {x}");
+            }
+            let (x, by_detector) = centre(&mut t, &moved);
+            println!(
+                ">>> left face moved {dy} px: found again at x {x:.1}, by the detector {by_detector}"
+            );
+            assert!(by_detector && x < 140.0, "{dy}: x {x}");
+        }
     }
 
     /// The face detector on the 0x50e fixture's frame: one face, the eyes

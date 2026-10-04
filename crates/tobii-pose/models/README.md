@@ -119,8 +119,10 @@ suppression, merging the candidates that overlap the best remaining one by
 an intersection over union above 0.3, their boxes and keypoints averaged
 with their scores as weights. The score threshold is 0.3, the
 `min_detection_confidence` the prototype ran MediaPipe's own detector with
-(MediaPipe's default is 0.5). The tracker uses the best detection only,
-and of its keypoints only the two eyes.
+(MediaPipe's default is 0.5). The tracker looks for a lost face in one
+detection: the one nearest the last face it found, or the best-scoring one
+before it has found any (the prototype took the best-scoring one every
+time). Of that detection's keypoints it uses only the two eyes.
 
 ### ONNX metadata
 
