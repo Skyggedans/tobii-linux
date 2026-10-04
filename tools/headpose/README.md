@@ -46,17 +46,25 @@ fits of a stateless run of a tracker, every image fitted on its own. The head po
 
 ## Refitting the constants and accepting them
 
-1. Replay every session through the tracker as it is now (release build):
+The commands run from the repository's root and write under `fixtures/` (gitignored), in a
+directory of the refit's own: the fits, and whatever is printed per image, come from images of a
+face.
+
+    OUT=fixtures/analysis/headpose-refit
+    mkdir -p $OUT
+
+1. Replay every session through the tracker as it is now (release build), for each N:
 
        target/release/tobii5-init-replay image83-replay \
-           fixtures/analysis/headpose-2026-09-27/data/session1.bin --fits fits_s1.csv
+           fixtures/analysis/headpose-2026-09-27/data/sessionN.bin --fits $OUT/fits_sN.csv
 
 2. Fit, leave one session out (fit.py names the sessions s1, s2, ... in the order given, and
    `fit.json` records each one's clock offset and image count, by which `evaluate.py --loso`
    finds the fold that leaves a session out, whatever the order of its own arguments):
 
-       tools/headpose/fit.py --session LOG1 JSONL1 fits_s1.csv --session LOG2 JSONL2 fits_s2.csv \
-           --session LOG3 JSONL3 fits_s3.csv --in-sample --out fit.json
+       tools/headpose/fit.py --session LOG1 JSONL1 $OUT/fits_s1.csv \
+           --session LOG2 JSONL2 $OUT/fits_s2.csv --session LOG3 JSONL3 $OUT/fits_s3.csv \
+           --in-sample --out $OUT/fit.json
 
    It prints each fold's constants and the beta grid it chose from, then every session's errors
    with the constants fitted without it (LOSO) and, with `--in-sample`, with those fitted on all.
@@ -65,25 +73,25 @@ fits of a stateless run of a tracker, every image fitted on its own. The head po
    one one-euro filter for the three angles (`--rotation-filters per-axis` for the study's).
 3. Copy `head_params` into `HeadParams::FITTED`, field for field, and say in its doc comment
    what it was fitted on (date, sessions, tracker). `reference.FITTED`, `evaluate.py`'s default,
-   stays the study's: give the scripts `--params fit.json` from here on.
+   stays the study's: give the scripts `--params $OUT/fit.json` from here on.
 4. Regenerate the vectors with the new constants and update the literals in `head.rs`'s tests.
    The vectors keep the eye branch on (the weight the fit found) and a different filter per
    angle, so that both stay covered:
 
-       tools/headpose/make_vectors.py vectors.json --params fit.json --eye-weight fitted \
-           --rotation-filters per-axis
+       tools/headpose/make_vectors.py $OUT/vectors.json --params $OUT/fit.json \
+           --eye-weight fitted --rotation-filters per-axis
 
    Without options it writes the study's vectors, the ones the tests carry now, byte for byte.
 5. Accept: `tobii5-init-replay compare-dll --head` replays every session through the daemon's own
    pipeline and checks `gates.json`; `evaluate.py` gives the lag and the rest jitter (G15-G18),
    which are measured in Python:
 
-       tools/headpose/evaluate.py --session ... --params fit.json \
+       tools/headpose/evaluate.py --session ... --params $OUT/fit.json \
            --reference-fits .../sl_s1.npz --reference-fits .../sl_s2.npz \
            --reference-fits .../sl_s3.npz
 
    Every gate must pass in every session; the numbers go into the commit message.
-   `evaluate.py --params fit.json --loso` gives the leave-one-session-out numbers, and
+   `evaluate.py --params $OUT/fit.json --loso` gives the leave-one-session-out numbers, and
    `--broken zyx|q-transposed|no-q|no-filter` shows which gates catch a broken pipeline.
 
 ## What is measured

@@ -13,3 +13,8 @@ tobii_stream*.bin
 
 # Python bytecode from running tools/abi/dll_abi.py
 __pycache__/
+
+# The per-image outputs of image83-replay --fits and --landmarks come from images of a face and
+# belong under fixtures/ (tools/headpose/README.md); these catch their usual names elsewhere.
+/fits_*.csv
+*.f32
