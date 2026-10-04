@@ -208,7 +208,8 @@ impl HeadParams {
             offset: [-0.004_033_985_018_082_697, -0.000_262_390_956_082_422_75],
         },
         eye_weight: 0.0,
-        // A third of the way at the stream's 30.208 ms frame interval.
+        // Each EMA moves 0.3 of the way (dt / (dt + tau) = 0.30) at the
+        // stream's 30.208 ms frame interval.
         position_tau_s: 0.070_485_333_333_333_33,
         correction_tau_s: 0.070_485_333_333_333_33,
         rotation_filters: [OneEuro {
@@ -1387,6 +1388,44 @@ mod tests {
         assert_close(&next.position_mm, &[1.0, 2.0, 603.0], "position");
     }
 
+    /// The position's EMA and the eye correction's low-pass each move by
+    /// their own time constant, `dt / (dt + tau)` of the way.
+    #[test]
+    fn the_position_and_the_correction_each_take_their_own_time_constant() {
+        let params = HeadParams {
+            position_tau_s: 0.05,
+            correction_tau_s: 0.1,
+            ..vector_params()
+        };
+        let first = Raw {
+            pnp_mm: [0.0, 0.0, 600.0],
+            correction_mm: Some([0.0; 3]),
+            angles_deg: [0.0; 3],
+        };
+        let dt = 0.030_208;
+        let next = Filters::start(0, &first).step(
+            30_208,
+            &Raw {
+                pnp_mm: [10.0, 0.0, 600.0],
+                correction_mm: Some([0.0, 4.0, 0.0]),
+                ..first
+            },
+            dt,
+            &params,
+        );
+        let (a_position, a_correction) = (dt / (dt + 0.05), dt / (dt + 0.1));
+        assert_close(
+            &next.correction_mm,
+            &[0.0, 4.0 * a_correction, 0.0],
+            "correction",
+        );
+        assert_close(
+            &next.position_mm,
+            &[10.0 * a_position, 4.0 * a_correction * a_position, 600.0],
+            "position",
+        );
+    }
+
     #[test]
     fn the_one_euro_filter_takes_the_short_way_round_180_degrees() {
         let settings = OneEuro {
@@ -1635,6 +1674,9 @@ mod tests {
         assert_eq!(bits(&pose), bits(&valid));
     }
 
+    /// A change of the display generation or the open restarts the filters
+    /// once, at the frame that brings it: the frames after it step on, and
+    /// going back is a change again.
     #[test]
     fn a_new_display_generation_or_open_restarts_the_filters() {
         let landmarks = sequence_landmarks();
@@ -1645,19 +1687,28 @@ mod tests {
             open,
             ..context(t_us, &frame)
         };
+        let fit = |i| Ok(sequence_fit(i, &landmarks));
         for (generation, open, restarts) in [(1, 1, false), (2, 1, true), (1, 2, true)] {
+            let what = format!("generation {generation}, open {open}");
             let mut poses = Poses::new(params, RestPose::default());
-            let _ = poses.step_with_fit(Ok(sequence_fit(0, &landmarks)), &at(0, 1, 1));
-            let _ = poses.step_with_fit(Ok(sequence_fit(1, &landmarks)), &at(30_208, 1, 1));
-            let out = poses.step_with_fit(
-                Ok(sequence_fit(2, &landmarks)),
-                &at(60_416, generation, open),
-            );
+            let _ = poses.step_with_fit(fit(0), &at(0, 1, 1));
+            let _ = poses.step_with_fit(fit(1), &at(30_208, 1, 1));
+            let out = poses.step_with_fit(fit(2), &at(60_416, generation, open));
             assert_eq!(
                 out.head == unfiltered(params, 2, 60_416),
                 restarts,
-                "generation {generation}, open {open}"
+                "{what}"
             );
+            let out = poses.step_with_fit(fit(3), &at(90_624, generation, open));
+            assert_ne!(out.head, unfiltered(params, 3, 90_624), "{what}");
+            let out = poses.step_with_fit(fit(4), &at(120_832, 1, 1));
+            assert_eq!(
+                out.head == unfiltered(params, 4, 120_832),
+                restarts,
+                "{what}"
+            );
+            let out = poses.step_with_fit(fit(1), &at(151_040, 1, 1));
+            assert_ne!(out.head, unfiltered(params, 1, 151_040), "{what}");
         }
     }
 
