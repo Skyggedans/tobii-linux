@@ -72,8 +72,8 @@ const MIN_SPREAD_MM: f64 = 0.1;
 /// of the screen.
 const FITTED_AREA_HALF_MM: f64 = 100.0;
 
-/// How much older than an image a gaze frame may be for its eyes to count
-/// for the image, µs (the stream sends one every 30 ms).
+/// A gaze frame's eyes count for an image while the frame is less than this
+/// much older than the image, µs (the stream sends one every 30 ms).
 const EYES_MAX_AGE_US: i64 = 100_000;
 
 /// The DLL-valid images after a loss of the face that are a re-acquisition.
@@ -100,7 +100,7 @@ const CSV_HEADER: &str = "image,device_ts_us,dll_ts_us,dll_valid,\
 dll_pos_x_mm,dll_pos_y_mm,dll_pos_z_mm,dll_rot_x_rad,dll_rot_y_rad,dll_rot_z_rad,\
 ours_valid,ours_pos_x_mm,ours_pos_y_mm,ours_pos_z_mm,ours_rot_x_rad,ours_rot_y_rad,ours_rot_z_rad,\
 face,face_score,by_detector,centroid_edge_px,nose_tip_edge_px,\
-both_eyes,no_eyes,yaw20,reacq,comb,step_us,landmark_runs,detector_runs";
+both_eyes,no_eyes,yaw20,reacq_gap,comb,step_us,landmark_runs,detector_runs";
 
 /// Where `compare-dll --head` takes the display area from.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -996,8 +996,19 @@ fn reacquisition(dll: &[DllState]) -> Vec<bool> {
     out
 }
 
-/// The subsets of the DLL-valid images that the errors are also given on,
-/// as the head-pose study defined them.
+/// The subsets of the DLL-valid images that the errors are also given on:
+/// the head-pose study's (its `fv_common.py`), by the names it gives them,
+/// but at two edges that no image of s1-s3 comes to, where the masks are
+/// the study's image for image:
+/// - [`Subset::BothEyes`] and [`Subset::NoEyes`] read the latest gaze frame
+///   at or before the image ([`eyes_at`]), the study the last one strictly
+///   before it.
+/// - [`Subset::Reacquired`] is the study's `REACQgap`, the first 10 images
+///   of each DLL-valid run but the session's first (its `REACQ` has that
+///   one too). It takes a run only after a DLL-invalid image, a loss, where
+///   `REACQgap` takes every run but the first: a run after images without a
+///   DLL pose is none here, and the first is one when the DLL's first
+///   poses are invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Subset {
     /// Every DLL-valid image.
@@ -1009,7 +1020,7 @@ enum Subset {
     /// The DLL's |yaw| at least 20°.
     LargeYaw,
     /// The first 10 DLL-valid images after a loss of the face
-    /// ([`reacquisition`]).
+    /// ([`reacquisition`]): the study's `REACQgap`.
     Reacquired,
     /// The DLL's |yaw| above 15° and its |pitch| above 8° or |roll| above
     /// 10°: combined turns, where the order of the Euler angles shows.
@@ -1032,7 +1043,7 @@ impl Subset {
             Self::BothEyes => "BOTH",
             Self::NoEyes => "NONE",
             Self::LargeYaw => "YAW20",
-            Self::Reacquired => "REACQ",
+            Self::Reacquired => "REACQgap",
             Self::Combined => "COMB",
         }
     }
@@ -1427,12 +1438,12 @@ fn print_errors(analysis: &Analysis) {
     let head = |what: &str| {
         println!("{what}, on the images both call valid:");
         println!(
-            "  subset  DLL-valid  ours valid           |e| median x / y / z    |e| p95 x / y / z"
+            "  subset    DLL-valid  ours valid           |e| median x / y / z    |e| p95 x / y / z"
         );
     };
     let lead = |subset: Subset, e: &Errors| {
         format!(
-            "  {:<6} {:>10} {:>11} {:>8} %",
+            "  {:<8} {:>10} {:>11} {:>8} %",
             subset.name(),
             e.subset,
             e.both_valid,
@@ -1943,6 +1954,11 @@ mod tests {
                 .map(Subset::name)
                 .collect()
         };
+        // The study's names, REACQgap its re-acquisitions without the start.
+        assert_eq!(
+            Subset::ALL.map(Subset::name),
+            ["ALL", "BOTH", "NONE", "YAW20", "REACQgap", "COMB"]
+        );
         assert_eq!(member(&frame([0.0; 3], both)), ["ALL", "BOTH"]);
         assert_eq!(member(&frame([0.0; 3], one)), ["ALL"]);
         assert_eq!(member(&frame([0.0; 3], Eyes::default())), ["ALL", "NONE"]);
@@ -2558,7 +2574,7 @@ mod tests {
              ours_valid,ours_pos_x_mm,ours_pos_y_mm,ours_pos_z_mm,\
              ours_rot_x_rad,ours_rot_y_rad,ours_rot_z_rad,\
              face,face_score,by_detector,centroid_edge_px,nose_tip_edge_px,\
-             both_eyes,no_eyes,yaw20,reacq,comb,step_us,landmark_runs,detector_runs"
+             both_eyes,no_eyes,yaw20,reacq_gap,comb,step_us,landmark_runs,detector_runs"
         );
         let mut f = frame([1.0, 25.0, 0.0], Eyes::default());
         f.image = 7;
