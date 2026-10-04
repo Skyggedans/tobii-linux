@@ -47,8 +47,9 @@ unfiltered pose. Our filter then delays the reference's own noise too, which add
 (enough to fail G15 where the stateless reference passes), so the lag and the rest jitter are
 printed for information only and their gates (G15-G18) are not checked.
 
-The gates (gates.json) apply to a session whose clock offset and image count they name. Exits 1
-if one fails.
+The gates (gates.json, the file compare-dll --head checks) apply to a session whose clock offset
+they name (and image count, where they give one); evaluate.py checks every gate, those marked as
+compare-dll's too. Exits 1 if one fails.
 """
 
 import argparse
@@ -67,11 +68,12 @@ import reference as ref  # noqa: E402
 GATES = os.path.join(HERE, "gates.json")
 # The gates that need an independent lag reference.
 FILTER_METRICS = (
-    "rotation_max_abs_lag_diff_ms",
-    "position_max_abs_lag_diff_ms",
+    "rotation_lag_max_ms",
+    "position_lag_max_ms",
     "rotation_rest_jitter_ratio",
     "position_rest_jitter_ratio",
 )
+GATE_KINDS = ("min", "max", "abs", "range")
 SUBSETS = ("ALL", "BOTH", "NONE", "YAW20", "REACQ", "REACQgap")
 CHANNELS = [("rot", 0), ("rot", 1), ("rot", 2), ("pos", 0), ("pos", 1), ("pos", 2)]
 
@@ -312,20 +314,20 @@ def evaluate(o, P, args, ref_fits):
     res["metrics"] = {
         "coverage_pct": 100.0 * res["coverage"],
         "agreement_pct": 100.0 * res["validity"]["agree"],
-        "loss_events_detected": res["validity"]["n_det"],
+        "loss_events_found": res["validity"]["n_det"],
         "rotation_median_abs_x_deg": float(a["med"][0]),
         "rotation_median_abs_y_deg": float(a["med"][1]),
         "rotation_median_abs_z_deg": float(a["med"][2]),
         "rotation_median_signed_x_deg": a["bias"],
         "rotation_geodesic_p95_deg": a["geo_p95"],
-        "comb_rotation_p95_abs_x_deg": float(c["p95"][0]),
-        "comb_rotation_geodesic_p95_deg": c["geo_p95"],
+        "combined_rotation_p95_abs_x_deg": float(c["p95"][0]),
+        "combined_rotation_geodesic_p95_deg": c["geo_p95"],
         "position_median_abs_x_mm": float(p["med"][0]),
         "position_median_abs_y_mm": float(p["med"][1]),
         "position_median_abs_z_mm": float(p["med"][2]),
         "position_p95_abs_z_mm": float(p["p95"][2]),
-        "rotation_max_abs_lag_diff_ms": max(abs(lj[("rot", k)]["dlag"]) for k in range(3)),
-        "position_max_abs_lag_diff_ms": max(abs(lj[("pos", k)]["dlag"]) for k in range(3)),
+        "rotation_lag_max_ms": max(abs(lj[("rot", k)]["dlag"]) for k in range(3)),
+        "position_lag_max_ms": max(abs(lj[("pos", k)]["dlag"]) for k in range(3)),
         "rotation_rest_jitter_ratio": [
             min(lj[("rot", k)]["jit"] for k in range(3)),
             max(lj[("rot", k)]["jit"] for k in range(3)),
@@ -366,14 +368,18 @@ def headroom(kind, gate, val):
 
 
 def gate_session(gates, o):
-    """The gates' name for session o, matched by clock offset and image count, or None."""
-    for name, s in gates["sessions"].items():
-        if s["clock_offset_us"] == o["k"] and s["images"] == o["n"]:
-            return name
+    """The gates' name for session o, matched by clock offset (and image count, where the file
+    gives one), or None."""
+    for s in gates["sessions"]:
+        if s["clock_offset_us"] == o["k"] and s.get("images", o["n"]) == o["n"]:
+            return s["name"]
     return None
 
 
 def print_gates(gates, sessions, results):
+    """Check the gates file (compare-dll --head's: the sessions by clock offset, per gate its
+    metric, kind and thresholds per session; evaluate.py checks every gate, whoever its "by"
+    names) and print the table. Returns whether none failed."""
     names = [gate_session(gates, o) for o in sessions]
     for o, g in zip(sessions, names):
         if g is None:
@@ -383,9 +389,17 @@ def print_gates(gates, sessions, results):
         return True
     rows, failed, unchecked = [], [], []
     for gt in gates["gates"]:
-        cells = [f"{gt['id']} {gt['about']}", gt["kind"]]
+        if gt["kind"] not in GATE_KINDS:
+            C.fail(f"gate {gt['id']}: unknown kind {gt['kind']!r}")
+        if gt["metric"] not in results[0]["metrics"]:
+            C.fail(f"gate {gt['id']}: no metric {gt['metric']!r} here")
+        cells = [f"{gt['id']} {gt['name']}", gt["kind"]]
         for o, g, res in cols:
-            val, th = res["metrics"][gt["metric"]], gt[g]
+            val, th = res["metrics"][gt["metric"]], gt["thresholds"].get(g)
+            if th is None:
+                unchecked.append(f"{gt['id']} {o['name']}")
+                cells.append(f"{fmt(val)}: not checked (no threshold for {g})")
+                continue
             if gt["metric"] in FILTER_METRICS and not res["independent_reference"]:
                 unchecked.append(f"{gt['id']} {o['name']}")
                 cells.append(f"{fmt(val)}: not checked (no --reference-fits)")
@@ -678,7 +692,10 @@ def main():
     ok = True
     if args.gates != "none":
         with open(args.gates) as f:
-            ok = print_gates(json.load(f), sessions, results)
+            gates = json.load(f)
+        if not (isinstance(gates.get("sessions"), list) and isinstance(gates.get("gates"), list)):
+            C.fail(f'{args.gates}: not a gates file (a "sessions" and a "gates" list)')
+        ok = print_gates(gates, sessions, results)
     sys.exit(0 if ok else 1)
 
 

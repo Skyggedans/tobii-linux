@@ -15,7 +15,7 @@ tests' vectors. Python 3 with NumPy and SciPy, nothing else.
 | `common.py` | Reads a session: the TBI5LOG1 log, the DLL's JSONL, the face fits; finds the clock offset, pairs every DLL pose with its image, fits the display frame. Vectorised twins of `reference.py` for whole sessions. |
 | `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON. |
 | `evaluate.py` | Runs `reference.py` over the fits with a set of constants and prints every acceptance metric, lag and rest jitter included, against `gates.json`. |
-| `gates.json` | The acceptance gates, per session. |
+| `gates.json` | The acceptance gates, per session: the file `compare-dll --head` checks, which `evaluate.py` reads too. |
 | `blaze_face_to_onnx.py` | The conversion of MediaPipe's BlazeFace detector to the ONNX model tobii-pose embeds (its own docstring; needs tflite2onnx). |
 
 ## The data, which never goes into the repository
@@ -109,12 +109,14 @@ REACQgap (the same without the session start's); COMB (|yaw| > 15° and (|pitch|
   quarter of the 32-image windows, chosen by the reference's speed; ours / DLL, all three axes
   within the gate's range.
 
-`gates.json` has, per gate, the metric, the kind (`min`: the value is at least the gate, `max`: at
-most, `abs`: its magnitude at most, `range`: every axis inside) and a threshold per session. A
-session is known by its clock offset and its number of images, so the gates follow the capture,
-not the order of the arguments. The thresholds are the study's leave-one-session-out values plus
-headroom for the port; each was checked against the broken pipelines, which fail at least one
-gate in every session.
+`gates.json` names the sessions by their clock offset, so the gates follow the capture, not the
+order of the arguments (a session may also give its number of images, which must then match). It
+has, per gate, the metric, the kind (`min`: the value is at least the gate, `max`: at most, `abs`:
+its magnitude at most, `range`: every axis inside), `by` (`compare-dll` for the gates
+`compare-dll --head` checks, `python` for the lag and the rest jitter, which only `evaluate.py`
+measures; `evaluate.py` checks them all) and a threshold per session (`thresholds`). The
+thresholds are the study's leave-one-session-out values plus headroom for the port; each was
+checked against the broken pipelines, which fail at least one gate in every session.
 
 ## Details
 
