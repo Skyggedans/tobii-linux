@@ -1202,7 +1202,7 @@ fn read_frames(
                     }
                 }
                 // Waits while the queue is full (see `REQUEST_QUEUE`).
-                if !worker.as_ref().is_some_and(|w| w.queue.send(body).is_ok()) {
+                if worker.as_ref().is_none_or(|w| w.queue.send(body).is_err()) {
                     // It panicked, and has hung up on the client; frames
                     // the client sent before that may still be read.
                     warn!(
