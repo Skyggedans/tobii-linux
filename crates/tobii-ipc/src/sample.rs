@@ -154,7 +154,11 @@ pub struct HeadPose {
     pub ts_us: i64,
     /// Whether `position_mm` holds a measurement for this image.
     pub position_valid: bool,
-    /// Head position in the display frame, mm.
+    /// Head position in the display frame, mm: the point the Stream Engine
+    /// reports, on the camera's line of sight to the point midway between
+    /// the eyes, at a range set by the head's size in the image. It is not
+    /// a fixed point of the head, nor the neck pivot of [`ServerMsg::Head`],
+    /// so turning the head moves it.
     pub position_mm: [f32; 3],
     /// Whether each angle of `rotation_rad`, x, y and z, holds a
     /// measurement for this image.
@@ -261,13 +265,21 @@ pub enum ServerMsg {
         /// Kind-specific payload (see [`crate::request`]).
         payload: Vec<u8>,
     },
-    /// Head pose.
+    /// The daemon's own head pose, not the Stream Engine's (that is
+    /// [`ServerMsg::HeadPose`]): relative to the rest pose a RECENTER
+    /// resets, and sent only while a face is tracked, with no validity.
     Head {
         /// When the sample was taken, on the host clock, microseconds.
         ts_us: i64,
-        /// Translation `[x, y, z]` in millimetres.
+        /// How far a pivot at the neck has moved from the rest pose,
+        /// `[x, y, z]` in millimetres, along the axes of the camera, which
+        /// looks up at the user: not the display frame, and z has the
+        /// opposite sign to [`HeadPose::position_mm`]'s.
         pos_mm: [f32; 3],
-        /// Rotation `[pitch, yaw, roll]` in radians (Stream-Engine axis order).
+        /// Rotation from the rest pose in radians, `[pitch, yaw, roll]`:
+        /// the angles about x, y and z, in [`HeadPose::rotation_rad`]'s
+        /// order but with pitch and roll of the opposite sign, each clamped
+        /// to ±45°.
         rot_rad: [f32; 3],
     },
     /// The Stream Engine's head pose (`tobii_head_pose_t`), validity
@@ -327,7 +339,8 @@ pub fn encode_reply(request_id: u32, status: u8, payload: &[u8]) -> Vec<u8> {
         .finish()
 }
 
-/// Daemon -> client HEAD body: position in mm, rotation in radians.
+/// Daemon -> client HEAD body, the daemon's own pose ([`ServerMsg::Head`]):
+/// position in mm, rotation in radians.
 #[must_use]
 pub fn encode_head(ts_us: i64, pos_mm: [f32; 3], rot_rad: [f32; 3]) -> Vec<u8> {
     Writer::with_tag(TAG_HEAD, 32)

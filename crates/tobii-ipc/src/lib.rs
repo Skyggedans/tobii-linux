@@ -52,13 +52,17 @@
 //!
 //! The daemon has two head pose streams. HEAD ([`STREAM_HEAD`]) is its own:
 //! relative to a rest pose that RECENTER resets, sent only while a face is
-//! tracked, with no validity. `HEAD_POSE` ([`STREAM_HEAD_POSE`], a
-//! [`HeadPose`]) is the Stream Engine's: absolute, in the display frame, one
-//! for every IR image the daemon processes, valid or not, with a validity
-//! for the position and for each angle. It is a stream of its own rather
-//! than a validity tail on HEAD because a HEAD decoder ignores a tail: a
-//! client from before the tail would take every invalid pose for a valid
-//! one.
+//! tracked, with no validity. Its position is that of a pivot at the neck,
+//! along the axes of the camera, which looks up at the user; its angles are
+//! clamped to ±45°; and its z, pitch and roll have the opposite sign to
+//! `HEAD_POSE`'s. `HEAD_POSE` ([`STREAM_HEAD_POSE`], a [`HeadPose`]) is the
+//! Stream Engine's: absolute, in the display frame, one for every IR image
+//! the daemon processes, valid or not, with a validity for the position and
+//! for each angle. Its position is a point on the camera's line of sight to
+//! the point midway between the eyes, and its angles are not clamped. It is
+//! a stream of its own rather than a validity tail on HEAD because a HEAD
+//! decoder ignores a tail: a client from before the tail would take every
+//! invalid pose for a valid one.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -84,7 +88,9 @@ pub use sample::{
 
 // Stream subscription bits (client -> daemon), OR-ed into the SUBSCRIBE mask.
 
-/// Subscribe to head pose ([`TAG_HEAD`] frames).
+/// Subscribe to the daemon's own head pose, relative to the rest pose a
+/// RECENTER resets ([`TAG_HEAD`] frames); the Stream Engine's is
+/// [`STREAM_HEAD_POSE`].
 pub const STREAM_HEAD: u32 = 1 << 0;
 /// Subscribe to gaze points ([`TAG_GAZE`] frames).
 pub const STREAM_GAZE: u32 = 1 << 1;
@@ -114,7 +120,8 @@ pub const STREAM_HEAD_POSE: u32 = 1 << 9;
 
 /// Client -> daemon: `u32 LE` stream mask (`STREAM_*`); `0` unsubscribes.
 pub const TAG_SUBSCRIBE: u8 = 0x01;
-/// Client -> daemon: reset the head rest pose. No payload.
+/// Client -> daemon: reset the rest pose HEAD is relative to; `HEAD_POSE`
+/// has none. No payload.
 pub const TAG_RECENTER: u8 = 0x02;
 /// Client -> daemon: `u32 id`, `u8 kind`, payload (see [`request`]).
 pub const TAG_REQUEST: u8 = 0x03;
@@ -122,7 +129,9 @@ pub const TAG_REQUEST: u8 = 0x03;
 pub const TAG_SUBSCRIBED: u8 = 0x10;
 /// Daemon -> client: `u32 id`, `u8 status`, payload, in reply to a REQUEST.
 pub const TAG_REPLY: u8 = 0x11;
-/// Daemon -> client: `i64 ts_us`, `3 x f32` position (mm), `3 x f32` rotation (rad).
+/// Daemon -> client: `i64 ts_us`, `3 x f32` position (mm), `3 x f32` rotation
+/// (rad): the daemon's own pose, relative to the rest pose (see
+/// [`ServerMsg::Head`]).
 pub const TAG_HEAD: u8 = 0x20;
 /// Daemon -> client: `i64 ts_us`, `u8 valid`, `2 x f32` xy, then an optional
 /// `2 x f32` pupil-diameter tail (mm, left/right, `NaN` when not valid).
@@ -727,7 +736,9 @@ mod tests {
     }
 
     /// A head pose whose fields all differ, valid but for the rotation's y,
-    /// so a field or flag the codec moves or swaps shows up.
+    /// so a field the codec moves, or a flag it swaps with y's, shows up. A
+    /// swap among the other three flags does not, as all three are set:
+    /// `each_head_pose_validity_has_its_own_bit` pins every flag to its bit.
     fn head_pose() -> HeadPose {
         HeadPose {
             ts_us: 9_613_320_391,
