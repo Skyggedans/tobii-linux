@@ -8,17 +8,18 @@
 
 use anyhow::{Context, Result};
 use rusb::{Context as UsbContext, UsbContext as _};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use std::{error, fmt, thread};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::engine::{
     CommandError, CommandResponse, DisplayGeneration, GazeSample, ImageSample, OpenNumber,
-    PoseSample, PresenceSample, QueuedCommand, Sample, Shared,
+    PresenceSample, QueuedCommand, Sample, Shared,
 };
+use crate::pose::{self, Mailbox};
 use crate::time_map::{Stream, TimeMap};
 use std::sync::mpsc::Receiver;
 use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
@@ -69,7 +70,7 @@ pub const MAX_REPLAY_ATTEMPTS: usize = 5;
 
 /// Bulk-flag parsing shared by the `TOBII_*` opt-out variables: set and
 /// neither empty nor `"0"`.
-fn is_env_flag_set(name: &str) -> bool {
+pub(crate) fn is_env_flag_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
@@ -653,14 +654,15 @@ pub(crate) fn run_gaze_engine(
     // Head pose from the 0x50e image stream runs on its own thread so a slow
     // inference never blocks the USB reader (an unread IN buffer stalls the
     // firmware). The reader drops each new frame into a single-slot mailbox;
-    // the worker always takes the newest one and skips whatever it missed.
-    let mailbox: PoseMailbox = Arc::new((Mutex::new(None), Condvar::new()));
+    // the worker always takes the newest one and skips whatever it missed
+    // (see `pose`).
+    let mailbox = Arc::new(Mailbox::default());
     // No worker (and no ONNX session) when the image stream is disabled.
     let worker = is_image_stream_enabled().then(|| {
-        let mailbox = mailbox.clone();
+        let mailbox = Arc::clone(&mailbox);
         let shared = Arc::clone(shared);
         let tx = tx.clone();
-        thread::spawn(move || pose_worker(&mailbox, &shared, &tx))
+        thread::spawn(move || pose::run_worker(&mailbox, &shared, &tx))
     });
 
     let reset = (!is_env_flag_set("TOBII_NO_RESET")).then_some(|| reset_device_baseline(&ctx));
@@ -675,7 +677,7 @@ pub(crate) fn run_gaze_engine(
     // us; on an internal failure we set it ourselves so the worker exits too).
     // Relaxed: a pure signal, the mailbox mutex orders the data hand-off.
     stop.store(true, Ordering::Relaxed);
-    mailbox.1.notify_all();
+    mailbox.wake();
     if let Some(worker) = worker {
         let _ = worker.join();
     }
@@ -803,110 +805,6 @@ fn run_opens(
     }
 }
 
-/// Single-slot hand-off of the newest image frame to the pose worker, with
-/// its host time, which the pose it makes carries (the pose may come after a
-/// re-open, whose time map knows nothing of the image).
-type PoseMailbox = Arc<(Mutex<Option<ImageSample>>, Condvar)>;
-
-/// Replace the mailbox slot with `image` (dropping any frame the worker
-/// has not taken yet) and wake the worker.
-///
-/// The slot only ever holds an `Option` that is written whole, so a poisoned
-/// lock (a panicking worker) leaves nothing half-updated and the guard is
-/// reused rather than propagating the panic to the USB reader.
-fn mailbox_put(mailbox: &PoseMailbox, image: ImageSample) {
-    let (lock, cv) = &**mailbox;
-    *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
-    cv.notify_one();
-}
-
-/// Head-pose inference loop over 0x50e frames (see `run_gaze_engine`).
-fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
-    let mut tracker = match tobii_pose::track::Tracker::new_image83() {
-        Ok(t) => t,
-        Err(e) => {
-            error!(
-                error = format_args!("{e:#}"),
-                "image83 pose worker disabled"
-            );
-            return;
-        }
-    };
-    // `TOBII_IMAGE83_DEBUG=1`: report frames taken / poses / inference time
-    // / face-detector runs.
-    let report_stats = is_env_flag_set("TOBII_IMAGE83_DEBUG");
-    let (mut taken, mut posed, mut infer_us) = (0u64, 0u64, 0u64);
-    let mut detector_runs = tracker.model_runs().detector;
-    let mut last_report = Instant::now();
-    // The tracker outlives head clients (a gaze client keeps the engine
-    // alive), so a new head subscriber must not inherit an old rest pose or
-    // smoothing state: recalibrate on every off->on edge after the first.
-    let mut was_wanted: Option<bool> = None;
-    let (lock, cv) = &**mailbox;
-    // Relaxed everywhere below: the flags are pure signals; the frame itself
-    // is handed over under the mailbox mutex.
-    while !shared.stop.load(Ordering::Relaxed) {
-        let image = {
-            // Poisoning cannot leave the slot half-written (see `mailbox_put`).
-            let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            while slot.is_none() && !shared.stop.load(Ordering::Relaxed) {
-                slot = cv
-                    .wait_timeout(slot, Duration::from_millis(200))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-            }
-            slot.take()
-        };
-        let Some(ImageSample { frame, host_us, .. }) = image else {
-            continue;
-        };
-        if shared.recenter.swap(false, Ordering::Relaxed) {
-            tracker.recenter();
-        }
-        let wanted = shared.head_wanted.load(Ordering::Relaxed);
-        if was_wanted == Some(false) && wanted {
-            tracker.recenter();
-        }
-        was_wanted = Some(wanted);
-        if !wanted {
-            continue;
-        }
-        let t0 = Instant::now();
-        match tracker.process(&frame.pixels, frame.width, frame.height) {
-            Ok(Some(p)) => {
-                posed += 1;
-                let _ = tx.send(Sample::Pose(PoseSample::new(
-                    to_i64_us(frame.device_ts_us),
-                    host_us,
-                    [p[0], p[1], p[2]],
-                    [p[3], p[4], p[5]],
-                )));
-            }
-            Ok(None) => {}
-            Err(e) => warn!(error = format_args!("{e:#}"), "image83 pose failed"),
-        }
-        taken += 1;
-        infer_us += u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if report_stats && last_report.elapsed() >= Duration::from_secs(5) {
-            let dt = last_report.elapsed().as_secs_f64();
-            let detector = tracker.model_runs().detector;
-            info!(
-                frames_per_s = format_args!("{:.1}", taken as f64 / dt),
-                poses_per_s = format_args!("{:.1}", posed as f64 / dt),
-                mean_ms = format_args!("{:.1}", infer_us as f64 / 1000.0 / taken.max(1) as f64),
-                detector_runs_per_s =
-                    format_args!("{:.1}", detector.saturating_sub(detector_runs) as f64 / dt),
-                "image83 pose worker"
-            );
-            taken = 0;
-            posed = 0;
-            infer_us = 0;
-            detector_runs = detector;
-            last_report = Instant::now();
-        }
-    }
-}
-
 /// One open+init+read of the 0x83 stream, pushing samples until `stop` or a
 /// failure. Fails with [`StreamStartupTimeout`] when no gaze frame arrives
 /// within 4.5 s of the init, and with a [`StreamLost`] context on any failure
@@ -916,7 +814,7 @@ fn gaze_engine_attempt(
     shared: &Shared,
     commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
-    mailbox: &PoseMailbox,
+    mailbox: &Mailbox,
     opens: &mut Opens,
 ) -> Result<()> {
     let mut h = open_tobii(ctx)?;
@@ -1803,7 +1701,7 @@ fn is_image_stream_enabled() -> bool {
 /// Microsecond timestamps as the `i64` the sample structs carry. `u64`
 /// values past `i64::MAX` (never in practice) saturate instead of wrapping.
 #[must_use]
-fn to_i64_us(us: u64) -> i64 {
+pub(crate) fn to_i64_us(us: u64) -> i64 {
     i64::try_from(us).unwrap_or(i64::MAX)
 }
 
@@ -1990,7 +1888,7 @@ struct Pump<'a> {
     shared: &'a Shared,
     commands: &'a Receiver<QueuedCommand>,
     tx: &'a Sender<Sample>,
-    mailbox: &'a PoseMailbox,
+    mailbox: &'a Mailbox,
     cmd_seq: u32,
     outstanding: Option<Outstanding>,
     image_live: bool,
@@ -2140,7 +2038,7 @@ impl Pump<'_> {
                 if self.shared.image_wanted.load(Ordering::Relaxed) {
                     let _ = self.tx.send(Sample::Image(image.clone()));
                 }
-                mailbox_put(self.mailbox, image);
+                self.mailbox.put(image);
             }
             Incoming::Notification(n) => {
                 debug!(notification = ?n, "device notification");
@@ -2332,7 +2230,7 @@ fn gaze_stream_loop(
     shared: &Shared,
     commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
-    mailbox: &PoseMailbox,
+    mailbox: &Mailbox,
     opens: &mut Opens,
 ) -> Result<()> {
     let stop = &shared.stop;
@@ -2499,6 +2397,7 @@ mod tests {
     use Step::{Open, Reset};
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::sync::{Mutex, PoisonError};
     use tobii_proto::facts::DEFAULT_DISPLAY_ID;
     use tobii_proto::protocol::hex_to_bytes;
 
@@ -2567,7 +2466,7 @@ mod tests {
         commands: Receiver<QueuedCommand>,
         tx: Sender<Sample>,
         samples: Receiver<Sample>,
-        mailbox: PoseMailbox,
+        mailbox: Mailbox,
     }
 
     impl Rig {
@@ -2580,7 +2479,7 @@ mod tests {
                 commands,
                 tx,
                 samples,
-                mailbox: PoseMailbox::default(),
+                mailbox: Mailbox::default(),
             }
         }
 
@@ -2630,12 +2529,7 @@ mod tests {
 
         /// The image waiting for the pose worker.
         fn pose_image(&self) -> Option<ImageSample> {
-            let slot = self
-                .mailbox
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            slot.clone()
+            self.mailbox.waiting()
         }
 
         /// What the image waiting for the pose worker says of the display

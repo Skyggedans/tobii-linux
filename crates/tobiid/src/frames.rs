@@ -8,22 +8,26 @@
 //! are passed through with their validity flags (the GAZE frame's pupil
 //! tail, which has none, sends `NaN` for an eye whose diameter is not
 //! valid); raw gaze is the Stream Engine's own record of the gaze frame,
-//! every value as sent; every timestamp is the sample's host time (the
-//! engine's `host_us`, on [`tobii_ipc::host_clock_us`]), bar gaze data's
-//! tracker time and raw gaze's time, which stay the device clock. Gaze
-//! data's system time is that tracker time on the host clock, as in the
-//! Stream Engine, not the time the frame was read.
+//! every value as sent; the head pose goes out for every image the engine
+//! makes one of, valid or not, its four validities all set from the pose's
+//! one; every timestamp is the sample's host time (the engine's `host_us`,
+//! on [`tobii_ipc::host_clock_us`]), bar gaze data's tracker time and raw
+//! gaze's time, which stay the device clock. Gaze data's system time is
+//! that tracker time on the host clock, as in the Stream Engine, not the
+//! time the frame was read. The daemon's own legacy head pose, HEAD, goes
+//! out only for an image the engine made one of.
 
 use tobii_ipc::{
-    EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, Notification, NotificationValue,
-    PRESENCE_AWAY, PRESENCE_PRESENT, STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA,
-    STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS,
-    STREAM_PRESENCE, encode_eye_position, encode_gaze, encode_gaze_data, encode_gaze_origin,
-    encode_gaze_raw, encode_head, encode_image, encode_notification, encode_presence, notification,
+    EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, HeadPose, Notification,
+    NotificationValue, PRESENCE_AWAY, PRESENCE_PRESENT, STREAM_EYE_POSITION, STREAM_GAZE,
+    STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD, STREAM_HEAD_POSE,
+    STREAM_IMAGE, STREAM_NOTIFICATIONS, STREAM_PRESENCE, encode_eye_position, encode_gaze,
+    encode_gaze_data, encode_gaze_origin, encode_gaze_raw, encode_head, encode_head_pose,
+    encode_image, encode_notification, encode_presence, notification,
 };
 use tobii_proto::facts::DeviceNotification;
 use tobii_proto::gaze83::{EyeFrame, GazeFrame, Valued};
-use tobii_usb::engine::{GazeSample, PresenceSample, Sample};
+use tobii_usb::engine::{GazeSample, PoseSample, PresenceSample, Sample};
 
 /// Narrow to the wire's `f32`: the C ABI this protocol feeds carries `float`.
 #[allow(clippy::cast_possible_truncation)] // reason: f32 is the wire type
@@ -160,6 +164,45 @@ fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
     }
 }
 
+/// Whether the streams in `wanted` take a head pose of every image: the
+/// Stream Engine's, [`STREAM_HEAD_POSE`], or the legacy one,
+/// [`STREAM_HEAD`], which the engine makes in the same step. Either has
+/// the engine run its head-pose inference (see
+/// [`Engine::set_head_wanted`](tobii_usb::engine::Engine::set_head_wanted)).
+#[must_use]
+pub(crate) fn head_wanted(wanted: u32) -> bool {
+    wanted & (STREAM_HEAD | STREAM_HEAD_POSE) != 0
+}
+
+/// A pose sample's frames, of the streams in `wanted`, both stamped with the
+/// host time of the image the poses were made of: `HEAD_POSE`, the Stream
+/// Engine's head pose, for every sample, its four validities all set from the
+/// pose's one; and HEAD, the legacy pose, only for a sample that has one.
+fn pose_frames(p: &PoseSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
+    if wanted & STREAM_HEAD_POSE != 0 {
+        let head = &p.head;
+        out.push((
+            STREAM_HEAD_POSE,
+            encode_head_pose(&HeadPose {
+                ts_us: p.host_us,
+                position_valid: head.valid,
+                position_mm: f32s(head.position_mm),
+                rotation_valid: [head.valid; 3],
+                rotation_rad: f32s(head.rotation_rad),
+            }),
+        ));
+    }
+    if wanted & STREAM_HEAD != 0
+        && let Some(legacy) = &p.legacy
+    {
+        // cm -> mm; rotation about x=pitch, y=yaw, z=roll in radians.
+        let pos = f32s(legacy.pos_cm.map(|c| c * 10.0));
+        let [yaw, pitch, roll] = legacy.rot_deg;
+        let rot = f32s([pitch, yaw, roll].map(f64::to_radians));
+        out.push((STREAM_HEAD, encode_head(p.host_us, pos, rot)));
+    }
+}
+
 /// A presence sample as its PRESENCE frame body, stamped with its host time:
 /// the frame a new subscriber is replayed is the one the others got.
 pub(crate) fn presence_frame(p: &PresenceSample) -> Vec<u8> {
@@ -204,16 +247,7 @@ pub(crate) fn notification_of(n: &DeviceNotification) -> Option<Notification> {
 /// the streams in `wanted`.
 pub(crate) fn push_sample_frames(s: &Sample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
     match s {
-        Sample::Pose(p) if wanted & STREAM_HEAD != 0 => {
-            // cm -> mm; rotation about x=pitch, y=yaw, z=roll in radians.
-            let pos = f32s(p.pos_cm.map(|c| c * 10.0));
-            let rot = f32s([
-                p.rot_deg[1].to_radians(),
-                p.rot_deg[0].to_radians(),
-                p.rot_deg[2].to_radians(),
-            ]);
-            out.push((STREAM_HEAD, encode_head(p.host_us, pos, rot)));
-        }
+        Sample::Pose(p) => pose_frames(p, wanted, out),
         Sample::Gaze(g) => gaze_frames(g, wanted, out),
         Sample::Presence(p) if wanted & STREAM_PRESENCE != 0 => {
             out.push((STREAM_PRESENCE, presence_frame(p)));
@@ -245,13 +279,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tobii_ipc::geometry::tracker_to_display;
-    use tobii_ipc::{ServerMsg, decode_server};
+    use tobii_ipc::{ServerMsg, TAG_HEAD, TAG_HEAD_POSE, decode_server};
     use tobii_proto::facts::parse_display_area;
     use tobii_proto::gaze83::{RecordKeys, decode_gaze_frame};
     use tobii_proto::image83::ImageFrame;
     use tobii_proto::protocol::{hex_to_bytes, parse_message};
     use tobii_proto::tlv::{KeyedFields, UNITS_PER_MM, keyed_fields};
-    use tobii_usb::engine::{ImageSample, PoseSample};
+    use tobii_usb::engine::{HeadPose as EngineHeadPose, ImageSample, LegacyPose};
 
     /// The session1 fixture frame's device timestamp.
     const DEVICE_US: i64 = 9_613_320_391;
@@ -623,6 +657,7 @@ mod tests {
             | STREAM_GAZE_DATA
             | STREAM_GAZE_RAW
             | STREAM_HEAD
+            | STREAM_HEAD_POSE
             | STREAM_PRESENCE
             | STREAM_IMAGE;
         let [
@@ -648,8 +683,9 @@ mod tests {
             height: 2,
             pixels: vec![0; 4],
         };
+        let legacy = LegacyPose::new([0.0; 3], [0.0; 3]);
         let others = [
-            Sample::Pose(PoseSample::new(DEVICE_US, HOST_US, [0.0; 3], [0.0; 3])),
+            pose_sample(EngineHeadPose::default(), Some(legacy)),
             Sample::Presence(PresenceSample::new(DEVICE_US, HOST_US, true)),
             Sample::Image(ImageSample::new(Arc::new(image), HOST_US)),
         ];
@@ -658,11 +694,12 @@ mod tests {
             .flat_map(|s| frames(s, wanted))
             .map(|(_, msg)| match msg {
                 ServerMsg::Head { ts_us, .. } | ServerMsg::Presence { ts_us, .. } => ts_us,
+                ServerMsg::HeadPose(pose) => pose.ts_us,
                 ServerMsg::Image(image) => image.ts_us,
                 other => panic!("unexpected frame {other:?}"),
             })
             .collect();
-        assert_eq!(stamps, [HOST_US; 3], "head, presence and image");
+        assert_eq!(stamps, [HOST_US; 4], "head pose, head, presence and image");
     }
 
     /// The tracker's fault and warning lists reach notification subscribers
@@ -688,5 +725,144 @@ mod tests {
         );
         assert_eq!(frames(&warnings, STREAM_NOTIFICATIONS), [string(11, "ok")]);
         assert!(frames(&faults, 0).is_empty(), "nobody subscribed");
+    }
+
+    /// A pose sample of the image of [`DEVICE_US`], [`HOST_US`] on the host
+    /// clock.
+    fn pose_sample(head: EngineHeadPose, legacy: Option<LegacyPose>) -> Sample {
+        Sample::Pose(Box::new(PoseSample::new(DEVICE_US, HOST_US, head, legacy)))
+    }
+
+    /// A valid head pose, its values exact in f32.
+    fn valid_head() -> EngineHeadPose {
+        EngineHeadPose {
+            valid: true,
+            position_mm: [-12.5, 30.25, 600.0],
+            rotation_rad: [0.125, -0.25, 0.5],
+        }
+    }
+
+    /// A legacy pose: 1, 2 and 3 cm, yaw 10°, pitch 20° and roll 30°.
+    fn legacy_pose() -> LegacyPose {
+        LegacyPose::new([1.0, 2.0, 3.0], [10.0, 20.0, 30.0])
+    }
+
+    /// The pose's frames, `(bit, tag)`, of the streams in `wanted`.
+    fn pose_tags(sample: &Sample, wanted: u32) -> Vec<(u32, u8)> {
+        let mut out = Vec::new();
+        push_sample_frames(sample, wanted, &mut out);
+        out.iter().map(|(bit, body)| (*bit, body[0])).collect()
+    }
+
+    /// A valid pose goes out as `HEAD_POSE` with its four validities set,
+    /// an invalid one with none, each with the values it carries (an
+    /// invalid one those of the last valid pose) and the host time of its
+    /// image.
+    #[test]
+    fn a_valid_and_an_invalid_pose_go_out_as_head_pose_with_their_validity() {
+        let invalid = EngineHeadPose {
+            valid: false,
+            ..valid_head()
+        };
+        let sent = |head| match &frames(&pose_sample(head, None), STREAM_HEAD_POSE)[..] {
+            [(STREAM_HEAD_POSE, ServerMsg::HeadPose(pose))] => *pose,
+            other => panic!("expected a HEAD_POSE frame alone, got {other:?}"),
+        };
+        let on_the_wire = |valid| HeadPose {
+            ts_us: HOST_US,
+            position_valid: valid,
+            position_mm: [-12.5, 30.25, 600.0],
+            rotation_valid: [valid; 3],
+            rotation_rad: [0.125, -0.25, 0.5],
+        };
+
+        assert_eq!(sent(valid_head()), on_the_wire(true));
+        assert_eq!(sent(invalid), on_the_wire(false));
+        assert_eq!(
+            sent(EngineHeadPose::default()),
+            HeadPose {
+                ts_us: HOST_US,
+                ..HeadPose::default()
+            },
+            "invalid before the first valid pose: zeros"
+        );
+    }
+
+    /// HEAD, the legacy pose, goes out after `HEAD_POSE` and only for a
+    /// sample that has one, whether the Stream Engine's pose is valid or
+    /// not (a face too near the edge has a legacy pose but no valid head
+    /// pose): its position in mm, its angles `[pitch, yaw, roll]` in
+    /// radians, and the image's host time.
+    #[test]
+    fn head_goes_out_only_for_a_sample_with_a_legacy_pose() {
+        let both = STREAM_HEAD | STREAM_HEAD_POSE;
+        let invalid = EngineHeadPose {
+            valid: false,
+            ..valid_head()
+        };
+
+        assert_eq!(
+            pose_tags(&pose_sample(valid_head(), None), both),
+            [(STREAM_HEAD_POSE, TAG_HEAD_POSE)]
+        );
+        for head in [valid_head(), invalid] {
+            let [
+                (STREAM_HEAD_POSE, ServerMsg::HeadPose(pose)),
+                (
+                    STREAM_HEAD,
+                    ServerMsg::Head {
+                        ts_us,
+                        pos_mm,
+                        rot_rad,
+                    },
+                ),
+            ] = &frames(&pose_sample(head, Some(legacy_pose())), both)[..]
+            else {
+                panic!("the sample did not give its HEAD_POSE and HEAD frames");
+            };
+            assert_eq!(pose.position_valid, head.valid);
+            assert_eq!(*ts_us, HOST_US);
+            assert_eq!(*pos_mm, [10.0, 20.0, 30.0]);
+            assert_eq!(*rot_rad, f32s([20.0, 10.0, 30.0].map(f64::to_radians)));
+        }
+    }
+
+    /// Each head pose stream is encoded only while some client wants it,
+    /// under its own bit, by which the pump writes it only to the clients
+    /// that subscribe to that stream.
+    #[test]
+    fn each_head_stream_goes_out_under_its_own_bit_only_when_wanted() {
+        let sample = pose_sample(valid_head(), Some(legacy_pose()));
+        let head = (STREAM_HEAD, TAG_HEAD);
+        let head_pose = (STREAM_HEAD_POSE, TAG_HEAD_POSE);
+
+        assert_eq!(pose_tags(&sample, STREAM_HEAD), [head]);
+        assert_eq!(pose_tags(&sample, STREAM_HEAD_POSE), [head_pose]);
+        assert_eq!(
+            pose_tags(&sample, STREAM_HEAD | STREAM_HEAD_POSE),
+            [head_pose, head]
+        );
+        assert_eq!(pose_tags(&sample, !(STREAM_HEAD | STREAM_HEAD_POSE)), []);
+    }
+
+    /// Head-pose inference is wanted for either head stream, both or one,
+    /// and for no other stream.
+    #[test]
+    fn head_inference_is_wanted_for_either_head_stream_alone() {
+        let heads = STREAM_HEAD | STREAM_HEAD_POSE;
+        for (mask, wanted) in [
+            (0, false),
+            (STREAM_HEAD, true),
+            (STREAM_HEAD_POSE, true),
+            (heads, true),
+        ] {
+            assert_eq!(head_wanted(mask), wanted, "{mask:#x}");
+            assert_eq!(head_wanted(mask | !heads), wanted, "{mask:#x} and the rest");
+        }
+        let alone: Vec<u32> = (0..32)
+            .map(|bit| 1 << bit)
+            .filter(|&bit| head_wanted(bit))
+            .collect();
+        assert_eq!(alone, [STREAM_HEAD, STREAM_HEAD_POSE]);
     }
 }

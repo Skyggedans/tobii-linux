@@ -47,7 +47,7 @@ use tobii_usb::engine::{Engine, PresenceSample, Sample};
 
 use crate::calibration::Calibration;
 use crate::device::DeviceCommands;
-use crate::frames::{presence_frame, push_sample_frames};
+use crate::frames::{head_wanted, presence_frame, push_sample_frames};
 use crate::restart::Backoff;
 
 /// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
@@ -484,11 +484,14 @@ impl State {
     }
 
     /// Tell the engine which optional work anyone consumes: head-pose
-    /// inference, and IR frames for image subscribers.
+    /// inference for either head pose stream (see [`head_wanted`]), the
+    /// legacy pose for HEAD subscribers, and IR frames for image
+    /// subscribers.
     fn sync_wanted(&self) {
         if let Some(engine) = self.engine.as_ref() {
             let wanted = self.wanted_mask();
-            engine.set_head_wanted(wanted & STREAM_HEAD != 0);
+            engine.set_head_wanted(head_wanted(wanted));
+            engine.set_legacy_head_wanted(wanted & STREAM_HEAD != 0);
             engine.set_image_wanted(wanted & STREAM_IMAGE != 0);
         }
     }
@@ -2167,6 +2170,62 @@ pub(crate) mod tests {
             written,
             [encode_subscribed(true), b"gaze".to_vec()],
             "client 2's outbox, then its stream's sample"
+        );
+    }
+
+    /// A pose sample reaches each client as the head pose streams it
+    /// subscribes to: HEAD a HEAD subscriber, `HEAD_POSE` a `HEAD_POSE` one,
+    /// both one that takes both, and neither a gaze subscriber.
+    #[test]
+    fn each_client_gets_the_head_pose_streams_it_subscribes_to() {
+        use tobii_ipc::{STREAM_GAZE, STREAM_HEAD_POSE, TAG_HEAD, TAG_HEAD_POSE};
+        use tobii_usb::engine::{HeadPose, LegacyPose, PoseSample};
+        let mut st = State::new(false);
+        let mut peers = Vec::new();
+        for (id, streams) in [
+            (1, STREAM_HEAD),
+            (2, STREAM_HEAD_POSE),
+            (3, STREAM_HEAD | STREAM_HEAD_POSE),
+            (4, STREAM_GAZE),
+        ] {
+            let (out, peer) = UnixStream::pair().expect("socket pair");
+            let mut client = Client::new(id, out);
+            client.streams = streams;
+            st.clients.push(client);
+            peer.set_read_timeout(Some(WAIT)).expect("read timeout");
+            peers.push(peer);
+        }
+        let head = HeadPose {
+            valid: true,
+            ..HeadPose::default()
+        };
+        let legacy = LegacyPose::new([1.0; 3], [2.0; 3]);
+        let pose = Sample::Pose(Box::new(PoseSample::new(5, 7, head, Some(legacy))));
+        let mut frames = Vec::new();
+        push_sample_frames(&pose, st.wanted_mask(), &mut frames);
+
+        write_clients(&mut st, &frames);
+        // The clients' ends close with the state.
+        drop(st);
+
+        let tags: Vec<Vec<u8>> = peers
+            .iter_mut()
+            .map(|peer| {
+                let mut tags = Vec::new();
+                while let Some(body) = read_frame(peer).expect("a frame or the end") {
+                    tags.push(body[0]);
+                }
+                tags
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                vec![TAG_HEAD],
+                vec![TAG_HEAD_POSE],
+                vec![TAG_HEAD_POSE, TAG_HEAD],
+                vec![],
+            ]
         );
     }
 
