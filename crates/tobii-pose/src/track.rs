@@ -2062,6 +2062,9 @@ mod tests {
         let short = vec![0u8; 280 * 279];
         let err = tracker.fit(&short, 280, 280).unwrap_err();
         assert!(format!("{err:#}").contains("bytes"), "{err:#}");
+        // The same frame, said to be a row short.
+        let err = tracker.fit(&short, 280, 279).unwrap_err();
+        assert!(format!("{err:#}").contains("280x279 frame"), "{err:#}");
         assert_eq!(tracker.model_runs(), ModelRuns::default());
     }
 

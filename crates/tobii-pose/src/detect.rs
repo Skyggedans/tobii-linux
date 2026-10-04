@@ -547,6 +547,41 @@ mod tests {
     }
 
     #[test]
+    fn the_score_threshold_and_the_merge_overlap_are_both_0_3() {
+        let anchors = anchors();
+        let kp = [[0.0; 2]; KEYPOINTS];
+        let mut decoder = Decoder::default();
+        // A lone candidate scoring 0.31 is kept (MediaPipe's own default,
+        // 0.5, would drop it).
+        let (r, c) = outputs(&[(10, 0.31, reg(0.0, 0.0, 20.0, 20.0, kp))]);
+        let d = decoder.decode(&r, &c, &anchors, 128.0);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!((d[0].score - 0.31).abs() < 1e-6, "{d:?}");
+        // Two 32-px boxes of anchors that share a centre: 16 px apart they
+        // overlap by an IoU of 1/3 and merge, 18 px apart by 0.28 and stay
+        // apart.
+        for (apart, merged) in [(16.0, true), (18.0, false)] {
+            let (r, c) = outputs(&[
+                (100, 0.9, reg(0.0, 0.0, 32.0, 32.0, kp)),
+                (101, 0.8, reg(apart, 0.0, 32.0, 32.0, kp)),
+            ]);
+            let d = decoder.decode(&r, &c, &anchors, 128.0);
+            assert_eq!(d.len(), if merged { 1 } else { 2 }, "{apart} px: {d:?}");
+        }
+    }
+
+    #[test]
+    fn detect_refuses_a_frame_smaller_than_it_says() {
+        let mut detector = FaceDetector::new().unwrap();
+        let (empty, short, row_short) = (vec![], vec![0u8; 100], vec![0u8; 280 * 279]);
+        for (frame, n) in [(&empty, 0), (&short, 280), (&row_short, 280)] {
+            let err = detector.detect(frame, n).unwrap_err();
+            let want = format!("a {n}x{n} frame of {} bytes", frame.len());
+            assert!(format!("{err:#}").contains(&want), "{err:#}");
+        }
+    }
+
+    #[test]
     fn candidates_below_the_threshold_are_dropped() {
         let anchors = anchors();
         let kp = [[0.0; 2]; KEYPOINTS];
