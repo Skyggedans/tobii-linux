@@ -160,6 +160,50 @@ impl PresenceSample {
     }
 }
 
+/// Which of the engine's opens of the tracker read something
+/// ([`ImageSample::open`]): the engine counts from 1 each open whose init
+/// ran to its end, across re-opens and USB resets. What one open reads does
+/// not follow on from what the open before it read: an open starts the
+/// tracker over, its clock included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct OpenNumber(pub(crate) u64);
+
+impl OpenNumber {
+    /// The number, from 1; 0 for none of the engine's opens.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The number of the open after this one.
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
+/// Which display area the device confirmed was in effect when something
+/// was read ([`ImageSample::display_generation`]): how many times the area
+/// in effect had changed since the engine started, so that all that one
+/// generation covers shares one area. 0 before the device first confirmed
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct DisplayGeneration(pub(crate) u64);
+
+impl DisplayGeneration {
+    /// How many times the area in effect had changed.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The generation after this one.
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
 /// One 0x50e IR frame, with the display area in effect on the device when
 /// it was read and the open that read it.
 ///
@@ -185,11 +229,11 @@ pub struct ImageSample {
     /// How many times that display area had changed since the engine
     /// started: frames of one generation share one area. 0 before the
     /// device first confirmed one.
-    pub display_generation: u64,
+    pub display_generation: DisplayGeneration,
     /// Which of the engine's opens of the tracker read the frame, from 1. A
     /// frame of another open does not follow on from the ones before it: an
     /// open starts the tracker over, its clock included.
-    pub open: u64,
+    pub open: OpenNumber,
 }
 
 impl ImageSample {
@@ -202,8 +246,8 @@ impl ImageSample {
             frame,
             host_us,
             display_frame: None,
-            display_generation: 0,
-            open: 0,
+            display_generation: DisplayGeneration::default(),
+            open: OpenNumber::default(),
         }
     }
 }

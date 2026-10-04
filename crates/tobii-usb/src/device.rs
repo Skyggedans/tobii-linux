@@ -16,8 +16,8 @@ use std::{error, fmt, thread};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::engine::{
-    CommandError, CommandResponse, GazeSample, ImageSample, PoseSample, PresenceSample,
-    QueuedCommand, Sample, Shared,
+    CommandError, CommandResponse, DisplayGeneration, GazeSample, ImageSample, OpenNumber,
+    PoseSample, PresenceSample, QueuedCommand, Sample, Shared,
 };
 use crate::time_map::{Stream, TimeMap};
 use std::sync::mpsc::Receiver;
@@ -1491,7 +1491,7 @@ struct AreaInEffect {
     frame: Option<DisplayFrame>,
     /// How many times the area changed since the engine started: 0 until
     /// the device first confirms one.
-    generation: u64,
+    generation: DisplayGeneration,
 }
 
 impl AreaInEffect {
@@ -1503,7 +1503,7 @@ impl AreaInEffect {
             *self = Self {
                 area,
                 frame: area.as_ref().and_then(DisplayFrame::new),
-                generation: self.generation.wrapping_add(1),
+                generation: self.generation.next(),
             };
         }
     }
@@ -1516,7 +1516,7 @@ impl AreaInEffect {
 struct Opens {
     /// Opens whose init replay ran to its end, the one under way included:
     /// its number, from 1.
-    count: u64,
+    count: OpenNumber,
     /// The display area in effect on the device.
     display: AreaInEffect,
     /// Whether the device converts its gaze origins as the display frame of
@@ -1527,7 +1527,7 @@ struct Opens {
 impl Opens {
     /// Another open's init replay ran to its end and left `area` in effect.
     fn opened(&mut self, area: Option<DisplayArea>) {
-        self.count = self.count.wrapping_add(1);
+        self.count = self.count.next();
         self.display.set(area);
     }
 
@@ -1586,11 +1586,11 @@ const MISSES_TO_WARN: u32 = 3;
 struct DisplayFrameCheck {
     /// The open and the display generation of the frames counted in
     /// `misses`.
-    run_of: (u64, u64),
+    run_of: (OpenNumber, DisplayGeneration),
     /// Frames in a row, of that open and generation, whose origins missed.
     misses: u32,
     /// The last display generation that was to be warned of.
-    warned: Option<u64>,
+    warned: Option<DisplayGeneration>,
 }
 
 impl DisplayFrameCheck {
@@ -1604,8 +1604,8 @@ impl DisplayFrameCheck {
         &mut self,
         frame: &GazeFrame,
         display: DisplayFrame,
-        open: u64,
-        generation: u64,
+        open: OpenNumber,
+        generation: DisplayGeneration,
     ) -> Option<f64> {
         let error_mm = origin_error_mm(frame, display)?;
         if self.run_of != (open, generation) {
@@ -2129,7 +2129,7 @@ impl Pump<'_> {
                     let in_effect = &mut self.opens.display;
                     in_effect.set(Some(*area));
                     debug!(
-                        generation = in_effect.generation,
+                        generation = in_effect.generation.get(),
                         has_frame = in_effect.frame.is_some(),
                         "display area in effect"
                     );
@@ -2181,7 +2181,7 @@ impl Pump<'_> {
         if let Some(error_mm) = check.judge(frame, display, *count, generation) {
             warn!(
                 error_mm,
-                generation,
+                generation = generation.get(),
                 "gaze: the device's gaze origins are not in the display frame in effect"
             );
         }
@@ -2620,7 +2620,7 @@ mod tests {
 
         /// What the image waiting for the pose worker says of the display
         /// area in effect and the open: its frame, generation and open.
-        fn pose_display(&self) -> (Option<DisplayFrame>, u64, u64) {
+        fn pose_display(&self) -> (Option<DisplayFrame>, DisplayGeneration, OpenNumber) {
             let image = self.pose_image().expect("an image for the pose worker");
             (image.display_frame, image.display_generation, image.open)
         }
@@ -3027,15 +3027,15 @@ mod tests {
         display.set(Some(start));
         let frame = display.frame.expect("a frame");
         assert_eq!(frame.to_display([30.0, -40.0, 600.0]), [30.0, -40.0, 600.0]);
-        assert_eq!(display.generation, 1);
+        assert_eq!(display.generation, DisplayGeneration(1));
         display.set(Some(start));
-        assert_eq!(display.generation, 1, "the same area");
+        assert_eq!(display.generation, DisplayGeneration(1), "the same area");
 
         let (b, _) = area_of("change-display-notify-1450");
         display.set(Some(b));
         assert_eq!(
             (display.frame, display.generation),
-            (DisplayFrame::new(&b), 2)
+            (DisplayFrame::new(&b), DisplayGeneration(2))
         );
         let narrow = DisplayArea {
             top_right_mm: [-1.5, 2.0, 0.0],
@@ -3044,13 +3044,13 @@ mod tests {
         display.set(Some(narrow));
         assert_eq!(
             (display.area, display.frame, display.generation),
-            (Some(narrow), None, 3),
+            (Some(narrow), None, DisplayGeneration(3)),
             "an area that fixes no frame"
         );
         display.set(None);
         assert_eq!(
             (display.area, display.frame, display.generation),
-            (None, None, 4)
+            (None, None, DisplayGeneration(4))
         );
     }
 
@@ -3065,22 +3065,29 @@ mod tests {
         let mut pump = rig.pump(&mut opens);
 
         pump.deliver_at(image_at(10 * S), 50 * S);
-        assert_eq!(rig.pose_display(), (DisplayFrame::new(&a), 1, 1));
+        let (a_frame, b_frame) = (DisplayFrame::new(&a), DisplayFrame::new(&b));
+        assert_eq!(
+            rig.pose_display(),
+            (a_frame, DisplayGeneration(1), OpenNumber(1))
+        );
         let notified = || classify(&fixture("change-display-notify-1450"));
         pump.deliver_at(notified(), 50 * S + 5 * MS);
         pump.deliver_at(image_at(10 * S + 30 * MS), 50 * S + 31 * MS);
-        assert_eq!(rig.pose_display(), (DisplayFrame::new(&b), 2, 1));
+        assert_eq!(
+            rig.pose_display(),
+            (b_frame, DisplayGeneration(2), OpenNumber(1))
+        );
         pump.deliver_at(notified(), 50 * S + 40 * MS);
         pump.deliver_at(image_at(10 * S + 60 * MS), 50 * S + 61 * MS);
         assert_eq!(
             rig.pose_display(),
-            (DisplayFrame::new(&b), 2, 1),
+            (b_frame, DisplayGeneration(2), OpenNumber(1)),
             "the same area again"
         );
 
         // The daemon gets the same images and both notifications.
         let samples = rig.samples();
-        let images: Vec<(Option<DisplayFrame>, u64, u64)> = samples
+        let images: Vec<(Option<DisplayFrame>, DisplayGeneration, OpenNumber)> = samples
             .iter()
             .filter_map(|sample| match sample {
                 Sample::Image(i) => Some((i.display_frame, i.display_generation, i.open)),
@@ -3090,9 +3097,9 @@ mod tests {
         assert_eq!(
             images,
             [
-                (DisplayFrame::new(&a), 1, 1),
-                (DisplayFrame::new(&b), 2, 1),
-                (DisplayFrame::new(&b), 2, 1),
+                (a_frame, DisplayGeneration(1), OpenNumber(1)),
+                (b_frame, DisplayGeneration(2), OpenNumber(1)),
+                (b_frame, DisplayGeneration(2), OpenNumber(1)),
             ]
         );
         let notifications = samples
@@ -3119,12 +3126,13 @@ mod tests {
         // What `Engine::set_display_area_override` does. tobiid sets it to
         // the TOBII_DISPLAY_MM area before it writes that area, and to None
         // when a calibration session puts back a configuration without one.
+        let in_effect = (DisplayFrame::new(&a), DisplayGeneration(1), OpenNumber(1));
         rig.shared.set_display_override(Some(b));
         pump.deliver_at(image_at(10 * S), 50 * S);
-        assert_eq!(rig.pose_display(), (DisplayFrame::new(&a), 1, 1));
+        assert_eq!(rig.pose_display(), in_effect);
         rig.shared.set_display_override(None);
         pump.deliver_at(image_at(10 * S + 30 * MS), 50 * S + 31 * MS);
-        assert_eq!(rig.pose_display(), (DisplayFrame::new(&a), 1, 1));
+        assert_eq!(rig.pose_display(), in_effect);
     }
 
     /// Open again on `opens`, the init leaving `area` in effect, and say
@@ -3133,7 +3141,7 @@ mod tests {
         rig: &Rig,
         opens: &mut Opens,
         area: Option<DisplayArea>,
-    ) -> (Option<DisplayFrame>, u64, u64) {
+    ) -> (Option<DisplayFrame>, DisplayGeneration, OpenNumber) {
         opens.opened(area);
         rig.pump(opens).deliver_at(image_at(10 * S), 50 * S);
         rig.pose_display()
@@ -3148,24 +3156,36 @@ mod tests {
 
         let a_frame = DisplayFrame::new(&a);
         let b_frame = DisplayFrame::new(&b);
-        assert_eq!(image_after_open(&rig, &mut opens, Some(a)), (a_frame, 1, 1));
         assert_eq!(
             image_after_open(&rig, &mut opens, Some(a)),
-            (a_frame, 1, 2),
+            (a_frame, DisplayGeneration(1), OpenNumber(1))
+        );
+        assert_eq!(
+            image_after_open(&rig, &mut opens, Some(a)),
+            (a_frame, DisplayGeneration(1), OpenNumber(2)),
             "the same area"
         );
-        assert_eq!(image_after_open(&rig, &mut opens, Some(b)), (b_frame, 2, 3));
+        assert_eq!(
+            image_after_open(&rig, &mut opens, Some(b)),
+            (b_frame, DisplayGeneration(2), OpenNumber(3))
+        );
         assert_eq!(
             image_after_open(&rig, &mut opens, None),
-            (None, 3, 4),
+            (None, DisplayGeneration(3), OpenNumber(4)),
             "an init that confirmed no area"
         );
 
         // A 1450 during an open is what the next one compares with.
-        assert_eq!(image_after_open(&rig, &mut opens, Some(a)), (a_frame, 4, 5));
+        assert_eq!(
+            image_after_open(&rig, &mut opens, Some(a)),
+            (a_frame, DisplayGeneration(4), OpenNumber(5))
+        );
         rig.pump(&mut opens)
             .deliver(classify(&fixture("change-display-notify-1450")));
-        assert_eq!(image_after_open(&rig, &mut opens, Some(b)), (b_frame, 5, 6));
+        assert_eq!(
+            image_after_open(&rig, &mut opens, Some(b)),
+            (b_frame, DisplayGeneration(5), OpenNumber(6))
+        );
     }
 
     /// What an open does once its init replay has run, as `gaze_stream_loop`
@@ -3200,12 +3220,22 @@ mod tests {
         };
 
         let (a_frame, b_frame) = (DisplayFrame::new(&a), DisplayFrame::new(&b));
-        assert_eq!(open(&took_b), (Some(b), (b_frame, 1, 1)));
-        assert_eq!(open(&took_b), (Some(b), (b_frame, 1, 2)), "the same area");
-        assert_eq!(open(&read_a), (Some(a), (a_frame, 2, 3)));
+        assert_eq!(
+            open(&took_b),
+            (Some(b), (b_frame, DisplayGeneration(1), OpenNumber(1)))
+        );
+        assert_eq!(
+            open(&took_b),
+            (Some(b), (b_frame, DisplayGeneration(1), OpenNumber(2))),
+            "the same area"
+        );
+        assert_eq!(
+            open(&read_a),
+            (Some(a), (a_frame, DisplayGeneration(2), OpenNumber(3)))
+        );
         assert_eq!(
             open(&InitCapture::default()),
-            (None, (None, 3, 4)),
+            (None, (None, DisplayGeneration(3), OpenNumber(4))),
             "an init that confirmed no area"
         );
     }
@@ -3227,7 +3257,10 @@ mod tests {
         ]);
         pump.deliver_at(image_at(10 * S), 50 * S);
 
-        assert_eq!(rig.pose_display(), (DisplayFrame::new(&b), 1, 1));
+        assert_eq!(
+            rig.pose_display(),
+            (DisplayFrame::new(&b), DisplayGeneration(1), OpenNumber(1))
+        );
         let delivered: Vec<&str> = rig
             .samples()
             .iter()
@@ -3478,7 +3511,11 @@ mod tests {
         let mut right_alone = right_misses;
         right_alone.left.origin_display_mm.valid = false;
         let mut check = DisplayFrameCheck::default();
-        let mut judge = |frame: &GazeFrame| check.judge(frame, display, 1, 1).is_some();
+        let mut judge = |frame: &GazeFrame| {
+            check
+                .judge(frame, display, OpenNumber(1), DisplayGeneration(1))
+                .is_some()
+        };
 
         assert!(!judge(&miss) && !judge(&miss));
         assert!(!judge(&fit), "fits");
@@ -3503,7 +3540,11 @@ mod tests {
         for (mm, warns) in [(0.0099, false), (0.0101, true), (-0.0101, true)] {
             let mut check = DisplayFrameCheck::default();
             let frame = off_by(mm);
-            let warned = (0..3).any(|_| check.judge(&frame, display, 1, 1).is_some());
+            let warned = (0..3).any(|_| {
+                check
+                    .judge(&frame, display, OpenNumber(1), DisplayGeneration(1))
+                    .is_some()
+            });
             assert_eq!(warned, warns, "{mm} mm");
         }
     }
@@ -4227,7 +4268,15 @@ mod tests {
 
         assert!(result.is_ok(), "a clean stop");
         assert_eq!(steps.into_inner(), [Open, Open, Reset, Open, Open]);
-        assert_eq!(handed, [(0, 0), (1, 1), (2, 1), (2, 1)]);
+        assert_eq!(
+            handed,
+            [
+                (OpenNumber(0), DisplayGeneration(0)),
+                (OpenNumber(1), DisplayGeneration(1)),
+                (OpenNumber(2), DisplayGeneration(1)),
+                (OpenNumber(2), DisplayGeneration(1)),
+            ]
+        );
     }
 
     #[test]
