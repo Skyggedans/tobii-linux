@@ -82,7 +82,15 @@ fn show(name: &str, answer: &(u8, Vec<u8>), decoded: impl FnOnce(&[u8]) -> Strin
 fn kind_of(msg: &ServerMsg) -> &'static str {
     match msg {
         ServerMsg::Head { .. } => "head",
-        ServerMsg::HeadPose(_) => "head_pose",
+        ServerMsg::HeadPose(pose) => {
+            // Sent for every IR image, valid or not: counted apart, the
+            // invalid ones leave the rate saying whether the pose works.
+            if pose.position_valid || pose.rotation_valid.contains(&true) {
+                "head_pose"
+            } else {
+                "head_pose_invalid"
+            }
+        }
         ServerMsg::Gaze { .. } => "gaze",
         ServerMsg::Presence { .. } => "presence",
         ServerMsg::GazeOrigin(_) => "gaze_origin",
@@ -249,7 +257,7 @@ pub(crate) fn run(streams: u32, secs: u64, set_display: Option<(f64, f64, f64)>)
         #[allow(clippy::cast_precision_loss)] // reason: a rate for display
         let rate = *n as f64 / secs.max(1) as f64;
         println!(
-            "{k:14} {n:6}  ({rate:.1}/s)  first: {}",
+            "{k:17} {n:6}  ({rate:.1}/s)  first: {}",
             first.get(k).map_or("", String::as_str)
         );
     }
@@ -262,12 +270,21 @@ mod tests {
     use std::collections::BTreeSet;
     use tobii_ipc::{EyePair, HeadPose, Notification, NotificationValue, PRESENCE_PRESENT};
 
+    /// A head pose with every validity set.
+    fn valid_head_pose() -> HeadPose {
+        HeadPose {
+            position_valid: true,
+            rotation_valid: [true; 3],
+            ..HeadPose::default()
+        }
+    }
+
     /// The frames of every stream, and the subscription ack, have a name
     /// of their own in the report, so no two streams share a count and
     /// none is lumped in with "other"; a REPLY, which is no stream, is.
     #[test]
     fn every_stream_has_a_name_of_its_own() {
-        let head_pose = ServerMsg::HeadPose(HeadPose::default());
+        let head_pose = ServerMsg::HeadPose(valid_head_pose());
         let msgs = [
             ServerMsg::Subscribed { ok: true },
             ServerMsg::Head {
@@ -276,6 +293,7 @@ mod tests {
                 rot_rad: [0.0; 3],
             },
             head_pose.clone(),
+            ServerMsg::HeadPose(HeadPose::default()),
             ServerMsg::Gaze {
                 ts_us: 1,
                 valid: true,
@@ -307,5 +325,37 @@ mod tests {
         assert!(!names.contains("other"), "{names:?}");
         assert_eq!(kind_of(&head_pose), "head_pose");
         assert_eq!(kind_of(&reply), "other");
+    }
+
+    /// A head pose with no validity set counts as `head_pose_invalid`, so
+    /// the rate of `head_pose` says whether the pose works; one with any
+    /// validity set, the position or a single angle, is a `head_pose`.
+    #[test]
+    fn a_head_pose_with_no_validity_counts_apart() {
+        let none = HeadPose::default();
+        let kind = |pose: HeadPose| kind_of(&ServerMsg::HeadPose(pose));
+
+        assert_eq!(kind(none), "head_pose_invalid");
+        assert_eq!(kind(valid_head_pose()), "head_pose");
+        assert_eq!(
+            kind(HeadPose {
+                position_valid: true,
+                ..none
+            }),
+            "head_pose"
+        );
+        for angle in 0..3 {
+            let mut rotation_valid = [false; 3];
+            rotation_valid[angle] = true;
+
+            assert_eq!(
+                kind(HeadPose {
+                    rotation_valid,
+                    ..none
+                }),
+                "head_pose",
+                "angle {angle}"
+            );
+        }
     }
 }
