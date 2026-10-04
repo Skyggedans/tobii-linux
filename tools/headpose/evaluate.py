@@ -9,7 +9,9 @@ among them, and the gates.
                 [--broken zyx|q-transposed|no-q|no-filter] [--gates GATES.json|none]
 
 The constants: reference.FITTED (the study's fit, as head.rs ships it) unless --params gives
-fit.py's JSON: its head_params, or with --loso each session's fold (fitted without it). --blend
+fit.py's JSON: its head_params, or with --loso each session's fold (fitted without it; the fold is
+found by the session's clock offset and image count, which the JSON records, so the sessions may
+come in any order and any subset of the fitted ones). --blend
 turns the eye correction on with the weight the fit found; --rotation-filters swaps the one-euro
 filters. --broken runs a deliberately broken pipeline, to see which gates catch it.
 
@@ -535,21 +537,49 @@ def report(sessions, results):
 
 
 # ------------------------------------------------------------------ main
+def fit_names(doc, o):
+    """The names fit.py gave session o in its JSON (its own s1, s2, ... by its argument order,
+    which need not be this one), found as the gates are: by clock offset and image count."""
+    return [
+        name
+        for name, s in doc.get("sessions", {}).items()
+        if s.get("clock_offset_us") == o["k"] and s.get("images") == o["n"]
+    ]
+
+
 def constants(args, o):
     """The constants for session o, and a line saying what they are."""
     if args.params:
         P, doc = C.load_params(args.params)
         what = os.path.basename(args.params)
         fit = doc.get("fit", {})
+        names = fit_names(doc, o)
         if args.loso:
-            fold = doc.get("folds", {}).get(o["name"])
-            if fold is None:
+            if not names:
                 C.fail(
-                    f"{args.params} has no fold {o['name']} (fit.py names the sessions in order)"
+                    f"{args.params} was not fitted on {o['paths']['log']} (clock offset "
+                    f"{o['k']} us, {o['n']} images): none of its folds leaves this session out"
+                )
+            fold = doc.get("folds", {}).get(names[0])
+            if fold is None:
+                C.fail(f"{args.params} has no fold that leaves out its {names[0]}")
+            if any(t in names for t in fold["trained_on"]):
+                C.fail(
+                    f"{args.params}: fold {names[0]} was fitted on this session too (fit.py was "
+                    f"given it as {' and '.join(names)})"
                 )
             P = ref.params_from_head_params(fold["head_params"])
             fit = fold.get("fit", {})
-            what += f" fold {o['name']} (fitted on {', '.join(fold['trained_on'])})"
+            what += (
+                f" fold {names[0]} (leaves out this session, the fit's {names[0]}; fitted on "
+                f"{', '.join(fold['trained_on'])})"
+            )
+        elif "sessions" in doc:
+            what += (
+                f" (fitted on this session too, the fit's {names[0]})"
+                if names
+                else " (not fitted on this session)"
+            )
         if args.blend:
             if "eye_weight" not in fit:
                 C.fail("--blend needs fit.py's JSON: it takes the eye weight the fit found")

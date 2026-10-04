@@ -51,8 +51,9 @@ fits of a stateless run of a tracker, every image fitted on its own. The head po
        target/release/tobii5-init-replay image83-replay \
            fixtures/analysis/headpose-2026-09-27/data/session1.bin --fits fits_s1.csv
 
-2. Fit, leave one session out (the sessions are named s1, s2, ... in the order given; keep the
-   order in every command):
+2. Fit, leave one session out (fit.py names the sessions s1, s2, ... in the order given, and
+   `fit.json` records each one's clock offset and image count, by which `evaluate.py --loso`
+   finds the fold that leaves a session out, whatever the order of its own arguments):
 
        tools/headpose/fit.py --session LOG1 JSONL1 fits_s1.csv --session LOG2 JSONL2 fits_s2.csv \
            --session LOG3 JSONL3 fits_s3.csv --in-sample --out fit.json
