@@ -6,7 +6,8 @@
 //! towards the user; everything the device reports about itself (track box,
 //! mounting, display area) is in S. The **display frame** (T) has its origin
 //! at the centre of the screen, x right, y up the screen, z out of the screen
-//! towards the user; the Stream Engine reports gaze origins in T.
+//! towards the user; the Stream Engine reports gaze origins in T. A display
+//! area fixes T: [`DisplayFrame`] builds it and maps points between the two.
 //!
 //! All lengths are millimetres. The device's own unit is 1/1024 mm; the
 //! conversion happens in the protocol decoder, never here.
@@ -72,11 +73,6 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn normalize(a: [f64; 3]) -> [f64; 3] {
-    let n = dot(a, a).sqrt();
-    if n > 0.0 { scale(a, 1.0 / n) } else { a }
-}
-
 /// The display rectangle a screen of `width_mm` x `height_mm`, centred
 /// `offset_x_mm` to the right of the tracker, occupies in the tracker frame:
 /// the Stream Engine's `tobii_calculate_display_area_basic`.
@@ -107,35 +103,117 @@ pub fn display_area_basic(
     }
 }
 
-/// Orthonormal basis of the display frame, expressed in the tracker frame:
-/// `(centre, right, up, normal)`.
-fn display_basis(area: &DisplayArea) -> ([f64; 3], [f64; 3], [f64; 3], [f64; 3]) {
-    let right = normalize(sub(area.top_right_mm, area.top_left_mm));
-    let up = normalize(sub(area.top_left_mm, area.bottom_left_mm));
-    let normal = cross(right, up);
-    let centre = scale(add(area.bottom_left_mm, area.top_right_mm), 0.5);
-    (centre, right, up, normal)
+/// The top edge of a display area, and its height across that edge, must be
+/// longer than this, mm, as tobiid requires of a saved area it loads.
+const MIN_SIDE_MM: f64 = 1.0;
+
+/// `side` scaled to unit length; `None` when it is `MIN_SIDE_MM` long or
+/// shorter, not finite, or too long to square.
+fn side_direction(side: [f64; 3]) -> Option<[f64; 3]> {
+    let square = dot(side, side);
+    // A NaN fails the comparison, an infinity the check.
+    (square > MIN_SIDE_MM * MIN_SIDE_MM && square.is_finite())
+        .then(|| scale(side, 1.0 / square.sqrt()))
 }
 
-/// Map a point from the display frame (T) to the tracker frame (S).
+/// The display frame (T) a display area fixes, and the rigid map between it
+/// and the tracker frame (S).
+///
+/// The origin is the centre of the area, half-way from the bottom-left corner
+/// to the top-right one. x runs along the top edge, from the top-left corner
+/// to the top-right one; y is the left edge, from the bottom-left corner up to
+/// the top-left one, less its part along x (Gram–Schmidt); z = x × y points
+/// out of the screen, towards the user. A point maps as
+/// `p_T = R * (p_S - centre)`, where the rows of R are those axes in S.
+///
+/// This is how the tracker converts its gaze origins: on the gaze frames of
+/// the Windows captures and the Linux logs, made on two different areas, it
+/// gives the display-frame origins the tracker sent (keys 0x22/0x24) from the
+/// tracker-frame ones (0x02/0x08) to 0.0002 mm. Every area seen so far was a
+/// rectangle. On a sheared one, taking the part along x out of the left edge
+/// keeps the frame orthonormal; how the tracker treats such an area is not
+/// known.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayFrame {
+    /// `R_T←S`: the display's x, y and z axes in the tracker frame, as rows.
+    rotation: [[f64; 3]; 3],
+    /// The centre of the area in the tracker frame, mm.
+    centre: [f64; 3],
+}
+
+impl DisplayFrame {
+    /// The frame `area` fixes, or `None` when it fixes none: a corner is not
+    /// finite, or the area has no width or height to speak of, its top edge
+    /// or its height across that edge being 1 mm or less. For a rectangle,
+    /// that is the check tobiid makes of a display area it loads.
+    #[must_use]
+    pub fn new(area: &DisplayArea) -> Option<Self> {
+        let DisplayArea {
+            top_left_mm: tl,
+            top_right_mm: tr,
+            bottom_left_mm: bl,
+        } = *area;
+        // A corner that is not finite leaves an edge that is not finite
+        // either, which side_direction refuses.
+        let x = side_direction(sub(tr, tl))?;
+        let left = sub(tl, bl);
+        let y = side_direction(sub(left, scale(x, dot(left, x))))?;
+        Some(Self {
+            rotation: [x, y, cross(x, y)],
+            // (tr + bl) / 2, halved first so that finite corners cannot
+            // overflow.
+            centre: add(scale(tr, 0.5), scale(bl, 0.5)),
+        })
+    }
+
+    /// Map a point from the tracker frame (S) to the display frame (T), mm.
+    #[must_use]
+    pub fn to_display(self, p: [f64; 3]) -> [f64; 3] {
+        let d = sub(p, self.centre);
+        self.rotation.map(|axis| dot(axis, d))
+    }
+
+    /// Map a point from the display frame (T) to the tracker frame (S), mm:
+    /// the inverse of [`to_display`](Self::to_display).
+    #[must_use]
+    pub fn to_tracker(self, p: [f64; 3]) -> [f64; 3] {
+        let [x, y, z] = self.rotation;
+        add(
+            self.centre,
+            add(scale(x, p[0]), add(scale(y, p[1]), scale(z, p[2]))),
+        )
+    }
+
+    /// The rotation from the tracker frame to the display frame, `R_T←S`. Its
+    /// rows are the display's x, y and z axes in the tracker frame, so `R * v`
+    /// turns a direction `v` from S into T.
+    #[must_use]
+    pub const fn rotation(&self) -> [[f64; 3]; 3] {
+        self.rotation
+    }
+
+    /// The centre of the area in the tracker frame, mm: the display frame's
+    /// origin.
+    #[must_use]
+    pub const fn centre(&self) -> [f64; 3] {
+        self.centre
+    }
+}
+
+/// Map a point from the display frame (T) of `area` to the tracker frame (S):
+/// [`DisplayFrame::to_tracker`]. Every coordinate is NaN when the area fixes
+/// no frame.
 #[must_use]
 pub fn display_to_tracker(area: &DisplayArea, p: [f64; 3]) -> [f64; 3] {
-    let (centre, right, up, normal) = display_basis(area);
-    add(
-        centre,
-        add(
-            scale(right, p[0]),
-            add(scale(up, p[1]), scale(normal, p[2])),
-        ),
-    )
+    DisplayFrame::new(area).map_or([f64::NAN; 3], |frame| frame.to_tracker(p))
 }
 
-/// Map a point from the tracker frame (S) to the display frame (T).
+/// Map a point from the tracker frame (S) to the display frame (T) of `area`:
+/// [`DisplayFrame::to_display`]. Every coordinate is NaN when the area fixes
+/// no frame.
 #[must_use]
 pub fn tracker_to_display(area: &DisplayArea, p: [f64; 3]) -> [f64; 3] {
-    let (centre, right, up, normal) = display_basis(area);
-    let d = sub(p, centre);
-    [dot(d, right), dot(d, up), dot(d, normal)]
+    DisplayFrame::new(area).map_or([f64::NAN; 3], |frame| frame.to_display(p))
 }
 
 #[cfg(test)]
@@ -164,28 +242,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_untilted_mount_gives_an_upright_rectangle() {
-        let flat = GeometryMounting {
-            guides: 2,
-            width_mm: 184.0,
-            angle_deg: 0.0,
-            external_offset_mm: [0.0; 3],
-            internal_offset_mm: [0.0; 3],
-        };
-        let area = display_area_basic(600.0, 300.0, 0.0, &flat);
-        assert!(close(area.bottom_left_mm, [-300.0, 0.0, 0.0], 1e-12));
-        assert!(close(area.top_left_mm, [-300.0, 300.0, 0.0], 1e-12));
-        assert!(close(area.top_right_mm, [300.0, 300.0, 0.0], 1e-12));
-    }
-
     /// The display area the Windows engine sent at init (command 1440, the
-    /// author's monitor): the formula must reproduce all nine coordinates
-    /// from the monitor's size, the reported mounting and the one x offset
-    /// both captured monitors share.
-    #[test]
-    fn reproduces_the_captured_display_area() {
-        let captured = DisplayArea {
+    /// author's monitor).
+    fn captured_area() -> DisplayArea {
+        DisplayArea {
             top_left_mm: [
                 mm(0xfffb_10d5_4800_0000),
                 mm(0x0005_11a5_5800_0000),
@@ -201,7 +261,71 @@ mod tests {
                 mm(0x0000_2911_bf00_0000),
                 mm(0xffff_f399_9450_0000),
             ],
+        }
+    }
+
+    /// A 597 x 336 mm area tobiid saved on Linux, centred 0.65 mm left of
+    /// the captured ones. No gaze frame was ever streamed on it.
+    fn linux_area() -> DisplayArea {
+        DisplayArea {
+            top_left_mm: [
+                -298.152_252_197_265_6,
+                326.004_058_837_890_6,
+                111.818_748_474_121_1,
+            ],
+            top_right_mm: [
+                298.847_747_802_734_4,
+                326.004_058_837_890_6,
+                111.818_748_474_121_1,
+            ],
+            bottom_left_mm: [
+                -298.152_252_197_265_6,
+                10.267_330_169_677_734,
+                -3.100_020_170_211_792,
+            ],
+        }
+    }
+
+    /// An area rolled 3° in its plane and sheared: its left edge is 1.1° off
+    /// square to its top edge.
+    fn sheared_area() -> DisplayArea {
+        DisplayArea {
+            top_left_mm: [-300.0, 330.0, 110.0],
+            top_right_mm: [298.6, 361.3, 110.0],
+            bottom_left_mm: [-290.0, 10.0, -3.0],
+        }
+    }
+
+    /// `R_T←S` of a display turned about x by the angle of `cos` and `sin`.
+    fn tilted(cos: f64, sin: f64) -> [[f64; 3]; 3] {
+        [[1.0, 0.0, 0.0], [0.0, cos, sin], [0.0, -sin, cos]]
+    }
+
+    fn close_rows(a: [[f64; 3]; 3], b: [[f64; 3]; 3], tol: f64) -> bool {
+        a.into_iter().zip(b).all(|(x, y)| close(x, y, tol))
+    }
+
+    #[test]
+    fn an_untilted_mount_gives_an_upright_rectangle() {
+        let flat = GeometryMounting {
+            guides: 2,
+            width_mm: 184.0,
+            angle_deg: 0.0,
+            external_offset_mm: [0.0; 3],
+            internal_offset_mm: [0.0; 3],
         };
+        let area = display_area_basic(600.0, 300.0, 0.0, &flat);
+        assert!(close(area.bottom_left_mm, [-300.0, 0.0, 0.0], 1e-12));
+        assert!(close(area.top_left_mm, [-300.0, 300.0, 0.0], 1e-12));
+        assert!(close(area.top_right_mm, [300.0, 300.0, 0.0], 1e-12));
+    }
+
+    /// The formula must reproduce all nine coordinates of the captured area
+    /// from the monitor's size, the reported mounting and the one x offset
+    /// both captured monitors share.
+    #[test]
+    fn reproduces_the_captured_display_area() {
+        let captured = captured_area();
         let width = captured.top_right_mm[0] - captured.top_left_mm[0];
         let height = dot(
             sub(captured.top_left_mm, captured.bottom_left_mm),
@@ -220,6 +344,173 @@ mod tests {
         assert!(close(area.bottom_left_mm, captured.bottom_left_mm, 1e-4));
     }
 
+    /// The frame the tracker converted the Windows sessions' gaze origins
+    /// with: turned 20° about x, and the tracker 175.7 mm below the screen's
+    /// centre and 6.4 mm in front of it.
+    #[test]
+    fn the_captured_area_gives_the_frame_the_tracker_used() {
+        let frame = DisplayFrame::new(&captured_area()).expect("a display frame");
+
+        let (cos, sin) = (0.939_692_618_726_777_8, 0.342_020_148_983_083_36);
+        assert!(
+            close_rows(frame.rotation(), tilted(cos, sin), 1e-12),
+            "{frame:?}"
+        );
+        // t = -R c, where the tracker is in the display frame.
+        let t = frame.to_display([0.0; 3]);
+        let want = [
+            -1.002_258_300_781_25,
+            -175.740_470_065_770_13,
+            6.424_699_866_143_832,
+        ];
+        assert!(close(t, want, 1e-9), "{t:?}");
+        // A head 60 cm in front of the tracker.
+        let head = frame.to_display([0.0, 150.0, 600.0]);
+        let want = [
+            -1.002_258_300_781_25,
+            170.425_512_133_096_56,
+            518.937_248_754_748,
+        ];
+        assert!(close(head, want, 1e-9), "{head:?}");
+    }
+
+    #[test]
+    fn the_linux_area_keeps_the_tilt_and_moves_the_centre() {
+        let frame = DisplayFrame::new(&linux_area()).expect("a display frame");
+
+        let (cos, sin) = (0.939_692_623_134_647_4, 0.342_020_136_872_561_05);
+        assert!(
+            close_rows(frame.rotation(), tilted(cos, sin), 1e-12),
+            "{frame:?}"
+        );
+        let t = frame.to_display([0.0; 3]);
+        let want = [
+            -0.347_747_802_734_375,
+            -176.587_868_978_383_6,
+            6.424_699_755_465_593,
+        ];
+        assert!(close(t, want, 1e-9), "{t:?}");
+    }
+
+    /// Taking the left edge as y would leave it 1.1° off square to x here.
+    #[test]
+    fn a_sheared_area_still_gives_an_orthonormal_frame() {
+        let frame = DisplayFrame::new(&sheared_area()).expect("a display frame");
+
+        let r = frame.rotation();
+        for (i, a) in r.into_iter().enumerate() {
+            for (j, b) in r.into_iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((dot(a, b) - want).abs() < 1e-12, "rows {i}, {j}: {r:?}");
+            }
+        }
+        let det = dot(cross(r[0], r[1]), r[2]);
+        assert!((det - 1.0).abs() < 1e-12, "{det}");
+        // As the study's reference implementation gives it.
+        let want = [
+            [0.998_635_744_185_910_7, 0.052_217_338_444_736_076, 0.0],
+            [
+                -0.049_239_064_085_348_65,
+                0.941_677_436_469_319_3,
+                0.332_895_058_858_749_04,
+            ],
+            [
+                0.017_382_893_955_007_635,
+                -0.332_440_904_839_219_4,
+                0.942_963_880_425_666,
+            ],
+        ];
+        assert!(close_rows(r, want, 1e-12), "{r:?}");
+        let t = frame.to_display([0.0; 3]);
+        let want = [
+            -13.988_282_582_264_68,
+            -192.420_573_753_905_22,
+            11.194_339_936_621_416,
+        ];
+        assert!(close(t, want, 1e-9), "{t:?}");
+    }
+
+    /// In its own frame an area lies in the plane z = 0, centred on the
+    /// origin, with its top edge along x and its top above its bottom; and
+    /// the frame maps points both ways.
+    #[test]
+    fn an_area_lies_flat_in_its_frame() {
+        let basic = display_area_basic(597.0, 336.0, 1.0, &captured_mounting());
+        for area in [captured_area(), linux_area(), sheared_area(), basic] {
+            let frame = DisplayFrame::new(&area).expect("a display frame");
+
+            let centre = scale(add(area.top_right_mm, area.bottom_left_mm), 0.5);
+            assert!(close(frame.centre(), centre, 1e-12), "{area:?}");
+            let [tl, tr, bl] = [area.top_left_mm, area.top_right_mm, area.bottom_left_mm]
+                .map(|corner| frame.to_display(corner));
+            for corner in [tl, tr, bl] {
+                assert!(
+                    corner[2].abs() < 1e-9,
+                    "{corner:?} off the plane of {area:?}"
+                );
+            }
+            assert!((tl[1] - tr[1]).abs() < 1e-9 && tl[0] < tr[0], "{area:?}");
+            assert!(bl[1] < tl[1], "{area:?}");
+            for p in [[-57.9, 112.5, 618.3], [0.0; 3], [250.0, -40.0, 1200.0]] {
+                let back = frame.to_tracker(frame.to_display(p));
+                assert!(close(back, p, 1e-9), "{back:?} for {p:?} on {area:?}");
+                let back = frame.to_display(frame.to_tracker(p));
+                assert!(close(back, p, 1e-9), "{back:?} for {p:?} on {area:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_area_without_width_or_height_fixes_no_frame() {
+        let good = DisplayArea {
+            top_left_mm: [-50.0, 60.0, 0.0],
+            top_right_mm: [50.0, 60.0, 0.0],
+            bottom_left_mm: [-50.0, 0.0, 0.0],
+        };
+        let with = |change: fn(&mut DisplayArea)| {
+            let mut area = good;
+            change(&mut area);
+            area
+        };
+        assert!(DisplayFrame::new(&good).is_some());
+
+        for (what, area) in [
+            ("all zeros", DisplayArea::default()),
+            ("no width", with(|a| a.top_right_mm = a.top_left_mm)),
+            ("1 mm wide", with(|a| a.top_right_mm = [-49.0, 60.0, 0.0])),
+            ("no height", with(|a| a.bottom_left_mm = a.top_left_mm)),
+            ("1 mm high", with(|a| a.bottom_left_mm = [-50.0, 59.0, 0.0])),
+            // Corners in a line: a left edge 30 mm long, and no height.
+            ("flat", with(|a| a.bottom_left_mm = [-80.0, 60.0, 0.0])),
+            // Sheared: a left edge 30 mm long, 1 mm high across the top.
+            (
+                "1 mm high, sheared",
+                with(|a| a.bottom_left_mm = [-80.0, 59.0, 0.0]),
+            ),
+            ("too wide to square", with(|a| a.top_right_mm[0] = 1e300)),
+        ] {
+            assert!(DisplayFrame::new(&area).is_none(), "{what}: {area:?}");
+        }
+        // A NaN or an infinity in any coordinate.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for i in 0..9 {
+                let mut corners = [good.top_left_mm, good.top_right_mm, good.bottom_left_mm];
+                corners.as_flattened_mut()[i] = bad;
+                let [top_left_mm, top_right_mm, bottom_left_mm] = corners;
+                let area = DisplayArea {
+                    top_left_mm,
+                    top_right_mm,
+                    bottom_left_mm,
+                };
+                assert!(DisplayFrame::new(&area).is_none(), "{area:?}");
+            }
+        }
+
+        // Just over 1 mm either way is enough.
+        assert!(DisplayFrame::new(&with(|a| a.top_right_mm = [-48.99, 60.0, 0.0])).is_some());
+        assert!(DisplayFrame::new(&with(|a| a.bottom_left_mm = [-50.0, 58.99, 0.0])).is_some());
+    }
+
     #[test]
     fn display_and_tracker_frames_are_inverse() {
         let area = display_area_basic(597.0, 336.0, 1.0, &captured_mounting());
@@ -229,5 +520,9 @@ mod tests {
         // The screen centre is the display frame's origin.
         let centre = scale(add(area.bottom_left_mm, area.top_right_mm), 0.5);
         assert!(close(tracker_to_display(&area, centre), [0.0; 3], 1e-9));
+        // An area that fixes no frame maps nowhere.
+        let none = DisplayArea::default();
+        assert!(tracker_to_display(&none, p).iter().all(|v| v.is_nan()));
+        assert!(display_to_tracker(&none, p).iter().all(|v| v.is_nan()));
     }
 }
