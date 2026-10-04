@@ -96,9 +96,10 @@ impl FaceModel {
         let y0 = cy - half;
         let span = half * 2.0;
         // Rows of IN pixels, each pixel three (identical) channels.
-        for (oy, row) in self.input.chunks_exact_mut(IN * 3).enumerate() {
+        let (rows, _) = self.input.as_chunks_mut::<{ IN * 3 }>();
+        for (oy, row) in rows.iter_mut().enumerate() {
             let sy = y0 + (oy as f32 + 0.5) / IN as f32 * span - 0.5;
-            for (ox, px) in row.chunks_exact_mut(3).enumerate() {
+            for (ox, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let sx = x0 + (ox as f32 + 0.5) / IN as f32 * span - 0.5;
                 let v = bilinear(gray, w, h, sx, sy) / 255.0;
                 px.fill(v);
@@ -112,7 +113,7 @@ impl FaceModel {
 
         self.pts.clear();
         self.pts
-            .extend(lm.chunks_exact(3).take(NLM).map(|p| [p[0], p[1], p[2]]));
+            .extend(lm.as_chunks::<3>().0.iter().take(NLM).copied());
         Ok((self.pts.as_slice(), score[0]))
     }
 }

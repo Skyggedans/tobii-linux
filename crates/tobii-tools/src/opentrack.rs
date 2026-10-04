@@ -546,8 +546,8 @@ impl OpentrackUdp {
         // as its plugin API: TX, TY, TZ, Yaw, Pitch, Roll.
         let values = self.filter_pose([x_cm, y_cm, z_cm, yaw_deg, pitch_deg, roll_deg]);
         let mut packet = [0u8; 48];
-        for (chunk, value) in packet.chunks_exact_mut(8).zip(values) {
-            chunk.copy_from_slice(&value.to_le_bytes());
+        for (chunk, value) in packet.as_chunks_mut::<8>().0.iter_mut().zip(values) {
+            *chunk = value.to_le_bytes();
         }
 
         self.socket

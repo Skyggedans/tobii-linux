@@ -122,16 +122,8 @@ impl<'a> Tlv<'a> {
         if items.len() != count.checked_mul(8)? {
             return None;
         }
-        Some(
-            items
-                .chunks_exact(8)
-                .map(|item| {
-                    let mut raw = [0; 8];
-                    raw.copy_from_slice(item);
-                    i64::from_be_bytes(raw)
-                })
-                .collect(),
-        )
+        let (items, _) = items.as_chunks::<8>();
+        Some(items.iter().copied().map(i64::from_be_bytes).collect())
     }
 
     fn length_prefixed(&self) -> Option<&'a [u8]> {

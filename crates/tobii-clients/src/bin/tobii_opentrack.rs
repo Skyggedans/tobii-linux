@@ -88,8 +88,8 @@ fn run() -> Result<()> {
                     f64::from(rot_rad[0]).to_degrees(), // pitch
                     f64::from(rot_rad[2]).to_degrees(), // roll
                 ];
-                for (chunk, v) in packet.chunks_exact_mut(8).zip(&pose) {
-                    chunk.copy_from_slice(&v.to_le_bytes());
+                for (chunk, v) in packet.as_chunks_mut::<8>().0.iter_mut().zip(&pose) {
+                    *chunk = v.to_le_bytes();
                 }
                 socket
                     .send_to(&packet, target)

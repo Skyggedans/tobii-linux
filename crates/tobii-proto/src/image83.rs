@@ -188,9 +188,8 @@ pub fn upscale2x_into(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
         .zip(out.chunks_exact_mut(ow * 2))
     {
         let (r0, r1) = out_rows.split_at_mut(ow);
-        for (pair, &v) in r0.chunks_exact_mut(2).zip(src_row) {
-            pair[0] = v;
-            pair[1] = v;
+        for (pair, &v) in r0.as_chunks_mut::<2>().0.iter_mut().zip(src_row) {
+            *pair = [v; 2];
         }
         r1.copy_from_slice(r0);
     }

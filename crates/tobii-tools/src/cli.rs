@@ -916,7 +916,7 @@ pub(crate) fn parse_matrix3(s: &str, option: &str) -> Result<[[f64; 3]; 3]> {
     );
 
     let mut matrix = [[0.0; 3]; 3];
-    for (row, values) in matrix.iter_mut().zip(parts.chunks_exact(3)) {
+    for (row, values) in matrix.iter_mut().zip(parts.as_chunks::<3>().0) {
         for (cell, value) in row.iter_mut().zip(values) {
             *cell = value
                 .parse()

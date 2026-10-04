@@ -94,7 +94,7 @@ pub fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
     // Walk the bytes, not char indices: slicing a `str` at an even byte
     // offset panics on a non-ASCII char boundary, whereas a non-UTF-8 pair
     // here is just a bad hex byte.
-    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+    for (i, pair) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let b = std::str::from_utf8(pair)
             .ok()
             .and_then(|pair| u8::from_str_radix(pair, 16).ok())
