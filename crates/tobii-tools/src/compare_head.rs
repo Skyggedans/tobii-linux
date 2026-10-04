@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -1258,14 +1258,24 @@ fn csv_row(frame: &Frame, reacquired: bool) -> Option<String> {
     Some(fields.collect::<Vec<_>>().join(","))
 }
 
-/// Write the CSV of `frames` to `path`: [`CSV_HEADER`], then one row per
-/// image with a DLL pose. Returns the rows written.
+/// Write the CSV of `frames` to `path` ([`write_rows`]). Returns the rows
+/// written.
 ///
 /// # Errors
-/// Fails when the file cannot be written.
+/// Fails when the file cannot be created or written, naming it.
 fn write_csv(path: &str, frames: &[Frame], reacquired: &[bool]) -> Result<usize> {
-    let mut out =
-        BufWriter::new(File::create(path).with_context(|| format!("failed to create {path}"))?);
+    let file = File::create(path).with_context(|| format!("failed to create {path}"))?;
+    write_rows(BufWriter::new(file), frames, reacquired)
+        .with_context(|| format!("failed to write {path}"))
+}
+
+/// Write [`CSV_HEADER`], then one row per image of `frames` with a DLL pose
+/// (each a re-acquisition or not, by `reacquired`), to `out`, and flush it.
+/// Returns the rows written.
+///
+/// # Errors
+/// Fails when `out` does.
+fn write_rows(mut out: impl Write, frames: &[Frame], reacquired: &[bool]) -> io::Result<usize> {
     writeln!(out, "{CSV_HEADER}")?;
     let mut rows = 0;
     for (frame, &r) in frames.iter().zip(reacquired) {
@@ -1274,8 +1284,7 @@ fn write_csv(path: &str, frames: &[Frame], reacquired: &[bool]) -> Result<usize>
             rows += 1;
         }
     }
-    out.flush()
-        .with_context(|| format!("failed to write {path}"))?;
+    out.flush()?;
     Ok(rows)
 }
 
@@ -2603,6 +2612,44 @@ mod tests {
         assert_eq!(row.split(',').count(), CSV_HEADER.split(',').count());
         f.dll = None;
         assert_eq!(csv_row(&f, false), None);
+    }
+
+    /// The CSV is its header and a row for each image with a DLL pose.
+    #[test]
+    fn the_csv_has_a_row_for_each_paired_image() {
+        let paired = frame([0.0; 3], Eyes::default());
+        let frames = [
+            paired,
+            Frame {
+                dll: None,
+                ..paired
+            },
+            paired,
+        ];
+        let mut out = Vec::new();
+        assert_eq!(write_rows(&mut out, &frames, &[false; 3]).ok(), Some(2));
+        let text = String::from_utf8(out).expect("text");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], CSV_HEADER);
+        assert_eq!(Some(lines[1]), csv_row(&paired, false).as_deref());
+    }
+
+    /// A write of the CSV that fails names the file, whether a row fails or
+    /// the last flush: /dev/full takes nothing, so a row past the writer's
+    /// buffer fails, and a CSV that fits in it fails at the flush.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_csv_write_that_fails_names_the_file() {
+        let many = vec![frame([0.0; 3], Eyes::default()); 2000];
+        for rows in [2000, 3] {
+            let error = write_csv("/dev/full", &many[..rows], &vec![false; rows])
+                .expect_err("no space on /dev/full");
+            assert!(
+                format!("{error:#}").starts_with("failed to write /dev/full: "),
+                "{rows} rows: {error:#}"
+            );
+        }
     }
 
     /// The committed gates file reads, and every gate this tool checks

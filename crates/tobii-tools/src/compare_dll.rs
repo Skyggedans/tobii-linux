@@ -139,18 +139,28 @@ fn parse_record(line: &str) -> Option<DllRecord> {
 }
 
 /// Every record of the DLL log at `jsonl_path` that the comparisons use, in
-/// log order. Reading stops at the first line that cannot be read.
+/// log order.
 ///
 /// # Errors
-/// Fails when the file cannot be opened.
+/// Fails when the file cannot be opened, and at the first line that cannot
+/// be read (one that is not UTF-8, say), naming it: the comparisons would
+/// otherwise run on part of the log.
 pub(crate) fn read_dll_records(jsonl_path: &str) -> Result<Vec<DllRecord>> {
-    Ok(BufReader::new(
-        File::open(jsonl_path).with_context(|| format!("failed to open {jsonl_path}"))?,
-    )
-    .lines()
-    .map_while(Result::ok)
-    .filter_map(|l| parse_record(&l))
-    .collect())
+    let file = File::open(jsonl_path).with_context(|| format!("failed to open {jsonl_path}"))?;
+    parse_dll_records(BufReader::new(file)).with_context(|| format!("failed to read {jsonl_path}"))
+}
+
+/// The records of a DLL log read from `reader` ([`read_dll_records`]).
+///
+/// # Errors
+/// Fails at the first line that cannot be read, naming it (from 1).
+fn parse_dll_records(reader: impl BufRead) -> Result<Vec<DllRecord>> {
+    let mut records = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("line {}", i + 1))?;
+        records.extend(parse_record(&line));
+    }
+    Ok(records)
 }
 
 #[allow(clippy::cast_possible_truncation)] // reason: compare as the f32 the DLL hands out
@@ -370,6 +380,28 @@ mod tests {
         assert!(!mixed.is_valid() && !mixed.flags_agree());
         let short = r#"{"headPose":{"position_validity":1,"position_xyz":[1.0,2.0],"rotation_validity_xyz":[1,1,1],"rotation_xyz":[0.0,0.0,0.0],"timestamp_us":1}}"#;
         assert_eq!(parse_record(short), None);
+    }
+
+    /// Every line of a DLL log is read, or the read fails naming the line
+    /// that cannot be: a byte that is not UTF-8 halfway through no longer
+    /// ends the log there unsaid.
+    #[test]
+    fn a_dll_log_reads_whole_or_fails_at_the_line_it_cannot_read() {
+        let pose = r#"{"headPose":{"position_validity":1,"position_xyz":[1.0,2.0,600.0],"rotation_validity_xyz":[1,1,1],"rotation_xyz":[0.0,0.1,0.0],"timestamp_us":5}}"#;
+        let point = r#"{"gazePoint":{"position_xy":[0.25,0.5],"timestamp_us":7,"validity":1}}"#;
+        let text = format!("{pose}\n{{\"presence\":{{\"status\":1}}}}\n{point}\n{pose}\n");
+        let records = parse_dll_records(text.as_bytes()).expect("every line reads");
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[1], DllRecord::GazePoint { ts_us: 7, .. }));
+
+        let broken = [
+            pose.as_bytes(),
+            b"\n{\"presence\":\xff}\n",
+            point.as_bytes(),
+        ]
+        .concat();
+        let error = parse_dll_records(&broken[..]).expect_err("line 2 is not UTF-8");
+        assert!(format!("{error:#}").starts_with("line 2: "), "{error:#}");
     }
 
     /// A gaze frame of device time `ts_us` whose gaze point is `xy`.
