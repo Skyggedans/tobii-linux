@@ -11,8 +11,8 @@
 use crate::geometry::DisplayArea;
 use crate::wire::{Reader, Writer};
 use crate::{
-    TAG_EYE_POSITION, TAG_GAZE, TAG_GAZE_DATA, TAG_GAZE_ORIGIN, TAG_GAZE_RAW, TAG_HEAD, TAG_IMAGE,
-    TAG_NOTIFICATION, TAG_PRESENCE, TAG_REPLY, TAG_SUBSCRIBED,
+    TAG_EYE_POSITION, TAG_GAZE, TAG_GAZE_DATA, TAG_GAZE_ORIGIN, TAG_GAZE_RAW, TAG_HEAD,
+    TAG_HEAD_POSE, TAG_IMAGE, TAG_NOTIFICATION, TAG_PRESENCE, TAG_REPLY, TAG_SUBSCRIBED,
 };
 
 /// One eye's 3-D point and whether it is usable.
@@ -141,6 +141,32 @@ pub struct GazeRaw {
     pub right_eyeball_center_mm: Option<[f32; 3]>,
 }
 
+/// The Stream Engine's head pose: `tobii_head_pose_t`, validity included.
+/// Absolute, in the display frame: the origin at the centre of the display
+/// area, +x to the right and +y up along the display as the user sees it,
+/// +z out of it towards the user. Unlike [`ServerMsg::Head`], nothing in it
+/// is relative to a rest pose, so a RECENTER leaves it alone. A value whose
+/// validity is clear holds no measurement, whatever it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HeadPose {
+    /// When the IR image the pose was made from was taken, on the host
+    /// clock, microseconds.
+    pub ts_us: i64,
+    /// Whether `position_mm` holds a measurement for this image.
+    pub position_valid: bool,
+    /// Head position in the display frame, mm.
+    pub position_mm: [f32; 3],
+    /// Whether each angle of `rotation_rad`, x, y and z, holds a
+    /// measurement for this image.
+    pub rotation_valid: [bool; 3],
+    /// Head rotation in the display frame, radians: the angles `[x, y, z]`
+    /// of the head-to-display rotation `R = Ry(y) · Rx(x) · Rz(z)`, all zero
+    /// for a face square to the display, looking along -z. +x lifts the
+    /// chin, +y turns the head to the user's left, +z tilts it towards the
+    /// left shoulder.
+    pub rotation_rad: [f32; 3],
+}
+
 /// One IR camera frame.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Image {
@@ -244,6 +270,9 @@ pub enum ServerMsg {
         /// Rotation `[pitch, yaw, roll]` in radians (Stream-Engine axis order).
         rot_rad: [f32; 3],
     },
+    /// The Stream Engine's head pose (`tobii_head_pose_t`), validity
+    /// included.
+    HeadPose(HeadPose),
     /// Gaze point.
     Gaze {
         /// When the sample was taken, on the host clock, microseconds.
@@ -305,6 +334,32 @@ pub fn encode_head(ts_us: i64, pos_mm: [f32; 3], rot_rad: [f32; 3]) -> Vec<u8> {
         .i64(ts_us)
         .f32s(&pos_mm)
         .f32s(&rot_rad)
+        .finish()
+}
+
+/// The `HEAD_POSE` flag bits, in the order of the validities they carry:
+/// the position, then the rotation's x, y and z. The other bits are sent as
+/// 0 and ignored when read, so a later daemon may give them a meaning.
+const HEAD_POSE_VALID_BITS: [u8; 4] = [1 << 0, 1 << 1, 1 << 2, 1 << 3];
+
+/// Daemon -> client `HEAD_POSE` body: `i64` host time, `u8` flags (bit 0
+/// set when the position is valid, bits 1, 2 and 3 when the rotation's x,
+/// y and z are; the others 0), `3 x f32` position (mm), `3 x f32` rotation
+/// (rad). 33 bytes after the tag; a later daemon may append a tail, which
+/// this decoder ignores.
+#[must_use]
+pub fn encode_head_pose(pose: &HeadPose) -> Vec<u8> {
+    let [x, y, z] = pose.rotation_valid;
+    let flags = [pose.position_valid, x, y, z]
+        .into_iter()
+        .zip(HEAD_POSE_VALID_BITS)
+        .filter_map(|(valid, bit)| valid.then_some(bit))
+        .fold(0, |flags, bit| flags | bit);
+    Writer::with_tag(TAG_HEAD_POSE, 33)
+        .i64(pose.ts_us)
+        .u8(flags)
+        .f32s(&pose.position_mm)
+        .f32s(&pose.rotation_rad)
         .finish()
 }
 
@@ -474,6 +529,19 @@ pub fn encode_notification(n: &Notification) -> Vec<u8> {
     w.finish()
 }
 
+fn read_head_pose(r: &mut Reader<'_>) -> Option<HeadPose> {
+    let ts_us = r.i64()?;
+    let flags = r.u8()?;
+    let [position_valid, x, y, z] = HEAD_POSE_VALID_BITS.map(|bit| flags & bit != 0);
+    Some(HeadPose {
+        ts_us,
+        position_valid,
+        position_mm: r.f32s()?,
+        rotation_valid: [x, y, z],
+        rotation_rad: r.f32s()?,
+    })
+}
+
 fn read_pair(r: &mut Reader<'_>) -> Option<EyePair> {
     Some(EyePair {
         ts_us: r.i64()?,
@@ -581,6 +649,7 @@ pub fn decode_server(body: &[u8]) -> Option<ServerMsg> {
             pos_mm: r.f32s()?,
             rot_rad: r.f32s()?,
         }),
+        TAG_HEAD_POSE => read_head_pose(&mut r).map(ServerMsg::HeadPose),
         TAG_GAZE => {
             let ts_us = r.i64()?;
             let valid = r.bool()?;

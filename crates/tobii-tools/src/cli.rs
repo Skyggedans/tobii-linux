@@ -9,7 +9,7 @@ use std::iter::{Peekable, Skip};
 use std::str::FromStr;
 use tobii_ipc::{
     STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW,
-    STREAM_HEAD, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
+    STREAM_HEAD, STREAM_HEAD_POSE, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
 };
 
 use crate::opentrack::{
@@ -40,7 +40,8 @@ const DEFAULT_IPC_PROBE_STREAMS: u32 = STREAM_HEAD
     | STREAM_EYE_POSITION
     | STREAM_GAZE_DATA
     | STREAM_NOTIFICATIONS
-    | STREAM_GAZE_RAW;
+    | STREAM_GAZE_RAW
+    | STREAM_HEAD_POSE;
 
 /// Init-packet capture replayed to bring the device up when none is given.
 const DEFAULT_INIT_PATH: &str = concat!(

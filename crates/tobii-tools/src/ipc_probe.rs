@@ -82,6 +82,7 @@ fn show(name: &str, answer: &(u8, Vec<u8>), decoded: impl FnOnce(&[u8]) -> Strin
 fn kind_of(msg: &ServerMsg) -> &'static str {
     match msg {
         ServerMsg::Head { .. } => "head",
+        ServerMsg::HeadPose(_) => "head_pose",
         ServerMsg::Gaze { .. } => "gaze",
         ServerMsg::Presence { .. } => "presence",
         ServerMsg::GazeOrigin(_) => "gaze_origin",

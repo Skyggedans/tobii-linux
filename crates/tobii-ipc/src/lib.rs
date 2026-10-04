@@ -10,7 +10,7 @@
 //! | `0x03` REQUEST | client -> daemon | `u32 id`, `u8 kind`, payload ([`request`]) |
 //! | `0x10` SUBSCRIBED | daemon -> client | `u8 ok` |
 //! | `0x11` REPLY | daemon -> client | `u32 id`, `u8 status`, payload |
-//! | `0x20` HEAD .. `0x28` `GAZE_RAW` | daemon -> client | samples ([`ServerMsg`]) |
+//! | `0x20` HEAD .. `0x29` `HEAD_POSE` | daemon -> client | samples ([`ServerMsg`]) |
 //!
 //! The daemon runs a connection's REQUESTs one at a time, in the order they
 //! came, and answers a SUBSCRIBE without waiting for the requests before it
@@ -38,14 +38,27 @@
 //! The SUBSCRIBE mask is written as `u32 LE`, whose first byte is the low
 //! byte of the mask: a daemon that reads only one byte still sees every
 //! stream below bit 8, so old and new peers interoperate either way. Raw
-//! gaze, [`STREAM_GAZE_RAW`], is bit 8, the first past that byte: a legacy
-//! one-byte SUBSCRIBE (paperwm-gaze sends one) cannot ask for it. A daemon
-//! from before raw gaze that reads the `u32` mask keeps the bit but never
-//! sends the frame, so the stream stays silent: SUBSCRIBED says ok all the
-//! same, and a mask of raw gaze alone still has it start and hold the
-//! tracker. One that reads a single byte sees such a mask as 0 and
-//! unsubscribes. A client from before raw gaze drops the frame as a tag it
-//! does not know ([`decode_server`] returns `None`).
+//! gaze, [`STREAM_GAZE_RAW`], is bit 8 and the Stream Engine's head pose,
+//! [`STREAM_HEAD_POSE`], bit 9, both past that byte: a legacy one-byte
+//! SUBSCRIBE (paperwm-gaze sends one) cannot ask for either. A daemon from
+//! before one of them that reads the `u32` mask keeps its bit but never
+//! sends its frame, so the stream stays silent: SUBSCRIBED says ok all the
+//! same, and a mask of that bit alone still has it start and hold the
+//! tracker, though one from before the head pose runs no head inference
+//! for bit 9 (only for [`STREAM_HEAD`]). One that reads a single byte sees
+//! such a mask as 0 and unsubscribes. A client from before one of them
+//! drops its frame as a tag it does not know ([`decode_server`] returns
+//! `None`).
+//!
+//! The daemon has two head pose streams. HEAD ([`STREAM_HEAD`]) is its own:
+//! relative to a rest pose that RECENTER resets, sent only while a face is
+//! tracked, with no validity. `HEAD_POSE` ([`STREAM_HEAD_POSE`], a
+//! [`HeadPose`]) is the Stream Engine's: absolute, in the display frame, one
+//! for every IR image the daemon processes, valid or not, with a validity
+//! for the position and for each angle. It is a stream of its own rather
+//! than a validity tail on HEAD because a HEAD decoder ignores a tail: a
+//! client from before the tail would take every invalid pose for a valid
+//! one.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -62,10 +75,11 @@ mod wire;
 
 pub use clock::host_clock_us;
 pub use sample::{
-    EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, Image, Notification,
+    EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, HeadPose, Image, Notification,
     NotificationValue, ServerMsg, decode_server, encode_eye_position, encode_gaze,
-    encode_gaze_data, encode_gaze_origin, encode_gaze_raw, encode_head, encode_image,
-    encode_notification, encode_presence, encode_reply, encode_subscribed, notification,
+    encode_gaze_data, encode_gaze_origin, encode_gaze_raw, encode_head, encode_head_pose,
+    encode_image, encode_notification, encode_presence, encode_reply, encode_subscribed,
+    notification,
 };
 
 // Stream subscription bits (client -> daemon), OR-ed into the SUBSCRIBE mask.
@@ -90,6 +104,11 @@ pub const STREAM_NOTIFICATIONS: u32 = 1 << 7;
 /// record of each gaze frame. Past the low byte: a legacy one-byte
 /// SUBSCRIBE cannot carry it.
 pub const STREAM_GAZE_RAW: u32 = 1 << 8;
+/// Subscribe to the Stream Engine's head pose ([`TAG_HEAD_POSE`] frames),
+/// validity included; the crate docs say how it differs from
+/// [`STREAM_HEAD`]'s. Past the low byte: a legacy one-byte SUBSCRIBE cannot
+/// carry it.
+pub const STREAM_HEAD_POSE: u32 = 1 << 9;
 
 // Frame tags (first body byte).
 
@@ -124,6 +143,10 @@ pub const TAG_NOTIFICATION: u8 = 0x27;
 /// Daemon -> client: a [`GazeRaw`] sample, stamped with the device clock
 /// rather than the host's.
 pub const TAG_GAZE_RAW: u8 = 0x28;
+/// Daemon -> client: a [`HeadPose`] sample: `i64 ts_us`, `u8 flags` (bit 0
+/// the position valid, bits 1..3 the rotation's x, y, z), `3 x f32`
+/// position (mm), `3 x f32` rotation (rad), both in the display frame.
+pub const TAG_HEAD_POSE: u8 = 0x29;
 
 // Presence status values carried by TAG_PRESENCE (Stream-Engine numbering).
 
@@ -699,6 +722,189 @@ mod tests {
         assert_eq!(body.get(1), Some(&0x02));
         assert_eq!(
             decode_subscribe(&[TAG_SUBSCRIBE, 0xff]).map(|mask| mask & STREAM_GAZE_RAW),
+            Some(0)
+        );
+    }
+
+    /// A head pose whose fields all differ, valid but for the rotation's y,
+    /// so a field or flag the codec moves or swaps shows up.
+    fn head_pose() -> HeadPose {
+        HeadPose {
+            ts_us: 9_613_320_391,
+            position_valid: true,
+            position_mm: [-12.5, 48.25, 612.75],
+            rotation_valid: [true, false, true],
+            rotation_rad: [0.125, -0.375, 0.0625],
+        }
+    }
+
+    fn decode_head_pose(body: &[u8]) -> Option<HeadPose> {
+        match decode_server(body)? {
+            ServerMsg::HeadPose(pose) => Some(pose),
+            other => panic!("expected HeadPose, got {other:?}"),
+        }
+    }
+
+    /// A head pose round-trips in 34 bytes, the tag included, whatever its
+    /// validity: an invalid one still carries the values it holds.
+    #[test]
+    fn head_pose_round_trips() {
+        let sent = head_pose();
+        let valid = HeadPose {
+            rotation_valid: [true; 3],
+            ..sent
+        };
+        let invalid = HeadPose {
+            position_valid: false,
+            rotation_valid: [false; 3],
+            ..sent
+        };
+
+        for pose in [sent, valid, invalid, HeadPose::default()] {
+            let body = encode_head_pose(&pose);
+
+            assert_eq!((body.len(), body.first()), (34, Some(&TAG_HEAD_POSE)));
+            assert_eq!(decode_server(&body), Some(ServerMsg::HeadPose(pose)));
+        }
+    }
+
+    /// The fields sit where [`TAG_HEAD_POSE`]'s doc puts them, so a daemon
+    /// and a libtobii built from different commits read one another: the
+    /// round trip passes for a change made to both codecs alike, such as
+    /// the position and the rotation swapped; this does not.
+    #[test]
+    fn head_pose_fields_sit_where_the_doc_puts_them() {
+        let pose = head_pose();
+        let body = encode_head_pose(&pose);
+        let floats = |vs: &[f32]| -> Vec<u8> { vs.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+        assert_eq!(body.get(1..9), Some(&pose.ts_us.to_le_bytes()[..]));
+        // The position and the rotation's x and z: bits 0, 1 and 3.
+        assert_eq!(body.get(9), Some(&0b1011));
+        assert_eq!(body.get(10..22), Some(&floats(&pose.position_mm)[..]));
+        assert_eq!(body.get(22..34), Some(&floats(&pose.rotation_rad)[..]));
+    }
+
+    /// Each validity has the bit the doc gives it, alone: bit 0 the
+    /// position, bits 1, 2 and 3 the rotation's x, y and z. The other bits
+    /// go out clear and are ignored when read, so a later daemon may use
+    /// them.
+    #[test]
+    fn each_head_pose_validity_has_its_own_bit() {
+        let none = HeadPose {
+            position_valid: false,
+            rotation_valid: [false; 3],
+            ..head_pose()
+        };
+        let all = HeadPose {
+            position_valid: true,
+            rotation_valid: [true; 3],
+            ..none
+        };
+        let poses = [
+            (
+                HeadPose {
+                    position_valid: true,
+                    ..none
+                },
+                0b0001,
+            ),
+            (
+                HeadPose {
+                    rotation_valid: [true, false, false],
+                    ..none
+                },
+                0b0010,
+            ),
+            (
+                HeadPose {
+                    rotation_valid: [false, true, false],
+                    ..none
+                },
+                0b0100,
+            ),
+            (
+                HeadPose {
+                    rotation_valid: [false, false, true],
+                    ..none
+                },
+                0b1000,
+            ),
+            (none, 0),
+            (all, 0b1111),
+        ];
+
+        for (pose, flags) in poses {
+            let mut body = encode_head_pose(&pose);
+
+            assert_eq!(body.get(9), Some(&flags), "{pose:?}");
+            assert_eq!(decode_head_pose(&body), Some(pose));
+            body[9] |= 0xf0;
+            assert_eq!(decode_head_pose(&body), Some(pose), "bits 4..7 set");
+        }
+    }
+
+    /// A body cut anywhere, one byte short (33 bytes) included, is dropped;
+    /// one with more after it decodes, which leaves room for a tail a later
+    /// daemon may add.
+    #[test]
+    fn a_short_head_pose_body_is_rejected_and_a_tail_is_ignored() {
+        let pose = head_pose();
+        let body = encode_head_pose(&pose);
+
+        for len in 0..body.len() {
+            assert_eq!(decode_server(&body[..len]), None, "cut at {len}");
+        }
+        assert_eq!(decode_server(&body[..33]), None);
+        let mut longer = body.clone();
+        longer.extend_from_slice(&[0xa5; 9]);
+        assert_eq!(decode_head_pose(&longer), Some(pose));
+    }
+
+    /// The head pose takes the bit and the tag after raw gaze's, so no
+    /// older peer reads either as something else. A `u32` SUBSCRIBE
+    /// carries the bit; the byte a one-byte decoder reads keeps the other
+    /// streams, and a legacy one-byte SUBSCRIBE cannot ask for it.
+    #[test]
+    fn head_pose_takes_a_new_bit_and_tag() {
+        let older = [
+            STREAM_HEAD,
+            STREAM_GAZE,
+            STREAM_PRESENCE,
+            STREAM_GAZE_ORIGIN,
+            STREAM_EYE_POSITION,
+            STREAM_GAZE_DATA,
+            STREAM_IMAGE,
+            STREAM_NOTIFICATIONS,
+            STREAM_GAZE_RAW,
+        ];
+        assert_eq!(older.iter().fold(0, |mask, bit| mask | bit), 0x1ff);
+        assert_eq!(STREAM_HEAD_POSE, 0x200);
+        let tags = [
+            TAG_SUBSCRIBE,
+            TAG_RECENTER,
+            TAG_REQUEST,
+            TAG_SUBSCRIBED,
+            TAG_REPLY,
+            TAG_HEAD,
+            TAG_GAZE,
+            TAG_PRESENCE,
+            TAG_GAZE_ORIGIN,
+            TAG_EYE_POSITION,
+            TAG_GAZE_DATA,
+            TAG_IMAGE,
+            TAG_NOTIFICATION,
+            TAG_GAZE_RAW,
+        ];
+        assert!(!tags.contains(&TAG_HEAD_POSE));
+        assert_eq!(TAG_HEAD_POSE, 0x29);
+
+        let body = encode_subscribe(STREAM_HEAD_POSE | STREAM_GAZE);
+
+        assert_eq!(decode_subscribe(&body), Some(0x202));
+        assert_eq!(body.get(1), Some(&0x02));
+        assert_eq!(
+            decode_subscribe(&[TAG_SUBSCRIBE, 0xff]).map(|mask| mask & STREAM_HEAD_POSE),
             Some(0)
         );
     }
