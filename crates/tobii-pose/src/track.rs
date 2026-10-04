@@ -969,8 +969,10 @@ impl Tracker {
     ///
     /// # Errors
     /// Fails when `geometry` has no pixels (a size or factor of 0), an
-    /// enlarged frame too large to address, or crop limits that are not two
-    /// numbers in order; or when a model cannot be loaded.
+    /// enlarged frame too large to address, a focal length or a first crop
+    /// size that is not a positive number, a first crop centred outside the
+    /// frame, or crop limits that are not two positive numbers in order; or
+    /// when a model cannot be loaded.
     pub fn with_geometry(geometry: Geometry) -> Result<Self> {
         let side = geometry.frame_size();
         ensure!(
@@ -983,13 +985,29 @@ impl Tracker {
             geometry.native_size,
             geometry.upscale
         );
+        // NaN fails every comparison, so these refuse it too.
         ensure!(
-            geometry.min_half.is_finite()
+            geometry.min_half > 0.0
                 && geometry.max_half.is_finite()
                 && geometry.min_half <= geometry.max_half,
             "crop half-sizes from {} to {}",
             geometry.min_half,
             geometry.max_half
+        );
+        ensure!(
+            geometry.focal.is_finite() && geometry.focal > 0.0,
+            "a focal length of {} px",
+            geometry.focal
+        );
+        ensure!(
+            geometry.start_half.is_finite() && geometry.start_half > 0.0,
+            "a first crop of half-size {}",
+            geometry.start_half
+        );
+        ensure!(
+            (0.0..=1.0).contains(&geometry.cy_frac),
+            "a first crop centred at {} of the frame's height",
+            geometry.cy_frac
         );
         let rest = RestPose::from_env();
         let models = OnnxModels {
@@ -2047,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn a_geometry_without_pixels_or_with_crossed_limits_is_refused() {
+    fn a_geometry_without_pixels_or_with_a_bad_size_or_place_is_refused() {
         let g = Geometry::IMAGE83;
         for bad in [
             Geometry { upscale: 0, ..g },
@@ -2067,8 +2085,45 @@ mod tests {
                 max_half: f32::NAN,
                 ..g
             },
+            Geometry { min_half: 0.0, ..g },
+            Geometry {
+                min_half: -5.0,
+                max_half: 0.0,
+                ..g
+            },
+            Geometry {
+                min_half: f32::NAN,
+                ..g
+            },
+            Geometry {
+                focal: f64::NAN,
+                ..g
+            },
+            Geometry { focal: 0.0, ..g },
+            Geometry {
+                focal: f64::INFINITY,
+                ..g
+            },
+            Geometry {
+                start_half: f32::NAN,
+                ..g
+            },
+            Geometry {
+                start_half: 0.0,
+                ..g
+            },
+            Geometry {
+                cy_frac: f64::NAN,
+                ..g
+            },
+            Geometry { cy_frac: 1.5, ..g },
+            Geometry { cy_frac: -0.1, ..g },
         ] {
             assert!(Tracker::with_geometry(bad).is_err(), "{bad:?}");
+        }
+        // Both built-in geometries pass.
+        for good in [Geometry::IMAGE83, Geometry::UVC] {
+            assert!(Tracker::with_geometry(good).is_ok(), "{good:?}");
         }
     }
 
