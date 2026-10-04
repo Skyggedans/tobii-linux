@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Evaluate the head pose against the Stream Engine's own: run reference.py's estimator over the
-face fits of recorded sessions and print the acceptance metrics, the filters' lag and rest jitter
-among them, and the gates.
+face fits of recorded sessions, or take the daemon's own poses of them, and print the acceptance
+metrics, the filters' lag and rest jitter among them, and the gates.
 
     evaluate.py --session LOG JSONL FITS [--session ...] [--area A]
                 [--params FIT.json [--loso]] [--blend] [--rotation-filters params|shared|per-axis]
-                [--rule timeaware|reset] [--reference-fits REF ...]
+                [--rule timeaware|reset] [--reference-fits REF ...] [--ours-csv CSV ...]
                 [--broken zyx|q-transposed|no-q|no-filter] [--gates GATES.json|none]
+
+Ours: the pose reference.py's estimator (the Python twin of head.rs) makes of the fits, unless
+--ours-csv gives, one per session in order, the --csv of `tobii5-init-replay compare-dll LOG JSONL
+--head`: the poses of the daemon's own pipeline (HeadStep, with the HeadParams it was built with),
+one row per image with a DLL pose. Those are then what every metric measures, the lag and the rest
+jitter included; the twin, run with the constants given here, gives the unfiltered rows only (the
+CSV has no unfiltered pose) and is compared with the CSV, image by image. Give the constants the
+daemon was built with and the fits of its tracker, or the comparison says they differ, and the
+lag reference (below) is mapped with other constants than the poses it is the reference of.
 
 The constants: --params gives fit.py's JSON, its head_params or with --loso each session's fold
 (fitted without it; the fold is found by the session's clock offset and image count, which the
@@ -56,6 +65,7 @@ for); with --gates none, 0.
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -211,6 +221,70 @@ def lag_jitter(o, ours, reference):
     return out
 
 
+# ------------------------------------------------------------------ ours, from compare-dll --head
+# The columns of compare-dll --head's --csv read here (it has more).
+OURS_COLUMNS = (
+    "image",
+    "device_ts_us",
+    "dll_valid",
+    "ours_valid",
+    *(f"ours_pos_{c}_mm" for c in "xyz"),
+    *(f"ours_rot_{c}_rad" for c in "xyz"),
+)
+
+
+def read_ours(path, o):
+    """compare-dll --head's --csv of session o as per-image arrays: valid, pos (T, mm) and rot
+    (yxz, deg), NaN where our pose is invalid or the image has no row; has, the images with a
+    row. Its rows must be this log's images with a DLL pose, by index and device time, and the
+    DLL's validity theirs: the same session, paired at the same clock offset."""
+    with open(path, newline="") as f:
+        rd = csv.DictReader(f)
+        missing = [c for c in OURS_COLUMNS if c not in (rd.fieldnames or [])]
+        if missing:
+            C.fail(f"{path}: not compare-dll --head's CSV (no {', '.join(missing)})")
+        rows = list(rd)
+    n = o["n"]
+    idx = np.array([int(r["image"]) for r in rows], np.int64)
+    devts = np.array([int(r["device_ts_us"]) for r in rows], np.int64)
+    if ((idx < 0) | (idx >= n)).any() or not np.array_equal(o["devts"][idx], devts):
+        C.fail(f"{path}: its rows are not images of {o['paths']['log']} (index, device time)")
+    has = np.zeros(n, bool)
+    has[idx] = True
+    if len(np.unique(idx)) != len(idx) or not np.array_equal(has, o["dll_have"]):
+        C.fail(
+            f"{path}: its {len(idx)} rows are not the {int(o['dll_have'].sum())} images with a "
+            "DLL pose (another clock offset?)"
+        )
+    if not np.array_equal(np.array([r["dll_valid"] == "1" for r in rows]), o["dll_valid"][idx]):
+        C.fail(f"{path}: the DLL's validity in it is not this session's")
+    ok = np.array([r["ours_valid"] == "1" for r in rows], bool)
+    pos = np.array([[float(r[f"ours_pos_{c}_mm"]) for c in "xyz"] for r in rows]).reshape(-1, 3)
+    rot = np.array([[float(r[f"ours_rot_{c}_rad"]) for c in "xyz"] for r in rows]).reshape(-1, 3)
+    valid = np.zeros(n, bool)
+    valid[idx] = ok
+    out = dict(valid=valid, pos=np.full((n, 3), np.nan), rot=np.full((n, 3), np.nan), has=has)
+    out["pos"][idx[ok]] = pos[ok]
+    out["rot"][idx[ok]] = np.degrees(rot[ok])
+    return out
+
+
+def twin_difference(r, ours):
+    """The Python twin's run r against the CSV's poses, on the images with a row: on how many
+    their validity differs, and where both are valid the largest |difference| of the position
+    (mm) and of each angle (deg, wrapped)."""
+    both = r["valid"] & ours["valid"]
+    dpos = np.abs(r["pos"][both] - ours["pos"][both])
+    drot = np.abs(C.wrap_deg(r["rot"][both] - ours["rot"][both]))
+    return dict(
+        validity=int(((r["valid"] != ours["valid"]) & ours["has"]).sum()),
+        rows=int(ours["has"].sum()),
+        both=int(both.sum()),
+        pos_mm=float(dpos.max()) if len(dpos) else np.nan,
+        rot_deg=float(drot.max()) if len(drot) else np.nan,
+    )
+
+
 # ------------------------------------------------------------------ validity
 def validity(pred, o):
     """Agreement with the DLL's validity on the images with a DLL pose, and its loss events."""
@@ -254,8 +328,9 @@ def validity(pred, o):
 
 
 # ------------------------------------------------------------------ one session
-def evaluate(o, P, args, ref_fits):
-    """Every metric of one session."""
+def evaluate(o, P, args, ref_fits, ours=None):
+    """Every metric of one session: of the Python twin's poses, or of ours, the poses of
+    compare-dll --head's CSV (read_ours), when given."""
     Pr = dict(P)
     dec = "yxz"
     if args.broken == "zyx":
@@ -266,17 +341,23 @@ def evaluate(o, P, args, ref_fits):
         Pr["Q"] = np.eye(3)
     r = C.run_reference(o, Pr, rule=args.rule, decomposition=dec)
     stage = "raw" if args.broken == "no-filter" else "final"
-    rot, pos = (r["rot"], r["pos"]) if stage == "final" else (r["raw_rot"], r["raw_pos"])
-    val = r["valid"]
-    res = dict(stage=stage, independent_reference=ref_fits is not None)
+    if ours is not None:
+        rot, pos, val = ours["rot"], ours["pos"], ours["valid"]
+    elif stage == "final":
+        rot, pos, val = r["rot"], r["pos"], r["valid"]
+    else:
+        rot, pos, val = r["raw_rot"], r["raw_pos"], r["valid"]
+    res = dict(stage=stage, independent_reference=ref_fits is not None, csv=ours is not None)
+    if ours is not None:
+        res["twin"] = twin_difference(r, ours)
     vd = o["dll_valid"]
     res["coverage"] = (val & vd).sum() / max(vd.sum(), 1)
     res["validity"] = validity(val, o)
-    # rotation
+    # rotation; raw is always the twin's, on its own validity
     rows = {}
     for sub in ("ALL", "COMB"):
-        m = o["masks"][sub] & val
-        for st, ang in (("raw", r["raw_rot"]), ("final", rot)):
+        for st, ang, v in (("raw", r["raw_rot"], r["valid"]), ("final", rot, val)):
+            m = o["masks"][sub] & v
             e = C.wrap_deg(ang[m] - o["dll_rot"][m])
             g = C.geo_deg(C.compose_yxz_v(np.radians(ang[m])), o["R_dll"][m])
             ok = len(e) > 0
@@ -456,6 +537,11 @@ def event_stat(v, i):
 def report(sessions, results):
     names = " / ".join(o["name"] for o in sessions)
     V = [res["validity"] for res in results]
+    if results[0]["csv"]:
+        print(
+            "\nours: compare-dll --head's poses (--ours-csv); raw and unfiltered: the Python "
+            "twin's (the CSV has no unfiltered pose)"
+        )
     print("\n## Validity (G3) against the DLL's flags")
     C.table(
         ["quantity", names],
@@ -677,6 +763,13 @@ def main():
         "the study's .npz); without it the lag gates are not checked",
     )
     ap.add_argument(
+        "--ours-csv",
+        action="append",
+        metavar="CSV",
+        help="our poses: compare-dll --head's --csv, one per session in order (the daemon's own "
+        "pipeline), evaluated in place of the Python twin's, which is compared with them",
+    )
+    ap.add_argument(
         "--broken",
         choices=("zyx", "q-transposed", "no-q", "no-filter"),
         help="evaluate a broken pipeline instead (the angles read as zyx, Q transposed, Q left "
@@ -690,6 +783,12 @@ def main():
         C.fail("--loso needs --params")
     if args.reference_fits and len(args.reference_fits) != len(args.session):
         C.fail(f"{len(args.reference_fits)} --reference-fits for {len(args.session)} sessions")
+    if args.ours_csv:
+        if len(args.ours_csv) != len(args.session):
+            C.fail(f"{len(args.ours_csv)} --ours-csv for {len(args.session)} sessions")
+        # The CSV is what the daemon made with its own constants: neither a fold's nor broken.
+        if args.loso or args.broken:
+            C.fail("--ours-csv evaluates the daemon's poses: no --loso or --broken with it")
     sessions = C.load_sessions(args)
     results = []
     for i, o in enumerate(sessions):
@@ -704,13 +803,33 @@ def main():
             if ref_fits is not None
             else "its own fits, unfiltered"
         )
+        ours = read_ours(args.ours_csv[i], o) if args.ours_csv else None
         print(
             f"{o['name']}: {what}; rule {args.rule}"
             + (f"; BROKEN: {args.broken}" if args.broken else "")
-            + f"; lag reference: {lag_ref}",
+            + f"; lag reference: {lag_ref}"
+            + (f"; ours: {os.path.basename(args.ours_csv[i])}" if ours is not None else ""),
             flush=True,
         )
-        results.append(evaluate(o, P, args, ref_fits))
+        res = evaluate(o, P, args, ref_fits, ours)
+        if ours is not None:
+            t = res["twin"]
+            # The twin and head.rs agree to ~1e-12 on the same fits and constants.
+            same = t["validity"] == 0 and t["pos_mm"] <= 1e-6 and t["rot_deg"] <= 1e-6
+            print(
+                "  the Python twin with these constants against the CSV: validity differs on "
+                f"{t['validity']} of its {t['rows']} images; where both are "
+                f"valid ({t['both']}), |position| up to {t['pos_mm']:.1e} mm, |angle| up to "
+                f"{t['rot_deg']:.1e} deg"
+                + (
+                    ""
+                    if same
+                    else "; WARNING: not the CSV's pipeline (other constants, fits or display "
+                    "frame), so the lag reference is not mapped as its poses are"
+                ),
+                flush=True,
+            )
+        results.append(res)
     report(sessions, results)
     verdict = "pass"
     if args.gates != "none":

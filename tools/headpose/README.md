@@ -14,7 +14,7 @@ tests' vectors. Python 3 with NumPy and SciPy, nothing else.
 | `make_vectors.py` | Writes the synthetic test vectors `head.rs`'s tests carry, from `reference.py` and the canonical mesh of `canonical.rs`. No session data. |
 | `common.py` | Reads a session: the TBI5LOG1 log, the DLL's JSONL, the face fits; finds the clock offset, pairs every DLL pose with its image, fits the display frame. Vectorised twins of `reference.py` for whole sessions. |
 | `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON. |
-| `evaluate.py` | Runs `reference.py` over the fits with a set of constants and prints every acceptance metric, lag and rest jitter included, against `gates.json`. |
+| `evaluate.py` | Runs `reference.py` over the fits with a set of constants, or takes the daemon's own poses from `compare-dll --head`'s CSV, and prints every acceptance metric, lag and rest jitter included, against `gates.json`. |
 | `gates.json` | The acceptance gates, per session: the file `compare-dll --head` checks, which `evaluate.py` reads too. |
 | `blaze_face_to_onnx.py` | The conversion of MediaPipe's BlazeFace detector to the ONNX model tobii-pose embeds (its own docstring; needs tflite2onnx). |
 
@@ -82,16 +82,26 @@ face.
            --eye-weight fitted --rotation-filters per-axis
 
    Without options it writes the study's vectors, the ones the tests carry now, byte for byte.
-5. Accept: `tobii5-init-replay compare-dll --head` replays every session through the daemon's own
-   pipeline and checks `gates.json`; `evaluate.py` gives the lag and the rest jitter (G15-G18),
-   which are measured in Python:
+5. Accept: replay every session through the daemon's own pipeline (`HeadStep` with the new
+   `HeadParams::FITTED`), which checks the gates it can (G1-G14) and writes its pose of every
+   image with a DLL pose, for each N:
 
-       tools/headpose/evaluate.py --session ... --params $OUT/fit.json \
-           --reference-fits .../sl_s1.npz --reference-fits .../sl_s2.npz \
-           --reference-fits .../sl_s3.npz
+       target/release/tobii5-init-replay compare-dll LOGN JSONLN --head \
+           --gates tools/headpose/gates.json --csv $OUT/head_sN.csv
 
-   Every gate must pass in every session; the numbers go into the commit message.
-   `evaluate.py --params $OUT/fit.json --loso` gives the leave-one-session-out numbers, and
+   then measure those poses' lag and rest jitter (G15-G18), and every other gate again, with
+   `evaluate.py`, given the same fits and the constants the daemon was built with:
+
+       tools/headpose/evaluate.py --session LOG1 JSONL1 $OUT/fits_s1.csv ... \
+           --params $OUT/fit.json --ours-csv $OUT/head_s1.csv --ours-csv $OUT/head_s2.csv \
+           --ours-csv $OUT/head_s3.csv --reference-fits .../sl_s1.npz \
+           --reference-fits .../sl_s2.npz --reference-fits .../sl_s3.npz
+
+   It also compares the Python twin of those constants with the CSV, image by image: with the
+   daemon's constants and fits they agree on every image's validity and to ~1e-12 mm and deg, and
+   a WARNING says when they do not. Every gate must pass in every session (exit 0); the numbers
+   go into the commit message. Without `--ours-csv` `evaluate.py` evaluates the Python twin:
+   `--params $OUT/fit.json --loso` gives the leave-one-session-out numbers, and
    `--broken zyx|q-transposed|no-q|no-filter` shows which gates catch a broken pipeline.
 
 ## What is measured
@@ -136,6 +146,10 @@ checked against the broken pipelines, which fail at least one gate in every sess
 - **Display frame.** Fitted to the gaze origins the device reports in both frames (0x02/0x08 in
   the tracker frame, 0x22/0x24 in the display frame), which agrees with the display area of the
   Windows sessions to 1e-4 mm; `--area windows` (or nine numbers) takes an area instead.
+- **`--ours-csv`**: `compare-dll --head` writes a row per image with a DLL pose only, so the lag
+  and the rest jitter of its poses are taken over the DLL's span of each session. On the
+  Windows sessions, against the same poses over every image, that moves an axis's lag by 0.8 ms
+  at most (s2's pitch), the lag gates' values by 0.23 ms and the jitter ratios by 0.0002.
 - **Without `--reference-fits`** the lag reference is the evaluated fits' own unfiltered pose.
   Our filter then also delays that reference's noise, which adds to our lag, so `evaluate.py`
   prints the lag and the jitter but leaves G15-G18 unchecked.
