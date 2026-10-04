@@ -221,6 +221,69 @@ impl HeadParams {
         min_centroid_edge_px: 6.0,
         min_nose_tip_edge_px: -4.0,
     };
+
+    /// A fingerprint of the constants, to tell a model by in reports:
+    /// FNV-1a (64 bits) of every number in the order of the fields, each
+    /// `f64` as the little-endian bytes of its bits and each landmark index
+    /// as those of a `u64`. Unlike their `Debug` form, which a Rust release
+    /// may print otherwise, the bytes stay as long as the constants do.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        // Every field, so that one added must be added here too.
+        let Self {
+            rotation_offset,
+            pnp_scale,
+            pnp_point_mm,
+            pnp_direction,
+            eye_rays,
+            eye_contours,
+            eye_range_mm,
+            eye_direction,
+            eye_weight,
+            position_tau_s,
+            correction_tau_s,
+            rotation_filters,
+            rotation_derivative_cutoff_hz,
+            reset_gap_s,
+            min_centroid_edge_px,
+            min_nose_tip_edge_px,
+        } = *self;
+        let direction = |map: DirectionMap| [map.gain, map.offset[0], map.offset[1]];
+        let RayIntrinsics { fu, cu, fv, cv } = eye_rays;
+        let numbers = rotation_offset
+            .into_iter()
+            .flatten()
+            .chain([pnp_scale])
+            .chain(pnp_point_mm)
+            .chain(direction(pnp_direction))
+            .chain([fu, cu, fv, cv])
+            .map(f64::to_bits)
+            // cast: a landmark index, below 468
+            .chain(eye_contours.into_iter().flatten().map(|i| i as u64))
+            .chain(
+                [eye_range_mm]
+                    .into_iter()
+                    .chain(direction(eye_direction))
+                    .chain([eye_weight, position_tau_s, correction_tau_s])
+                    .chain(
+                        rotation_filters
+                            .into_iter()
+                            .flat_map(|f| [f.min_cutoff_hz, f.beta]),
+                    )
+                    .chain([
+                        rotation_derivative_cutoff_hz,
+                        reset_gap_s,
+                        min_centroid_edge_px,
+                        min_nose_tip_edge_px,
+                    ])
+                    .map(f64::to_bits),
+            );
+        numbers
+            .flat_map(u64::to_le_bytes)
+            .fold(0xcbf2_9ce4_8422_2325, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
 }
 
 /// One head pose, as the Stream Engine reports it.
@@ -1125,6 +1188,48 @@ mod tests {
         );
     }
 
+    /// The fingerprint changes with each constant, and FITTED's is pinned:
+    /// it changes with them, or with how the fingerprint reads them.
+    #[test]
+    fn the_fingerprint_follows_every_constant() {
+        let fitted = HeadParams::FITTED.fingerprint();
+        assert_eq!(fitted, HeadParams::FITTED.fingerprint());
+        assert_eq!(fitted, FITTED_FINGERPRINT, "{fitted:016x}");
+        let changed = |change: fn(&mut HeadParams)| {
+            let mut params = HeadParams::FITTED;
+            change(&mut params);
+            params.fingerprint()
+        };
+        let prints = [
+            changed(|p| p.rotation_offset[2][1] += 1e-9),
+            changed(|p| p.pnp_scale = 0.97),
+            changed(|p| p.pnp_point_mm[2] = -36.0),
+            changed(|p| p.pnp_direction.gain = 1.0),
+            changed(|p| p.pnp_direction.offset[1] = 0.0),
+            changed(|p| p.eye_rays.fu = -376.0),
+            changed(|p| p.eye_rays.cu = 140.0),
+            changed(|p| p.eye_rays.fv = -383.0),
+            changed(|p| p.eye_rays.cv = 140.0),
+            changed(|p| p.eye_contours[1][15] = 467),
+            changed(|p| p.eye_range_mm = 64.0),
+            changed(|p| p.eye_direction.gain = 1.0),
+            changed(|p| p.eye_direction.offset[0] = 0.0),
+            changed(|p| p.eye_weight = 0.383),
+            changed(|p| p.position_tau_s = 0.07),
+            changed(|p| p.correction_tau_s = 0.07),
+            changed(|p| p.rotation_filters[2].min_cutoff_hz = 1.5),
+            changed(|p| p.rotation_filters[0].beta = 0.4),
+            changed(|p| p.rotation_derivative_cutoff_hz = 1.2),
+            changed(|p| p.reset_gap_s = 1.000_000_000_000_001),
+            changed(|p| p.min_centroid_edge_px = 6.5),
+            changed(|p| p.min_nose_tip_edge_px = -3.5),
+        ];
+        for (i, print) in prints.iter().enumerate() {
+            assert_ne!(*print, fitted, "change {i}");
+            assert!(!prints[..i].contains(print), "change {i}");
+        }
+    }
+
     #[test]
     fn euler_yxz_and_compose_yxz_match_the_vectors() {
         for v in &EULER {
@@ -1861,6 +1966,11 @@ mod tests {
         assert!(!out.head.valid && out.error.is_some());
         assert_eq!(out.model_runs, runs);
     }
+
+    /// [`HeadParams::fingerprint`] of [`HeadParams::FITTED`], as Python
+    /// packing the same numbers with `struct` gets it too. It changes with
+    /// the constants.
+    const FITTED_FINGERPRINT: u64 = 0x8443_11fe_3b47_e7ed;
 
     // The study's test vectors (`test_vectors.json`, generated by its
     // Python reference implementation), as its generator wrote them.

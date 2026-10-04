@@ -732,21 +732,11 @@ struct Replay {
     undecoded: usize,
     /// Images the tracker failed on, and the first error.
     tracker_errors: (usize, Option<String>),
-    /// The fingerprint of the model's constants ([`fingerprint`]).
+    /// The fingerprint of the model's constants
+    /// ([`HeadParams::fingerprint`]).
     fingerprint: u64,
     /// How long the whole replay took, s.
     seconds: f64,
-}
-
-/// A fingerprint of the head pose model's constants: FNV-1a (64 bits) of
-/// their `Debug` form, which has every field and each number in the
-/// shortest form that reads back to it.
-fn fingerprint(params: &HeadParams) -> u64 {
-    format!("{params:?}")
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        })
 }
 
 /// Replay every image of a log's records, in log order, through the
@@ -762,7 +752,7 @@ fn replay(payloads: &[Vec<u8>], display: &DisplayFrame) -> Result<Replay> {
         frames: Vec::new(),
         undecoded: 0,
         tracker_errors: (0, None),
-        fingerprint: fingerprint(step.params()),
+        fingerprint: step.params().fingerprint(),
         seconds: 0.0,
     };
     let mut runs_before = step.model_runs();
@@ -2308,7 +2298,7 @@ mod tests {
             assert_eq!((f.cost.landmark_runs, f.cost.detector_runs), runs, "{f:?}");
         }
         assert_eq!((replay.undecoded, &replay.tracker_errors), (1, &(0, None)));
-        assert_eq!(replay.fingerprint, fingerprint(&HeadParams::FITTED));
+        assert_eq!(replay.fingerprint, HeadParams::FITTED.fingerprint());
     }
 
     /// The tracker-frame and display-frame points of `points` through area
@@ -2776,15 +2766,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The fingerprint follows every constant.
-    #[test]
-    fn the_fingerprint_changes_with_the_constants() {
-        let fitted = HeadParams::FITTED;
-        let mut other = fitted;
-        other.reset_gap_s = 1.000_000_000_000_001;
-        assert_eq!(fingerprint(&fitted), fingerprint(&HeadParams::FITTED));
-        assert_ne!(fingerprint(&fitted), fingerprint(&other));
     }
 }
