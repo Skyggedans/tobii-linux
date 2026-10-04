@@ -1584,6 +1584,27 @@ mod tests {
     }
 
     #[test]
+    fn rest_pose_reads_the_rotation_from_a_rest_pose_that_is_not_straight_ahead() {
+        // Calibrated on a head at pitch -8°, yaw 12° and roll 3° in the
+        // upright frame (`from_euler_deg`'s angles), not facing the camera.
+        let lm = eye_line(0.0);
+        let at_rest = upright([-8.0, 12.0, 3.0]);
+        let calibrated_turned = || {
+            let mut rest = RestPose::default();
+            calibrate(&mut rest, &synthetic(at_rest, REST, &lm));
+            rest
+        };
+        // The rest pose itself then reads as no rotation and no move.
+        let out = calibrated_turned().update(Some(&synthetic(at_rest, REST, &lm)));
+        assert_close(&out.unwrap(), &[0.0; 6]);
+        // A further rotation of pitch 10° and yaw 20° from there reads as
+        // exactly that, with MediaPipe's signs (yaw negated).
+        let turned = matmul3(&upright([10.0, 20.0, 0.0]), &at_rest);
+        let out = calibrated_turned().update(Some(&synthetic(turned, REST, &lm)));
+        assert_close(&out.unwrap()[3..], &[-20.0, 10.0, 0.0]);
+    }
+
+    #[test]
     fn rest_pose_moves_the_translation_to_the_neck_pivot() {
         let lm = eye_line(0.0);
         let mut rest = RestPose::default();
