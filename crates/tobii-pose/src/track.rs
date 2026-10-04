@@ -283,7 +283,7 @@ impl Crop {
 /// c + Rot(angle)·((o + 0.5)/`IN`·2h − h) (the edge pixels carried on past
 /// the frame's edges), normalised to [0, 1], in all three channels. The
 /// offsets from the centre are stepped in f32; each position is worked out
-/// in f64 and rounded to f32 for the sampler.
+/// in f64 and rounded to f32 for the sampler (`bilinear_input`).
 // reason: a sample position, frame pixels plus at most a crop's diagonal, is
 // rounded to the f32 the sampler works in (num-cast-try-from).
 #[allow(clippy::cast_possible_truncation)]
@@ -299,7 +299,7 @@ fn sample_crop(gray: &[u8], w: usize, h: usize, crop: &Crop, input: &mut [f32]) 
             let dx = f64::from(dx);
             let sx = (crop.cx + c * dx - s * dy - 0.5) as f32;
             let sy = (crop.cy + s * dx + c * dy - 0.5) as f32;
-            *px = [bilinear(gray, w, h, sx, sy) / 255.0; 3];
+            *px = [bilinear_input(gray, w, h, sx, sy); 3];
         }
     }
 }
@@ -359,23 +359,34 @@ impl FaceModel {
     }
 }
 
+/// The `w`x`h` grey frame `g` at the position `(x, y)` (clamped to the
+/// frame, so the edge pixels carry on past its edges) as the landmark model
+/// takes it: the bilinear blend of the four pixels around it over 255, in
+/// [0, 1]. The position is f32; its fractions, the blend and the division
+/// are worked out in f64 and the result rounded to f32 once. The Python
+/// reference the tracker was validated with does the same, `NumPy`
+/// promoting an f32 position less an integer pixel index to f64. Blending in
+/// f32 instead changes many of the values by a unit in the last place
+/// (18,823 of the 65,536 of a test grid), and the crop, fed back from frame
+/// to frame, drifts off the reference's.
 // reason: `x`/`y` are clamped to `[0, w-1]`/`[0, h-1]` first, so the
-// floor->usize cast is in range and non-negative (num-cast-try-from).
+// floor->usize cast is in range and non-negative; the result, within
+// [0, 1], is rounded to the f32 the model takes (num-cast-try-from).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[must_use]
-fn bilinear(g: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
+fn bilinear_input(g: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
     let x0 = x.floor() as usize; // cast: clamped to [0, w-1] above
     let y0 = y.floor() as usize; // cast: clamped to [0, h-1] above
     let x1 = (x0 + 1).min(w - 1);
     let y1 = (y0 + 1).min(h - 1);
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-    let p = |xx: usize, yy: usize| f32::from(g[yy * w + xx]);
+    let fx = f64::from(x) - x0 as f64;
+    let fy = f64::from(y) - y0 as f64;
+    let p = |xx: usize, yy: usize| f64::from(g[yy * w + xx]);
     let top = p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx;
     let bot = p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx;
-    top * (1.0 - fy) + bot * fy
+    ((top * (1.0 - fy) + bot * fy) / 255.0) as f32 // cast: within [0, 1]
 }
 
 /// Rotation (canonical -> observed) via Horn's quaternion method on the
@@ -1594,7 +1605,7 @@ mod tests {
             let sy = y0 + (oy as f32 + 0.5) / IN as f32 * span - 0.5;
             for (ox, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let sx = x0 + (ox as f32 + 0.5) / IN as f32 * span - 0.5;
-                *px = [bilinear(gray, w, h, sx, sy) / 255.0; 3];
+                *px = [bilinear_input(gray, w, h, sx, sy); 3];
             }
         }
         input
@@ -1633,6 +1644,45 @@ mod tests {
                 &axis_aligned_input(&gray, n, n, cx, cy, half),
             );
             assert!(diff < 1e-4, "({cx}, {cy}, {half}): {diff}");
+        }
+    }
+
+    #[test]
+    fn the_sampler_blends_as_the_python_reference_does() {
+        // The blend of the Python reference's sample_crop (the head-pose
+        // study's work/face-loss/tracker.py, NumPy 2.4.6) on
+        // `textured_frame(560, 560)` at x = 2.1 i + 0.3, y = 2.1 j + 1.7
+        // (f32 arithmetic, i and j 0..256): the sum of the 65,536 values'
+        // f32 bits, the sum weighted by their row-major index + 1, and a few
+        // of the values. Blended in f32, 18,823 of them are a unit in the
+        // last place off, and the sums 69_126_199_415_935 and
+        // 2_265_146_503_021_151_219.
+        let n = 560;
+        let gray = textured_frame(n, n);
+        let at = |i: usize, j: usize| {
+            let (x, y) = (2.1f32 * i as f32 + 0.3, 2.1f32 * j as f32 + 1.7);
+            bilinear_input(&gray, n, n, x, y).to_bits()
+        };
+        let (mut sum, mut weighted) = (0u64, 0u64);
+        for j in 0..IN {
+            for i in 0..IN {
+                let bits = u64::from(at(i, j));
+                sum += bits;
+                weighted += u64::try_from(j * IN + i + 1).unwrap() * bits;
+            }
+        }
+        assert_eq!(sum, 69_126_199_415_918);
+        assert_eq!(weighted, 2_265_146_503_017_149_028);
+        // (i, j): the reference's value; in f32, 0x3f61e1ac, 0x3eeeda1c,
+        // 0x3f24d6f2, 0x3ecf6901 and (alike) 0x3e196633.
+        for (i, j, bits) in [
+            (17, 3, 0x3f61_e1ab),
+            (31, 200, 0x3eee_da1d),
+            (255, 255, 0x3f24_d6f1),
+            (1, 0, 0x3ecf_6902),
+            (0, 0, 0x3e19_6633),
+        ] {
+            assert_eq!(at(i, j), bits, "({i}, {j})");
         }
     }
 
