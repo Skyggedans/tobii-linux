@@ -24,10 +24,10 @@ only in the standalone research subcommands (`camera`, `track`, `probe`).
 ## 1. Prerequisites
 
 - Rust toolchain (stable) + Cargo.
-- The repo includes the model (`crates/tobii-pose/models/face_landmarks.onnx`)
-  and the init capture (`crates/tobii-usb/init_packets_ep.txt`); both are
-  embedded at **build** time, so no runtime
-  data files are needed.
+- The repo includes the models (`face_landmarks.onnx` and
+  `blaze_face_short_range.onnx` in `crates/tobii-pose/models/`) and the init
+  capture (`crates/tobii-usb/init_packets_ep.txt`); all are embedded at
+  **build** time, so no runtime data files are needed.
 - A Tobii Eye Tracker 5 plugged in.
 
 ## 2. Build
@@ -57,7 +57,7 @@ embedded assets (it is ~0.45 MB rather than ~20 MB).
 | Crate | What it holds | Heavy deps |
 |---|---|---|
 | `tobii-proto` | wire formats: framing, TLV, commands and responses, the 0x500/0x504/0x50e streams, device facts, the `TBI5LOG1` log | none |
-| `tobii-pose` | face landmarks and the head-pose fit; owns `models/` | `ort` |
+| `tobii-pose` | face landmarks, face detection and the head-pose fit; owns `models/` | `ort` |
 | `tobii-usb` | USB transport and the live 0x83 engine; owns `init_packets_ep.txt` | `rusb` |
 | `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
@@ -325,7 +325,7 @@ tracker runs in the daemon, not in the client):
 | `TOBII_PREWARM` | unset | `1` (or the historical `head` / `gaze`): init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). |
 | `TOBII_NO_RESET` | unset | `1` skips the USB reset the engine tries once opens keep failing, after two failures in a row: opens whose init fails, that do not arm the stream (bar the first after a start or a lost stream: the tracker needs that one to arm), or that lose it within 30 s (until the engine waited out a tracker starting its sensor, every open right after the reset failed its init on a 2 s write timeout; whether the reset helps is unconfirmed on hardware) |
 | `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
-| `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate and inference time every 5 s (an `info` event with `frames_per_s`/`poses_per_s`/`mean_ms` fields) |
+| `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's frame/pose rate, inference time and face-detector rate (how often the tracker looked for a lost face) every 5 s (an `info` event with `frames_per_s`/`poses_per_s`/`mean_ms`/`detector_runs_per_s` fields) |
 | `RUST_LOG` | `info` | log filter for all binaries (`debug`, `tobii=debug,ort=warn`, …); see §6 |
 | `TOBII_DISPLAY_MM` | unset | your monitor as `<width>x<height>[+<offset_x>]` in mm, e.g. `597x336`: once the tracker reports its mounting, the daemon computes the display area (the Stream Engine's `tobii_calculate_display_area_basic`) and writes it, replacing the capture author's monitor that the init replay configures. Gaze coordinates are relative to this area. `offset_x` is how far right of the tracker the screen centre is. Usually unneeded: `tobii-calibrate` sets the display area and the daemon keeps it (§8a); a saved display area wins over this variable, which only fills in while nothing is saved (delete `~/.config/tobii/display-area` to use it). |
 | `TOBII_CALIBRATION` | unset | where the calibration is kept (default `$XDG_CONFIG_HOME/tobii/calibration.bin`), or `embedded` to use the built-in one (§8a) |

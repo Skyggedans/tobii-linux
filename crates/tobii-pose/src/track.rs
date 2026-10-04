@@ -3,16 +3,18 @@
 //! `MediaPipe` does), run the `MediaPipe` face-landmark model via ONNX
 //! Runtime (`ort`) and fit the canonical face mesh to the landmarks (Kabsch
 //! start, perspective `PnP`): [`Tracker::fit`] gives that [`FaceFit`] per
-//! frame. [`RestPose`] reads the legacy yaw/pitch/roll and translation
-//! relative to a calibrated rest pose out of the fits. Validated against
-//! `MediaPipe` to within ~3 degrees.
+//! frame. A face the crop has lost is looked for in the whole frame with
+//! `MediaPipe`'s `BlazeFace` detector. [`RestPose`] reads the legacy
+//! yaw/pitch/roll and translation relative to a calibrated rest pose out of
+//! the fits. Validated against `MediaPipe` to within ~3 degrees.
 
 use anyhow::{Context, Result, ensure};
 use ort::session::Session;
 use ort::value::TensorRef;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::canonical::CANONICAL_FACE;
+use crate::detect::{Detection, FaceDetector};
 
 // MediaPipe Face Mesh V2 converted to ONNX; Apache-2.0, see models/README.md.
 const MODEL: &[u8] = include_bytes!("../models/face_landmarks.onnx");
@@ -33,9 +35,8 @@ const PIVOT_NECK_BACK_CM: f64 = 6.0;
 const SMOOTH: f64 = 0.5;
 const CALIB_FRAMES: usize = 30;
 const CLAMP_DEG: f64 = 45.0;
-/// UVC camera (560x560 frames): half-size (px) of the first crop and of the
-/// search crops, and the height of the first crop's centre (fraction of the
-/// frame).
+/// UVC camera (560x560 frames): half-size (px) of the first crop and the
+/// height of its centre (fraction of the frame).
 const CROP_HALF: f32 = 160.0;
 const CY_FRAC: f64 = 0.42;
 const FOCAL: f64 = 457.0; // ~63deg vertical FOV on a 560px frame (matches MediaPipe)
@@ -45,17 +46,17 @@ const FOCAL: f64 = 457.0; // ~63deg vertical FOV on a 560px frame (matches Media
 /// f = 376 px in the 280 frame (r² 0.999), i.e. 752 px at 560.
 const IMAGE83_FOCAL: f64 = 752.0;
 const IMAGE83_CY_FRAC: f64 = 0.5;
-/// Half-size (px at 560) of the first 0x50e face crop and of every crop of
-/// the search grid; once a face is found, the crop takes its size from the
-/// landmarks instead (about this size at 65-75 cm). Replaying the Windows
-/// captures, an upright crop of half-size 110 that followed the landmarks'
-/// centroid kept the face in 80.2 and 85.8 % of the frames in which the
-/// Stream Engine had one, in the two captures with large turns (100 % in
-/// the third); turned and sized as below, with this start and search size,
-/// in 94.7 and 99.1 %.
+/// Half-size (px at 560) of the first 0x50e face crop; once a face is found,
+/// the crop takes its size from the landmarks instead (about this size at
+/// 65-75 cm). Replaying the Windows captures, an upright crop of half-size
+/// 110 that followed the landmarks' centroid, with a 3x3 grid of such crops
+/// to search for a lost face, kept the face in 80.2 and 85.8 % of the frames
+/// in which the Stream Engine had one, in the two captures with large turns
+/// (100 % in the third); turned and sized as below, with this start size
+/// and the face detector instead of the grid, in 96.8 and 99.9 %.
 const IMAGE83_CROP_HALF: f32 = 150.0;
 /// Bounds (px at 560) of the half-size a 0x50e crop takes from the
-/// landmarks.
+/// landmarks or from a detection.
 const IMAGE83_MIN_HALF: f32 = 120.0;
 const IMAGE83_MAX_HALF: f32 = 200.0;
 /// `MediaPipe`'s face region: the crop's side is 1.5x the long side of the
@@ -71,41 +72,45 @@ const EYE_LINE: (usize, usize) = (33, 263);
 /// 11° roll and a 20° tilt as 19° roll + 7° yaw. Override: `TOBII_CAMERA_TILT_DEG`.
 const CAMERA_TILT_DEG: f64 = 20.0;
 
-/// Where the frames given to [`Tracker::fit`] come from and how the face
-/// crop is sized in them: the camera's square image, enlarged `upscale`
-/// times; a pinhole camera of focal length `focal` whose principal point is
-/// the frame's centre; and the crop's start size and limits. All sizes but
-/// `native_size` are in the pixels of the enlarged frame.
+/// The frames [`Tracker::fit`] takes and how the face crop is sized in them:
+/// the camera's square image, which the tracker enlarges `upscale` times
+/// (nearest neighbour) for the landmark model, while the face detector sees
+/// it as it came; a pinhole camera of focal length `focal` whose principal
+/// point is the enlarged frame's centre; and the crop's start size and
+/// limits. All sizes but `native_size` are in the pixels of the enlarged
+/// frame.
 ///
 /// [`Geometry::IMAGE83`] is the device's own IR stream, [`Geometry::UVC`]
 /// the UVC camera of the `track` research command.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Geometry {
-    /// Side (px) of the camera's square image.
+    /// Side (px) of the camera's square image, the frames given to
+    /// [`Tracker::fit`].
     pub native_size: usize,
-    /// How many times larger the frames given to [`Tracker::fit`] are than
-    /// the camera's image.
+    /// How many times the tracker enlarges those frames for the landmark
+    /// model.
     pub upscale: usize,
     /// Focal length (px).
     pub focal: f64,
-    /// Half-size (px) of the first crop and of the search crops, which are
-    /// upright.
+    /// Half-size (px) of the first crop, which is upright.
     pub start_half: f32,
     /// Height of the first crop's centre, as a fraction of the frame's; it
     /// is centred across.
     pub cy_frac: f64,
-    /// Smallest half-size (px) a crop takes from the landmarks.
+    /// Smallest half-size (px) a crop takes from the landmarks or from a
+    /// detection.
     pub min_half: f32,
-    /// Largest half-size (px) a crop takes from the landmarks.
+    /// Largest half-size (px) a crop takes from the landmarks or from a
+    /// detection.
     pub max_half: f32,
 }
 
 impl Geometry {
-    /// The device's own 280x280 IR stream (EP 0x83, stream 0x50e), given to
-    /// the tracker upscaled 2x (`image83::upscale2x_into`): 560x560 frames,
-    /// focal length 752 px; crops start at half-size 150 and take 120-200
-    /// from the landmarks.
+    /// The device's own 280x280 IR stream (EP 0x83, stream 0x50e), which the
+    /// tracker enlarges 2x: 560x560 for the landmark model, focal length
+    /// 752 px at 560; crops start at half-size 150 and take 120-200 from the
+    /// landmarks or a detection.
     pub const IMAGE83: Self = Self {
         native_size: 280,
         upscale: 2,
@@ -119,9 +124,9 @@ impl Geometry {
     /// The UVC camera on interface 2 (the `track` research command):
     /// 560x560 frames as they come, focal length 457 px; crops start at
     /// half-size 160 at 0.42 of the frame's height. The limits of a crop
-    /// sized from the landmarks are the 0x50e stream's scaled by the ratio
-    /// of the start sizes (160 / 150): 128-213. They have never been
-    /// validated on this camera.
+    /// sized from the landmarks or a detection are the 0x50e stream's scaled
+    /// by the ratio of the start sizes (160 / 150): 128-213. Neither they nor
+    /// the face detector on this camera's frames have ever been validated.
     pub const UVC: Self = Self {
         native_size: 560,
         upscale: 1,
@@ -132,11 +137,34 @@ impl Geometry {
         max_half: CROP_HALF * (IMAGE83_MAX_HALF / IMAGE83_CROP_HALF),
     };
 
-    /// Side (px) of the frames given to [`Tracker::fit`]: the camera's
+    /// Side (px) of the frame the landmark model crops from: the camera's
     /// image enlarged `upscale` times.
     #[must_use]
     pub const fn frame_size(&self) -> usize {
         self.native_size.saturating_mul(self.upscale)
+    }
+}
+
+/// Enlarge the `n`x`n` grey `frame` `factor` times into `out` (resized to
+/// fit): each pixel becomes a `factor`x`factor` block (nearest neighbour; for
+/// a factor of 2 the same as `tobii_proto::image83::upscale2x_into`, through
+/// which the tracker's callers used to enlarge the 0x50e stream's frames).
+/// `frame` holds at least `n * n` pixels; `n` and `factor` are not 0.
+fn upscale_into(frame: &[u8], n: usize, factor: usize, out: &mut Vec<u8>) {
+    let side = n * factor;
+    out.clear();
+    out.resize(side * side, 0);
+    for (row, block) in frame
+        .chunks_exact(n)
+        .zip(out.chunks_exact_mut(side * factor))
+    {
+        let (first, copies) = block.split_at_mut(side);
+        for (px, &v) in first.chunks_exact_mut(factor).zip(row) {
+            px.fill(v);
+        }
+        for copy in copies.chunks_exact_mut(side) {
+            copy.copy_from_slice(first);
+        }
     }
 }
 
@@ -197,6 +225,29 @@ impl Crop {
             cy: s * mid[0] + c * mid[1],
             half: half as f32, // cast: clamped to two f32s above
             angle,
+        }
+    }
+
+    /// The crop for a face the detector found in the camera's image, in the
+    /// pixels of a `geometry` frame (the image enlarged `upscale` times):
+    /// centred on the detection's box, turned by its eyes (the keypoint of
+    /// the eye on the image's left to the other), its half-size the
+    /// landmarks' rule on the box, 0.75x its long side (`ROI_SCALE`), clamped
+    /// to `[min_half, max_half]`.
+    // reason: the half-size is clamped to [min_half, max_half], two f32s,
+    // before it is rounded back to f32 (num-cast-try-from).
+    #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
+    fn from_detection(d: &Detection, geometry: &Geometry) -> Self {
+        let up = geometry.upscale as f64;
+        let (a, b) = (d.keypoints[0], d.keypoints[1]);
+        let half = (ROI_SCALE / 2.0 * up * d.w.max(d.h))
+            .clamp(f64::from(geometry.min_half), f64::from(geometry.max_half));
+        Self {
+            cx: up * (d.x + d.w / 2.0),
+            cy: up * (d.y + d.h / 2.0),
+            half: half as f32, // cast: clamped to two f32s above
+            angle: (b[1] - a[1]).atan2(b[0] - a[0]),
         }
     }
 
@@ -660,8 +711,8 @@ pub(crate) fn canonical_f64() -> Vec<[f64; 3]> {
 /// nose points to -z).
 ///
 /// It borrows the tracker's landmark buffer, so it lasts until the next
-/// frame. Only this crate builds one, so fields can be added (how the face
-/// was found, say) without breaking a reader.
+/// frame. Only this crate builds one, so fields can be added without
+/// breaking a reader.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FaceFit<'a> {
     /// Rotation of the mesh into the camera frame (object -> camera; camera x
@@ -671,13 +722,19 @@ pub struct FaceFit<'a> {
     /// The mesh origin in the camera frame, mm.
     pub translation_mm: [f64; 3],
     /// The 468 landmarks in the pixels of the frame given to
-    /// [`Tracker::fit`]: x right, y down, pixel k spanning `[k, k + 1)`, so
-    /// the frame centre, the fit's principal point, is (w/2, h/2). The 0x50e
-    /// stream is fit upscaled 2x; halve them for its own 280x280 image.
+    /// [`Tracker::fit`], the camera's own image: x right, y down, pixel k
+    /// spanning `[k, k + 1)`. In these pixels the fit's camera has its
+    /// principal point at the frame's centre and the focal length
+    /// [`Geometry::focal`] / [`Geometry::upscale`] (376 px for the 0x50e
+    /// stream's 280x280 image).
     pub landmarks: &'a [[f64; 2]; NLM],
     /// The landmark model's face-presence score, a logit. Never negative:
     /// below zero the tracker reports no face.
     pub score: f32,
+    /// Whether the face detector found the face on this frame: the crop that
+    /// followed the face lost it, or the face had been lost before, and the
+    /// landmark model found it where the detector put the crop.
+    pub found_by_detector: bool,
     /// `translation_mm` in cm, exactly as the solver returned it. The legacy
     /// pose is computed in cm, and a cm -> mm -> cm round trip changes the
     /// last bit of about one value in eleven.
@@ -691,46 +748,74 @@ impl<'a> FaceFit<'a> {
         translation_cm: [f64; 3],
         landmarks: &'a [[f64; 2]; NLM],
         score: f32,
+        found_by_detector: bool,
     ) -> Self {
         Self {
             rotation,
             translation_mm: translation_cm.map(|v| v * 10.0),
             landmarks,
             score,
+            found_by_detector,
             translation_cm,
         }
     }
 }
 
-/// Live head-pose tracker: face-following crop, landmark inference and the
-/// perspective fit ([`Tracker::fit`]), plus the legacy pose relative to a
-/// calibrated rest pose: `process` returns the `OpenTrack` pose
-/// [TX, TY, TZ, Yaw, Pitch, Roll] of its own [`RestPose`] once calibrated,
-/// else `None`.
+/// How many times a [`Tracker`] has run each model since it was made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ModelRuns {
+    /// Landmark-model runs: one on every frame the crop follows the face
+    /// into, and one more on every frame on which the detector finds a face.
+    pub landmarks: u64,
+    /// Face-detector runs: one on every frame the crop loses the face on or
+    /// does not follow it into, because the last frame had none.
+    pub detector: u64,
+}
+
+/// Live head-pose tracker: face-following crop, landmark inference, the face
+/// detector for a face the crop lost and the perspective fit
+/// ([`Tracker::fit`]), plus the legacy pose relative to a calibrated rest
+/// pose: `process` returns the `OpenTrack` pose [TX, TY, TZ, Yaw, Pitch,
+/// Roll] of its own [`RestPose`] once calibrated, else `None`.
 pub struct Tracker {
     face: FaceFitter,
     rest: RestPose,
 }
 
 /// The half of [`Tracker`] that makes a [`FaceFit`] of each frame: the
-/// face-following crop, the landmark model and the perspective fit.
+/// face-following crop, the landmark model, the face detector and the
+/// perspective fit.
 struct FaceFitter {
-    model: FaceModel,
+    models: Models,
     canonical: Vec<[f64; 3]>,
-    /// Landmarks in full-frame pixels (reused every frame).
+    /// The frame enlarged `geometry.upscale` times, when that is more than
+    /// once (reused every frame).
+    upscaled: Vec<u8>,
+    /// Landmarks in the enlarged frame's pixels (reused every frame).
     image2d: Vec<[f64; 2]>,
     /// Landmarks as the Kabsch start takes them: x, y in model input pixels
     /// turned into the frame's axes, z as the model gives it (reused every
     /// frame).
     observed: Vec<[f64; 3]>,
+    /// Landmarks in the pixels of the frame given to [`Tracker::fit`], as
+    /// [`FaceFit::landmarks`] (reused every frame).
+    landmarks: Box<[[f64; 2]; NLM]>,
     geometry: Geometry,
-    /// Where the next frame is cropped while the face is tracked: the start
-    /// crop until a face is found, then the region of the last face's
+    /// Where the next frame is cropped while the face is followed: the
+    /// start crop until a face is found, then the region of the last face's
     /// landmarks.
     crop: Crop,
-    /// While the face is lost: index into `SEARCH_GRID` of the crop centre to
-    /// try on the next frame (one candidate per frame); `None` once tracking.
-    searching: Option<usize>,
+    /// Whether the last frame had no face: the next one goes to the face
+    /// detector first.
+    lost: bool,
+}
+
+/// The landmark model and the face detector, and how often each has run.
+struct Models {
+    landmark: FaceModel,
+    detector: FaceDetector,
+    runs: ModelRuns,
 }
 
 /// The legacy head pose, the one tobiid publishes on the `HEAD` stream: each
@@ -767,30 +852,6 @@ pub struct RestPose {
     untilt: [[f64; 3]; 3],
 }
 
-/// Crop centres (fractions of frame width/height) cycled while the face is
-/// lost. Centre first, then the cardinal offsets, then the corners; a 3x3 grid
-/// with a face-sized crop covers the whole frame within 9 frames (~0.3 s).
-const SEARCH_GRID: [(f64, f64); 9] = [
-    (0.5, 0.5),
-    (0.5, 0.25),
-    (0.5, 0.75),
-    (0.25, 0.5),
-    (0.75, 0.5),
-    (0.25, 0.25),
-    (0.75, 0.25),
-    (0.25, 0.75),
-    (0.75, 0.75),
-];
-
-/// The crop the search tries at `SEARCH_GRID` position `i` (cycled) of a
-/// `geometry` frame: upright, of the start size.
-#[must_use]
-fn search_crop(i: usize, geometry: &Geometry) -> Crop {
-    let (fx, fy) = SEARCH_GRID[i % SEARCH_GRID.len()];
-    let side = geometry.frame_size() as f64;
-    Crop::upright(side * fx, side * fy, geometry.start_half)
-}
-
 fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key)
         .ok()
@@ -803,17 +864,16 @@ impl Tracker {
     /// `MediaPipe`-like FOV).
     ///
     /// # Errors
-    /// Fails when the landmark model cannot be loaded.
+    /// Fails when a model cannot be loaded.
     pub fn new() -> Result<Self> {
         Self::with_geometry(Geometry::UVC)
     }
 
     /// Tracker for the 0x50e image stream ([`Geometry::IMAGE83`]): feed it
-    /// 280x280 frames upscaled 2x (`image83::upscale2x_into`), i.e. 560x560
-    /// at the fitted focal length.
+    /// the stream's 280x280 frames as they come.
     ///
     /// # Errors
-    /// Fails when the landmark model cannot be loaded.
+    /// Fails when a model cannot be loaded.
     pub fn new_image83() -> Result<Self> {
         Self::with_geometry(Geometry::IMAGE83)
     }
@@ -825,19 +885,46 @@ impl Tracker {
     /// overrides ([`RestPose::from_env`]).
     ///
     /// # Errors
-    /// Fails when the landmark model cannot be loaded.
+    /// Fails when `geometry` has no pixels (a size or factor of 0), an
+    /// enlarged frame too large to address, or crop limits that are not two
+    /// numbers in order; or when a model cannot be loaded.
     pub fn with_geometry(geometry: Geometry) -> Result<Self> {
+        let side = geometry.frame_size();
+        ensure!(
+            geometry.native_size > 0
+                && geometry.upscale > 0
+                && geometry.native_size.checked_mul(geometry.upscale) == Some(side)
+                && side.checked_mul(side).is_some(),
+            "a tracker for {}x{} frames enlarged {} times",
+            geometry.native_size,
+            geometry.native_size,
+            geometry.upscale
+        );
+        ensure!(
+            geometry.min_half.is_finite()
+                && geometry.max_half.is_finite()
+                && geometry.min_half <= geometry.max_half,
+            "crop half-sizes from {} to {}",
+            geometry.min_half,
+            geometry.max_half
+        );
         let rest = RestPose::from_env();
-        let side = geometry.frame_size() as f64;
+        let side = side as f64;
         Ok(Self {
             face: FaceFitter {
-                model: FaceModel::new()?,
+                models: Models {
+                    landmark: FaceModel::new()?,
+                    detector: FaceDetector::new()?,
+                    runs: ModelRuns::default(),
+                },
                 canonical: canonical_f64(),
+                upscaled: Vec::new(),
                 image2d: Vec::with_capacity(NLM),
                 observed: Vec::with_capacity(NLM),
+                landmarks: Box::new([[0.0; 2]; NLM]),
                 geometry,
                 crop: Crop::upright(side / 2.0, side * geometry.cy_frac, geometry.start_half),
-                searching: None,
+                lost: false,
             },
             rest,
         })
@@ -850,24 +937,36 @@ impl Tracker {
         self.rest.last_raw()
     }
 
+    /// How many times the tracker has run each model.
+    #[must_use]
+    pub fn model_runs(&self) -> ModelRuns {
+        self.face.models.runs
+    }
+
     /// Drop the calibrated rest pose so it recalibrates from the next frames.
     pub fn recenter(&mut self) {
         self.rest.recenter();
     }
 
     /// Fit the face mesh to one `w`x`h` grayscale frame of the tracker's
-    /// [`Geometry`]; `None` when the landmark model finds no face in the crop
-    /// (it then tries the next `SEARCH_GRID` position, upright and of the
-    /// start size, on the next frame). The crop follows the face from frame
-    /// to frame, turned by its eye line and sized from its landmarks.
+    /// [`Geometry`], the camera's image as it came; `None` when no face is
+    /// found. The tracker enlarges the frame for the landmark model itself.
+    ///
+    /// The crop follows the face from frame to frame, turned by its eye line
+    /// and sized from its landmarks. When the landmark model finds no face in
+    /// it, or the last frame had none, the face detector looks for one in the
+    /// whole frame, and the landmark model tries once more in a crop around
+    /// the best detection (`Crop::from_detection`): at most two landmark runs
+    /// and one detector run per frame.
     ///
     /// The fit borrows the tracker until the next frame. It leaves the legacy
     /// pose alone: `process` is `fit` followed by the tracker's [`RestPose`].
     ///
     /// # Errors
-    /// Fails when the frame is not [`Geometry::frame_size`] pixels square or
-    /// `gray` holds fewer than `w * h` of them, when landmark inference fails
-    /// or when the model returns fewer than 468 landmarks.
+    /// Fails when the frame is not [`Geometry::native_size`] pixels square or
+    /// `gray` holds fewer than `w * h` of them, when landmark inference or
+    /// face detection fails, or when the landmark model returns fewer than
+    /// 468 landmarks.
     pub fn fit(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<FaceFit<'_>>> {
         self.face.fit(gray, w, h)
     }
@@ -878,44 +977,110 @@ impl Tracker {
     /// found.
     ///
     /// # Errors
-    /// Fails when the frame does not fit the tracker's geometry or landmark
-    /// inference fails (see [`Tracker::fit`]).
+    /// Fails when the frame does not fit the tracker's geometry or a model
+    /// fails (see [`Tracker::fit`]).
     pub fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
         let fit = self.face.fit(gray, w, h)?;
         Ok(self.rest.update(fit.as_ref()))
     }
 }
 
+/// Where a frame's face was found: the crop the landmark model found it in,
+/// its presence score, and whether the face detector placed that crop. The
+/// landmarks are the model's last.
+struct Found {
+    crop: Crop,
+    score: f32,
+    by_detector: bool,
+}
+
+impl Models {
+    /// Look for the face in one frame (see [`Tracker::fit`]): the landmark
+    /// model in `follow`, the crop that follows the face, unless the face
+    /// was lost; then, if that found nothing, the detector on the camera's
+    /// `frame` and the landmark model in a crop around the best detection.
+    /// `big` is the frame enlarged for the landmark model. `None` when
+    /// neither found a face; a NaN presence score (never seen) counts as no
+    /// face, like a negative one.
+    fn locate(
+        &mut self,
+        geometry: &Geometry,
+        follow: Option<Crop>,
+        frame: &[u8],
+        big: &[u8],
+    ) -> Result<Option<Found>> {
+        let side = geometry.frame_size();
+        if let Some(crop) = follow {
+            self.runs.landmarks += 1;
+            let (_, score) = self.landmark.landmarks(big, side, side, &crop)?;
+            if score >= 0.0 {
+                return Ok(Some(Found {
+                    crop,
+                    score,
+                    by_detector: false,
+                }));
+            }
+        }
+        self.runs.detector += 1;
+        let detections = self.detector.detect(frame, geometry.native_size)?;
+        let Some(detection) = detections.first().copied() else {
+            return Ok(None);
+        };
+        let crop = Crop::from_detection(&detection, geometry);
+        if !crop.is_finite() {
+            return Ok(None);
+        }
+        self.runs.landmarks += 1;
+        let (_, score) = self.landmark.landmarks(big, side, side, &crop)?;
+        debug!(
+            detection_score = detection.score,
+            landmark_score = score,
+            "landmark model run on a face the detector found"
+        );
+        Ok((score >= 0.0).then_some(Found {
+            crop,
+            score,
+            by_detector: true,
+        }))
+    }
+}
+
 impl FaceFitter {
     /// See [`Tracker::fit`].
     fn fit(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<FaceFit<'_>>> {
-        let side = self.geometry.frame_size();
+        let geometry = self.geometry;
+        let n = geometry.native_size;
         ensure!(
-            side > 0 && w == side && h == side,
-            "a {w}x{h} frame for a tracker of {side}x{side} frames"
+            w == n && h == n,
+            "a {w}x{h} frame for a tracker of {n}x{n} frames"
         );
-        ensure!(
-            w.checked_mul(h).is_some_and(|n| gray.len() >= n),
-            "a {w}x{h} frame of {} bytes",
-            gray.len()
-        );
-        // While the face is lost, sweep an upright start-size crop over a
-        // grid of candidate centres (one per frame); otherwise a face outside
-        // the first crop would never be found. Once found, the crop follows
-        // the face.
-        let crop = match self.searching {
-            Some(i) => search_crop(i, &self.geometry),
-            None => self.crop,
+        let frame = w
+            .checked_mul(h)
+            .and_then(|len| gray.get(..len))
+            .with_context(|| format!("a {w}x{h} frame of {} bytes", gray.len()))?;
+        // The landmark model crops from the frame enlarged, the detector
+        // takes it as it came.
+        let side = geometry.frame_size();
+        let big = if geometry.upscale == 1 {
+            frame
+        } else {
+            upscale_into(frame, n, geometry.upscale, &mut self.upscaled);
+            self.upscaled.as_slice()
         };
-        let focal = self.geometry.focal;
-        let (pts, score) = self.model.landmarks(gray, w, h, &crop)?;
-        // A NaN score (never seen) counts as no face, like a negative one.
-        if score.is_nan() || score < 0.0 {
-            // Face lost - try the next search position on the next frame.
-            self.searching = Some(self.searching.map_or(1, |i| i + 1));
+        let follow = (!self.lost).then_some(self.crop);
+        let found = self.models.locate(&geometry, follow, frame, big)?;
+        let Some(Found {
+            crop,
+            score,
+            by_detector,
+        }) = found
+        else {
+            self.lost = true;
             return Ok(None);
-        }
-        self.searching = None;
+        };
+        let focal = geometry.focal;
+        // The landmarks of the run that found the face, the model's last.
+        let pts = &self.models.landmark.pts;
 
         // Landmarks to full-frame 2D; for the Kabsch start, their x and y
         // turned back into the frame's axes, so that the crop's turn does not
@@ -938,24 +1103,35 @@ impl FaceFitter {
             &self.canonical,
             &self.image2d,
             focal,
-            w as f64 / 2.0,
-            h as f64 / 2.0,
+            side as f64 / 2.0,
+            side as f64 / 2.0,
             init_r,
             init_depth,
         );
-        let landmarks =
-            <&[[f64; 2]; NLM]>::try_from(self.image2d.as_slice()).with_context(|| {
-                format!(
-                    "the landmark model returned {} points, not {NLM}",
-                    self.image2d.len()
-                )
-            })?;
+        let image2d = <&[[f64; 2]; NLM]>::try_from(self.image2d.as_slice()).with_context(|| {
+            format!(
+                "the landmark model returned {} points, not {NLM}",
+                self.image2d.len()
+            )
+        })?;
         // Follow the face: crop the next frame to this one's face region. A
         // region that is not finite (no model output has given one) keeps the
         // crop that found the face.
-        let next = Crop::around(landmarks, self.geometry.min_half, self.geometry.max_half);
+        let next = Crop::around(image2d, geometry.min_half, geometry.max_half);
         self.crop = if next.is_finite() { next } else { crop };
-        Ok(Some(FaceFit::new(r, t, landmarks, score)))
+        self.lost = false;
+        // The fit's landmarks in the pixels of the frame as it came.
+        let up = geometry.upscale as f64;
+        for (out, p) in self.landmarks.iter_mut().zip(image2d) {
+            *out = [p[0] / up, p[1] / up];
+        }
+        Ok(Some(FaceFit::new(
+            r,
+            t,
+            &self.landmarks,
+            score,
+            by_detector,
+        )))
     }
 }
 
@@ -1213,7 +1389,7 @@ mod tests {
 
     /// A synthetic fit: rotation `r`, the mesh origin at `t_cm`.
     fn synthetic(r: [[f64; 3]; 3], t_cm: [f64; 3], lm: &[[f64; 2]; NLM]) -> FaceFit<'_> {
-        FaceFit::new(r, t_cm, lm, 1.0)
+        FaceFit::new(r, t_cm, lm, 1.0, false)
     }
 
     fn assert_close(got: &[f64], want: &[f64]) {
@@ -1606,49 +1782,179 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_face_is_searched_for_with_upright_crops_of_the_start_size() {
-        let g = Geometry::IMAGE83;
-        // The first frame after a loss tries the second grid position; the
-        // search goes round the grid.
-        assert_eq!(search_crop(1, &g), Crop::upright(280.0, 140.0, 150.0));
-        assert_eq!(search_crop(5, &g), Crop::upright(140.0, 140.0, 150.0));
-        assert_eq!(search_crop(9 + 5, &g), search_crop(5, &g));
-        assert_eq!(
-            search_crop(8, &Geometry::UVC),
-            Crop::upright(420.0, 420.0, 160.0)
+    fn a_detection_is_cropped_around_its_box_turned_by_its_eyes() {
+        // A detection in a 280-px frame: the box (100, 60) 80 x 96, the eye
+        // on the image's right 10 px lower than the other.
+        let mut keypoints = [[0.0; 2]; 6];
+        keypoints[0] = [120.0, 90.0];
+        keypoints[1] = [160.0, 100.0];
+        let d = Detection {
+            x: 100.0,
+            y: 60.0,
+            w: 80.0,
+            h: 96.0,
+            keypoints,
+            score: 0.9,
+        };
+        let half = |d: &Detection, g: &Geometry| f64::from(Crop::from_detection(d, g).half);
+        // At 560: the centre twice the box's, the half-size 0.75 x 2 x 96.
+        let crop = Crop::from_detection(&d, &Geometry::IMAGE83);
+        assert_close(&[crop.cx, crop.cy], &[280.0, 216.0]);
+        assert!(
+            (half(&d, &Geometry::IMAGE83) - 144.0).abs() < 1e-4,
+            "{crop:?}"
         );
+        assert!((crop.angle - 10f64.atan2(40.0)).abs() < 1e-12, "{crop:?}");
+        // Within 120-200: a small face and a large one.
+        let small = Detection {
+            w: 30.0,
+            h: 30.0,
+            ..d
+        };
+        assert!((half(&small, &Geometry::IMAGE83) - 120.0).abs() < 1e-4);
+        let large = Detection {
+            w: 150.0,
+            h: 120.0,
+            ..d
+        };
+        assert!((half(&large, &Geometry::IMAGE83) - 200.0).abs() < 1e-4);
+        // The UVC camera's frames are not enlarged: 0.75 x 96 = 72, raised
+        // to its 128.
+        let uvc = Crop::from_detection(&d, &Geometry::UVC);
+        assert_close(&[uvc.cx, uvc.cy], &[140.0, 108.0]);
+        assert!((half(&d, &Geometry::UVC) - 128.0).abs() < 1e-4, "{uvc:?}");
     }
 
     #[test]
-    fn both_geometries_fit_560_pixel_frames_and_the_uvc_limits_scale_with_its_start() {
+    fn the_0x50e_geometry_enlarges_its_frames_and_the_uvc_limits_scale_with_its_start() {
+        assert_eq!(Geometry::IMAGE83.native_size, 280);
         assert_eq!(Geometry::IMAGE83.frame_size(), 560);
+        assert_eq!(Geometry::UVC.native_size, 560);
         assert_eq!(Geometry::UVC.frame_size(), 560);
         let uvc = Geometry::UVC;
         assert!((uvc.min_half - 128.0).abs() < 1e-4 && (uvc.max_half - 213.333).abs() < 1e-3);
     }
 
     #[test]
-    fn fit_refuses_a_frame_the_geometry_does_not_describe() {
-        let mut tracker = Tracker::new_image83().unwrap();
-        // The camera's own 280x280 image, not upscaled.
-        let small = vec![0u8; 280 * 280];
-        let err = tracker.fit(&small, 280, 280).unwrap_err();
-        assert!(format!("{err:#}").contains("280x280 frame"), "{err:#}");
-        // A 560x560 frame short of a row.
-        let short = vec![0u8; 560 * 559];
-        let err = tracker.fit(&short, 560, 560).unwrap_err();
-        assert!(format!("{err:#}").contains("bytes"), "{err:#}");
+    fn frames_are_enlarged_as_the_0x50e_stream_used_to_be() {
+        let n = 280;
+        let frame = textured_frame(n, n);
+        let mut ours = Vec::new();
+        upscale_into(&frame, n, 2, &mut ours);
+        let mut theirs = Vec::new();
+        tobii_proto::image83::upscale2x_into(&frame, n, n, &mut theirs);
+        assert_eq!(ours, theirs);
+        // Three times, into the same buffer.
+        upscale_into(&[1, 2, 3, 4], 2, 3, &mut ours);
+        let row = |a: u8, b: u8| [a, a, a, b, b, b];
+        let want: Vec<u8> = [row(1, 2); 3]
+            .into_iter()
+            .chain([row(3, 4); 3])
+            .flatten()
+            .collect();
+        assert_eq!(ours, want);
     }
 
-    /// A face far from the initial crop (frame shifted so the face sits in a
-    /// corner) must be found by the grid search within one sweep.
+    #[test]
+    fn a_geometry_without_pixels_or_with_crossed_limits_is_refused() {
+        let g = Geometry::IMAGE83;
+        for bad in [
+            Geometry { upscale: 0, ..g },
+            Geometry {
+                native_size: 0,
+                ..g
+            },
+            Geometry {
+                native_size: usize::MAX / 2,
+                ..g
+            },
+            Geometry {
+                min_half: 210.0,
+                ..g
+            },
+            Geometry {
+                max_half: f32::NAN,
+                ..g
+            },
+        ] {
+            assert!(Tracker::with_geometry(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn fit_refuses_a_frame_the_geometry_does_not_describe() {
+        let mut tracker = Tracker::new_image83().unwrap();
+        // The camera's image enlarged, as the tracker used to take it.
+        let big = vec![0u8; 560 * 560];
+        let err = tracker.fit(&big, 560, 560).unwrap_err();
+        assert!(format!("{err:#}").contains("560x560 frame"), "{err:#}");
+        // A 280x280 frame short of a row.
+        let short = vec![0u8; 280 * 279];
+        let err = tracker.fit(&short, 280, 280).unwrap_err();
+        assert!(format!("{err:#}").contains("bytes"), "{err:#}");
+        assert_eq!(tracker.model_runs(), ModelRuns::default());
+    }
+
+    /// Name, element type and shape (-1: any size) of each of a session's
+    /// inputs or outputs.
+    fn signature(
+        outlets: &[ort::value::Outlet],
+    ) -> Vec<(&str, Option<ort::value::TensorElementType>, Vec<i64>)> {
+        outlets
+            .iter()
+            .map(|o| {
+                let shape = o.dtype().tensor_shape().map(|s| s.to_vec());
+                (o.name(), o.dtype().tensor_type(), shape.unwrap_or_default())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_embedded_models_load_with_the_inputs_and_outputs_the_code_uses() {
+        use ort::value::TensorElementType::Float32;
+        let landmark = FaceModel::new().unwrap();
+        assert_eq!(
+            signature(landmark.session.inputs()),
+            [("input_12", Some(Float32), vec![-1, 256, 256, 3])]
+        );
+        assert_eq!(
+            signature(landmark.session.outputs()),
+            [
+                ("Identity", Some(Float32), vec![-1, 1, 1, 1434]),
+                ("Identity_1", Some(Float32), vec![-1, 1, 1, 1]),
+                ("Identity_2", Some(Float32), vec![-1, 1]),
+            ]
+        );
+        let detector = FaceDetector::new().unwrap();
+        assert_eq!(
+            signature(detector.session().inputs()),
+            [("input", Some(Float32), vec![1, 3, 128, 128])]
+        );
+        assert_eq!(
+            signature(detector.session().outputs()),
+            [
+                ("regressors", Some(Float32), vec![1, 896, 16]),
+                ("classificators", Some(Float32), vec![1, 896, 1]),
+            ]
+        );
+    }
+
+    /// The 0x50e fixture's frame (`TOBII_IMAGE83_FIXTURE`, a captured
+    /// 78609-byte message; the user's face, so it is not committed), if set.
+    fn image83_fixture() -> Option<tobii_proto::image83::ImageFrame> {
+        let path = std::env::var("TOBII_IMAGE83_FIXTURE").ok()?;
+        let msg = std::fs::read(path).unwrap();
+        Some(tobii_proto::image83::decode_image_payload(&msg).unwrap())
+    }
+
+    /// A face far from the first crop (the frame shifted so the face sits in
+    /// a corner) is found on the first frame, through the face detector, and
+    /// followed on the next without it.
     #[test]
     fn image83_tracker_finds_face_outside_initial_crop() {
-        let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
+        let Some(frame) = image83_fixture() else {
             return;
         };
-        let msg = std::fs::read(path).unwrap();
-        let frame = tobii_proto::image83::decode_image_payload(&msg).unwrap();
         let (w, h) = (frame.width, frame.height);
         // Shift the 280 image by (-70, -60): the face (centre ~ (140, 130))
         // moves to ~ (70, 70), i.e. into the corner of the centred 150-px
@@ -1659,29 +1965,77 @@ mod tests {
                 shifted[y * w + x] = frame.pixels[(y + 60) * w + (x + 70)];
             }
         }
-        let mut big = Vec::new();
-        tobii_proto::image83::upscale2x_into(&shifted, w, h, &mut big);
         let mut t = Tracker::new_image83().unwrap();
-        let mut found_at = None;
-        for i in 0..12 {
-            t.process(&big, w * 2, h * 2).unwrap();
-            if t.last_raw().is_some() {
-                found_at = Some(i);
-                break;
-            }
-        }
+        let first = t
+            .fit(&shifted, w, h)
+            .unwrap()
+            .map(|f| (f.found_by_detector, f.score));
         println!(
-            ">>> shifted face found at frame {found_at:?}, crop {:?}",
-            t.face.crop
+            ">>> shifted face on the first frame: (by detector, score) {first:?}, next crop {:?}, runs {:?}",
+            t.face.crop,
+            t.model_runs()
         );
         assert!(
-            matches!(found_at, Some(i) if i < SEARCH_GRID.len()),
-            "face found within one sweep, got {found_at:?}"
+            matches!(first, Some((true, _))),
+            "found through the detector"
+        );
+        // The start crop missed it, the detector's crop found it.
+        assert_eq!(
+            t.model_runs(),
+            ModelRuns {
+                landmarks: 2,
+                detector: 1
+            }
         );
         assert!(
             t.face.crop.cx < 300.0 && t.face.crop.cy < 300.0,
             "crop re-seated onto the shifted face: {:?}",
             t.face.crop
+        );
+        let second = t.fit(&shifted, w, h).unwrap().map(|f| f.found_by_detector);
+        assert_eq!(second, Some(false), "followed by the crop");
+        assert_eq!(
+            t.model_runs(),
+            ModelRuns {
+                landmarks: 3,
+                detector: 1
+            }
+        );
+    }
+
+    /// The face detector on the 0x50e fixture's frame: one face, the eyes
+    /// where the landmark model puts them.
+    #[test]
+    fn image83_detector_finds_the_face_the_landmarks_see() {
+        let Some(frame) = image83_fixture() else {
+            return;
+        };
+        let (w, h) = (frame.width, frame.height);
+        let mut tracker = Tracker::new_image83().unwrap();
+        let lm = *tracker.fit(&frame.pixels, w, h).unwrap().unwrap().landmarks;
+        let mut detector = FaceDetector::new().unwrap();
+        let found = detector.detect(&frame.pixels, w).unwrap();
+        println!(">>> detections in the 280 frame: {found:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        let d = found[0];
+        assert!(d.score > 0.5, "{d:?}");
+        // The eye keypoints against the middle of each eye's corners: the
+        // subject's right eye (image left) is landmarks 33 and 133, the left
+        // 263 and 362.
+        for (k, (a, b)) in [(33, 133), (263, 362)].into_iter().enumerate() {
+            let eye = [(lm[a][0] + lm[b][0]) / 2.0, (lm[a][1] + lm[b][1]) / 2.0];
+            let off = (d.keypoints[k][0] - eye[0]).hypot(d.keypoints[k][1] - eye[1]);
+            println!(">>> eye keypoint {k}: {off:.2} px from landmarks {a}/{b}");
+            assert!(off < 6.0, "eye keypoint {k} {off} px off");
+        }
+        // The box holds the landmarks' centroid.
+        let n = lm.len() as f64;
+        let c = lm
+            .iter()
+            .fold([0.0; 2], |s, p| [s[0] + p[0] / n, s[1] + p[1] / n]);
+        assert!(
+            (d.x..d.x + d.w).contains(&c[0]) && (d.y..d.y + d.h).contains(&c[1]),
+            "{d:?} vs {c:?}"
         );
     }
 
@@ -1689,13 +2043,11 @@ mod tests {
     /// committed): set `TOBII_IMAGE83_FIXTURE` to a captured 78609-byte message.
     #[test]
     fn image83_frame_yields_a_face_pose() {
-        let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
+        let Some(frame) = image83_fixture() else {
             return;
         };
-        let msg = std::fs::read(path).unwrap();
-        let frame = tobii_proto::image83::decode_image_payload(&msg).unwrap();
         let mut big = Vec::new();
-        tobii_proto::image83::upscale2x_into(&frame.pixels, frame.width, frame.height, &mut big);
+        upscale_into(&frame.pixels, frame.width, 2, &mut big);
         let (w, h) = (frame.width * 2, frame.height * 2);
         let mut fm = FaceModel::new().unwrap();
         let crop = Crop::upright(
@@ -1741,27 +2093,26 @@ mod tests {
     /// The fit of a real 0x50e frame read back through its documented
     /// conventions (same fixture as above): a proper object -> camera
     /// rotation, the mesh origin in mm, the landmarks in the pixels of the
-    /// upscaled frame. Projected with them, the canonical mesh must land on
+    /// 280x280 image. Projected with them, the canonical mesh must land on
     /// the landmarks. The frame goes through twice: first through the
     /// upright start crop, then through the crop the first fit turned by the
     /// eye line and sized from the landmarks.
     #[test]
     fn image83_fit_projects_the_mesh_onto_its_landmarks() {
-        let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
+        let Some(frame) = image83_fixture() else {
             return;
         };
-        let msg = std::fs::read(path).unwrap();
-        let frame = tobii_proto::image83::decode_image_payload(&msg).unwrap();
-        let mut big = Vec::new();
-        tobii_proto::image83::upscale2x_into(&frame.pixels, frame.width, frame.height, &mut big);
-        let (w, h) = (frame.width * 2, frame.height * 2);
+        let (w, h) = (frame.width, frame.height);
+        // The focal length in the 280-px image.
+        let focal = IMAGE83_FOCAL / 2.0;
         let mut tracker = Tracker::new_image83().unwrap();
         for pass in ["start crop", "turned crop"] {
             let crop = tracker.face.crop;
             let fit = tracker
-                .fit(&big, w, h)
+                .fit(&frame.pixels, w, h)
                 .unwrap()
                 .unwrap_or_else(|| panic!("a face in the {pass}"));
+            assert!(!fit.found_by_detector, "{pass}");
             let r = fit.rotation;
             let rrt = matmul3(&r, &transpose3(&r));
             let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
@@ -1783,31 +2134,31 @@ mod tests {
                     let q = matvec3(&r, &[f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
                     // The mesh is in cm, the translation in mm.
                     let c = [q[0] * 10.0 + t[0], q[1] * 10.0 + t[1], q[2] * 10.0 + t[2]];
-                    let u = IMAGE83_FOCAL * c[0] / c[2] + w as f64 / 2.0;
-                    let v = IMAGE83_FOCAL * c[1] / c[2] + h as f64 / 2.0;
+                    let u = focal * c[0] / c[2] + w as f64 / 2.0;
+                    let v = focal * c[1] / c[2] + h as f64 / 2.0;
                     (u - lm[0]).hypot(v - lm[1])
                 })
                 .collect();
             err.sort_by(f64::total_cmp);
             let (median, max) = (err[err.len() / 2], err[err.len() - 1]);
             println!(
-                ">>> image83 fit, {pass} {crop:?}: score={:.2} t = {:.1}/{:.1}/{:.1} mm, reprojection median {median:.2} px, max {max:.2} px (560 frame)",
+                ">>> image83 fit, {pass} {crop:?}: score={:.2} t = {:.1}/{:.1}/{:.1} mm, reprojection median {median:.2} px, max {max:.2} px (280 frame)",
                 fit.score, t[0], t[1], t[2]
             );
             assert!(fit.score >= 0.0);
-            // The rigid canonical mesh is not the user's face: 2.5-3 px
-            // median is the fit's own residual on this session-1 frame (4.5
+            // The rigid canonical mesh is not the user's face: 1.2-1.5 px
+            // median is the fit's own residual on this session-1 frame (2.3
             // through the 110-px crop the tracker used to start with).
             // Reading a convention wrong (the translation as cm, the
-            // landmarks as 280-px ones, the rotation as camera -> object)
-            // misses by 45-200 px.
+            // landmarks as 560-px ones, the rotation as camera -> object)
+            // misses by 20-100 px.
             assert!(
-                median < 8.0 && max < 30.0,
+                median < 4.0 && max < 15.0,
                 "{pass}: reprojection {median} / {max} px"
             );
-            // The next frame is cropped to this face's region: turned by its
-            // eye line, 120-200 px.
-            let lm = *fit.landmarks;
+            // The next frame is cropped to this face's region at 560, twice
+            // these: turned by its eye line, 120-200 px.
+            let lm = fit.landmarks.map(|p| [p[0] * 2.0, p[1] * 2.0]);
             let next = tracker.face.crop;
             assert_eq!(next, Crop::around(&lm, IMAGE83_MIN_HALF, IMAGE83_MAX_HALF));
             let eye = (lm[EYE_LINE.1][1] - lm[EYE_LINE.0][1])

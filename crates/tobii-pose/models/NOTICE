@@ -14,6 +14,15 @@ models/face_landmarks.onnx
     Changed: converted from TensorFlow Lite to ONNX with tf2onnx 1.17.0,
     which also stores the float16 weights as float32 (same values).
 
+models/blaze_face_short_range.onnx
+    MediaPipe's BlazeFace short-range face-detection model (model card
+    "MediaPipe BlazeFace Model Card (Short Range)", June 9, 2021):
+    blaze_face_short_range.tflite of the MediaPipe Face Detector,
+    float16, version 1.
+    Changed: converted from TensorFlow Lite to ONNX with tflite2onnx
+    0.4.1, which also turns its NHWC layout into NCHW and stores the
+    float16 weights as float32 (same values).
+
 src/canonical.rs (CANONICAL_FACE)
     The vertex positions of MediaPipe's canonical face model,
     mediapipe/modules/face_geometry/data/canonical_face_model.obj.

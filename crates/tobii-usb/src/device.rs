@@ -28,7 +28,7 @@ use tobii_proto::facts::{
     parse_display_area,
 };
 use tobii_proto::gaze83::{GazeFrame, PresenceFrame, decode_gaze_frame, decode_presence_frame};
-use tobii_proto::image83::{ImageFrame, decode_image_payload, upscale2x_into};
+use tobii_proto::image83::{ImageFrame, decode_image_payload};
 use tobii_proto::log::{PacketLog, log_packet};
 use tobii_proto::protocol::{
     BulkReassembler, InitPacket, MARKER_COMMAND, MARKER_NOTIFICATION, MARKER_RESPONSE,
@@ -832,17 +832,16 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
             return;
         }
     };
-    // `TOBII_IMAGE83_DEBUG=1`: report frames taken / poses / inference time.
+    // `TOBII_IMAGE83_DEBUG=1`: report frames taken / poses / inference time
+    // / face-detector runs.
     let report_stats = is_env_flag_set("TOBII_IMAGE83_DEBUG");
     let (mut taken, mut posed, mut infer_us) = (0u64, 0u64, 0u64);
+    let mut detector_runs = tracker.model_runs().detector;
     let mut last_report = Instant::now();
     // The tracker outlives head clients (a gaze client keeps the engine
     // alive), so a new head subscriber must not inherit an old rest pose or
     // smoothing state: recalibrate on every off->on edge after the first.
     let mut was_wanted: Option<bool> = None;
-    // Reused across frames so the 33 Hz loop does not allocate a fresh
-    // 560x560 buffer every time (mem-reuse-collections).
-    let mut upscaled = Vec::new();
     let (lock, cv) = &**mailbox;
     // Relaxed everywhere below: the flags are pure signals; the frame itself
     // is handed over under the mailbox mutex.
@@ -873,8 +872,7 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
             continue;
         }
         let t0 = Instant::now();
-        upscale2x_into(&frame.pixels, frame.width, frame.height, &mut upscaled);
-        match tracker.process(&upscaled, frame.width * 2, frame.height * 2) {
+        match tracker.process(&frame.pixels, frame.width, frame.height) {
             Ok(Some(p)) => {
                 posed += 1;
                 let _ = tx.send(Sample::Pose(PoseSample::new(
@@ -891,15 +889,19 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
         infer_us += u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
         if report_stats && last_report.elapsed() >= Duration::from_secs(5) {
             let dt = last_report.elapsed().as_secs_f64();
+            let detector = tracker.model_runs().detector;
             info!(
                 frames_per_s = format_args!("{:.1}", taken as f64 / dt),
                 poses_per_s = format_args!("{:.1}", posed as f64 / dt),
                 mean_ms = format_args!("{:.1}", infer_us as f64 / 1000.0 / taken.max(1) as f64),
+                detector_runs_per_s =
+                    format_args!("{:.1}", detector.saturating_sub(detector_runs) as f64 / dt),
                 "image83 pose worker"
             );
             taken = 0;
             posed = 0;
             infer_us = 0;
+            detector_runs = detector;
             last_report = Instant::now();
         }
     }

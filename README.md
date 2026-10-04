@@ -69,7 +69,7 @@ Full instructions, tuning knobs and troubleshooting are in
 **[INSTALL.md](INSTALL.md)**.
 
 Requirements: a stable Rust toolchain, libusb, and the tracker plugged in. The
-face model and the init capture are embedded at build time, so the installed
+face models and the init capture are embedded at build time, so the installed
 binaries need no runtime data files.
 
 ## Architecture
@@ -331,7 +331,7 @@ rather than 20 MB).
 | Crate | Holds | Heavy deps |
 |---|---|---|
 | `tobii-proto` | wire formats: framing, TLV, commands, the gaze/presence/image streams, device facts, the capture log | none |
-| `tobii-pose` | face landmarks and the head-pose fit; owns the model | `ort` |
+| `tobii-pose` | face landmarks, face detection and the head-pose fit; owns the models | `ort` |
 | `tobii-usb` | USB transport and the live `0x83` engine; owns the init capture | `rusb` |
 | `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
@@ -395,9 +395,10 @@ tools/abi/dll_abi.py headers                                 # headers vs tobii_
 
 MIT ([LICENSE](LICENSE)), except for the MediaPipe material that `tobii-pose`
 embeds, and that `tobiid` and `tobii5-init-replay` carry with it: the
-face-landmark model (`crates/tobii-pose/models/face_landmarks.onnx`, converted
-from TensorFlow Lite to ONNX) and the canonical face mesh in
-`crates/tobii-pose/src/canonical.rs`. Those are Apache-2.0. The licence text,
-the notice and where they come from are in
+face-landmark and face-detection models
+(`crates/tobii-pose/models/face_landmarks.onnx` and
+`blaze_face_short_range.onnx`, converted from TensorFlow Lite to ONNX) and the
+canonical face mesh in `crates/tobii-pose/src/canonical.rs`. Those are
+Apache-2.0. The licence text, the notice and where they come from are in
 [crates/tobii-pose/models/](crates/tobii-pose/models/) (`LICENSE`, `NOTICE`,
 `README.md`).

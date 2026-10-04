@@ -5,8 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 # Not the workspace's MIT alone: the crate embeds MediaPipe's face-landmark
-# model and canonical face mesh, which are Apache-2.0 (models/LICENSE,
-# models/NOTICE, provenance in models/README.md).
+# and face-detection models and canonical face mesh, which are Apache-2.0
+# (models/LICENSE, models/NOTICE, provenance in models/README.md).
 license = "MIT AND Apache-2.0"
 publish.workspace = true
 

@@ -18,7 +18,11 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 libc = "0.2"
-ort = "2.0.0-rc.10"
+# Pinned: ort's 2.0 release candidates change its API from one to the next
+# (in rc.12 the session builder's setters fail with an error that carries the
+# builder and is not Send, which tobii-pose converts), and a requirement of
+# "2.0.0-rc.10" would take any later one, or 2.0.0, on a fresh resolve.
+ort = "=2.0.0-rc.12"
 rusb = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

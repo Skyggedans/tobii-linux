@@ -22,7 +22,7 @@ use crate::dashboard::render_dashboard_status;
 use crate::opentrack::OpentrackUdp;
 use crate::sinks::{DecodedCsv, JsonlOutput, handle_live_decoded};
 use tobii_proto::decode::{TrackingFrame, decode_stream_payload};
-use tobii_proto::image83::{decode_image_payload, upscale2x_into, write_pgm};
+use tobii_proto::image83::{decode_image_payload, write_pgm};
 use tobii_proto::log::{PacketLog, log_packet};
 use tobii_proto::protocol::{
     BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, declared_len,
@@ -581,7 +581,6 @@ pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
     let mut last_gaze: Option<TrackingFrame> = None;
     let (mut images, mut faces, mut poses, mut gaze_frames) = (0u64, 0u64, 0u64, 0u64);
     let mut yaw_vs_x: Vec<(f64, f64)> = Vec::new();
-    let mut upscaled = Vec::new();
     let mut msgs = Vec::new();
     for payload in &payloads {
         asm.push_into(payload, &mut msgs);
@@ -598,8 +597,7 @@ pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
                     let Some(frame) = decode_image_payload(msg) else {
                         continue;
                     };
-                    upscale2x_into(&frame.pixels, frame.width, frame.height, &mut upscaled);
-                    let rel = tracker.process(&upscaled, frame.width * 2, frame.height * 2)?;
+                    let rel = tracker.process(&frame.pixels, frame.width, frame.height)?;
                     let raw = tracker.last_raw();
                     faces += u64::from(raw.is_some());
                     poses += u64::from(rel.is_some());
@@ -645,8 +643,11 @@ pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
             }
         }
     }
+    let runs = tracker.model_runs();
     println!(
-        "{path}: {gaze_frames} gaze frames, {images} images, face found in {faces}, {poses} calibrated poses"
+        "{path}: {gaze_frames} gaze frames, {images} images, face found in {faces}, {poses} calibrated poses; \
+         landmark model run {} times, face detector {}",
+        runs.landmarks, runs.detector
     );
     if yaw_vs_x.len() > 10 {
         let n = yaw_vs_x.len() as f64;
@@ -757,7 +758,6 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
             let start = Instant::now();
             let dur = Duration::from_secs_f64(*secs);
             let mut msgs = Vec::new();
-            let mut upscaled = Vec::new();
             while start.elapsed() < dur {
                 let n = match h.read_bulk(EP_IN, &mut buf, Duration::from_millis(300)) {
                     Ok(n) => n,
@@ -801,23 +801,16 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
                                 );
                                 saved += 1;
                             }
-                            if let Some(t) = tracker.as_mut() {
-                                upscale2x_into(
-                                    &frame.pixels,
-                                    frame.width,
-                                    frame.height,
-                                    &mut upscaled,
-                                );
-                                if let Some(p) =
-                                    t.process(&upscaled, frame.width * 2, frame.height * 2)?
-                                {
-                                    poses += 1;
-                                    if poses % 10 == 1 {
-                                        println!(
-                                            "pose: yaw {:+6.1} pitch {:+6.1} roll {:+6.1}  t = [{:+5.1} {:+5.1} {:+5.1}] cm",
-                                            p[3], p[4], p[5], p[0], p[1], p[2]
-                                        );
-                                    }
+                            if let Some(t) = tracker.as_mut()
+                                && let Some(p) =
+                                    t.process(&frame.pixels, frame.width, frame.height)?
+                            {
+                                poses += 1;
+                                if poses % 10 == 1 {
+                                    println!(
+                                        "pose: yaw {:+6.1} pitch {:+6.1} roll {:+6.1}  t = [{:+5.1} {:+5.1} {:+5.1}] cm",
+                                        p[3], p[4], p[5], p[0], p[1], p[2]
+                                    );
                                 }
                             }
                         }
