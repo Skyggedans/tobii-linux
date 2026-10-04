@@ -1499,14 +1499,31 @@ impl AreaInEffect {
     /// Take `area` as the area in effect. The generation moves on, and the
     /// frame is built anew, only if it differs from the one before, as the
     /// device sends a 1450 only for an area that changes the one it holds.
+    ///
+    /// An area that fixes no display frame (see [`DisplayFrame::new`]) is
+    /// warned of as it is taken, so once for each generation: the images
+    /// read while it is in effect carry no display frame, and the device's
+    /// gaze origins are not checked. tobiid sets and loads such areas, a
+    /// sheared one among them, and the device may take them.
     fn set(&mut self, area: Option<DisplayArea>) {
-        if area != self.area {
-            *self = Self {
-                area,
-                frame: area.as_ref().and_then(DisplayFrame::new).map(Arc::new),
-                generation: self.generation.next(),
-            };
+        if area == self.area {
+            return;
         }
+        let frame = area.as_ref().and_then(DisplayFrame::new).map(Arc::new);
+        let generation = self.generation.next();
+        if let (Some(area), None) = (&area, &frame) {
+            warn!(
+                generation = generation.get(),
+                ?area,
+                "gaze: the display area in effect fixes no display frame; \
+                 images carry none and gaze origins go unchecked"
+            );
+        }
+        *self = Self {
+            area,
+            frame,
+            generation,
+        };
     }
 }
 
@@ -3380,11 +3397,21 @@ mod tests {
         /// The error and generation of a warning that the device's display
         /// frame is not ours.
         fn mismatch(&self) -> (f64, u64) {
-            assert!(self.message.contains("display frame"), "{self:?}");
+            assert!(
+                self.message.contains("not in the display frame in effect"),
+                "{self:?}"
+            );
             (
                 self.field("error_mm").parse().expect("error_mm"),
                 self.field("generation").parse().expect("generation"),
             )
+        }
+
+        /// The generation of a warning that the display area in effect
+        /// fixes no display frame.
+        fn frameless(&self) -> u64 {
+            assert!(self.message.contains("fixes no display frame"), "{self:?}");
+            self.field("generation").parse().expect("generation")
         }
     }
 
@@ -3411,16 +3438,29 @@ mod tests {
             (warnings, guard)
         }
 
-        /// The error and generation of each warning so far that the
-        /// device's display frame is not ours, taking them.
-        fn mismatches(&self) -> Vec<(f64, u64)> {
+        /// The warnings logged so far, taking them.
+        fn take(&self) -> Vec<Logged> {
             let mut logged = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            logged.drain(..).map(|w| w.mismatch()).collect()
+            logged.drain(..).collect()
+        }
+
+        /// The error and generation of each warning so far that the
+        /// device's display frame is not ours, taking them: there must be
+        /// no other.
+        fn mismatches(&self) -> Vec<(f64, u64)> {
+            self.take().iter().map(Logged::mismatch).collect()
         }
 
         /// The generations of [`Warnings::mismatches`].
         fn generations(&self) -> Vec<u64> {
             self.mismatches().into_iter().map(|(_, g)| g).collect()
+        }
+
+        /// The generation of each warning so far that the display area in
+        /// effect fixes no display frame, taking them: there must be no
+        /// other.
+        fn frameless(&self) -> Vec<u64> {
+            self.take().iter().map(Logged::frameless).collect()
         }
     }
 
@@ -3664,7 +3704,52 @@ mod tests {
             }
             assert_eq!(pump.opens.check, DisplayFrameCheck::default(), "{area:?}");
         }
-        assert_eq!(warnings.mismatches(), []);
+        assert_eq!(
+            warnings.frameless(),
+            [1],
+            "the narrow area, as it was taken"
+        );
+    }
+
+    /// An area that fixes no display frame is warned of as an init or a
+    /// 1450 makes it the area in effect, once for each generation: a re-open
+    /// that keeps it, or a 1450 of it again, says nothing more. An init that
+    /// confirms no area at all is no such area (its "device ready" line
+    /// says where the area came from).
+    #[test]
+    fn an_area_in_effect_that_fixes_no_frame_is_warned_of_once_for_each_generation() {
+        let (warnings, _guard) = Warnings::collect();
+        let rig = Rig::new();
+        let (a, _) = area_of("init-rsp-1430");
+        // Its left edge is 30 mm long, as tobiid asks of an area it loads,
+        // but it is 1 mm high across its top edge.
+        let sheared = DisplayArea {
+            top_left_mm: [-50.0, 60.0, 0.0],
+            top_right_mm: [50.0, 60.0, 0.0],
+            bottom_left_mm: [-80.0, 59.0, 0.0],
+        };
+        let mut opens = Opens::default();
+
+        opens.opened(Some(sheared));
+        assert_eq!(warnings.frameless(), [1], "taken at an init");
+        opens.opened(Some(sheared));
+        assert_eq!(warnings.frameless(), [], "a re-open that keeps it");
+        let mut pump = rig.pump(&mut opens);
+        pump.deliver(classify(&notification_of(&a)));
+        assert_eq!(warnings.frameless(), [], "A fixes one");
+        pump.deliver(classify(&notification_of(&sheared)));
+        assert_eq!(warnings.frameless(), [3], "taken from a 1450");
+        pump.deliver(classify(&notification_of(&sheared)));
+        assert_eq!(warnings.frameless(), [], "the same area again");
+        pump.deliver_at(image_at(10 * S), 50 * S);
+        assert_eq!(
+            rig.pose_display(),
+            (None, DisplayGeneration(3), OpenNumber(2))
+        );
+
+        opens.opened(None);
+        assert_eq!(warnings.frameless(), [], "no area");
+        assert_eq!(opens.display.generation, DisplayGeneration(4));
     }
 
     #[test]

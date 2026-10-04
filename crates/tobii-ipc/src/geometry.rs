@@ -104,7 +104,10 @@ pub fn display_area_basic(
 }
 
 /// The top edge of a display area, and its height across that edge, must be
-/// longer than this, mm, as tobiid requires of a saved area it loads.
+/// longer than this, mm. For a rectangle that is what tobiid requires of a
+/// saved area it loads, whose top and left edges must be longer than 1 mm;
+/// a sheared area is less high across its top edge than its left edge is
+/// long, so tobiid may load one that fixes no frame.
 const MIN_SIDE_MM: f64 = 1.0;
 
 /// `side` scaled to unit length; `None` when it is `MIN_SIDE_MM` long or
@@ -145,7 +148,8 @@ impl DisplayFrame {
     /// The frame `area` fixes, or `None` when it fixes none: a corner is not
     /// finite, or the area has no width or height to speak of, its top edge
     /// or its height across that edge being 1 mm or less. For a rectangle,
-    /// that is the check tobiid makes of a display area it loads.
+    /// that is the check tobiid makes of a display area it loads; for a
+    /// sheared one it is stricter.
     #[must_use]
     pub fn new(area: &DisplayArea) -> Option<Self> {
         let DisplayArea {
