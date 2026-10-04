@@ -11,6 +11,7 @@ use rusb::Context as UsbContext;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -567,9 +568,10 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Fails if the log cannot be read, the face model cannot be loaded, a gaze
-/// payload does not decode, the tracker fails on an image, or an output
-/// cannot be written.
+/// Fails if an output is the log or another output (before anything is
+/// read or written), the log cannot be read, the face model cannot be
+/// loaded, a gaze payload does not decode, the tracker fails on an image,
+/// or an output cannot be written.
 pub(crate) fn run_image83_replay(
     path: &str,
     csv: Option<&str>,
@@ -577,6 +579,11 @@ pub(crate) fn run_image83_replay(
     landmarks: Option<&str>,
 ) -> Result<()> {
     use tobii_proto::log::read_log_payloads;
+    let outputs: Vec<(&str, &str)> = [("--csv", csv), ("--fits", fits), ("--landmarks", landmarks)]
+        .into_iter()
+        .filter_map(|(option, output)| output.map(|o| (option, o)))
+        .collect();
+    ensure_distinct_paths(path, &outputs, resolved_path)?;
     let payloads = read_log_payloads(path)?;
     let mut tracker = tobii_pose::track::Tracker::new_image83()?;
     let mut rest = RestPose::from_env();
@@ -707,6 +714,56 @@ pub(crate) fn run_image83_replay(
         );
     }
     Ok(())
+}
+
+/// Refuse outputs that would overwrite the log they are made from, or one
+/// another. Each output is created, so truncated, once the log has been
+/// read whole: `image83-replay session2.bin --fits session2.bin` would
+/// leave the capture holding a CSV header and still succeed, and two
+/// outputs on one path would interleave. `outputs` are (option, path);
+/// paths are compared as `resolve` gives them ([`resolved_path`]).
+///
+/// # Errors
+/// Names the output that is the log, or the two outputs that are one file.
+fn ensure_distinct_paths(
+    log: &str,
+    outputs: &[(&str, &str)],
+    resolve: impl Fn(&str) -> PathBuf,
+) -> Result<()> {
+    let log_path = resolve(log);
+    let mut seen: Vec<(&str, PathBuf)> = Vec::with_capacity(outputs.len());
+    for &(option, path) in outputs {
+        let resolved = resolve(path);
+        anyhow::ensure!(
+            resolved != log_path,
+            "{option} {path} is the log {log}: it would be overwritten"
+        );
+        if let Some((other, _)) = seen.iter().find(|(_, p)| *p == resolved) {
+            anyhow::bail!("{option} {path} is also the {other} output");
+        }
+        seen.push((option, resolved));
+    }
+    Ok(())
+}
+
+/// `path` as the file system names it, to tell whether two paths are one
+/// file: canonical (absolute, symbolic links and `..` resolved) when it
+/// exists; for a file still to be created, its directory's canonical path
+/// joined with its name; as given when neither resolves.
+fn resolved_path(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    std::fs::canonicalize(dir).map_or_else(|_| path.to_path_buf(), |dir| dir.join(name))
 }
 
 /// Diagnostic: bring the device up in gaze mode, additionally start the 0x50e
@@ -1300,4 +1357,116 @@ fn save_pgm(prefix: &str, index: usize, data: &[u8]) -> Result<()> {
         data.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Paths as they are written: the check itself, apart from the file
+    /// system.
+    fn as_written(path: &str) -> PathBuf {
+        PathBuf::from(path)
+    }
+
+    /// A scratch directory, removed when dropped, after a failed assertion
+    /// too.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Nothing to report a failure to here; a leftover is harmless.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_output_that_is_the_log_or_another_output_is_refused() {
+        let outputs = [
+            ("--csv", "poses.csv"),
+            ("--fits", "fits.csv"),
+            ("--landmarks", "landmarks.f32"),
+        ];
+        ensure_distinct_paths("session2.bin", &outputs, as_written).expect("distinct paths");
+        ensure_distinct_paths("session2.bin", &[], as_written).expect("no outputs");
+
+        for at in 0..outputs.len() {
+            let mut onto_log = outputs;
+            onto_log[at].1 = "session2.bin";
+            let error = ensure_distinct_paths("session2.bin", &onto_log, as_written)
+                .expect_err("an output onto the log")
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "{} session2.bin is the log session2.bin: it would be overwritten",
+                    outputs[at].0
+                )
+            );
+        }
+
+        let twice = [("--csv", "out.csv"), ("--fits", "out.csv")];
+        let error = ensure_distinct_paths("session2.bin", &twice, as_written)
+            .expect_err("two outputs on one file")
+            .to_string();
+        assert_eq!(error, "--fits out.csv is also the --csv output");
+    }
+
+    /// One file under different names resolves to one path: through `..`,
+    /// a relative path and, for a file still to be created, its directory.
+    #[test]
+    fn paths_to_one_file_resolve_alike() {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("tobii-resolved-path-{}", std::process::id())),
+        );
+        let dir = &scratch.0;
+        std::fs::create_dir_all(dir.join("sub")).expect("scratch directory");
+        let log = dir.join("session.bin");
+        std::fs::write(&log, b"TBI5LOG1").expect("scratch log");
+        let name = |p: &Path| p.to_str().expect("a UTF-8 path").to_string();
+
+        let roundabout = dir.join("sub").join("..").join("session.bin");
+        assert_eq!(
+            resolved_path(&name(&roundabout)),
+            resolved_path(&name(&log))
+        );
+        let error = ensure_distinct_paths(
+            &name(&log),
+            &[("--fits", &name(&roundabout))],
+            resolved_path,
+        )
+        .expect_err("the log under another name");
+        assert!(error.to_string().starts_with("--fits "), "{error}");
+
+        let new = dir.join("sub").join("fits.csv");
+        let new_roundabout = dir.join("sub").join("..").join("sub").join("fits.csv");
+        assert_eq!(
+            resolved_path(&name(&new_roundabout)),
+            resolved_path(&name(&new))
+        );
+        assert!(!new.exists());
+        ensure_distinct_paths(
+            &name(&log),
+            &[
+                ("--fits", &name(&new)),
+                ("--landmarks", &name(&log.with_extension("f32"))),
+            ],
+            resolved_path,
+        )
+        .expect("other files");
+
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.bin");
+            std::os::unix::fs::symlink(&log, &link).expect("scratch link");
+            assert_eq!(resolved_path(&name(&link)), resolved_path(&name(&log)));
+        }
+
+        // Relative to the working directory, which cargo sets to the
+        // package's own.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        for relative in ["Cargo.toml", "./Cargo.toml", "src/../Cargo.toml"] {
+            assert_eq!(resolved_path(relative), resolved_path(&name(&manifest)));
+        }
+    }
 }
