@@ -44,6 +44,31 @@ const DEFAULT_IPC_PROBE_STREAMS: u32 = STREAM_HEAD
     | STREAM_GAZE_RAW
     | STREAM_HEAD_POSE;
 
+/// `image83-replay`'s synopsis.
+const IMAGE83_REPLAY_USAGE: &str =
+    "usage: image83-replay <log.bin> [--csv out.csv] [--fits fits.csv] [--landmarks landmarks.f32]";
+
+/// What `image83-replay -h` says after the synopsis: what it does and the
+/// layouts of its outputs, those of `--fits` and `--landmarks` as
+/// `face_fits` documents them.
+const IMAGE83_REPLAY_OUTPUTS: &str = "\
+Runs the daemon's head tracker over every 0x50e image of a TBI5LOG1 log, in log order.
+  --csv        per image: the legacy pose, raw and calibrated (cm, deg), and the head anchors of
+               the last 0x83 gaze frame
+  --fits       per image, one row: image_idx, device_ts_us, face (1 or 0; without a face every
+               later field is empty), score (the landmark model's logit), found_by_detector (1 or
+               0), r_cam_00 .. r_cam_22 (mesh -> camera rotation, row-major; camera x right, y
+               down, z forward), t_cam_x_mm, t_cam_y_mm, t_cam_z_mm (mesh origin in the camera
+               frame), then six points as <name>_u, <name>_v in the 280-px image's continuous
+               pixels (x right, y down, pixel k spans [k, k+1)): centroid (of the 468 landmarks),
+               nose_tip (landmark 1), eye_image_left and eye_image_right (the means of the eye
+               contours 33 7 163 144 145 153 154 155 133 173 157 158 159 160 161 246 and 263 249
+               390 373 374 380 381 382 362 398 384 385 386 387 388 466), corner_33, corner_263.
+               Numbers in the shortest form that reads back as the same f64.
+  --landmarks  per image, in log order like the rows above, no header: the 468 landmarks as (u, v)
+               pairs of little-endian f32 in the same pixels, 3744 bytes, all NaN without a face.
+               NumPy: np.fromfile(path, '<f4').reshape(-1, 468, 2)";
+
 /// Init-packet capture replayed to bring the device up when none is given.
 const DEFAULT_INIT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -117,6 +142,10 @@ pub(crate) enum Command {
         path: String,
         /// Optional CSV output of the decoded poses.
         csv: Option<String>,
+        /// Optional CSV output of each image's face fit, at full precision.
+        fits: Option<String>,
+        /// Optional raw f32 output of each image's 468 landmarks.
+        landmarks: Option<String>,
     },
     /// Head-axis analysis of the 0x83 3D points in a recorded log.
     Head83 {
@@ -357,17 +386,33 @@ impl Options {
     }
 
     fn parse_image83_replay(args: &mut Args) -> Result<Self> {
-        let path = args
-            .next()
-            .context("usage: image83-replay <log.bin> [--csv out.csv]")?;
+        let mut path = None;
         let mut csv = None;
+        let mut fits = None;
+        let mut landmarks = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--csv" => csv = Some(take_value(args, "--csv", "a path")?),
-                s => bail!("unknown option: {s}"),
+                "--fits" => fits = Some(take_value(args, "--fits", "a path")?),
+                "--landmarks" => landmarks = Some(take_value(args, "--landmarks", "a path")?),
+                "-h" | "--help" => print_help_and_exit(&format!(
+                    "{IMAGE83_REPLAY_USAGE}\n{IMAGE83_REPLAY_OUTPUTS}"
+                )),
+                s if s.starts_with('-') => bail!("unknown option: {s}"),
+                other => {
+                    if path.replace(other.to_string()).is_some() {
+                        bail!("image83-replay takes one log\n{IMAGE83_REPLAY_USAGE}");
+                    }
+                }
             }
         }
-        Ok(Self::for_command(Command::Image83Replay { path, csv }))
+        let path = path.context(IMAGE83_REPLAY_USAGE)?;
+        Ok(Self::for_command(Command::Image83Replay {
+            path,
+            csv,
+            fits,
+            landmarks,
+        }))
     }
 
     fn parse_image83(args: &mut Args) -> Result<Self> {

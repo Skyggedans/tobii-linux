@@ -10,6 +10,7 @@ mod compare_dll;
 mod compare_head;
 mod dashboard;
 mod devcmd;
+mod face_fits;
 mod gates;
 mod ipc_probe;
 mod math;
@@ -38,7 +39,14 @@ fn run() -> Result<()> {
         Command::Track { .. } => devcmd::run_track(&opts),
         Command::Probe { .. } => devcmd::run_probe(&opts),
         Command::Image83 { .. } => devcmd::run_image83(&opts),
-        Command::Image83Replay { path, csv } => devcmd::run_image83_replay(path, csv.as_deref()),
+        Command::Image83Replay {
+            path,
+            csv,
+            fits,
+            landmarks,
+        } => {
+            devcmd::run_image83_replay(path, csv.as_deref(), fits.as_deref(), landmarks.as_deref())
+        }
         Command::Head83 { path, occs } => analysis::head83(path, occs),
         Command::CompareDll {
             log_path,

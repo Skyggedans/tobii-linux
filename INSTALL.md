@@ -518,10 +518,12 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
 - Diagnostics: `tobii5-init-replay image83 [--secs 10] [--pose] [--log f.bin] [--no-image]`
   (starts gaze + the 0x50e image stream, reports per-stream rates and gaze
   validity, saves the first frames as PGM, `--pose` runs the head tracker live;
-  `--no-image` is the gaze-only baseline), `… image83-replay <log.bin> [--csv out.csv]`
-  (runs the tracker over a logged capture and pairs poses with the 0x83 head
-  anchors), `… probe` (UVC-camera-vs-0x83 concurrency), `… head83 <log.bin>`
-  (research: head pose from 0x83 points).
+  `--no-image` is the gaze-only baseline), `… image83-replay <log.bin> [--csv out.csv]
+  [--fits fits.csv] [--landmarks landmarks.f32]` (runs the tracker over a logged
+  capture and pairs poses with the 0x83 head anchors; `--fits` exports every
+  image's face fit at full precision and `--landmarks` its 468 landmarks as f32,
+  layouts in `--help`), `… probe` (UVC-camera-vs-0x83 concurrency), `… head83
+  <log.bin>` (research: head pose from 0x83 points).
 
 ### 8a. Calibration
 

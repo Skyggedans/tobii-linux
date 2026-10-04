@@ -19,8 +19,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::cli::{Command, Options};
 use crate::dashboard::render_dashboard_status;
+use crate::face_fits::{FitFields, FitsCsv, LandmarksF32};
 use crate::opentrack::OpentrackUdp;
 use crate::sinks::{DecodedCsv, JsonlOutput, handle_live_decoded};
+use tobii_pose::track::RestPose;
 use tobii_proto::decode::{TrackingFrame, decode_stream_payload};
 use tobii_proto::image83::{decode_image_payload, write_pgm};
 use tobii_proto::log::{PacketLog, log_packet};
@@ -554,14 +556,32 @@ pub(crate) fn run_track(opts: &Options) -> Result<()> {
 /// CSV for analysis and prints a summary (used to validate sign/scale against
 /// the `MediaPipe` reference and the 0x83 eyeball-centre translation).
 ///
+/// The tracker is the daemon's, fed every image in log order: its face fit
+/// ([`Tracker::fit`]), then the legacy pose of a [`RestPose`] with the
+/// daemon's settings, which is what [`Tracker::process`] does. `fits` and
+/// `landmarks` also export each image's fit at full precision, as a CSV and
+/// as raw f32 landmarks ([`crate::face_fits`] gives their layouts).
+///
+/// [`Tracker::fit`]: tobii_pose::track::Tracker::fit
+/// [`Tracker::process`]: tobii_pose::track::Tracker::process
+///
 /// # Errors
 ///
 /// Fails if the log cannot be read, the face model cannot be loaded, a gaze
-/// payload does not decode, or the CSV cannot be written.
-pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
+/// payload does not decode, the tracker fails on an image, or an output
+/// cannot be written.
+pub(crate) fn run_image83_replay(
+    path: &str,
+    csv: Option<&str>,
+    fits: Option<&str>,
+    landmarks: Option<&str>,
+) -> Result<()> {
     use tobii_proto::log::read_log_payloads;
     let payloads = read_log_payloads(path)?;
     let mut tracker = tobii_pose::track::Tracker::new_image83()?;
+    let mut rest = RestPose::from_env();
+    let mut fits_csv = fits.map(FitsCsv::create).transpose()?;
+    let mut landmarks_f32 = landmarks.map(LandmarksF32::create).transpose()?;
     let mut asm = BulkReassembler::new();
     let mut out = csv
         .map(|p| {
@@ -597,10 +617,18 @@ pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
                     let Some(frame) = decode_image_payload(msg) else {
                         continue;
                     };
-                    let rel = tracker.process(&frame.pixels, frame.width, frame.height)?;
-                    let raw = tracker.last_raw();
+                    let fit = tracker.fit(&frame.pixels, frame.width, frame.height)?;
+                    let rel = rest.update(fit.as_ref());
+                    let raw = rest.last_raw();
                     faces += u64::from(raw.is_some());
                     poses += u64::from(rel.is_some());
+                    if let Some(fits_csv) = fits_csv.as_mut() {
+                        let fields = fit.as_ref().map(FitFields::from);
+                        fits_csv.write_image(images, frame.device_ts_us, fields.as_ref())?;
+                    }
+                    if let Some(landmarks_f32) = landmarks_f32.as_mut() {
+                        landmarks_f32.write_image(fit.as_ref().map(|f| f.landmarks))?;
+                    }
                     let g = last_gaze.as_ref();
                     if let Some(r) = raw
                         && let Some(g) = g
@@ -642,6 +670,17 @@ pub(crate) fn run_image83_replay(path: &str, csv: Option<&str>) -> Result<()> {
                 _ => {}
             }
         }
+    }
+    if let (Some(mut o), Some(p)) = (out, csv) {
+        o.flush().with_context(|| format!("failed to write {p}"))?;
+    }
+    if let (Some(fits_csv), Some(p)) = (fits_csv, fits) {
+        fits_csv.finish()?;
+        println!("wrote the face fits of {images} images to {p}");
+    }
+    if let (Some(landmarks_f32), Some(p)) = (landmarks_f32, landmarks) {
+        landmarks_f32.finish()?;
+        println!("wrote the landmarks of {images} images to {p}");
     }
     let runs = tracker.model_runs();
     println!(
