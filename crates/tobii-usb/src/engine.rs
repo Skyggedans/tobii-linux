@@ -224,8 +224,10 @@ pub struct ImageSample {
     /// gave since. Never the area handed to
     /// [`Engine::set_display_area_override`], which only the next init
     /// writes. `None` while the device has confirmed no area, or one that
-    /// fixes no frame (see [`DisplayFrame::new`]).
-    pub display_frame: Option<DisplayFrame>,
+    /// fixes no frame (see [`DisplayFrame::new`]). Built once for each
+    /// [display generation](Self::display_generation) and shared by all
+    /// its images.
+    pub display_frame: Option<Arc<DisplayFrame>>,
     /// How many times that display area had changed since the engine
     /// started: frames of one generation share one area. 0 before the
     /// device first confirmed one.
@@ -251,6 +253,11 @@ impl ImageSample {
         }
     }
 }
+
+// An image sample carries its frame and its display frame by pointer: five
+// words. The display frame inline (104 bytes) would make it the largest
+// sample by far, and so every sample larger.
+const _: () = assert!(size_of::<ImageSample>() <= 5 * size_of::<u64>());
 
 /// One item out of the engine.
 #[derive(Debug, Clone, PartialEq)]

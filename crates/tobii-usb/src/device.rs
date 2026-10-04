@@ -1486,9 +1486,10 @@ fn init_facts(packets: &[InitPacket], capture: &InitCapture) -> (DeviceFacts, Op
 struct AreaInEffect {
     /// The area; `None` while the device has confirmed none.
     area: Option<DisplayArea>,
-    /// The display frame the area fixes; `None` without an area, and for
-    /// one that fixes none.
-    frame: Option<DisplayFrame>,
+    /// The display frame the area fixes, which every image read while it
+    /// is in effect shares; `None` without an area, and for one that fixes
+    /// none.
+    frame: Option<Arc<DisplayFrame>>,
     /// How many times the area changed since the engine started: 0 until
     /// the device first confirms one.
     generation: DisplayGeneration,
@@ -1502,7 +1503,7 @@ impl AreaInEffect {
         if area != self.area {
             *self = Self {
                 area,
-                frame: area.as_ref().and_then(DisplayFrame::new),
+                frame: area.as_ref().and_then(DisplayFrame::new).map(Arc::new),
                 generation: self.generation.next(),
             };
         }
@@ -2112,7 +2113,7 @@ impl Pump<'_> {
                 let image = ImageSample {
                     frame: Arc::new(frame),
                     host_us,
-                    display_frame: in_effect.frame,
+                    display_frame: in_effect.frame.clone(),
                     display_generation: in_effect.generation,
                     open: self.opens.count,
                 };
@@ -2174,7 +2175,7 @@ impl Pump<'_> {
             display: in_effect,
             check,
         } = &mut *self.opens;
-        let Some(display) = in_effect.frame else {
+        let Some(display) = in_effect.frame.as_deref().copied() else {
             return;
         };
         let generation = in_effect.generation;
@@ -2622,7 +2623,11 @@ mod tests {
         /// area in effect and the open: its frame, generation and open.
         fn pose_display(&self) -> (Option<DisplayFrame>, DisplayGeneration, OpenNumber) {
             let image = self.pose_image().expect("an image for the pose worker");
-            (image.display_frame, image.display_generation, image.open)
+            (
+                image.display_frame.as_deref().copied(),
+                image.display_generation,
+                image.open,
+            )
         }
     }
 
@@ -3025,7 +3030,7 @@ mod tests {
             bottom_left_mm: [-2.0, -2.0, 0.0],
         };
         display.set(Some(start));
-        let frame = display.frame.expect("a frame");
+        let frame = display.frame.as_deref().copied().expect("a frame");
         assert_eq!(frame.to_display([30.0, -40.0, 600.0]), [30.0, -40.0, 600.0]);
         assert_eq!(display.generation, DisplayGeneration(1));
         display.set(Some(start));
@@ -3034,7 +3039,7 @@ mod tests {
         let (b, _) = area_of("change-display-notify-1450");
         display.set(Some(b));
         assert_eq!(
-            (display.frame, display.generation),
+            (display.frame.as_deref().copied(), display.generation),
             (DisplayFrame::new(&b), DisplayGeneration(2))
         );
         let narrow = DisplayArea {
@@ -3043,13 +3048,13 @@ mod tests {
         };
         display.set(Some(narrow));
         assert_eq!(
-            (display.area, display.frame, display.generation),
+            (display.area, display.frame.as_deref(), display.generation),
             (Some(narrow), None, DisplayGeneration(3)),
             "an area that fixes no frame"
         );
         display.set(None);
         assert_eq!(
-            (display.area, display.frame, display.generation),
+            (display.area, display.frame.as_deref(), display.generation),
             (None, None, DisplayGeneration(4))
         );
     }
@@ -3090,7 +3095,11 @@ mod tests {
         let images: Vec<(Option<DisplayFrame>, DisplayGeneration, OpenNumber)> = samples
             .iter()
             .filter_map(|sample| match sample {
-                Sample::Image(i) => Some((i.display_frame, i.display_generation, i.open)),
+                Sample::Image(i) => Some((
+                    i.display_frame.as_deref().copied(),
+                    i.display_generation,
+                    i.open,
+                )),
                 _ => None,
             })
             .collect();
@@ -3112,6 +3121,45 @@ mod tests {
             })
             .count();
         assert_eq!(notifications, 2);
+    }
+
+    /// The images read while one display area is in effect share the frame
+    /// built for its generation, the one waiting for the pose worker
+    /// included: a 1450 of the same area builds none, one of another area
+    /// builds its own.
+    #[test]
+    fn the_images_of_a_display_generation_share_its_frame() {
+        let rig = Rig::new();
+        rig.shared.image_wanted.store(true, Ordering::Relaxed);
+        let (a, _) = area_of("init-rsp-1430");
+        let mut opens = Opens::default();
+        opens.opened(Some(a));
+        let mut pump = rig.pump(&mut opens);
+        let notified = || classify(&fixture("change-display-notify-1450"));
+
+        pump.deliver_at(image_at(10 * S), 50 * S);
+        pump.deliver_at(image_at(10 * S + 30 * MS), 50 * S + 31 * MS);
+        pump.deliver_at(notified(), 50 * S + 40 * MS);
+        pump.deliver_at(image_at(10 * S + 60 * MS), 50 * S + 61 * MS);
+        pump.deliver_at(notified(), 50 * S + 70 * MS);
+        pump.deliver_at(image_at(10 * S + 90 * MS), 50 * S + 91 * MS);
+
+        let frames: Vec<Arc<DisplayFrame>> = rig
+            .samples()
+            .into_iter()
+            .filter_map(|sample| match sample {
+                Sample::Image(image) => image.display_frame,
+                _ => None,
+            })
+            .collect();
+        let [a1, a2, b1, b2] = &frames[..] else {
+            panic!("four images with a display frame: {frames:?}");
+        };
+        assert!(Arc::ptr_eq(a1, a2), "A's generation");
+        assert!(Arc::ptr_eq(b1, b2), "B's, notified twice");
+        assert!(!Arc::ptr_eq(a1, b1));
+        let waiting = rig.pose_image().and_then(|image| image.display_frame);
+        assert!(waiting.is_some_and(|frame| Arc::ptr_eq(&frame, b2)));
     }
 
     #[test]
