@@ -58,7 +58,11 @@ pub struct DeviceFacts {
     pub properties: Vec<(u32, String)>,
     /// Stream catalogue, in the device's order (command 1200).
     pub streams: Vec<StreamType>,
-    /// The display area in effect (command 1430, or the last 1440/1450).
+    /// The display area in effect: the answer to command 1430, or the last
+    /// display-area notification (1450) since. The engine's init asks the
+    /// 1430 before it writes its 1440, so it reports the area the device
+    /// confirmed instead: the 1450 that followed the write, or the write the
+    /// device took.
     pub display_area: Option<DisplayArea>,
     /// The display id that accompanies the display area.
     pub display_id: Option<u32>,

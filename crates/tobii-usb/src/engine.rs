@@ -39,6 +39,17 @@
 //! A message read with no arrival in the 120 s before it (presence as a long
 //! pause ends), and an image without a device timestamp, get the time they
 //! were read. A head pose has the host time of the image it was made from.
+//!
+//! # Display area
+//!
+//! The engine keeps the display area in effect on the device as the device
+//! confirms it: at each init, the display-area notification (1450) the init
+//! brought, else the area the init wrote if the device took it, else the
+//! device's answer to the init's read, which comes before the write (on
+//! Linux, the 4 x 4 mm square the tracker starts each open with); after
+//! that, each 1450. [`Sample::DeviceReady`] reports that area, and every
+//! [`ImageSample`] carries its display frame. The area handed to
+//! [`Engine::set_display_area_override`] is only what the next inits write.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -49,7 +60,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tobii_ipc::deadline;
-use tobii_ipc::geometry::DisplayArea;
+use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
 use tobii_proto::facts::{DeviceFacts, DeviceNotification};
 use tobii_proto::gaze83::GazeFrame;
 use tobii_proto::image83::ImageFrame;
@@ -140,7 +151,12 @@ impl PresenceSample {
     }
 }
 
-/// One 0x50e IR frame.
+/// One 0x50e IR frame, with the display area in effect on the device when
+/// it was read and the open that read it.
+///
+/// The display frame, its generation and the open are for the head pose the
+/// Stream Engine reports, which is in the display frame; nothing reads them
+/// yet (the pose worker still makes the tracker's own head pose).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ImageSample {
@@ -149,14 +165,37 @@ pub struct ImageSample {
     /// The frame's device timestamp on the host clock, microseconds (see
     /// [Timestamps](crate::engine#timestamps)).
     pub host_us: i64,
+    /// The display frame of the display area in effect on the device when
+    /// the frame was read, as the device confirmed that area: the one the
+    /// open's init left in effect, or the one a display-area notification
+    /// gave since. Never the area handed to
+    /// [`Engine::set_display_area_override`], which only the next init
+    /// writes. `None` while the device has confirmed no area, or one that
+    /// fixes no frame (see [`DisplayFrame::new`]).
+    pub display_frame: Option<DisplayFrame>,
+    /// How many times that display area had changed since the engine
+    /// started: frames of one generation share one area. 0 before the
+    /// device first confirmed one.
+    pub display_generation: u64,
+    /// Which of the engine's opens of the tracker read the frame, from 1. A
+    /// frame of another open does not follow on from the ones before it: an
+    /// open starts the tracker over, its clock included.
+    pub open: u64,
 }
 
 impl ImageSample {
     /// A sample of `frame`, whose device timestamp is `host_us` on the host
-    /// clock.
+    /// clock, with no display frame, display generation 0 and open 0 (no
+    /// open the engine makes is 0).
     #[must_use]
     pub fn new(frame: Arc<ImageFrame>, host_us: i64) -> Self {
-        Self { frame, host_us }
+        Self {
+            frame,
+            host_us,
+            display_frame: None,
+            display_generation: 0,
+            open: 0,
+        }
     }
 }
 
@@ -174,7 +213,9 @@ pub enum Sample {
     Image(ImageSample),
     /// A device notification.
     Notification(DeviceNotification),
-    /// The device finished its init; what it reported about itself.
+    /// The device finished its init; what it reported about itself, the
+    /// display area it confirmed included (see [Display
+    /// area](crate::engine#display-area)).
     DeviceReady(Arc<DeviceFacts>),
 }
 
@@ -290,12 +331,22 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// The display area the next init writes, if not the replay's own.
     pub(crate) fn display_override(&self) -> Option<DisplayArea> {
         // Written whole; a poisoned lock cannot hold a torn value.
         *self
             .display_override
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Have the next inits write `area` (see
+    /// [`Engine::set_display_area_override`]).
+    pub(crate) fn set_display_override(&self, area: Option<DisplayArea>) {
+        *self
+            .display_override
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = area;
     }
 }
 
@@ -383,13 +434,12 @@ impl Engine {
     }
 
     /// Keep `area` as the display area across device re-inits (the init
-    /// replay would otherwise restore the one it embeds).
+    /// replay would otherwise restore the one it embeds); `None` goes back
+    /// to the replay's own. This is only what the next inits write: the
+    /// area in effect, which the device's facts and the image samples carry
+    /// ([`ImageSample::display_frame`]), is the one the device confirms.
     pub fn set_display_area_override(&self, area: Option<DisplayArea>) {
-        *self
-            .shared
-            .display_override
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = area;
+        self.shared.set_display_override(area);
     }
 
     /// Is the device thread still running (false once it has exited/failed)?

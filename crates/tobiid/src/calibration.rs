@@ -834,9 +834,20 @@ pub(crate) mod tests {
         /// Have the pump take in a `DeviceReady`.
         fn reinit(&self) {
             if let Some(state) = self.state.upgrade() {
-                lock_state(&state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+                init_done(&mut lock_state(&state));
             }
         }
+    }
+
+    /// Have the pump take in the `DeviceReady` of an init that wrote the
+    /// display area configured, which the device took: the init reports it
+    /// (none configured, none reported: the stand-in replays nothing).
+    fn init_done(st: &mut State) {
+        let facts = DeviceFacts {
+            display_area: st.display_override,
+            ..DeviceFacts::default()
+        };
+        st.observe(&Sample::DeviceReady(Arc::new(facts)));
     }
 
     impl DeviceCommands for FakeDevice {
@@ -970,7 +981,7 @@ pub(crate) mod tests {
 
     /// The device re-initialised.
     fn device_ready(s: &Setup) {
-        lock_state(&s.state).observe(&Sample::DeviceReady(Arc::new(DeviceFacts::default())));
+        init_done(&mut lock_state(&s.state));
     }
 
     /// Forget the commands the device got so far.

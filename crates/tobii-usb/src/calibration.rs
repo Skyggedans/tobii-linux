@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use tobii_calib::store::{self, Location};
 use tobii_ipc::geometry::DisplayArea;
 use tobii_proto::calibration::{self as calib_cmd, blob_from_payload, write_payload};
-use tobii_proto::facts::{DEFAULT_DISPLAY_ID, display_area_set_payload};
+use tobii_proto::facts::{DEFAULT_DISPLAY_ID, display_area_set_payload, parse_display_area};
 use tobii_proto::protocol::{
     InitPacket, MARKER_COMMAND, chunk_command, cmd, parse_init_packets, parse_message,
 };
@@ -66,6 +66,17 @@ fn command_run(packets: &[InitPacket], id: u32) -> Option<(Range<usize>, u32)> {
     Some((start..end, seq))
 }
 
+/// The whole message of a command written as `pieces`: each piece's body
+/// after its 8-byte prefix, joined behind a zero prefix of that size, which
+/// is where [`parse_message`] reads the header from.
+fn command_message(pieces: &[InitPacket]) -> Vec<u8> {
+    let mut message = vec![0u8; 8];
+    for piece in pieces {
+        message.extend_from_slice(piece.data.get(8..).unwrap_or_default());
+    }
+    message
+}
+
 /// The calibration blob the embedded replay uploads.
 ///
 /// # Errors
@@ -75,15 +86,24 @@ pub fn embedded_blob() -> Result<Vec<u8>> {
     let packets = embedded_packets()?;
     let (run, _) = command_run(&packets, calib_cmd::cmd::WRITE)
         .context("no calibration upload in the init replay")?;
-    // Reassemble the command body from its prefixed pieces.
-    let body: Vec<u8> = packets[run]
-        .iter()
-        .flat_map(|p| p.data[8..].iter().copied())
-        .collect();
-    let prefixed = [&[0u8; 8][..], &body].concat();
+    let prefixed = command_message(&packets[run]);
     let message = parse_message(&prefixed).context("calibration upload header")?;
     let blob = blob_from_payload(message.payload).context("calibration upload payload")?;
     Ok(blob.to_vec())
+}
+
+/// The display area `packets` write (their 1440), as the device reads it:
+/// the seq the device answers the write with, the corners as the wire
+/// carries them (32.32 fixed point of 1/1024 mm, so an area set in `f64`
+/// comes back rounded) and the display id. `None` when `packets` write no
+/// display area, or one that does not parse.
+pub(crate) fn written_display_area(
+    packets: &[InitPacket],
+) -> Option<(u32, DisplayArea, Option<u32>)> {
+    let (run, seq) = command_run(packets, cmd::DISPLAY_AREA_SET)?;
+    let message = command_message(&packets[run]);
+    let (area, display_id) = parse_display_area(&parse_message(&message)?)?;
+    Some((seq, area, display_id))
 }
 
 /// Replace the calibration upload in `packets` with `blob`, keeping its seq.
@@ -205,10 +225,9 @@ mod tests {
         assert_eq!(next_command_seq(&substituted), next_command_seq(&packets));
     }
 
-    #[test]
-    fn display_area_is_written_in_place() {
-        let packets = embedded_packets().expect("embedded");
-        let area = tobii_ipc::geometry::display_area_basic(
+    /// A display area a user might set: a 597 x 336 mm monitor.
+    fn user_area() -> DisplayArea {
+        tobii_ipc::geometry::display_area_basic(
             597.0,
             336.0,
             1.0,
@@ -219,7 +238,13 @@ mod tests {
                 external_offset_mm: [0.0, -0.16, 13.85],
                 internal_offset_mm: [0.0, 5.38, 9.86],
             },
-        );
+        )
+    }
+
+    #[test]
+    fn display_area_is_written_in_place() {
+        let packets = embedded_packets().expect("embedded");
+        let area = user_area();
 
         let substituted = substitute_display_area(&packets, &area).expect("substitute");
 
@@ -230,5 +255,30 @@ mod tests {
         let (written, id) = tobii_proto::facts::parse_display_area(&msg).expect("area");
         assert_eq!(id, Some(DEFAULT_DISPLAY_ID));
         assert!((written.top_right_mm[0] - written.top_left_mm[0] - 597.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_area_written_reads_back_as_the_wire_carries_it() {
+        let packets = embedded_packets().expect("embedded");
+        let (seq, embedded, id) = written_display_area(&packets).expect("the replay's 1440");
+        assert_eq!((seq, id), (0x0e, Some(DEFAULT_DISPLAY_ID)));
+        assert_eq!(written_display_area(&packets[..13]), None, "no 1440");
+
+        let area = user_area();
+        let substituted = substitute_display_area(&packets, &area).expect("substitute");
+        let (seq, written, id) = written_display_area(&substituted).expect("the user's 1440");
+
+        assert_eq!((seq, id), (0x0e, Some(DEFAULT_DISPLAY_ID)));
+        assert_ne!(written, embedded);
+        // 32.32 fixed point of 1/1024 mm: rounded to 2^-42 mm.
+        let half_step = 0.5 / 1024.0 / 4_294_967_296.0;
+        let corners = |a: DisplayArea| [a.top_left_mm, a.top_right_mm, a.bottom_left_mm];
+        for (w, a) in corners(written)
+            .iter()
+            .flatten()
+            .zip(corners(area).iter().flatten())
+        {
+            assert!((w - a).abs() <= half_step, "{w} for {a}");
+        }
     }
 }

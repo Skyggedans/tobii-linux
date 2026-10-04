@@ -589,9 +589,9 @@ impl State {
                 self.note_engine_armed();
                 let mut facts = (**facts).clone();
                 keep_unreported(&mut facts, self.facts.as_deref());
-                if let Some(area) = self.display_override {
-                    facts.display_area = Some(area);
-                }
+                // The display area is the one the device confirmed at this
+                // init (see tobii_usb::engine), not `display_override`: the
+                // init wrote that one, but the device may have refused it.
                 if let Some(id) = facts.calibration_id {
                     self.calibration.id = Some(id);
                 }
@@ -1810,6 +1810,31 @@ pub(crate) mod tests {
 
         watch_engine_at(&state, t0);
         assert_eq!(engines_started(&state), 2, "not the watchdog");
+    }
+
+    #[test]
+    fn an_init_reports_the_display_area_the_device_confirmed() {
+        let mut st = state_with_client(1);
+        st.display_override = Some(area(600.0));
+        let ready = |display_area| {
+            Sample::DeviceReady(Arc::new(DeviceFacts {
+                display_area,
+                ..DeviceFacts::default()
+            }))
+        };
+
+        st.observe(&ready(Some(area(520.0))));
+        assert_eq!(
+            st.facts.as_ref().and_then(|f| f.display_area),
+            Some(area(520.0))
+        );
+        st.observe(&ready(None));
+        assert_eq!(
+            st.facts.as_ref().and_then(|f| f.display_area),
+            None,
+            "not the configured one, which the device did not confirm"
+        );
+        assert_eq!(st.display_override, Some(area(600.0)), "the next init's");
     }
 
     #[test]

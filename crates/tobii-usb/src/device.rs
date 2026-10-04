@@ -21,17 +21,20 @@ use crate::engine::{
 };
 use crate::time_map::{Stream, TimeMap};
 use std::sync::mpsc::Receiver;
+use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
 use tobii_ipc::host_clock_us;
 use tobii_proto::facts::{
     DeviceFacts, DeviceNotification, STATUS_FAULTS, STATUS_WARNINGS, decode_notification,
+    parse_display_area,
 };
 use tobii_proto::gaze83::{GazeFrame, PresenceFrame, decode_gaze_frame, decode_presence_frame};
 use tobii_proto::image83::{ImageFrame, decode_image_payload, upscale2x_into};
 use tobii_proto::log::{PacketLog, log_packet};
 use tobii_proto::protocol::{
     BulkReassembler, InitPacket, MARKER_COMMAND, MARKER_NOTIFICATION, MARKER_RESPONSE,
-    MARKER_STREAM, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, chunk_command,
-    declared_len, marker, parse_message, seq, stream_id, stream_start_packet, stream_stop_packet,
+    MARKER_STREAM, RESPONSE_STATUS_OK, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE,
+    chunk_command, cmd, declared_len, marker, notify, parse_message, seq, stream_id,
+    stream_start_packet, stream_stop_packet, ttp_error,
 };
 
 /// USB vendor id of the Tobii Eye Tracker 5.
@@ -661,9 +664,10 @@ pub(crate) fn run_gaze_engine(
     });
 
     let reset = (!is_env_flag_set("TOBII_NO_RESET")).then_some(|| reset_device_baseline(&ctx));
+    let mut opens = Opens::default();
     let result = run_opens(
         stop,
-        || gaze_engine_attempt(&ctx, shared, commands, tx, &mailbox),
+        || gaze_engine_attempt(&ctx, shared, commands, tx, &mailbox, &mut opens),
         reset,
         REOPEN_PAUSE,
     );
@@ -899,13 +903,14 @@ fn pose_worker(mailbox: &PoseMailbox, shared: &Shared, tx: &Sender<Sample>) {
 /// One open+init+read of the 0x83 stream, pushing samples until `stop` or a
 /// failure. Fails with [`StreamStartupTimeout`] when no gaze frame arrives
 /// within 4.5 s of the init, and with a [`StreamLost`] context on any failure
-/// after one did.
+/// after one did. `opens` is what the opens before this one left.
 fn gaze_engine_attempt(
     ctx: &UsbContext,
     shared: &Shared,
     commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
     mailbox: &PoseMailbox,
+    opens: &mut Opens,
 ) -> Result<()> {
     let mut h = open_tobii(ctx)?;
     vendor_control_init(&mut h)?;
@@ -913,7 +918,7 @@ fn gaze_engine_attempt(
     // inside vendor_control_init). Guarantee the Windows-style stop (request 66)
     // on every exit — clean stop, error, or timeout — so the device isn't left
     // mid-stream and the next open starts from a defined state.
-    let result = gaze_stream_loop(&mut h, shared, commands, tx, mailbox);
+    let result = gaze_stream_loop(&mut h, shared, commands, tx, mailbox, opens);
     vendor_control_deinit(&mut h);
     result
 }
@@ -1350,6 +1355,174 @@ pub fn replay_init_packets(
     Ok(capture)
 }
 
+/// Where the display area an init leaves in effect came from (see
+/// [`init_display_area`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AreaSource {
+    /// The last display-area notification (1450) the replay read.
+    Notified,
+    /// The replay's display-area write (1440), which the device took.
+    Written,
+    /// The device's answer to the replay's display-area read (1430).
+    Read,
+}
+
+impl AreaSource {
+    /// The id of the message the area came in, for the log.
+    const fn message_id(self) -> u32 {
+        match self {
+            Self::Notified => notify::DISPLAY_AREA,
+            Self::Written => cmd::DISPLAY_AREA_SET,
+            Self::Read => cmd::DISPLAY_AREA_GET,
+        }
+    }
+}
+
+/// The display area an init leaves in effect on the device, the display id
+/// that goes with it, and where the two came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct InitArea {
+    area: DisplayArea,
+    display_id: Option<u32>,
+    source: AreaSource,
+}
+
+/// The area in `msg`, if it is a `marker` message `id` that carries one.
+fn display_area_in(msg: &[u8], marker: u32, id: u32) -> Option<(DisplayArea, Option<u32>)> {
+    let m = parse_message(msg)?;
+    if m.marker != marker || m.id != id {
+        return None;
+    }
+    parse_display_area(&m)
+}
+
+/// The display area the init replay of `packets` left in effect, as the
+/// device confirmed it in `capture`, the first of:
+///
+/// 1. the last display-area notification (1450) the replay read besides
+///    the responses: the device sends one when an area it takes differs
+///    from the one it holds;
+/// 2. the area the replay wrote (its 1440, as the wire carries it), if the
+///    device answered the write OK and with no error, as tobiid judges an
+///    answer: an area the device holds already brings no 1450 (the Windows
+///    inits), and the write stands in for a 1450 the side messages had no
+///    room for;
+/// 3. the device's answer to the replay's display-area read (1430).
+///
+/// The replay reads the area (seq 11) before it writes one (seq 14), so the
+/// read answers what the device held before the init wrote: on Linux, the
+/// 4 x 4 mm square around its origin it starts every open with (all 20
+/// recorded logs, each followed by a 1450). The display id comes from the
+/// same message; a 1450 carries none, and the next source down gives it.
+fn init_display_area(packets: &[InitPacket], capture: &InitCapture) -> Option<InitArea> {
+    let notified = capture
+        .side
+        .iter()
+        .rev()
+        .find_map(|m| display_area_in(m, MARKER_NOTIFICATION, notify::DISPLAY_AREA));
+    let written = crate::calibration::written_display_area(packets).and_then(|(seq, area, id)| {
+        capture
+            .responses
+            .iter()
+            .filter_map(|r| parse_message(r))
+            .any(|m| {
+                m.marker == MARKER_RESPONSE
+                    && m.id == cmd::DISPLAY_AREA_SET
+                    && m.seq == seq
+                    && m.status == RESPONSE_STATUS_OK
+                    && m.error == ttp_error::NONE
+            })
+            .then_some((area, id))
+    });
+    let read = capture
+        .responses
+        .iter()
+        .rev()
+        .find_map(|m| display_area_in(m, MARKER_RESPONSE, cmd::DISPLAY_AREA_GET));
+    let mut confirmed = [
+        notified.map(|found| (found, AreaSource::Notified)),
+        written.map(|found| (found, AreaSource::Written)),
+        read.map(|found| (found, AreaSource::Read)),
+    ]
+    .into_iter()
+    .flatten();
+    let ((area, display_id), source) = confirmed.next()?;
+    Some(InitArea {
+        area,
+        display_id: display_id.or_else(|| confirmed.find_map(|((_, id), _)| id)),
+        source,
+    })
+}
+
+/// What the init replay of `packets` says of the device in `capture`: the
+/// facts its responses give, but for the display area and display id, which
+/// are the ones the device confirmed ([`init_display_area`], also returned):
+/// not the 1430 answer, which predates the init's write, nor the area the
+/// init meant to write, which the device may have refused.
+fn init_facts(packets: &[InitPacket], capture: &InitCapture) -> (DeviceFacts, Option<InitArea>) {
+    let mut facts =
+        DeviceFacts::from_messages(capture.responses.iter().filter_map(|r| parse_message(r)));
+    let confirmed = init_display_area(packets, capture);
+    facts.display_area = confirmed.map(|c| c.area);
+    facts.display_id = confirmed.and_then(|c| c.display_id);
+    (facts, confirmed)
+}
+
+/// The display area in effect on the device, as the device confirmed it:
+/// the area an init left in effect (see [`init_display_area`]), or the one
+/// a display-area notification (1450) gave since (see [`Pump::route`]).
+/// Never the area handed to
+/// [`Engine::set_display_area_override`](crate::engine::Engine::set_display_area_override),
+/// which is what the next inits write and may run ahead of the device:
+/// tobiid hands it the `TOBII_DISPLAY_MM` area before its own write of that
+/// area, which the device may refuse, and `None` when a calibration session
+/// puts back a configuration that had no area.
+#[derive(Debug, Default, PartialEq)]
+struct AreaInEffect {
+    /// The area; `None` while the device has confirmed none.
+    area: Option<DisplayArea>,
+    /// The display frame the area fixes; `None` without an area, and for
+    /// one that fixes none.
+    frame: Option<DisplayFrame>,
+    /// How many times the area changed since the engine started: 0 until
+    /// the device first confirms one.
+    generation: u64,
+}
+
+impl AreaInEffect {
+    /// Take `area` as the area in effect. The generation moves on, and the
+    /// frame is built anew, only if it differs from the one before, as the
+    /// device sends a 1450 only for an area that changes the one it holds.
+    fn set(&mut self, area: Option<DisplayArea>) {
+        if area != self.area {
+            *self = Self {
+                area,
+                frame: area.as_ref().and_then(DisplayFrame::new),
+                generation: self.generation.wrapping_add(1),
+            };
+        }
+    }
+}
+
+/// What the engine's USB thread keeps from one open of the tracker to the
+/// next: how many it made, and the display area in effect.
+#[derive(Debug, Default)]
+struct Opens {
+    /// Opens whose init replay ran to its end, the one under way included:
+    /// its number, from 1.
+    count: u64,
+    /// The display area in effect on the device.
+    display: AreaInEffect,
+}
+
+impl Opens {
+    /// Another open's init replay ran to its end and left `area` in effect.
+    fn opened(&mut self, area: Option<DisplayArea>) {
+        self.count = self.count.wrapping_add(1);
+        self.display.set(area);
+    }
+}
+
 /// Read 0x83 for up to `dur`, returning true as soon as a decodable GAZE
 /// (0x500) frame arrives. 0x52 handshake/config responses and any image /
 /// presence messages are drained and ignored — an image frame must not count
@@ -1686,6 +1859,9 @@ struct Pump<'a> {
     /// This open's device-to-host time map: a new open may restart the
     /// tracker's clock, and a new pump starts a new map.
     time: TimeMap,
+    /// This open's number and the display area in effect, which every image
+    /// carries; a 1450 the pump routes changes the area.
+    opens: &'a mut Opens,
 }
 
 impl Pump<'_> {
@@ -1701,6 +1877,24 @@ impl Pump<'_> {
     fn deliver_at(&mut self, incoming: Incoming, rx_us: i64) {
         self.observe(&incoming, rx_us);
         self.route(incoming, rx_us);
+    }
+
+    /// Deliver the messages the init replay read besides its responses,
+    /// stamped as read now: no arrival of this open has come yet to map
+    /// them. A display-area notification (1450) among them is passed on but
+    /// changes nothing here: the init took the area of the last one already
+    /// (see [`init_display_area`]), and routing any before it would make
+    /// the area in effect go back and forth.
+    fn deliver_init_side(&mut self, side: &[Vec<u8>]) {
+        for msg in side {
+            match classify(msg) {
+                Incoming::Notification(n @ DeviceNotification::DisplayAreaChanged(_)) => {
+                    debug!(notification = ?n, "device notification");
+                    let _ = self.tx.send(Sample::Notification(n));
+                }
+                incoming => self.deliver(incoming),
+            }
+        }
     }
 
     /// Deliver the messages read while the stream armed, each with the host
@@ -1738,7 +1932,11 @@ impl Pump<'_> {
     }
 
     /// Stamp a message read at host time `rx_us` and route it (see
-    /// [`Pump::deliver`]); the time map has already seen it.
+    /// [`Pump::deliver`]); the time map has already seen it. An image
+    /// carries the display area in effect when it is routed, which a
+    /// display-area notification (1450) changes as it is routed: messages
+    /// are routed in the order they were read, so an image read after a
+    /// 1450 carries the area it gave.
     fn route(&mut self, incoming: Incoming, rx_us: i64) {
         match incoming {
             Incoming::Gaze(frame) => {
@@ -1777,9 +1975,13 @@ impl Pump<'_> {
                         self.time.stamp_read(Stream::Image, rx_us)
                     }
                 };
+                let in_effect = &self.opens.display;
                 let image = ImageSample {
                     frame: Arc::new(frame),
                     host_us,
+                    display_frame: in_effect.frame,
+                    display_generation: in_effect.generation,
+                    open: self.opens.count,
                 };
                 // Relaxed: a pure signal.
                 if self.shared.image_wanted.load(Ordering::Relaxed) {
@@ -1789,6 +1991,16 @@ impl Pump<'_> {
             }
             Incoming::Notification(n) => {
                 debug!(notification = ?n, "device notification");
+                if let DeviceNotification::DisplayAreaChanged(area) = &n {
+                    // Not named `display`: tracing's macros take that name.
+                    let in_effect = &mut self.opens.display;
+                    in_effect.set(Some(*area));
+                    debug!(
+                        generation = in_effect.generation,
+                        has_frame = in_effect.frame.is_some(),
+                        "display area in effect"
+                    );
+                }
                 let _ = self.tx.send(Sample::Notification(n));
             }
             Incoming::Response {
@@ -1935,12 +2147,17 @@ const PRESENCE_STATE_PRESENT: u32 = 2;
 /// actually arms it; the first such bail is the prime, not a failure (see
 /// [`FailedOpens`]). A failure after arming carries a [`StreamLost`] context
 /// saying how long the stream ran (see [`after_arming`]).
+///
+/// An init that runs to its end counts an open in `opens` and leaves the
+/// display area the device confirmed in effect (see [`init_display_area`]);
+/// the facts it reports carry that area and its display id.
 fn gaze_stream_loop(
     h: &mut rusb::DeviceHandle<UsbContext>,
     shared: &Shared,
     commands: &Receiver<QueuedCommand>,
     tx: &Sender<Sample>,
     mailbox: &PoseMailbox,
+    opens: &mut Opens,
 ) -> Result<()> {
     let stop = &shared.stop;
     let display_override = shared.display_override();
@@ -1949,11 +2166,7 @@ fn gaze_stream_loop(
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let mut facts =
-        DeviceFacts::from_messages(capture.responses.iter().filter_map(|r| parse_message(r)));
-    if let Some(area) = display_override {
-        facts.display_area = Some(area);
-    }
+    let (facts, confirmed) = init_facts(&packets, &capture);
     // This init's own 1330 answer, so empty after one that lost it; tobiid
     // then keeps the previous init's properties, if there was one, and tells
     // its clients those (`keep_unreported`).
@@ -1964,10 +2177,12 @@ fn gaze_stream_loop(
         calibration_id = ?facts.calibration_id,
         faults = ?facts.status_string(STATUS_FAULTS),
         warnings = ?facts.status_string(STATUS_WARNINGS),
+        display_area_from = ?confirmed.map(|c| c.source.message_id()),
         "device ready"
     );
     let _ = tx.send(Sample::DeviceReady(Arc::new(facts)));
 
+    opens.opened(confirmed.map(|c| c.area));
     let mut pump = Pump {
         shared,
         commands,
@@ -1979,12 +2194,9 @@ fn gaze_stream_loop(
         last_gaze: Instant::now(),
         resume: ResumeWatch::default(),
         time: TimeMap::default(),
+        opens,
     };
-    // Read during the replay, which has just ended: stamped as read now, as
-    // no arrival of this open has come yet to map them.
-    for msg in &capture.side {
-        pump.deliver(classify(msg));
-    }
+    pump.deliver_init_side(&capture.side);
 
     // The Windows Stream Engine subscribes the image stream right after its
     // init; we do the same. Failure here is not fatal — gaze still works.
@@ -2111,6 +2323,7 @@ mod tests {
     use Step::{Open, Reset};
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use tobii_proto::facts::DEFAULT_DISPLAY_ID;
     use tobii_proto::protocol::hex_to_bytes;
 
     const MS: i64 = 1_000;
@@ -2151,7 +2364,8 @@ mod tests {
     #[test]
     fn a_gaze_frame_is_stamped_with_the_host_clock_when_read() {
         let rig = Rig::new();
-        let mut pump = rig.pump();
+        let mut opens = Opens::default();
+        let mut pump = rig.pump(&mut opens);
 
         let before = host_clock_us();
         pump.deliver(classify(&fixture("session1-gaze-frame")));
@@ -2194,8 +2408,10 @@ mod tests {
             }
         }
 
-        /// A pump as a fresh open starts one.
-        fn pump(&self) -> Pump<'_> {
+        /// A pump as a fresh open starts one, after the opens before it left
+        /// `opens` (an open counts itself there first, see
+        /// [`Opens::opened`]).
+        fn pump<'a>(&'a self, opens: &'a mut Opens) -> Pump<'a> {
             Pump {
                 shared: &self.shared,
                 commands: &self.commands,
@@ -2207,6 +2423,7 @@ mod tests {
                 last_gaze: Instant::now(),
                 resume: ResumeWatch::default(),
                 time: TimeMap::default(),
+                opens,
             }
         }
 
@@ -2231,12 +2448,24 @@ mod tests {
         /// The host time of the image waiting for the pose worker, which the
         /// pose made from it carries.
         fn pose_host_us(&self) -> Option<i64> {
+            self.pose_image().map(|image| image.host_us)
+        }
+
+        /// The image waiting for the pose worker.
+        fn pose_image(&self) -> Option<ImageSample> {
             let slot = self
                 .mailbox
                 .0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            slot.as_ref().map(|image| image.host_us)
+            slot.clone()
+        }
+
+        /// What the image waiting for the pose worker says of the display
+        /// area in effect and the open: its frame, generation and open.
+        fn pose_display(&self) -> (Option<DisplayFrame>, u64, u64) {
+            let image = self.pose_image().expect("an image for the pose worker");
+            (image.display_frame, image.display_generation, image.open)
         }
     }
 
@@ -2271,7 +2500,8 @@ mod tests {
     fn the_pump_maps_every_stream_from_gaze_and_image_arrivals() {
         let rig = Rig::new();
         rig.shared.image_wanted.store(true, Ordering::Relaxed);
-        let mut pump = rig.pump();
+        let mut opens = Opens::default();
+        let mut pump = rig.pump(&mut opens);
 
         // Device time plus 40 s, and the latency: 4 ms for the first gaze
         // frame, 1 ms for the image that follows.
@@ -2297,7 +2527,8 @@ mod tests {
     #[test]
     fn a_gaze_frame_whose_device_clock_went_back_maps_from_itself() {
         let rig = Rig::new();
-        let mut pump = rig.pump();
+        let mut opens = Opens::default();
+        let mut pump = rig.pump(&mut opens);
 
         pump.deliver_at(gaze_at(600 * S), 640 * S + 3 * MS);
         // The device clock restarts: mapped with the old offset, this frame
@@ -2314,7 +2545,8 @@ mod tests {
     fn an_image_without_a_device_time_is_stamped_as_read_and_teaches_nothing() {
         let rig = Rig::new();
         rig.shared.image_wanted.store(true, Ordering::Relaxed);
-        let mut pump = rig.pump();
+        let mut opens = Opens::default();
+        let mut pump = rig.pump(&mut opens);
 
         pump.deliver_at(image_at(10 * S), 50 * S + MS);
         pump.deliver_at(image_at(0), 50 * S + 31 * MS);
@@ -2339,7 +2571,8 @@ mod tests {
     #[test]
     fn the_gaze_frame_that_arms_the_stream_stamps_what_was_read_before_it() {
         let rig = Rig::new();
-        let mut pump = rig.pump();
+        let mut opens = Opens::default();
+        let mut pump = rig.pump(&mut opens);
 
         // Presence at stream start, read 5 ms after device time plus 40 s,
         // then the gaze frame that arms the stream, 1 ms after.
@@ -2358,7 +2591,8 @@ mod tests {
     #[test]
     fn messages_read_while_arming_are_stamped_from_the_arrivals_that_followed() {
         let rig = Rig::new();
-        let mut pump = rig.pump();
+        let mut opens = Opens::default();
+        let mut pump = rig.pump(&mut opens);
 
         // Presence at stream start, then an image (which nobody wants) read
         // 1 ms after device time plus 40 s, then the gaze frame that arms the
@@ -2396,6 +2630,424 @@ mod tests {
         );
         assert!(facts.hardware.is_some());
         assert_eq!(facts.calibration_id, Some(1_904_654_973));
+    }
+
+    /// The display area and display id the fixture `name` carries.
+    fn area_of(name: &str) -> (DisplayArea, Option<u32>) {
+        let msg = fixture(name);
+        parse_display_area(&parse_message(&msg).expect("a message")).expect("an area")
+    }
+
+    /// The device's answer to the captured 1440, as it would answer one of
+    /// seq `seq` with `status` and TTP `error`.
+    fn answer_1440(seq: u32, status: u32, error: u32) -> Vec<u8> {
+        let mut msg = fixture("change-display-rsp-1440");
+        msg[12..16].copy_from_slice(&seq.to_be_bytes());
+        msg[16..20].copy_from_slice(&status.to_be_bytes());
+        msg[24..28].copy_from_slice(&error.to_be_bytes());
+        msg
+    }
+
+    /// A replay that writes `area` with `display_id` as its 1440, of seq 42
+    /// as the captured one.
+    fn replay_writing(area: &DisplayArea, display_id: u32) -> Vec<InitPacket> {
+        let payload = tobii_proto::facts::display_area_set_payload(area, display_id);
+        chunk_command(cmd::DISPLAY_AREA_SET, 0x2a, &payload)
+            .into_iter()
+            .map(|data| InitPacket { ep: EP_OUT, data })
+            .collect()
+    }
+
+    /// A display-area notification (1450) of `area`: the captured one's
+    /// corners, without its trailing zero.
+    fn notification_of(area: &DisplayArea) -> Vec<u8> {
+        let payload = tobii_proto::tlv::TlvWriter::new()
+            .point_mm(area.top_left_mm)
+            .point_mm(area.top_right_mm)
+            .point_mm(area.bottom_left_mm)
+            .finish();
+        let mut msg = chunk_command(notify::DISPLAY_AREA, 0, &payload).swap_remove(0);
+        msg[..4].copy_from_slice(&[1, 0, 0, 0]);
+        msg[8..12].copy_from_slice(&MARKER_NOTIFICATION.to_be_bytes());
+        msg
+    }
+
+    /// What `init_display_area` makes of an init that replayed `packets`
+    /// and read `responses`, and `side` besides.
+    fn init_area(
+        packets: &[InitPacket],
+        responses: &[Vec<u8>],
+        side: &[Vec<u8>],
+    ) -> Option<(DisplayArea, Option<u32>, AreaSource)> {
+        let capture = InitCapture {
+            responses: responses.to_vec(),
+            side: side.to_vec(),
+        };
+        init_display_area(packets, &capture).map(|d| (d.area, d.display_id, d.source))
+    }
+
+    #[test]
+    fn the_replay_writes_the_area_its_capture_read_back() {
+        let packets = crate::calibration::embedded_packets().expect("embedded");
+        let (a, id) = area_of("init-rsp-1430");
+        assert_eq!(
+            crate::calibration::written_display_area(&packets),
+            Some((0x0e, a, id)),
+            "the capture author's monitor, bit for bit as the Windows device read it back"
+        );
+        let (b, _) = area_of("change-display-cmd-1440");
+        assert_ne!(DisplayFrame::new(&a), DisplayFrame::new(&b), "A and B");
+    }
+
+    #[test]
+    fn an_init_takes_the_last_display_area_notification_first() {
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-notify-1450");
+        // The embedded replay writes A at seq 14, which the device takes,
+        // and reads A before it: only the 1450 says B.
+        let packets = crate::calibration::embedded_packets().expect("embedded");
+        let responses = [fixture("init-rsp-1430"), answer_1440(0x0e, 1, 0)];
+        let b_1450 = fixture("change-display-notify-1450");
+
+        assert_eq!(
+            init_area(&packets, &responses, std::slice::from_ref(&b_1450)),
+            Some((b, Some(DEFAULT_DISPLAY_ID), AreaSource::Notified)),
+            "a 1450 carries no display id: the write's"
+        );
+        let side = [
+            fixture("init-notify-3180"),
+            notification_of(&a),
+            b_1450.clone(),
+            fixture("init-presence"),
+        ];
+        assert_eq!(
+            init_area(&packets, &responses, &side).map(|(area, ..)| area),
+            Some(b),
+            "the last 1450, among other messages"
+        );
+        let side = [b_1450, notification_of(&a)];
+        assert_eq!(
+            init_area(&packets, &responses, &side),
+            Some((a, Some(DEFAULT_DISPLAY_ID), AreaSource::Notified))
+        );
+        assert_eq!(
+            init_area(&packets, &[], &side[..1]),
+            Some((b, None, AreaSource::Notified)),
+            "nothing else gives a display id"
+        );
+    }
+
+    #[test]
+    fn without_a_notification_an_init_takes_the_area_the_device_took() {
+        let (b, _) = area_of("change-display-cmd-1440");
+        let packets = vec![InitPacket {
+            ep: EP_OUT,
+            data: fixture("change-display-cmd-1440"),
+        }];
+        let read = fixture("init-rsp-1430");
+        let took = fixture("change-display-rsp-1440");
+
+        for responses in [[read.clone(), took.clone()], [took, read]] {
+            assert_eq!(
+                init_area(&packets, &responses, &[fixture("init-presence")]),
+                Some((b, Some(DEFAULT_DISPLAY_ID), AreaSource::Written))
+            );
+        }
+        // A write of the area the device holds brings no 1450.
+        let replay = replay_writing(&b, 77);
+        assert_eq!(
+            init_area(&replay, &[fixture("change-display-rsp-1440")], &[]),
+            Some((b, Some(77), AreaSource::Written))
+        );
+    }
+
+    #[test]
+    fn an_init_whose_write_was_refused_takes_the_area_it_read() {
+        let (a, _) = area_of("init-rsp-1430");
+        let packets = vec![InitPacket {
+            ep: EP_OUT,
+            data: fixture("change-display-cmd-1440"),
+        }];
+        let read = fixture("init-rsp-1430");
+
+        for (answer, why) in [
+            (None, "no answer"),
+            (
+                Some(answer_1440(0x2a, 1, ttp_error::INVALID_PARAMETER)),
+                "an error",
+            ),
+            (Some(answer_1440(0x2a, 0, 0)), "another status"),
+            (Some(answer_1440(0x2b, 1, 0)), "the answer to another seq"),
+        ] {
+            let responses: Vec<Vec<u8>> =
+                [Some(read.clone()), answer].into_iter().flatten().collect();
+            assert_eq!(
+                init_area(&packets, &responses, &[]),
+                Some((a, Some(DEFAULT_DISPLAY_ID), AreaSource::Read)),
+                "{why}"
+            );
+        }
+        assert_eq!(
+            init_area(&packets, &[answer_1440(0x2a, 0, 0)], &[]),
+            None,
+            "nothing confirmed"
+        );
+        assert_eq!(init_area(&[], &[], &[]), None);
+    }
+
+    #[test]
+    fn an_inits_facts_carry_the_area_the_device_confirmed() {
+        let (b, _) = area_of("change-display-notify-1450");
+        let packets = replay_writing(&b, 77);
+        let responses: Vec<Vec<u8>> = ["1420", "1400", "1430", "2110", "1490"]
+            .iter()
+            .map(|cmd| fixture(&format!("init-rsp-{cmd}")))
+            .chain([answer_1440(0x2a, 1, 0)])
+            .collect();
+        let capture = InitCapture {
+            responses,
+            side: vec![fixture("change-display-notify-1450")],
+        };
+
+        let (facts, confirmed) = init_facts(&packets, &capture);
+
+        assert_eq!(
+            (facts.display_area, facts.display_id),
+            (Some(b), Some(77)),
+            "not the 1430's"
+        );
+        assert_eq!(confirmed.map(|c| c.source), Some(AreaSource::Notified));
+        let from_responses =
+            DeviceFacts::from_messages(capture.responses.iter().filter_map(|r| parse_message(r)));
+        assert_eq!(from_responses.display_id, Some(DEFAULT_DISPLAY_ID));
+        assert_eq!(
+            DeviceFacts {
+                display_area: from_responses.display_area,
+                display_id: from_responses.display_id,
+                ..facts
+            },
+            from_responses,
+            "the rest as the responses give it"
+        );
+
+        let none = init_facts(&packets, &InitCapture::default());
+        assert_eq!(none, (DeviceFacts::default(), None));
+    }
+
+    #[test]
+    fn a_notified_area_takes_its_display_id_from_the_next_source_down() {
+        let (b, _) = area_of("change-display-notify-1450");
+        let replay = replay_writing(&b, 77);
+        let side = [fixture("change-display-notify-1450")];
+        let read = fixture("init-rsp-1430");
+
+        assert_eq!(
+            init_area(&replay, &[read.clone(), answer_1440(0x2a, 1, 0)], &side),
+            Some((b, Some(77), AreaSource::Notified)),
+            "the write's, which the device took"
+        );
+        assert_eq!(
+            init_area(&replay, &[read, answer_1440(0x2a, 0, 0)], &side),
+            Some((b, Some(DEFAULT_DISPLAY_ID), AreaSource::Notified)),
+            "the read's, the write refused"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // reason: the 4 x 4 mm square maps exactly
+    fn the_area_in_effect_moves_its_generation_on_only_when_it_changes() {
+        let mut display = AreaInEffect::default();
+        display.set(None);
+        assert_eq!(display, AreaInEffect::default(), "nothing confirmed yet");
+
+        // The square the tracker starts each open with fixes the tracker
+        // frame itself.
+        let start = DisplayArea {
+            top_left_mm: [-2.0, 2.0, 0.0],
+            top_right_mm: [2.0, 2.0, 0.0],
+            bottom_left_mm: [-2.0, -2.0, 0.0],
+        };
+        display.set(Some(start));
+        let frame = display.frame.expect("a frame");
+        assert_eq!(frame.to_display([30.0, -40.0, 600.0]), [30.0, -40.0, 600.0]);
+        assert_eq!(display.generation, 1);
+        display.set(Some(start));
+        assert_eq!(display.generation, 1, "the same area");
+
+        let (b, _) = area_of("change-display-notify-1450");
+        display.set(Some(b));
+        assert_eq!(
+            (display.frame, display.generation),
+            (DisplayFrame::new(&b), 2)
+        );
+        let narrow = DisplayArea {
+            top_right_mm: [-1.5, 2.0, 0.0],
+            ..start
+        };
+        display.set(Some(narrow));
+        assert_eq!(
+            (display.area, display.frame, display.generation),
+            (Some(narrow), None, 3),
+            "an area that fixes no frame"
+        );
+        display.set(None);
+        assert_eq!(
+            (display.area, display.frame, display.generation),
+            (None, None, 4)
+        );
+    }
+
+    #[test]
+    fn an_image_routed_after_a_display_area_notification_carries_its_area() {
+        let rig = Rig::new();
+        rig.shared.image_wanted.store(true, Ordering::Relaxed);
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-notify-1450");
+        let mut opens = Opens::default();
+        opens.opened(Some(a));
+        let mut pump = rig.pump(&mut opens);
+
+        pump.deliver_at(image_at(10 * S), 50 * S);
+        assert_eq!(rig.pose_display(), (DisplayFrame::new(&a), 1, 1));
+        let notified = || classify(&fixture("change-display-notify-1450"));
+        pump.deliver_at(notified(), 50 * S + 5 * MS);
+        pump.deliver_at(image_at(10 * S + 30 * MS), 50 * S + 31 * MS);
+        assert_eq!(rig.pose_display(), (DisplayFrame::new(&b), 2, 1));
+        pump.deliver_at(notified(), 50 * S + 40 * MS);
+        pump.deliver_at(image_at(10 * S + 60 * MS), 50 * S + 61 * MS);
+        assert_eq!(
+            rig.pose_display(),
+            (DisplayFrame::new(&b), 2, 1),
+            "the same area again"
+        );
+
+        // The daemon gets the same images and both notifications.
+        let samples = rig.samples();
+        let images: Vec<(Option<DisplayFrame>, u64, u64)> = samples
+            .iter()
+            .filter_map(|sample| match sample {
+                Sample::Image(i) => Some((i.display_frame, i.display_generation, i.open)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            images,
+            [
+                (DisplayFrame::new(&a), 1, 1),
+                (DisplayFrame::new(&b), 2, 1),
+                (DisplayFrame::new(&b), 2, 1),
+            ]
+        );
+        let notifications = samples
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    Sample::Notification(DeviceNotification::DisplayAreaChanged(area)) if *area == b
+                )
+            })
+            .count();
+        assert_eq!(notifications, 2);
+    }
+
+    #[test]
+    fn the_display_area_override_leaves_the_area_in_effect_alone() {
+        let rig = Rig::new();
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-cmd-1440");
+        let mut opens = Opens::default();
+        opens.opened(Some(a));
+        let mut pump = rig.pump(&mut opens);
+
+        // What `Engine::set_display_area_override` does. tobiid sets it to
+        // the TOBII_DISPLAY_MM area before it writes that area, and to None
+        // when a calibration session puts back a configuration without one.
+        rig.shared.set_display_override(Some(b));
+        pump.deliver_at(image_at(10 * S), 50 * S);
+        assert_eq!(rig.pose_display(), (DisplayFrame::new(&a), 1, 1));
+        rig.shared.set_display_override(None);
+        pump.deliver_at(image_at(10 * S + 30 * MS), 50 * S + 31 * MS);
+        assert_eq!(rig.pose_display(), (DisplayFrame::new(&a), 1, 1));
+    }
+
+    /// Open again on `opens`, the init leaving `area` in effect, and say
+    /// what an image the open reads carries.
+    fn image_after_open(
+        rig: &Rig,
+        opens: &mut Opens,
+        area: Option<DisplayArea>,
+    ) -> (Option<DisplayFrame>, u64, u64) {
+        opens.opened(area);
+        rig.pump(opens).deliver_at(image_at(10 * S), 50 * S);
+        rig.pose_display()
+    }
+
+    #[test]
+    fn a_re_open_is_counted_and_keeps_the_generation_of_an_area_that_stayed() {
+        let rig = Rig::new();
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-notify-1450");
+        let mut opens = Opens::default();
+
+        let a_frame = DisplayFrame::new(&a);
+        let b_frame = DisplayFrame::new(&b);
+        assert_eq!(image_after_open(&rig, &mut opens, Some(a)), (a_frame, 1, 1));
+        assert_eq!(
+            image_after_open(&rig, &mut opens, Some(a)),
+            (a_frame, 1, 2),
+            "the same area"
+        );
+        assert_eq!(image_after_open(&rig, &mut opens, Some(b)), (b_frame, 2, 3));
+        assert_eq!(
+            image_after_open(&rig, &mut opens, None),
+            (None, 3, 4),
+            "an init that confirmed no area"
+        );
+
+        // A 1450 during an open is what the next one compares with.
+        assert_eq!(image_after_open(&rig, &mut opens, Some(a)), (a_frame, 4, 5));
+        rig.pump(&mut opens)
+            .deliver(classify(&fixture("change-display-notify-1450")));
+        assert_eq!(image_after_open(&rig, &mut opens, Some(b)), (b_frame, 5, 6));
+    }
+
+    #[test]
+    fn the_inits_own_notifications_leave_the_area_it_took_alone() {
+        let rig = Rig::new();
+        let (a, _) = area_of("init-rsp-1430");
+        let (b, _) = area_of("change-display-notify-1450");
+        let mut opens = Opens::default();
+        // An init whose replay read a 1450 of A, then one of B, took B.
+        opens.opened(Some(b));
+        let mut pump = rig.pump(&mut opens);
+
+        pump.deliver_init_side(&[
+            notification_of(&a),
+            fixture("init-presence"),
+            fixture("change-display-notify-1450"),
+        ]);
+        pump.deliver_at(image_at(10 * S), 50 * S);
+
+        assert_eq!(rig.pose_display(), (DisplayFrame::new(&b), 1, 1));
+        let delivered: Vec<&str> = rig
+            .samples()
+            .iter()
+            .map(|sample| match sample {
+                Sample::Notification(DeviceNotification::DisplayAreaChanged(area))
+                    if *area == a =>
+                {
+                    "A"
+                }
+                Sample::Notification(DeviceNotification::DisplayAreaChanged(area))
+                    if *area == b =>
+                {
+                    "B"
+                }
+                Sample::Presence(_) => "presence",
+                other => panic!("unexpected sample {other:?}"),
+            })
+            .collect();
+        assert_eq!(delivered, ["A", "presence", "B"], "all passed on, in order");
     }
 
     #[test]
