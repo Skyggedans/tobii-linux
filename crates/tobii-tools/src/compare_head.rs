@@ -87,14 +87,15 @@ const LARGE_YAW_DEG: f64 = 20.0;
 const COMBINED_DEG: [f64; 3] = [15.0, 8.0, 10.0];
 
 /// The columns of the CSV, one row per image with a DLL pose: the image's
-/// index in the log and device time; the DLL's pose (its timestamp, all
-/// four flags as one validity, position in the display frame, mm, rotation
-/// as yxz angles, radians) and ours alike; what the tracker found (whether
-/// a face, its score, whether the detector found it, how far inside the
-/// frame the landmarks' centroid and the tip of the nose are, px; empty
-/// without a face); the image's subsets ([`Subset`], 0 or 1); and what the
-/// step cost (µs, model runs). An invalid pose carries the values its side
-/// gave: ours the last valid pose's, the DLL's whatever its record held.
+/// number in the log ([`Frame::image`]) and device time; the DLL's pose
+/// (its timestamp, all four flags as one validity, position in the display
+/// frame, mm, rotation as yxz angles, radians) and ours alike; what the
+/// tracker found (whether a face, its score, whether the detector found it,
+/// how far inside the frame the landmarks' centroid and the tip of the nose
+/// are, px; empty without a face); the image's subsets ([`Subset`], 0 or
+/// 1); and what the step cost (µs, model runs). An invalid pose carries the
+/// values its side gave: ours the last valid pose's, the DLL's whatever its
+/// record held.
 const CSV_HEADER: &str = "image,device_ts_us,dll_ts_us,dll_valid,\
 dll_pos_x_mm,dll_pos_y_mm,dll_pos_z_mm,dll_rot_x_rad,dll_rot_y_rad,dll_rot_z_rad,\
 ours_valid,ours_pos_x_mm,ours_pos_y_mm,ours_pos_z_mm,ours_rot_x_rad,ours_rot_y_rad,ours_rot_z_rad,\
@@ -684,7 +685,8 @@ enum DllState {
 /// One image of the session: what the replay and the DLL made of it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Frame {
-    /// Its index among the log's images.
+    /// Its number among the log's image messages, from 0: those that did
+    /// not decode count too, as the study numbers its images.
     image: usize,
     /// Its device time, µs.
     device_ts_us: i64,
@@ -722,7 +724,9 @@ impl Frame {
 /// The replay of a log's images through [`HeadStep`].
 #[derive(Debug)]
 struct Replay {
-    /// One frame per image that decoded, in log order, not paired yet.
+    /// One frame per image that decoded, in log order, not paired yet; the
+    /// analysis indexes them by their position here, the report and the
+    /// CSV number them as the log does ([`Frame::image`]).
     frames: Vec<Frame>,
     /// Image messages that did not decode.
     undecoded: usize,
@@ -762,6 +766,7 @@ fn replay(payloads: &[Vec<u8>], display: &DisplayFrame) -> Result<Replay> {
         seconds: 0.0,
     };
     let mut runs_before = step.model_runs();
+    let mut images = 0;
     let start = Instant::now();
     for msg in messages(payloads) {
         let is_image = parse_message(&msg)
@@ -769,6 +774,8 @@ fn replay(payloads: &[Vec<u8>], display: &DisplayFrame) -> Result<Replay> {
         if !is_image {
             continue;
         }
+        let number = images;
+        images += 1;
         let Some(image) = decode_image_payload(&msg) else {
             out.undecoded += 1;
             continue;
@@ -791,7 +798,7 @@ fn replay(payloads: &[Vec<u8>], display: &DisplayFrame) -> Result<Replay> {
         }
         let runs = stepped.model_runs;
         out.frames.push(Frame {
-            image: out.frames.len(),
+            image: number,
             device_ts_us,
             ours: stepped.head,
             face: stepped.face.as_ref().map(Face::from),
@@ -910,7 +917,9 @@ impl Confusion {
 }
 
 /// A run of images the DLL calls invalid, a loss of the face, and whether
-/// we lost the face too.
+/// we lost the face too. It counts the images that decoded, by their
+/// position in the replay's frames ([`LossEvent::images`] numbers them as
+/// the log does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LossEvent {
     /// The run's first image.
@@ -921,6 +930,16 @@ struct LossEvent {
     /// run's start the first of them starts (onset), and after the run's
     /// end the last of them ends (offset); negative when before.
     seen: Option<(i64, i64)>,
+}
+
+impl LossEvent {
+    /// The log's numbers ([`Frame::image`]) of the run's first image and of
+    /// the one after its last, of `frames`, the frames it was found in.
+    fn images(&self, frames: &[Frame]) -> (usize, usize) {
+        let number = |i: usize| frames.get(i).map_or(i, |f| f.image);
+        let last = (self.start + self.len).saturating_sub(1);
+        (number(self.start), number(last) + 1)
+    }
 }
 
 /// The DLL's loss events, and the runs of our invalid poses that overlap
@@ -1337,8 +1356,9 @@ fn print_cost(replay: &Replay) {
     }
 }
 
-/// Print the validity of our poses against the DLL's.
-fn print_validity(analysis: &Analysis) {
+/// Print the validity of our poses against the DLL's, on `frames`, the
+/// frames `analysis` is of.
+fn print_validity(analysis: &Analysis, frames: &[Frame]) {
     let c = &analysis.confusion;
     println!(
         "validity on the {} images with a DLL pose (ours invalid: without a face / with one):",
@@ -1388,12 +1408,8 @@ fn print_validity(analysis: &Analysis) {
             || "not seen".to_string(),
             |(on, off)| format!("onset {on:+}, offset {off:+}"),
         );
-        println!(
-            "  images {}..{} ({}): {seen}",
-            e.start,
-            e.start + e.len,
-            e.len
-        );
+        let (first, end) = e.images(frames);
+        println!("  images {first}..{end} ({}): {seen}", e.len);
     }
     println!(
         "runs of our invalid poses with no DLL-invalid image: {} ({} of 3 images or more)",
@@ -1604,7 +1620,7 @@ pub(crate) fn compare_head(log_path: &str, jsonl_path: &str, options: &HeadOptio
     print_cost(&replay);
 
     let analysis = Analysis::of(&replay.frames);
-    print_validity(&analysis);
+    print_validity(&analysis, &replay.frames);
     print_errors(&analysis);
 
     if let Some(path) = &options.csv {
@@ -1819,6 +1835,25 @@ mod tests {
         assert_eq!(c.paired(), 40);
         assert!(close(c.coverage_pct(), 100.0 * 23.0 / 30.0, 1e-12));
         assert!(close(c.agreement_pct(), 100.0 * 30.0 / 40.0, 1e-12));
+    }
+
+    /// A loss is printed in the log's image numbers: those of the images
+    /// that decoded, past one that did not.
+    #[test]
+    fn a_loss_spans_the_log_s_image_numbers() {
+        let numbered = |image: usize| Frame {
+            image,
+            ..frame([0.0; 3], Eyes::default())
+        };
+        let frames = [numbered(0), numbered(2), numbered(3), numbered(4)];
+        let event = |start, len| LossEvent {
+            start,
+            len,
+            seen: None,
+        };
+        assert_eq!(event(1, 2).images(&frames), (2, 4));
+        assert_eq!(event(0, 4).images(&frames), (0, 5));
+        assert_eq!(event(3, 1).images(&frames), (4, 5));
     }
 
     /// A run of our invalid poses that only touches a loss, ending where it
@@ -2222,7 +2257,8 @@ mod tests {
 
     /// A replay steps every image of the log once, in log order, at its
     /// device time, each with the model runs of its own step, and passes
-    /// over the other messages. Black images make invalid poses: the first
+    /// over the other messages; an image that does not decode is counted
+    /// and keeps its number. Black images make invalid poses: the first
     /// runs the landmark model in the tracker's starting crop and then the
     /// detector; with the face lost, the others run the detector alone.
     #[test]
@@ -2232,6 +2268,8 @@ mod tests {
         let log = [
             image_message(1_000_000, 280, &black),
             stream_message(0x500, &[]),
+            // Short of its pixels: it does not decode, and keeps its number.
+            image_message(1_015_104, 280, &black[..1000]),
             image_message(1_030_208, 280, &black),
             image_message(1_060_416, 280, &black),
         ];
@@ -2241,7 +2279,7 @@ mod tests {
             .iter()
             .map(|f| (f.image, f.device_ts_us))
             .collect();
-        assert_eq!(images, [(0, 1_000_000), (1, 1_030_208), (2, 1_060_416)]);
+        assert_eq!(images, [(0, 1_000_000), (2, 1_030_208), (3, 1_060_416)]);
         for (f, runs) in replay.frames.iter().zip([(1, 1), (0, 1), (0, 1)]) {
             assert!(
                 !f.ours.valid && f.face.is_none() && f.dll.is_none(),
@@ -2249,7 +2287,7 @@ mod tests {
             );
             assert_eq!((f.cost.landmark_runs, f.cost.detector_runs), runs, "{f:?}");
         }
-        assert_eq!((replay.undecoded, &replay.tracker_errors), (0, &(0, None)));
+        assert_eq!((replay.undecoded, &replay.tracker_errors), (1, &(0, None)));
         assert_eq!(replay.fingerprint, fingerprint(&HeadParams::FITTED));
     }
 
