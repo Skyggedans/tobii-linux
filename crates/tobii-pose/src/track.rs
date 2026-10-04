@@ -19,7 +19,7 @@ use crate::detect::{Detection, FaceDetector};
 // MediaPipe Face Mesh V2 converted to ONNX; Apache-2.0, see models/README.md.
 const MODEL: &[u8] = include_bytes!("../models/face_landmarks.onnx");
 const IN: usize = 256; // model input is 256x256x3
-const NLM: usize = 468; // canonical landmarks (model emits 478 incl. iris)
+pub(crate) const NLM: usize = 468; // canonical landmarks (model emits 478 incl. iris)
 // The landmark model's input (the 256x256x3 crop) and the outputs the code
 // reads: the landmarks and the face-presence logit (models/README.md).
 const LANDMARK_INPUT: &str = "input_12";
@@ -539,7 +539,7 @@ fn transpose3(r: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
 }
 
 #[must_use]
-fn matvec3(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
+pub(crate) fn matvec3(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
     [
         r[0][0] * p[0] + r[0][1] * p[1] + r[0][2] * p[2],
         r[1][0] * p[0] + r[1][1] * p[1] + r[1][2] * p[2],
@@ -548,7 +548,7 @@ fn matvec3(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
 }
 
 #[must_use]
-fn matmul3(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+pub(crate) fn matmul3(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut o = [[0.0; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
@@ -777,7 +777,7 @@ pub struct FaceFit<'a> {
 
 impl<'a> FaceFit<'a> {
     /// A fit from the solver's rotation and translation (cm).
-    fn new(
+    pub(crate) fn new(
         rotation: [[f64; 3]; 3],
         translation_cm: [f64; 3],
         landmarks: &'a [[f64; 2]; NLM],
@@ -819,9 +819,9 @@ pub struct Tracker {
 
 /// The half of [`Tracker`] that makes a [`FaceFit`] of each frame: the
 /// face-following crop, the landmark model, the face detector and the
-/// perspective fit. The models are [`OnnxModels`] in a [`Tracker`]; the
-/// tests give it scripted ones.
-struct FaceFitter<M> {
+/// perspective fit. The models are [`OnnxModels`] in a [`Tracker`] and in a
+/// [`HeadStep`](crate::head::HeadStep); the tests give it scripted ones.
+pub(crate) struct FaceFitter<M> {
     models: Models<M>,
     canonical: Vec<[f64; 3]>,
     /// The frame enlarged `geometry.upscale` times, when that is more than
@@ -854,7 +854,7 @@ struct FaceFitter<M> {
 /// came. In a [`Tracker`] they are the embedded ONNX models
 /// ([`OnnxModels`]); the tests script their answers, to drive the
 /// follow / detector / retry logic without them.
-trait FaceModels {
+pub(crate) trait FaceModels {
     /// Run the landmark model on `crop` of `big`, the `side`x`side` enlarged
     /// frame, and return its face-presence score (a logit); the landmarks
     /// are then [`FaceModels::points`].
@@ -876,7 +876,7 @@ trait FaceModels {
 }
 
 /// The embedded landmark model and face detector, in ONNX Runtime.
-struct OnnxModels {
+pub(crate) struct OnnxModels {
     landmark: FaceModel,
     detector: FaceDetector,
 }
@@ -974,49 +974,10 @@ impl Tracker {
     /// frame, or crop limits that are not two positive numbers in order; or
     /// when a model cannot be loaded.
     pub fn with_geometry(geometry: Geometry) -> Result<Self> {
-        let side = geometry.frame_size();
-        ensure!(
-            geometry.native_size > 0
-                && geometry.upscale > 0
-                && geometry.native_size.checked_mul(geometry.upscale) == Some(side)
-                && side.checked_mul(side).is_some(),
-            "a tracker for {}x{} frames enlarged {} times",
-            geometry.native_size,
-            geometry.native_size,
-            geometry.upscale
-        );
-        // NaN fails every comparison, so these refuse it too.
-        ensure!(
-            geometry.min_half > 0.0
-                && geometry.max_half.is_finite()
-                && geometry.min_half <= geometry.max_half,
-            "crop half-sizes from {} to {}",
-            geometry.min_half,
-            geometry.max_half
-        );
-        ensure!(
-            geometry.focal.is_finite() && geometry.focal > 0.0,
-            "a focal length of {} px",
-            geometry.focal
-        );
-        ensure!(
-            geometry.start_half.is_finite() && geometry.start_half > 0.0,
-            "a first crop of half-size {}",
-            geometry.start_half
-        );
-        ensure!(
-            (0.0..=1.0).contains(&geometry.cy_frac),
-            "a first crop centred at {} of the frame's height",
-            geometry.cy_frac
-        );
-        let rest = RestPose::from_env();
-        let models = OnnxModels {
-            landmark: FaceModel::new()?,
-            detector: FaceDetector::new()?,
-        };
+        let face = FaceFitter::with_geometry(geometry)?;
         Ok(Self {
-            face: FaceFitter::new(geometry, models),
-            rest,
+            face,
+            rest: RestPose::from_env(),
         })
     }
 
@@ -1030,7 +991,7 @@ impl Tracker {
     /// How many times the tracker has run each model.
     #[must_use]
     pub fn model_runs(&self) -> ModelRuns {
-        self.face.models.runs
+        self.face.model_runs()
     }
 
     /// Drop the calibrated rest pose so it recalibrates from the next frames.
@@ -1169,6 +1130,64 @@ impl<M: FaceModels> Models<M> {
     }
 }
 
+impl FaceFitter<OnnxModels> {
+    /// A fitter for frames of `geometry` running the embedded models (see
+    /// [`Tracker::with_geometry`]).
+    ///
+    /// # Errors
+    /// Fails when `geometry` does not describe frames a face can be followed
+    /// in, or when a model cannot be loaded (see [`Tracker::with_geometry`]).
+    pub(crate) fn with_geometry(geometry: Geometry) -> Result<Self> {
+        let side = geometry.frame_size();
+        ensure!(
+            geometry.native_size > 0
+                && geometry.upscale > 0
+                && geometry.native_size.checked_mul(geometry.upscale) == Some(side)
+                && side.checked_mul(side).is_some(),
+            "a tracker for {}x{} frames enlarged {} times",
+            geometry.native_size,
+            geometry.native_size,
+            geometry.upscale
+        );
+        // NaN fails every comparison, so these refuse it too.
+        ensure!(
+            geometry.min_half > 0.0
+                && geometry.max_half.is_finite()
+                && geometry.min_half <= geometry.max_half,
+            "crop half-sizes from {} to {}",
+            geometry.min_half,
+            geometry.max_half
+        );
+        ensure!(
+            geometry.focal.is_finite() && geometry.focal > 0.0,
+            "a focal length of {} px",
+            geometry.focal
+        );
+        ensure!(
+            geometry.start_half.is_finite() && geometry.start_half > 0.0,
+            "a first crop of half-size {}",
+            geometry.start_half
+        );
+        ensure!(
+            (0.0..=1.0).contains(&geometry.cy_frac),
+            "a first crop centred at {} of the frame's height",
+            geometry.cy_frac
+        );
+        let models = OnnxModels {
+            landmark: FaceModel::new()?,
+            detector: FaceDetector::new()?,
+        };
+        Ok(Self::new(geometry, models))
+    }
+}
+
+impl<M> FaceFitter<M> {
+    /// How many times the fitter has run each model.
+    pub(crate) const fn model_runs(&self) -> ModelRuns {
+        self.models.runs
+    }
+}
+
 impl<M: FaceModels> FaceFitter<M> {
     /// A fitter for frames of `geometry` (which the caller has checked),
     /// running `models`. Its first crop is the start crop: upright, of the
@@ -1193,7 +1212,7 @@ impl<M: FaceModels> FaceFitter<M> {
     }
 
     /// See [`Tracker::fit`].
-    fn fit(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<FaceFit<'_>>> {
+    pub(crate) fn fit(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<FaceFit<'_>>> {
         let geometry = self.geometry;
         let n = geometry.native_size;
         ensure!(

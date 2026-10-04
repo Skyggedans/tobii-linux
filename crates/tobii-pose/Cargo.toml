@@ -13,6 +13,8 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 ort.workspace = true
+# The display frame the head pose is in (tobii-ipc depends on libc alone).
+tobii-ipc.workspace = true
 tracing.workspace = true
 
 # Tests only: the fixtures are raw 0x50e stream messages that have to be
