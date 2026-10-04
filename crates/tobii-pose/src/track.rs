@@ -813,15 +813,16 @@ pub struct ModelRuns {
 /// pose: `process` returns the `OpenTrack` pose [TX, TY, TZ, Yaw, Pitch,
 /// Roll] of its own [`RestPose`] once calibrated, else `None`.
 pub struct Tracker {
-    face: FaceFitter,
+    face: FaceFitter<OnnxModels>,
     rest: RestPose,
 }
 
 /// The half of [`Tracker`] that makes a [`FaceFit`] of each frame: the
 /// face-following crop, the landmark model, the face detector and the
-/// perspective fit.
-struct FaceFitter {
-    models: Models,
+/// perspective fit. The models are [`OnnxModels`] in a [`Tracker`]; the
+/// tests give it scripted ones.
+struct FaceFitter<M> {
+    models: Models<M>,
     canonical: Vec<[f64; 3]>,
     /// The frame enlarged `geometry.upscale` times, when that is more than
     /// once (reused every frame).
@@ -845,10 +846,55 @@ struct FaceFitter {
     lost: bool,
 }
 
-/// The landmark model and the face detector, and how often each has run.
-struct Models {
+/// The two models as the tracker runs them: the landmark model on a crop of
+/// the camera's image enlarged, and the face detector on the image as it
+/// came. In a [`Tracker`] they are the embedded ONNX models
+/// ([`OnnxModels`]); the tests script their answers, to drive the
+/// follow / detector / retry logic without them.
+trait FaceModels {
+    /// Run the landmark model on `crop` of `big`, the `side`x`side` enlarged
+    /// frame, and return its face-presence score (a logit); the landmarks
+    /// are then [`FaceModels::points`].
+    ///
+    /// # Errors
+    /// Fails when the model does.
+    fn landmarks(&mut self, big: &[u8], side: usize, crop: &Crop) -> Result<f32>;
+
+    /// The landmarks of the last [`FaceModels::landmarks`] run: x and y in
+    /// the pixels of the model's 256x256 input, and z.
+    fn points(&self) -> &[[f32; 3]];
+
+    /// Run the face detector on `frame`, the camera's `n`x`n` image, and
+    /// return the faces it found, best first.
+    ///
+    /// # Errors
+    /// Fails when the detector does.
+    fn detect(&mut self, frame: &[u8], n: usize) -> Result<&[Detection]>;
+}
+
+/// The embedded landmark model and face detector, in ONNX Runtime.
+struct OnnxModels {
     landmark: FaceModel,
     detector: FaceDetector,
+}
+
+impl FaceModels for OnnxModels {
+    fn landmarks(&mut self, big: &[u8], side: usize, crop: &Crop) -> Result<f32> {
+        Ok(self.landmark.landmarks(big, side, side, crop)?.1)
+    }
+
+    fn points(&self) -> &[[f32; 3]] {
+        &self.landmark.pts
+    }
+
+    fn detect(&mut self, frame: &[u8], n: usize) -> Result<&[Detection]> {
+        self.detector.detect(frame, n)
+    }
+}
+
+/// The landmark model and the face detector, and how often each has run.
+struct Models<M> {
+    inner: M,
     runs: ModelRuns,
 }
 
@@ -943,23 +989,12 @@ impl Tracker {
             geometry.max_half
         );
         let rest = RestPose::from_env();
-        let side = side as f64;
+        let models = OnnxModels {
+            landmark: FaceModel::new()?,
+            detector: FaceDetector::new()?,
+        };
         Ok(Self {
-            face: FaceFitter {
-                models: Models {
-                    landmark: FaceModel::new()?,
-                    detector: FaceDetector::new()?,
-                    runs: ModelRuns::default(),
-                },
-                canonical: canonical_f64(),
-                upscaled: Vec::new(),
-                image2d: Vec::with_capacity(NLM),
-                observed: Vec::with_capacity(NLM),
-                landmarks: Box::new([[0.0; 2]; NLM]),
-                geometry,
-                crop: Crop::upright(side / 2.0, side * geometry.cy_frac, geometry.start_half),
-                lost: false,
-            },
+            face: FaceFitter::new(geometry, models),
             rest,
         })
     }
@@ -1028,7 +1063,7 @@ struct Found {
     by_detector: bool,
 }
 
-impl Models {
+impl<M: FaceModels> Models<M> {
     /// Look for the face in one frame (see [`Tracker::fit`]): the landmark
     /// model in `follow`, the crop that follows the face, unless the face
     /// was lost; then, if that found nothing, the detector on the camera's
@@ -1046,7 +1081,7 @@ impl Models {
         let side = geometry.frame_size();
         if let Some(crop) = follow {
             self.runs.landmarks += 1;
-            let (_, score) = self.landmark.landmarks(big, side, side, &crop)?;
+            let score = self.inner.landmarks(big, side, &crop)?;
             if score >= 0.0 {
                 return Ok(Some(Found {
                     crop,
@@ -1056,7 +1091,7 @@ impl Models {
             }
         }
         self.runs.detector += 1;
-        let detections = self.detector.detect(frame, geometry.native_size)?;
+        let detections = self.inner.detect(frame, geometry.native_size)?;
         let Some(detection) = detections.first().copied() else {
             return Ok(None);
         };
@@ -1065,7 +1100,7 @@ impl Models {
             return Ok(None);
         }
         self.runs.landmarks += 1;
-        let (_, score) = self.landmark.landmarks(big, side, side, &crop)?;
+        let score = self.inner.landmarks(big, side, &crop)?;
         debug!(
             detection_score = detection.score,
             landmark_score = score,
@@ -1079,7 +1114,28 @@ impl Models {
     }
 }
 
-impl FaceFitter {
+impl<M: FaceModels> FaceFitter<M> {
+    /// A fitter for frames of `geometry` (which the caller has checked),
+    /// running `models`. Its first crop is the start crop: upright, of the
+    /// start size, centred across the frame at `cy_frac` of its height.
+    fn new(geometry: Geometry, models: M) -> Self {
+        let side = geometry.frame_size() as f64;
+        Self {
+            models: Models {
+                inner: models,
+                runs: ModelRuns::default(),
+            },
+            canonical: canonical_f64(),
+            upscaled: Vec::new(),
+            image2d: Vec::with_capacity(NLM),
+            observed: Vec::with_capacity(NLM),
+            landmarks: Box::new([[0.0; 2]; NLM]),
+            geometry,
+            crop: Crop::upright(side / 2.0, side * geometry.cy_frac, geometry.start_half),
+            lost: false,
+        }
+    }
+
     /// See [`Tracker::fit`].
     fn fit(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<FaceFit<'_>>> {
         let geometry = self.geometry;
@@ -1114,7 +1170,7 @@ impl FaceFitter {
         };
         let focal = geometry.focal;
         // The landmarks of the run that found the face, the model's last.
-        let pts = &self.models.landmark.pts;
+        let pts = self.models.inner.points();
 
         // Landmarks to full-frame 2D; for the Kabsch start, their x and y
         // turned back into the frame's axes, so that the crop's turn does not
@@ -1356,6 +1412,7 @@ impl RestPose {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn from_euler_round_trips_euler_deg() {
@@ -2040,6 +2097,248 @@ mod tests {
         );
     }
 
+    /// Models that answer from a script: each landmark run the next score of
+    /// `scores`, with the landmarks `points`, and each detector run the next
+    /// list of `detections`. A run past the end of the script is an error.
+    /// The crop of every landmark run is kept, in order.
+    struct Script {
+        points: Vec<[f32; 3]>,
+        scores: VecDeque<f32>,
+        detections: VecDeque<Vec<Detection>>,
+        /// The detector's last answer.
+        found: Vec<Detection>,
+        crops: Vec<Crop>,
+    }
+
+    impl Script {
+        fn new(
+            points: &[[f32; 3]],
+            scores: impl IntoIterator<Item = f32>,
+            detections: impl IntoIterator<Item = Vec<Detection>>,
+        ) -> Self {
+            Self {
+                points: points.to_vec(),
+                scores: scores.into_iter().collect(),
+                detections: detections.into_iter().collect(),
+                found: Vec::new(),
+                crops: Vec::new(),
+            }
+        }
+
+        /// Whether every answer has been given.
+        fn is_done(&self) -> bool {
+            self.scores.is_empty() && self.detections.is_empty()
+        }
+    }
+
+    impl FaceModels for Script {
+        fn landmarks(&mut self, big: &[u8], side: usize, crop: &Crop) -> Result<f32> {
+            ensure!(
+                big.len() == side * side,
+                "a {side}-px frame of {}",
+                big.len()
+            );
+            self.crops.push(*crop);
+            self.scores
+                .pop_front()
+                .context("a landmark run past the script")
+        }
+
+        fn points(&self) -> &[[f32; 3]] {
+            &self.points
+        }
+
+        fn detect(&mut self, frame: &[u8], n: usize) -> Result<&[Detection]> {
+            ensure!(frame.len() == n * n, "a {n}-px frame of {}", frame.len());
+            self.found = self
+                .detections
+                .pop_front()
+                .context("a detector run past the script")?;
+            Ok(&self.found)
+        }
+    }
+
+    /// The landmarks the model would give for the canonical face facing the
+    /// camera with its origin at `t_cm`, seen through `crop` of a 0x50e
+    /// frame: each point projected through the enlarged frame's camera
+    /// (focal length 752 px, principal point at the centre) and taken into
+    /// the crop's 256x256 input; z in the input pixels per cm of the
+    /// origin's depth.
+    // reason: input pixels, within a few hundred, rounded to the f32 the
+    // model gives (num-cast-try-from).
+    #[allow(clippy::cast_possible_truncation)]
+    fn seen_through(crop: &Crop, t_cm: [f64; 3]) -> Vec<[f32; 3]> {
+        let h = f64::from(crop.half);
+        let (s, c) = crop.angle.sin_cos();
+        let k = IN as f64 / (2.0 * h); // input pixels per frame pixel
+        canonical_f64()
+            .iter()
+            .map(|p| {
+                let z = p[2] + t_cm[2];
+                let q = [
+                    IMAGE83_FOCAL * (p[0] + t_cm[0]) / z + 280.0 - crop.cx,
+                    IMAGE83_FOCAL * (p[1] + t_cm[1]) / z + 280.0 - crop.cy,
+                ];
+                // Turned by -angle into the crop's axes.
+                let u = [c * q[0] + s * q[1], -s * q[0] + c * q[1]];
+                let depth = p[2] * IMAGE83_FOCAL / t_cm[2];
+                [
+                    ((u[0] + h) * k) as f32,
+                    ((u[1] + h) * k) as f32,
+                    (depth * k) as f32,
+                ]
+            })
+            .collect()
+    }
+
+    /// A detection in the 280-px frame: a `side`-px box centred at `centre`,
+    /// the eyes level, a quarter of the box either side of its centre.
+    fn detection(centre: [f64; 2], side: f64, score: f32) -> Detection {
+        let mut keypoints = [centre; 6];
+        keypoints[0] = [centre[0] - side / 4.0, centre[1] - side / 8.0];
+        keypoints[1] = [centre[0] + side / 4.0, centre[1] - side / 8.0];
+        Detection {
+            x: centre[0] - side / 2.0,
+            y: centre[1] - side / 2.0,
+            w: side,
+            h: side,
+            keypoints,
+            score,
+        }
+    }
+
+    fn runs(landmarks: u64, detector: u64) -> ModelRuns {
+        ModelRuns {
+            landmarks,
+            detector,
+        }
+    }
+
+    /// The 0x50e start crop.
+    const START: Crop = Crop::upright(280.0, 280.0, 150.0);
+
+    #[test]
+    fn a_face_the_model_sees_exactly_is_fitted_exactly() {
+        // The canonical face 3 cm right of and 2 cm above the camera's axis,
+        // 60 cm away, facing it, as the start crop sees it.
+        let face = seen_through(&START, [3.0, -2.0, 60.0]);
+        let mut fitter = FaceFitter::new(Geometry::IMAGE83, Script::new(&face, [5.0], []));
+        let frame = vec![0u8; 280 * 280];
+        let fit = fitter.fit(&frame, 280, 280).unwrap().unwrap();
+        assert!(!fit.found_by_detector);
+        assert_eq!(fit.score.to_bits(), 5f32.to_bits());
+        for (row, want) in fit.rotation.iter().zip(&IDENTITY3) {
+            for (v, w) in row.iter().zip(want) {
+                assert!((v - w).abs() < 1e-6, "{:?}", fit.rotation);
+            }
+        }
+        let t = fit.translation_mm;
+        assert!(
+            (t[0] - 30.0).abs() < 1e-3 && (t[1] + 20.0).abs() < 1e-3 && (t[2] - 600.0).abs() < 1e-3,
+            "{t:?}"
+        );
+        // The landmarks in the camera's own 280-px image, focal length 376.
+        for (lm, p) in fit.landmarks.iter().zip(&canonical_f64()) {
+            let z = p[2] + 60.0;
+            let want = [
+                376.0 * (p[0] + 3.0) / z + 140.0,
+                376.0 * (p[1] - 2.0) / z + 140.0,
+            ];
+            assert!(
+                (lm[0] - want[0]).abs() < 1e-4 && (lm[1] - want[1]).abs() < 1e-4,
+                "{lm:?} vs {want:?}"
+            );
+        }
+        assert_eq!(fitter.models.runs, runs(1, 0));
+        assert_eq!(fitter.models.inner.crops, [START]);
+    }
+
+    #[test]
+    fn a_lost_face_goes_to_the_detector_until_it_is_found_and_then_is_followed() {
+        let face = seen_through(&START, [0.0, 0.0, 60.0]);
+        let d = detection([150.0, 135.0], 80.0, 0.9);
+        let script = Script::new(&face, [5.0, -1.0, 3.0, 4.0], [vec![], vec![], vec![d]]);
+        let mut fitter = FaceFitter::new(Geometry::IMAGE83, script);
+        let frame = vec![0u8; 280 * 280];
+        let fit = |fitter: &mut FaceFitter<Script>| {
+            let by_detector = fitter
+                .fit(&frame, 280, 280)
+                .unwrap()
+                .map(|f| f.found_by_detector);
+            (by_detector, fitter.models.runs)
+        };
+        // 1: the start crop finds the face; the next frame is cropped to its
+        // region.
+        assert_eq!(fit(&mut fitter), (Some(false), runs(1, 0)));
+        let first = fitter.crop;
+        assert_ne!(first, START);
+        // 2: the crop that follows the face loses it, and the detector finds
+        // nothing.
+        assert_eq!(fit(&mut fitter), (None, runs(2, 1)));
+        assert!(fitter.lost);
+        // 3: lost, so the detector alone, which finds nothing again.
+        assert_eq!(fit(&mut fitter), (None, runs(2, 2)));
+        // 4: the detector finds the face, and the landmark model accepts the
+        // crop around the detection.
+        assert_eq!(fit(&mut fitter), (Some(true), runs(3, 3)));
+        assert!(!fitter.lost);
+        let found = fitter.crop;
+        // 5: followed by the crop again, without the detector (which has no
+        // answer left in the script).
+        assert_eq!(fit(&mut fitter), (Some(false), runs(4, 3)));
+        let crops = &fitter.models.inner.crops;
+        let from_detection = Crop::from_detection(&d, &Geometry::IMAGE83);
+        assert_eq!(*crops, [START, first, from_detection, found]);
+        assert!(fitter.models.inner.is_done());
+    }
+
+    #[test]
+    fn the_crop_the_detector_placed_needs_a_presence_score_of_zero() {
+        let face = seen_through(&START, [0.0, 0.0, 60.0]);
+        let d = detection([140.0, 140.0], 80.0, 0.9);
+        // The start crop scores -1, the crop around the detection -0.5: no
+        // face. Lost, the crop around the detection scores 0: a face. The
+        // crop that follows it scores NaN, which is no face either.
+        let script = Script::new(
+            &face,
+            [-1.0, -0.5, 0.0, f32::NAN],
+            [vec![d], vec![d], vec![]],
+        );
+        let mut fitter = FaceFitter::new(Geometry::IMAGE83, script);
+        let frame = vec![0u8; 280 * 280];
+        assert!(fitter.fit(&frame, 280, 280).unwrap().is_none());
+        assert_eq!(fitter.models.runs, runs(2, 1));
+        let again = fitter
+            .fit(&frame, 280, 280)
+            .unwrap()
+            .map(|f| f.found_by_detector);
+        assert_eq!(again, Some(true));
+        assert_eq!(fitter.models.runs, runs(3, 2));
+        assert!(fitter.fit(&frame, 280, 280).unwrap().is_none());
+        assert_eq!(fitter.models.runs, runs(4, 3));
+        assert!(fitter.lost && fitter.models.inner.is_done());
+    }
+
+    #[test]
+    fn a_detection_without_a_finite_crop_is_no_face() {
+        let face = seen_through(&START, [0.0, 0.0, 60.0]);
+        let d = detection([140.0, 140.0], 80.0, 0.9);
+        let bad = Detection { x: f64::NAN, ..d };
+        let script = Script::new(&face, [-1.0, 2.0], [vec![bad], vec![d]]);
+        let mut fitter = FaceFitter::new(Geometry::IMAGE83, script);
+        let frame = vec![0u8; 280 * 280];
+        // No landmark run in a crop that is not finite.
+        assert!(fitter.fit(&frame, 280, 280).unwrap().is_none());
+        assert_eq!(fitter.models.runs, runs(1, 1));
+        let again = fitter
+            .fit(&frame, 280, 280)
+            .unwrap()
+            .map(|f| f.found_by_detector);
+        assert_eq!(again, Some(true));
+        assert_eq!(fitter.models.runs, runs(2, 2));
+        assert!(fitter.models.inner.is_done());
+    }
+
     /// The 0x50e fixture's frame (`TOBII_IMAGE83_FIXTURE`, a captured
     /// 78609-byte message; the user's face, so it is not committed), if set.
     fn image83_fixture() -> Option<tobii_proto::image83::ImageFrame> {
@@ -2102,6 +2401,31 @@ mod tests {
                 detector: 1
             }
         );
+    }
+
+    /// A face that comes back after a frame without one is found by the
+    /// detector, the tracker having lost it, then followed by the crop.
+    #[test]
+    fn image83_tracker_finds_the_face_again_after_a_frame_without_one() {
+        let Some(frame) = image83_fixture() else {
+            return;
+        };
+        let (w, h) = (frame.width, frame.height);
+        let mut t = Tracker::new_image83().unwrap();
+        assert!(t.fit(&vec![0; w * h], w, h).unwrap().is_none());
+        assert_eq!(t.model_runs(), runs(1, 1));
+        let again = t
+            .fit(&frame.pixels, w, h)
+            .unwrap()
+            .map(|f| f.found_by_detector);
+        assert_eq!(again, Some(true), "found by the detector");
+        assert_eq!(t.model_runs(), runs(2, 2));
+        let next = t
+            .fit(&frame.pixels, w, h)
+            .unwrap()
+            .map(|f| f.found_by_detector);
+        assert_eq!(next, Some(false), "followed by the crop");
+        assert_eq!(t.model_runs(), runs(3, 2));
     }
 
     /// The face detector on the 0x50e fixture's frame: one face, the eyes
