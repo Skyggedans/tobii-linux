@@ -20,6 +20,11 @@ use crate::detect::{Detection, FaceDetector};
 const MODEL: &[u8] = include_bytes!("../models/face_landmarks.onnx");
 const IN: usize = 256; // model input is 256x256x3
 const NLM: usize = 468; // canonical landmarks (model emits 478 incl. iris)
+// The landmark model's input (the 256x256x3 crop) and the outputs the code
+// reads: the landmarks and the face-presence logit (models/README.md).
+const LANDMARK_INPUT: &str = "input_12";
+const LANDMARK_POINTS: &str = "Identity";
+const LANDMARK_PRESENCE: &str = "Identity_1";
 
 // Tunables (flip a sign if an axis is reversed; raise a gain if too weak).
 const ANGLE_SIGN: [f64; 3] = [1.0, 1.0, 1.0]; // pitch, yaw, roll
@@ -320,7 +325,8 @@ impl FaceModel {
     /// # Errors
     /// Fails when ONNX Runtime cannot be initialised or rejects the model.
     pub fn new() -> Result<Self> {
-        let session = Session::builder()?
+        let session = Session::builder()
+            .context("failed to start ONNX Runtime for the face landmark model")?
             .commit_from_memory(MODEL)
             .context("failed to load face landmark model")?;
         Ok(Self {
@@ -337,7 +343,9 @@ impl FaceModel {
     /// overwrites.
     ///
     /// # Errors
-    /// Fails when the ONNX session rejects the input or the run fails.
+    /// Fails when the ONNX session rejects the input or the run fails, or
+    /// when an output the code reads is missing, not f32 or empty. Each
+    /// error says it was the face landmark model's.
     pub(crate) fn landmarks(
         &mut self,
         gray: &[u8],
@@ -347,15 +355,30 @@ impl FaceModel {
     ) -> Result<(&[[f32; 3]], f32)> {
         sample_crop(gray, w, h, crop, &mut self.input);
 
-        let value = TensorRef::from_array_view(([1usize, IN, IN, 3], self.input.as_slice()))?;
-        let outputs = self.session.run(ort::inputs!["input_12" => value])?;
-        let (_, lm) = outputs["Identity"].try_extract_tensor::<f32>()?;
-        let (_, score) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
+        let value = TensorRef::from_array_view(([1usize, IN, IN, 3], self.input.as_slice()))
+            .context("passing the crop to the face landmark model")?;
+        let outputs = self
+            .session
+            .run(ort::inputs![LANDMARK_INPUT => value])
+            .context("running the face landmark model")?;
+        let (_, lm) = outputs
+            .get(LANDMARK_POINTS)
+            .context("the face landmark model has no landmark output")?
+            .try_extract_tensor::<f32>()
+            .context("reading the face landmark model's landmarks")?;
+        let (_, score) = outputs
+            .get(LANDMARK_PRESENCE)
+            .context("the face landmark model has no face presence output")?
+            .try_extract_tensor::<f32>()
+            .context("reading the face landmark model's face presence")?;
+        let score = *score
+            .first()
+            .context("the face landmark model returned no face presence score")?;
 
         self.pts.clear();
         self.pts
             .extend(lm.as_chunks::<3>().0.iter().take(NLM).copied());
-        Ok((self.pts.as_slice(), score[0]))
+        Ok((self.pts.as_slice(), score))
     }
 }
 
@@ -1945,6 +1968,31 @@ mod tests {
         assert_eq!(tracker.model_runs(), ModelRuns::default());
     }
 
+    #[test]
+    fn frames_without_a_face_run_both_models_then_the_detector_alone() {
+        // Both ONNX sessions, run through the names the code gives ort, on
+        // frames that hold no face: the landmark model scores the start
+        // crop below 0 (-14.1, -14.2 and -28.0 here) and the detector finds
+        // nothing. From the second frame on, the face is lost, and only the
+        // detector runs.
+        let n = 280;
+        for (what, frame) in [
+            ("black", vec![0u8; n * n]),
+            ("grey", vec![128u8; n * n]),
+            ("textured", textured_frame(n, n)),
+        ] {
+            let mut tracker = Tracker::new_image83().unwrap();
+            for detector in 1..=3 {
+                assert!(tracker.fit(&frame, n, n).unwrap().is_none(), "{what}");
+                let runs = ModelRuns {
+                    landmarks: 1,
+                    detector,
+                };
+                assert_eq!(tracker.model_runs(), runs, "{what}");
+            }
+        }
+    }
+
     /// Name, element type and shape (-1: any size) of each of a session's
     /// inputs or outputs.
     fn signature(
@@ -1961,30 +2009,33 @@ mod tests {
 
     #[test]
     fn both_embedded_models_load_with_the_inputs_and_outputs_the_code_uses() {
+        use crate::detect::{CLASSIFICATORS, INPUT, REGRESSORS};
         use ort::value::TensorElementType::Float32;
+        // The names as the code passes them to ort; the tongue-out score
+        // (Identity_2) is not read.
         let landmark = FaceModel::new().unwrap();
         assert_eq!(
             signature(landmark.session.inputs()),
-            [("input_12", Some(Float32), vec![-1, 256, 256, 3])]
+            [(LANDMARK_INPUT, Some(Float32), vec![-1, 256, 256, 3])]
         );
         assert_eq!(
             signature(landmark.session.outputs()),
             [
-                ("Identity", Some(Float32), vec![-1, 1, 1, 1434]),
-                ("Identity_1", Some(Float32), vec![-1, 1, 1, 1]),
+                (LANDMARK_POINTS, Some(Float32), vec![-1, 1, 1, 1434]),
+                (LANDMARK_PRESENCE, Some(Float32), vec![-1, 1, 1, 1]),
                 ("Identity_2", Some(Float32), vec![-1, 1]),
             ]
         );
         let detector = FaceDetector::new().unwrap();
         assert_eq!(
             signature(detector.session().inputs()),
-            [("input", Some(Float32), vec![1, 3, 128, 128])]
+            [(INPUT, Some(Float32), vec![1, 3, 128, 128])]
         );
         assert_eq!(
             signature(detector.session().outputs()),
             [
-                ("regressors", Some(Float32), vec![1, 896, 16]),
-                ("classificators", Some(Float32), vec![1, 896, 1]),
+                (REGRESSORS, Some(Float32), vec![1, 896, 16]),
+                (CLASSIFICATORS, Some(Float32), vec![1, 896, 1]),
             ]
         );
     }

@@ -35,6 +35,11 @@ const MIN_SCORE: f32 = 0.3;
 /// Candidates that overlap the best remaining one by more than this
 /// intersection over union are merged into it.
 const MERGE_IOU: f64 = 0.3;
+// The model's input (the 1x3x128x128 frame) and its two outputs: per
+// anchor, the box and keypoints, and the score logit (models/README.md).
+pub(crate) const INPUT: &str = "input";
+pub(crate) const REGRESSORS: &str = "regressors";
+pub(crate) const CLASSIFICATORS: &str = "classificators";
 
 /// A face the detector found, in the pixels of the frame it was given: x
 /// right, y down, pixel k spanning `[k, k + 1)`.
@@ -80,9 +85,11 @@ impl FaceDetector {
         // One intra-op thread, as the prototype ran it (0.8 ms a call). In ort
         // 2.0.0-rc.12 the builder's setters fail with an error that hands the
         // builder back, which is not Send; convert it to a plain ort::Error.
-        let session = Session::builder()?
+        let session = Session::builder()
+            .context("failed to start ONNX Runtime for the face detection model")?
             .with_intra_threads(1)
-            .map_err(ort::Error::<()>::from)?
+            .map_err(ort::Error::<()>::from)
+            .context("failed to give the face detection model one thread")?
             .commit_from_memory(MODEL)
             .context("failed to load face detection model")?;
         Ok(Self {
@@ -101,7 +108,8 @@ impl FaceDetector {
     /// # Errors
     /// Fails when `frame` holds fewer than `n * n` pixels or `n` is 0, when
     /// the ONNX session rejects the input or the run fails, or when an output
-    /// is missing or not of the model's size.
+    /// is missing, not f32 or not of the model's size. Each error from the
+    /// model says it was the face detection model's.
     pub(crate) fn detect(&mut self, frame: &[u8], n: usize) -> Result<&[Detection]> {
         ensure!(
             n > 0 && n.checked_mul(n).is_some_and(|len| frame.len() >= len),
@@ -110,16 +118,22 @@ impl FaceDetector {
         );
         prepare_input(frame, n, &mut self.input);
 
-        let value = TensorRef::from_array_view(([1usize, 3, SIDE, SIDE], self.input.as_slice()))?;
-        let outputs = self.session.run(ort::inputs!["input" => value])?;
+        let value = TensorRef::from_array_view(([1usize, 3, SIDE, SIDE], self.input.as_slice()))
+            .context("passing the frame to the face detection model")?;
+        let outputs = self
+            .session
+            .run(ort::inputs![INPUT => value])
+            .context("running the face detection model")?;
         let (_, regressors) = outputs
-            .get("regressors")
+            .get(REGRESSORS)
             .context("the face detection model has no regressors output")?
-            .try_extract_tensor::<f32>()?;
+            .try_extract_tensor::<f32>()
+            .context("reading the face detection model's regressors")?;
         let (_, classificators) = outputs
-            .get("classificators")
+            .get(CLASSIFICATORS)
             .context("the face detection model has no classificators output")?
-            .try_extract_tensor::<f32>()?;
+            .try_extract_tensor::<f32>()
+            .context("reading the face detection model's classificators")?;
         ensure!(
             regressors.len() == ANCHORS * REG && classificators.len() == ANCHORS,
             "the face detection model returned {} regressors and {} scores, not {} and {ANCHORS}",
