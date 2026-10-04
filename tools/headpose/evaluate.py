@@ -49,7 +49,10 @@ printed for information only and their gates (G15-G18) are not checked.
 
 The gates (gates.json, the file compare-dll --head checks) apply to a session whose clock offset
 they name (and image count, where they give one); evaluate.py checks every gate, those marked as
-compare-dll's too. Exits 1 if one fails.
+compare-dll's too. A metric that could not be measured (NaN, on any axis) fails its gate. Exits 0
+when every gate of every session was checked and passed, 1 when one fails, 3 when none fails but
+some went unchecked (G15-G18 without --reference-fits, a session the gates have no thresholds
+for); with --gates none, 0.
 """
 
 import argparse
@@ -74,6 +77,8 @@ FILTER_METRICS = (
     "position_rest_jitter_ratio",
 )
 GATE_KINDS = ("min", "max", "abs", "range")
+# The exit status of each verdict on the gates: 2 is argparse's, for a bad command line.
+EXIT = {"pass": 0, "fail": 1, "incomplete": 3}
 SUBSETS = ("ALL", "BOTH", "NONE", "YAW20", "REACQ", "REACQgap")
 CHANNELS = [("rot", 0), ("rot", 1), ("rot", 2), ("pos", 0), ("pos", 1), ("pos", 2)]
 
@@ -311,6 +316,10 @@ def evaluate(o, P, args, ref_fits):
     c = rows[("COMB", stage)]
     p = prow["ALL"]
     lj = res["lag"]
+    # Per axis; np.max and np.min keep a NaN (a lag or a jitter that could not be measured), so
+    # that the gate fails, where max() and min() would skip it unless it came first.
+    dlag = {kind: np.array([lj[(kind, k)]["dlag"] for k in range(3)]) for kind in ("rot", "pos")}
+    jit = {kind: np.array([lj[(kind, k)]["jit"] for k in range(3)]) for kind in ("rot", "pos")}
     res["metrics"] = {
         "coverage_pct": 100.0 * res["coverage"],
         "agreement_pct": 100.0 * res["validity"]["agree"],
@@ -326,16 +335,10 @@ def evaluate(o, P, args, ref_fits):
         "position_median_abs_y_mm": float(p["med"][1]),
         "position_median_abs_z_mm": float(p["med"][2]),
         "position_p95_abs_z_mm": float(p["p95"][2]),
-        "rotation_lag_max_ms": max(abs(lj[("rot", k)]["dlag"]) for k in range(3)),
-        "position_lag_max_ms": max(abs(lj[("pos", k)]["dlag"]) for k in range(3)),
-        "rotation_rest_jitter_ratio": [
-            min(lj[("rot", k)]["jit"] for k in range(3)),
-            max(lj[("rot", k)]["jit"] for k in range(3)),
-        ],
-        "position_rest_jitter_ratio": [
-            min(lj[("pos", k)]["jit"] for k in range(3)),
-            max(lj[("pos", k)]["jit"] for k in range(3)),
-        ],
+        "rotation_lag_max_ms": float(np.max(np.abs(dlag["rot"]))),
+        "position_lag_max_ms": float(np.max(np.abs(dlag["pos"]))),
+        "rotation_rest_jitter_ratio": [float(np.min(jit["rot"])), float(np.max(jit["rot"]))],
+        "position_rest_jitter_ratio": [float(np.min(jit["pos"])), float(np.max(jit["pos"]))],
     }
     return res
 
@@ -376,19 +379,25 @@ def gate_session(gates, o):
     return None
 
 
+def measurable(val):
+    """Whether a metric's value is a number (both ends of a range)."""
+    return bool(np.isfinite(np.asarray(val, float)).all())
+
+
 def print_gates(gates, sessions, results):
     """Check the gates file (compare-dll --head's: the sessions by clock offset, per gate its
     metric, kind and thresholds per session; evaluate.py checks every gate, whoever its "by"
-    names) and print the table. Returns whether none failed."""
+    names) and print the table. Returns "fail" when a gate fails (a value that is not a number
+    fails), "incomplete" when none fails but a gate or a whole session went unchecked, else
+    "pass"."""
     names = [gate_session(gates, o) for o in sessions]
+    no_gates = [o["name"] for o, g in zip(sessions, names) if g is None]
     for o, g in zip(sessions, names):
         if g is None:
             print(f"\n{o['name']}: no gates (none for clock offset {o['k']} and {o['n']} images)")
     cols = [(o, g, res) for o, g, res in zip(sessions, names, results) if g is not None]
-    if not cols:
-        return True
     rows, failed, unchecked = [], [], []
-    for gt in gates["gates"]:
+    for gt in gates["gates"] if cols else ():
         if gt["kind"] not in GATE_KINDS:
             C.fail(f"gate {gt['id']}: unknown kind {gt['kind']!r}")
         if gt["metric"] not in results[0]["metrics"]:
@@ -404,22 +413,36 @@ def print_gates(gates, sessions, results):
                 unchecked.append(f"{gt['id']} {o['name']}")
                 cells.append(f"{fmt(val)}: not checked (no --reference-fits)")
                 continue
-            ok = check(gt["kind"], th, val)
+            ok = measurable(val) and check(gt["kind"], th, val)
             if not ok:
                 failed.append(f"{gt['id']} {o['name']}")
             th_s = f"{th[0]}..{th[1]}" if isinstance(th, list) else f"{th}"
-            verdict = "pass" if ok else "FAIL"
-            cells.append(f"{fmt(val)} vs {th_s}: {verdict} ({headroom(gt['kind'], th, val)})")
+            if not measurable(val):
+                cells.append(f"{fmt(val)} vs {th_s}: FAIL (not measurable)")
+                continue
+            word = "pass" if ok else "FAIL"
+            cells.append(f"{fmt(val)} vs {th_s}: {word} ({headroom(gt['kind'], th, val)})")
         rows.append(cells)
-    print("\n## Gates: value (headroom, + = passes)")
-    heads = [o["name"] if g == o["name"] else f"{o['name']} (gates' {g})" for o, g, _ in cols]
-    C.table(["gate", "kind", *heads], rows)
+    if cols:
+        print("\n## Gates: value (headroom, + = passes)")
+        heads = [o["name"] if g == o["name"] else f"{o['name']} (gates' {g})" for o, g, _ in cols]
+        C.table(["gate", "kind", *heads], rows)
+    if failed:
+        verdict = "fail"
+        line = "FAIL " + ", ".join(failed)
+    elif unchecked or no_gates:
+        verdict = "incomplete"
+        line = "INCOMPLETE (none failed, but not every gate was checked)"
+    else:
+        verdict = "pass"
+        line = "all pass"
     print(
         "\ngates: "
-        + ("all pass" if not failed else "FAIL " + ", ".join(failed))
+        + line
         + (f"; not checked: {', '.join(unchecked)}" if unchecked else "")
+        + (f"; no gates for {', '.join(no_gates)}" if no_gates else "")
     )
-    return not failed
+    return verdict
 
 
 # ------------------------------------------------------------------ the report
@@ -689,14 +712,14 @@ def main():
         )
         results.append(evaluate(o, P, args, ref_fits))
     report(sessions, results)
-    ok = True
+    verdict = "pass"
     if args.gates != "none":
         with open(args.gates) as f:
             gates = json.load(f)
         if not (isinstance(gates.get("sessions"), list) and isinstance(gates.get("gates"), list)):
             C.fail(f'{args.gates}: not a gates file (a "sessions" and a "gates" list)')
-        ok = print_gates(gates, sessions, results)
-    sys.exit(0 if ok else 1)
+        verdict = print_gates(gates, sessions, results)
+    sys.exit(EXIT[verdict])
 
 
 if __name__ == "__main__":

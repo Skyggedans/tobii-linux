@@ -131,3 +131,7 @@ checked against the broken pipelines, which fail at least one gate in every sess
 - **Without `--reference-fits`** the lag reference is the evaluated fits' own unfiltered pose.
   Our filter then also delays that reference's noise, which adds to our lag, so `evaluate.py`
   prints the lag and the jitter but leaves G15-G18 unchecked.
+- **The verdict.** `evaluate.py` exits 0 only when every gate of every session was checked and
+  passed: 1 when a gate fails (a lag or a jitter that could not be measured on one of the axes
+  fails it too), 3 when none fails but some were not checked (G15-G18 without
+  `--reference-fits`, or a session `gates.json` has no thresholds for). The last line says which.
