@@ -17,7 +17,8 @@ image's time (offline the image's device time, live its host time).
 
   1. validity G3: face AND score >= 0 AND edge(centroid of the 468 landmarks) >= 6 px AND
      edge(landmark 1, the nose tip) >= -4 px, edge(u, v) = min(u, 280 - u, v, 280 - v), signed
-     (+ inside). No hysteresis. All four of the pose's validity flags take this one value.
+     (+ inside), NaN (so failing) when u or v is. No hysteresis. All four of the pose's validity
+     flags take this one value.
   2. rotation: H_S = D R_cam D Q (head -> S), R_T = R_TS H_S, (x, y, z) = yxz(R_T):
      x = asin(-R_T[1][2]), y = atan2(R_T[0][2], R_T[2][2]), z = atan2(R_T[1][0], R_T[1][1]).
   3. position (S, mm):
@@ -28,8 +29,8 @@ image's time (offline the image's device time, live its host time).
                    m = unit(r_a + r_b), ang = acos(r_a . r_b), fs = sqrt(max(1 - (H_S[:, 0] . m)^2,
                    1e-6)), range = K fs / sin(ang), p_eye = range unit(g_e mx/mz + ox_e,
                    g_e my/mz + oy_e, 1)
-       correction  c = w (p_eye - p_pnp) (w = 0: the PnP branch alone; a non-finite eye branch
-                   leaves the correction as it was)
+       correction  c = w (p_eye - p_pnp) (w = 0: the PnP branch alone; a non-finite eye branch,
+                   such as two eyes on one ray (sin(ang) = 0), leaves the correction as it was)
   4. filters, one step per valid image; dt is the time since the last VALID image:
        correction  c_lp += beta(dt) (c - c_lp),           beta(dt) = dt / (dt + TAU_BETA)
        position    y += alpha(dt) (p_pnp + c_lp - y),     alpha(dt) = dt / (dt + TAU_POS)   (in S)
@@ -186,6 +187,11 @@ def wrap_deg(a):
 
 # ------------------------------------------------------------------ validity
 def edge_px(u, v):
+    """The signed distance of (u, v) from the frame's nearest edge, px (+ inside). NaN when u or v
+    is: min() would pass over a NaN that does not come first, and an unusable point must fail G3
+    (head.rs's edge_px, common.edge_v)."""
+    if math.isnan(u) or math.isnan(v):
+        return math.nan
     return min(u, FRAME_PX - u, v, FRAME_PX - v)
 
 
@@ -238,12 +244,17 @@ def eye_points(lm280):
 def p_eye_S(eye_a, eye_b, H, P):
     ra, rb = ray_S(*eye_a), ray_S(*eye_b)
     m = unit(ra + rb)
-    ang = math.acos(max(-1.0, min(1.0, float(ra @ rb))))
+    # As head.rs's f64: the clamp keeps a NaN, and a division by sin(0) (the two rays one) gives
+    # inf, not an exception. Either way the eye branch is not finite, which leaves the correction
+    # as it was.
+    cos = float(ra @ rb)
+    ang = math.acos(cos if math.isnan(cos) else max(-1.0, min(1.0, cos)))
     fs = math.sqrt(max(1.0 - float(H[:, 0] @ m) ** 2, 1e-6))
-    rng = P["K"] * fs / math.sin(ang)
-    return rng * unit(
-        np.array([P["g_e"] * m[0] / m[2] + P["ox_e"], P["g_e"] * m[1] / m[2] + P["oy_e"], 1.0])
-    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rng = float(np.float64(P["K"] * fs) / math.sin(ang))
+        return rng * unit(
+            np.array([P["g_e"] * m[0] / m[2] + P["ox_e"], P["g_e"] * m[1] / m[2] + P["oy_e"], 1.0])
+        )
 
 
 # ------------------------------------------------------------------ filters
