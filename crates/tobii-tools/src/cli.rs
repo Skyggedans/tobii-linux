@@ -55,16 +55,16 @@ const IMAGE83_REPLAY_OUTPUTS: &str = "\
 Runs the daemon's head tracker over every 0x50e image of a TBI5LOG1 log, in log order.
   --csv        per image: the legacy pose, raw and calibrated (cm, deg), and the head anchors of
                the last 0x83 gaze frame
-  --fits       per image, one row: image_idx, device_ts_us, face (1 or 0; without a face every
-               later field is empty), score (the landmark model's logit), found_by_detector (1 or
-               0), r_cam_00 .. r_cam_22 (mesh -> camera rotation, row-major; camera x right, y
-               down, z forward), t_cam_x_mm, t_cam_y_mm, t_cam_z_mm (mesh origin in the camera
-               frame), then six points as <name>_u, <name>_v in the 280-px image's continuous
-               pixels (x right, y down, pixel k spans [k, k+1)): centroid (of the 468 landmarks),
-               nose_tip (landmark 1), eye_image_left and eye_image_right (the means of the eye
-               contours 33 7 163 144 145 153 154 155 133 173 157 158 159 160 161 246 and 263 249
-               390 373 374 380 381 382 362 398 384 385 386 387 388 466), corner_33, corner_263.
-               Numbers in the shortest form that reads back as the same f64.
+  --fits       per image, one row: image_idx, device_ts_us (0 if the image has none), face (1 or
+               0; without a face every later field is empty), score (the landmark model's logit),
+               found_by_detector (1 or 0), r_cam_00 .. r_cam_22 (mesh -> camera rotation,
+               row-major; camera x right, y down, z forward), t_cam_x_mm, t_cam_y_mm, t_cam_z_mm
+               (mesh origin in the camera frame), then six points as <name>_u, <name>_v in the
+               280-px image's continuous pixels (x right, y down, pixel k spans [k, k+1)): centroid
+               (of the 468 landmarks), nose_tip (landmark 1), eye_image_left and eye_image_right
+               (the means of the eye contours 33 7 163 144 145 153 154 155 133 173 157 158 159 160
+               161 246 and 263 249 390 373 374 380 381 382 362 398 384 385 386 387 388 466),
+               corner_33, corner_263. Numbers in the shortest form that reads back as the same f64.
   --landmarks  per image, in log order like the rows above, no header: the 468 landmarks as (u, v)
                pairs of little-endian f32 in the same pixels, 3744 bytes, all NaN without a face.
                NumPy: np.fromfile(path, '<f4').reshape(-1, 468, 2)";

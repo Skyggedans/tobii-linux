@@ -139,7 +139,8 @@ def keyed(payload):
 def read_log(path):
     """The images' device times and the gaze frames of a log: dict(image_devts (n,), gaze_devts
     (m,), gaze {key: (m, k) raw values, NaN where the frame lacks the key}, gaze_scalars {key: (m,)
-    int, -1 where absent}). Gaze frames without a device time are dropped."""
+    int, -1 where absent}). Images and gaze frames without a device time are dropped (an image
+    without one is a fits row with device_ts_us 0, which load_session refuses)."""
     img, gdev, gvec, gsc = [], [], {k: [] for k in GAZE_VECTORS}, {k: [] for k in GAZE_SCALARS}
     for _, m in log_messages(path):
         if len(m) < 24 or struct.unpack_from(">I", m, 8)[0] != MARKER_STREAM:
@@ -433,6 +434,13 @@ def load_session(name, log_path, dll_path, fits_path, area=None):
     fits = read_fits(fits_path)
     devts = fits["devts"]
     n = len(devts)
+    timeless = np.flatnonzero(devts == 0)
+    if len(timeless):
+        more = f" and {len(timeless) - 1} more" if len(timeless) > 1 else ""
+        fail(
+            f"{fits_path}: no device time (device_ts_us 0) for image {timeless[0]}{more}: the "
+            "images are paired with the DLL's poses and filtered by it"
+        )
     if n != len(log["image_devts"]) or not (devts == log["image_devts"]).all():
         fail(
             f"{fits_path}: its {n} rows are not the {len(log['image_devts'])} images of {log_path}"

@@ -7,7 +7,9 @@
 //! rows of `--csv`):
 //!
 //! - `image_idx`: the image's index among the log's decoded 0x50e images,
-//!   from 0; `device_ts_us`: its device timestamp (µs).
+//!   from 0; `device_ts_us`: its device timestamp (µs), 0 when the image
+//!   carries none (the decoder's stand-in; `tools/headpose` refuses such a
+//!   row, since it pairs and filters images by this time).
 //! - `face`: 1 when the tracker found a face, else 0. When 0, every later
 //!   field of the row is empty.
 //! - `score`: the landmark model's face-presence logit (never negative), the
