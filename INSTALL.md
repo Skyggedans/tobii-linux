@@ -57,7 +57,7 @@ embedded assets (it is ~0.45 MB rather than ~20 MB).
 | Crate | What it holds | Heavy deps |
 |---|---|---|
 | `tobii-proto` | wire formats: framing, TLV, commands and responses, the 0x500/0x504/0x50e streams, device facts, the `TBI5LOG1` log | none |
-| `tobii-pose` | face landmarks, face detection and the head-pose fit; owns `models/` | `ort` |
+| `tobii-pose` | face landmarks, face detection, the Stream Engine's head pose and the legacy relative one; owns `models/` | `ort` |
 | `tobii-usb` | USB transport and the live 0x83 engine; owns `init_packets_ep.txt` | `rusb` |
 | `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
@@ -244,6 +244,25 @@ that application gets no samples and cannot recover by reconnecting. Restart
 every `libtobii.so` application after the first daemon restart onto such a
 build; in OpenTrack, stop and start tracking.
 
+**Once, when moving to the Stream Engine's head pose.** A `libtobii.so`
+built with the commit "ffi: deliver the Stream Engine's head pose, validity
+included" subscribes to the daemon's new head-pose stream, which a `tobiid`
+built without the commit "engine, tobiid: publish a head pose for every
+image" (any build before it, whatever its date) acknowledges and never
+sends: the application gets no head pose and no error, only one WARN line
+to its logger after 20 s (§8; OpenTrack gives libtobii no logger).
+`make install` replaces the binaries, not the daemon that is running:
+after installing the first build with those commits, restart it with
+`systemctl --user restart tobiid.service` (4b and 4c; under 4c
+`pkill -x tobiid` does too, as the socket starts the new daemon at the next
+connection; under 4a `pkill -x tobiid`, and the next client spawns it),
+then restart the `libtobii.so` applications that were running. Until then
+one started before the install keeps the old library, which asks for the
+daemon's own, relative head pose (`tobii-opentrack`'s, §8) and still gets
+it, all valid, as before. OpenTrack loads its tracker plugins, and
+`libtobii.so` with them, when it starts: quit it and start it again, as
+stopping and starting tracking keeps the library it has.
+
 **Running clients.** A restart, like a crash, closes every client's
 connection:
 
@@ -313,30 +332,36 @@ its diagnostics go only to the `tobii_custom_log_t` the application hands
 
 ## 7. Tuning (environment variables on the daemon)
 
-The head-pose tracker reads these at start. Set them on **`tobiid`** (the
-tracker runs in the daemon, not in the client):
+Set these on **`tobiid`** (the head-pose tracker runs in the daemon, not in
+the client). The five head-pose ones, `TOBII_PIVOT_DOWN`, `TOBII_PIVOT_BACK`,
+`TOBII_POSE_DEBUG`, `TOBII_ROLL_EYELINE` and `TOBII_CAMERA_TILT_DEG`, shape
+only the daemon's own, relative head pose, the one `tobii-opentrack` reads
+(§8). The Stream Engine's head pose, which `libtobii.so` delivers (to
+OpenTrack's `tracker-tobii` plugin, among others), takes none of them: its
+constants are fitted to the Stream Engine's output, and its frame is the
+display area's (§8a; README.md, Architecture, "Head pose").
 
 | Var | Default | Meaning |
 |---|---|---|
-| `TOBII_PIVOT_DOWN` | `11.0` | neck pivot below the face origin (cm) — fixes yaw sliding |
-| `TOBII_PIVOT_BACK` | `6.0` | neck pivot behind the face origin (cm) — fixes pitch sliding |
-| `TOBII_POSE_DEBUG` | unset | log raw `t` vs pivoted `t'` and angles |
-| `TOBII_ROLL_EYELINE` | unset | `1` measures roll directly from the eye line (decoupled from yaw/pitch, symmetric by construction) instead of from the euler solve |
+| `TOBII_PIVOT_DOWN` | `11.0` | `tobii-opentrack` only: neck pivot below the face origin (cm) — fixes yaw sliding |
+| `TOBII_PIVOT_BACK` | `6.0` | `tobii-opentrack` only: neck pivot behind the face origin (cm) — fixes pitch sliding |
+| `TOBII_POSE_DEBUG` | unset | `tobii-opentrack` only: log raw `t` vs pivoted `t'` and angles |
+| `TOBII_ROLL_EYELINE` | unset | `tobii-opentrack` only: `1` measures roll directly from the eye line (decoupled from yaw/pitch, symmetric by construction) instead of from the euler solve |
 | `TOBII_PREWARM` | unset | `1` (or the historical `head` / `gaze`): init the device at daemon start and keep it warm, so client connects are instant (IR illuminator stays on while the service runs). |
 | `TOBII_NO_RESET` | unset | `1` skips the USB reset the engine tries once opens keep failing, after two failures in a row: opens whose init fails, that do not arm the stream (bar the first after a start or a lost stream: the tracker needs that one to arm), or that lose it within 30 s (until the engine waited out a tracker starting its sensor, every open right after the reset failed its init on a 2 s write timeout; whether the reset helps is unconfirmed on hardware) |
 | `TOBII_NO_IMAGE` | unset | `1` does not start the 0x50e image stream (gaze/presence only; no head pose from the gaze engine) |
 | `TOBII_IMAGE83_DEBUG` | unset | `1` logs the image head-pose worker's statistics every 5 s while a client wants a head pose (an `info` event): the images it made a pose of and the valid poses, per second (`frames_per_s`/`valid_per_s`), the images dropped before it could take them (`overwritten`, 0 when it keeps up), the time per image (`mean_ms`/`p99_ms`/`max_ms`) and the face-detector rate (`detector_runs_per_s`: how often the tracker looked for a lost face) |
 | `RUST_LOG` | `info` | log filter for all binaries (`debug`, `tobii=debug,ort=warn`, …); see §6 |
-| `TOBII_DISPLAY_MM` | unset | your monitor as `<width>x<height>[+<offset_x>]` in mm, e.g. `597x336`: once the tracker reports its mounting, the daemon computes the display area (the Stream Engine's `tobii_calculate_display_area_basic`) and writes it, replacing the capture author's monitor that the init replay configures. Gaze coordinates are relative to this area. `offset_x` is how far right of the tracker the screen centre is. Usually unneeded: `tobii-calibrate` sets the display area and the daemon keeps it (§8a); a saved display area wins over this variable, which only fills in while nothing is saved (delete `~/.config/tobii/display-area` to use it). |
+| `TOBII_DISPLAY_MM` | unset | your monitor as `<width>x<height>[+<offset_x>]` in mm, e.g. `597x336`: once the tracker reports its mounting, the daemon computes the display area (the Stream Engine's `tobii_calculate_display_area_basic`) and writes it, replacing the capture author's monitor that the init replay configures. Gaze coordinates, and the Stream Engine's head pose, are relative to this area. `offset_x` is how far right of the tracker the screen centre is. Usually unneeded: `tobii-calibrate` sets the display area and the daemon keeps it (§8a); a saved display area wins over this variable, which only fills in while nothing is saved (delete `~/.config/tobii/display-area` to use it). |
 | `TOBII_CALIBRATION` | unset | where the calibration is kept (default `$XDG_CONFIG_HOME/tobii/calibration.bin`), or `embedded` to use the built-in one (§8a) |
-| `TOBII_CAMERA_TILT_DEG` | `20` | upward tilt of the tracker camera; head angles are reported in the upright frame (yaw about the true vertical), so a turn does not leak into roll |
+| `TOBII_CAMERA_TILT_DEG` | `20` | `tobii-opentrack` only: upward tilt of the tracker camera; head angles are reported in the upright frame (yaw about the true vertical), so a turn does not leak into roll |
 
 Head-pose inference on the image stream runs only while some client subscribes
-to head pose (about 6 ms per frame at 33 Hz on a desktop CPU); gaze-only
-clients don't pay for it.
+to a head pose, either one (about 6 ms per frame at 33 Hz on a desktop CPU);
+gaze-only clients don't pay for it.
 
-Raise the pivots if pure rotations still **slide**; lower them if they
-**over-shoot** (slide the other way). For a systemd unit:
+In `tobii-opentrack`, raise the pivots if pure rotations still **slide**;
+lower them if they **over-shoot** (slide the other way). For a systemd unit:
 
 ```bash
 systemctl --user edit tobiid
@@ -359,9 +384,19 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
 
 ## 8. Clients
 
-- **`tobii-opentrack`** — subscribes head pose, sends the OpenTrack UDP packet
-  (`x,y,z,yaw,pitch,roll`; translation in **cm**, angles in **degrees**). In
-  OpenTrack pick *Input = UDP over network*, port 4242.
+- **`tobii-opentrack`** — subscribes to the daemon's own head pose and sends
+  the OpenTrack UDP packet (`x,y,z,yaw,pitch,roll`; translation in **cm**,
+  angles in **degrees**). In OpenTrack pick *Input = UDP over network*, port
+  4242. That pose is not the Stream Engine's, which `libtobii.so` delivers
+  (below), but the daemon's legacy one, as before: relative to a rest pose,
+  the mean of the first 30 images with a face (*Recenter* below), its
+  position a pivot at the neck along the camera's axes (§7), its angles
+  clamped to ±45°, and nothing sent while there is no face. Since the
+  tracker turns its face crop with the eye line, it loses the face less
+  often, and its yaw and roll now follow the head about as far as the
+  Stream Engine's: 1.0 to 1.15 and about 1.0 times them, where they were
+  0.4 to 0.8 and 0.7 to 0.8 times. A gain you raised in OpenTrack to make
+  up for that may now be too much.
 - **`libtobii.so`** — the Stream Engine 4.1 C API: every one of the 153
   entry points of `tobii_stream_engine.dll` 4.1.0.3, with its signatures,
   `tobii_error_t` numbering and struct layouts, plus the `tobii_recenter`
@@ -377,11 +412,12 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   normalised), gaze data (per eye, tracker frame, with the pupil diameter),
   raw gaze (the Stream Engine's own record of each gaze frame, every value
   as the tracker sent it, `tobii_gaze_raw_subscribe`), presence (on change),
-  head pose (mm, radians about x/y/z), the IR image (280×280,
-  `tobii_image_subscribe`), notifications (display area, calibration,
-  pause, faults and warnings), device info, track box, display area (get
-  and set — kept across re-inits and, like the Stream Engine, across
-  sessions), mounting, states, capabilities, 2-D calibration
+  head pose (the Stream Engine's: absolute, in the display frame, one for
+  every IR image, valid or not; README.md, Architecture, "Head pose"), the
+  IR image (280×280, `tobii_image_subscribe`), notifications (display area,
+  calibration, pause, faults and warnings), device info, track box, display
+  area (get and set — kept across re-inits and, like the Stream Engine,
+  across sessions), mounting, states, capabilities, 2-D calibration
   (discarding a point too), a device/host clock pair (`tobii_timesync`), the
   tracker's stream catalogue (`tobii_enumerate_stream_types`), pause and
   resume, and the device name. `tobii_hardware_configuration_get` is
@@ -406,7 +442,9 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   to its internal feature group, and only without Tobii's service (for any
   URL, libtobii's `tobii-ffi://` included, but `tobii-prp://` and
   `tprp-tcp://`). A `tobiid` built before raw gaze takes the subscription
-  and never sends the stream: restart the daemon after installing (§5).
+  and never sends the stream, and one built before the Stream Engine's head
+  pose does the same with the head pose: restart the daemon after
+  installing (§5).
 
   A name set with `tobii_set_device_name` is kept by the daemon, not the
   tracker, in `~/.config/tobii/device-name` (`$XDG_CONFIG_HOME/tobii`): the
@@ -483,10 +521,42 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   Then pick *Tobii Eye Tracker* as OpenTrack's tracker. This is the alternative
   to the `tobii-opentrack` UDP bridge above; the bridge needs no plugin at all.
 
+  Through `libtobii.so` the plugin gets the Stream Engine's head pose, the
+  pose it was written for (the bridge gets the daemon's own, above).
+  Compared with a `libtobii.so` from before that, which handed it the
+  bridge's pose, you will notice:
+
+  - **Signs.** TZ, Pitch and Roll now move as on Windows; libtobii had them
+    reversed. Undo any inversion you set on those axes in OpenTrack's
+    mapping.
+  - **Centring.** The pose is absolute, and OpenTrack centres it itself, as
+    on Windows: at the first valid pose (*Center at startup*, on by
+    default) and on its *Center* shortcut. A daemon recenter
+    (`tobii_recenter`, SIGUSR1, `tobii-opentrack --recenter`) no longer
+    reaches it.
+  - **Translation with rotation.** The position is a point between the
+    eyes, not a pivot at the neck, so turning the head moves TX, TY and TZ
+    too, some 5 cm sideways for a 30° turn, as with the DLL;
+    `TOBII_PIVOT_DOWN` and `TOBII_PIVOT_BACK` do not apply to it.
+    OpenTrack's *Relative translation* options, with *Neck displacement*,
+    can make up for part of that (untried here).
+  - **Range.** Yaw and roll are larger, as large as the Stream Engine's
+    (they were 0.4 to 0.8 and 0.7 to 0.8 times them), and no longer stop
+    at ±45°.
+  - **Invalid poses.** Near the edges of the camera's view, and when the face
+    is lost, the pose now comes marked invalid, as the DLL's does (before,
+    nothing came without a face). The plugin as it stands then sets no axis,
+    which OpenTrack takes as zeros: until the face is back, the view jumps to
+    minus the pose OpenTrack centred on (in TZ by about your distance from the
+    screen), and a centring meanwhile takes the zeros as the centre. It does
+    the same with the DLL on Windows. The patch on the
+    `tracker-tobii-hold-last` branch of the OpenTrack fork has the plugin hold
+    each axis's last valid value instead.
+
   The plugin needs a reconnect call to survive a daemon restart or crash
   (§5). As it stands it never calls `tobii_device_reconnect`, and on any
   error from `tobii_device_process_callbacks` it leaves the pose unset,
-  which OpenTrack takes as all zeros, the head at the tracker's origin. So
+  which OpenTrack takes as all zeros, the head at the display's centre. So
   from the restart on, the view jumps away (with OpenTrack's centering on,
   by the pose it was centered at) and stays there until you stop and start
   tracking in OpenTrack, which creates the device again. A plugin that, on
@@ -517,7 +587,8 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   `--interval-ms` is the min gap between repeated taps while gaze stays at an edge;
   `--no-super` drops the Super requirement.
 - **`tobii5-init-replay track`** — standalone head→OpenTrack without the daemon
-  (claims the device directly). Handy for isolating issues; same tracker code.
+  (claims the device directly). Handy for isolating issues; same tracker code,
+  and the relative pose `tobii-opentrack` sends.
 - Diagnostics: `tobii5-init-replay image83 [--secs 10] [--pose] [--log f.bin] [--no-image]`
   (starts gaze + the 0x50e image stream, reports per-stream rates and gaze
   validity, saves the first frames as PGM, `--pose` runs the head tracker live;
@@ -619,9 +690,11 @@ will not take the display setup until the window is fullscreen on the right
 monitor (with PaperWM, Super+Shift+Ctrl+Left/Right moves it); the points
 wait for it too.
 
-### Recenter (recalibrate the head rest pose)
+### Recenter (`tobii-opentrack`'s rest pose)
 
-Sit in your neutral pose and trigger a recenter — the daemon recalibrates
+A recenter is for the daemon's own, relative head pose, the one
+`tobii-opentrack` reads: sit in your neutral pose and trigger one — the
+daemon takes its rest pose again from the next 30 images with a face,
 without restarting the device/stream. Three ways:
 
 ```bash
@@ -630,8 +703,11 @@ systemctl --user kill -s SIGUSR1 tobiid    # or signal the service
 kill -USR1 $(pgrep -x tobiid)              # or signal the process
 ```
 
-Via `libtobii.so`: call `tobii_recenter(device)`. (Affects the head tracker;
-gaze has no rest pose.)
+Via `libtobii.so`: call `tobii_recenter(device)`, which does the same, for
+that pose alone. The head pose `libtobii.so` delivers is the Stream
+Engine's, absolute, with no rest pose, and the Stream Engine has no
+recenter: an application centres it itself, as OpenTrack does on its
+*Center* shortcut. (Gaze has no rest pose either.)
 
 ---
 
@@ -642,9 +718,12 @@ gaze has no rest pose.)
   with gaze validity unchanged. Never stream the UVC camera while the daemon
   runs (the `camera`/`track`/`probe` research commands, or any app opening it
   through uvcvideo): that throttles the 0x83 streams to <1 Hz.
-- **Head pose arrives ~1 s after the first frame.** The tracker averages the
-  first 30 frames as the rest pose (recenter to redo it); a cold device may
-  additionally take one re-open (~10 s) before any stream arms.
+- **When the head pose starts.** `libtobii.so`'s comes with the first IR
+  image, invalid until the tracker has a face clear of the image's edges.
+  `tobii-opentrack`'s arrives ~1 s after the first face: the daemon averages
+  the first 30 images with a face as its rest pose (a recenter redoes that).
+  A cold device may additionally take one re-open (~10 s) before any stream
+  arms.
 - **A stalled tracker is re-opened in place.** No gaze for 5 s (10 s after a
   resume) outside a pause, or a USB error, makes the engine re-open and
   re-init the tracker. Only failures in a row add up: an open whose init
@@ -684,7 +763,15 @@ gaze has no rest pose.)
   it are `TOBII_ERROR_CALIBRATION_NOT_STARTED` (§8a).
 - **"It flies around."** You're talking to an **old daemon** (pre-rebuild) — it
   still has the previous code/units. Restart it (§5).
-- **"Rotations slide."** Tune `TOBII_PIVOT_DOWN` / `TOBII_PIVOT_BACK` (§7).
+- **No head pose in a Stream Engine application.** After an install, the
+  running `tobiid` is likely older than the library: it takes the
+  subscription and sends nothing, and libtobii logs one WARN line after
+  20 s, to an application that gave it a logger. Restart the daemon, then
+  the application (§5). A daemon whose tracker sends no IR images (unplugged,
+  paused, or with `TOBII_NO_IMAGE` set) sends none either.
+- **"Rotations slide" in `tobii-opentrack`.** Tune `TOBII_PIVOT_DOWN` /
+  `TOBII_PIVOT_BACK` (§7). In OpenTrack's `tracker-tobii` plugin a turn
+  moves the position by design, as on Windows (§8).
 - **Tracking after logout.** User services stop at logout unless you enable
   lingering: `loginctl enable-linger $USER`. The shipped udev rule grants
   the tracker through `uaccess`, to the user of the active local session

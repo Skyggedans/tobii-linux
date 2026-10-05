@@ -26,10 +26,12 @@ from USB captures of the Windows Stream Engine.
 | Notifications: display area, calibration, pause, faults, warnings | on change | the device's own, and the daemon's for calibration and pause |
 | Calibration | on demand | `tobii-calibrate`, saved per user |
 
-Everything the Stream Engine reports is reproduced bit for bit: replaying a
-captured Windows session through the decoder gives exactly the gaze points
-and gaze origins the Stream Engine delivered for it (5 284 of 5 284 frames,
-error 0; `tobii5-init-replay compare-dll`).
+Everything the Stream Engine reports from the tracker's data is reproduced
+bit for bit: replaying a captured Windows session through the decoder gives
+exactly the gaze points and gaze origins the Stream Engine delivered for it
+(5 284 of 5 284 frames, error 0; `tobii5-init-replay compare-dll`). The head
+pose is computed, not decoded, on Windows too: libtobii's follows the Stream
+Engine's to within a few degrees and millimetres (Architecture, *Head pose*).
 
 The head pose is **gaze-independent**: turning your eyes does not move it.
 
@@ -38,7 +40,9 @@ The head pose is **gaze-independent**: turning your eyes does not move it.
 The device multiplexes a second stream, `0x50e` `primary_camera_image`, on the
 same bulk endpoint as gaze — a 280×280 8-bit IR frame of your face at 33 Hz.
 The Windows driver subscribes to it with command 1220 right after init; nothing
-in the documented API hints it exists.
+in the documented API hints it exists. It is what the Stream Engine's head pose
+is made of: no head pose crosses the USB, and Tobii's runtime computes one on
+the host from every frame.
 
 That matters because the eye-position fields in the gaze stream **cannot** give
 you a signed head yaw. Both eyes are reconstructed at equal range from the
@@ -223,6 +227,37 @@ Where the answers come from, and where they differ from Windows:
   blob says so, and returns `TOBII_ERROR_NO_ERROR` (8 zero bytes are an
   empty calibration there). Both report an eye whose status word is -1 as
   `FAILED_OR_INVALID` and pass its mapping on as the blob holds it.
+- **Head pose.** The Stream Engine's comes from Tobii's runtime, which computes
+  it on the host from each IR image; libtobii's from the daemon, which runs a
+  face-landmark tracker on the same images and a model fitted to the poses the
+  DLL delivered in three captured Windows sessions. It has the Stream Engine's
+  form: absolute, in the display frame of the display area in effect, as gaze
+  origins are (the position a point between the eyes, in mm from the area's
+  centre; the rotation as the Stream Engine's yxz Euler angles, zero for a face
+  square to the display), with no rest pose and no clamp; one pose for every IR
+  image, ~33 Hz, with the image's time; and invalid, all four validities at
+  once, when there is no face or it is at the edge of the image, where the
+  Stream Engine's turns invalid too. An invalid pose holds the last valid
+  values (zeros before the first), where the DLL's holds leftovers of its other
+  callbacks. Replayed through the daemon's pipeline, the three sessions' poses
+  are valid on 96.8 to 100 % of the images on which the DLL's are, and differ
+  from the DLL's by a median 2.2 to 4.0° in rotation, 4 to 7 mm in z and under
+  4 mm across; constants fitted on two of the sessions do about as well on the
+  third (`tobii5-init-replay compare-dll --head`, `tools/headpose/README.md`).
+  What it does not reproduce: the head size the runtime ranges by, which
+  differed by up to 1.5 % between the sessions (6 to 9 mm in z at a desk),
+  where the model has one constant; the range the runtime reports 7.5 to 11 %
+  long for some 17 images after it finds a lost face again; its filters, which
+  an EMA on the position and a single one-euro filter for the three angles
+  approximate (lags that differ from the DLL's by up to 13 ms on the angles and
+  21 ms on the position, noise at rest 0.6 to 1.4 times the DLL's); and a pose
+  for every image: the daemon's pose worker takes the newest image, and one it
+  has not taken by the time the next comes gets none, which at ~6 ms an image
+  on a desktop CPU, against 30 ms between images, takes a busy machine
+  (`TOBII_IMAGE83_DEBUG` counts them, INSTALL.md §7). `tobii_recenter`
+  re-zeroes only the daemon's own, relative head pose, a stream of its own that
+  the `tobii-opentrack` bridge reads (INSTALL.md §8): the Stream Engine has no
+  recenter, and an application centres this pose itself, as OpenTrack does.
 - **Timestamps.** Every callback timestamp but the tracker times below is on
   `tobii_system_clock`'s clock, as in the Stream Engine; the tracker's clock
   is left only in gaze data's and raw gaze's `timestamp_tracker_us` (raw
@@ -332,7 +367,7 @@ rather than 20 MB).
 | Crate | Holds | Heavy deps |
 |---|---|---|
 | `tobii-proto` | wire formats: framing, TLV, commands, the gaze/presence/image streams, device facts, the capture log | none |
-| `tobii-pose` | face landmarks, face detection and the head-pose fit; owns the models | `ort` |
+| `tobii-pose` | face landmarks, face detection, the Stream Engine's head pose and the legacy relative one; owns the models | `ort` |
 | `tobii-usb` | USB transport and the live `0x83` engine; owns the init capture | `rusb` |
 | `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |
@@ -385,7 +420,9 @@ tools/headpose/evaluate.py --session LOG JSONL FITS ...      # head pose vs the 
 - The UVC camera interface and the `0x83` streams are mutually exclusive in
   firmware. Nothing in the driver uses UVC any more, but keep the shipped
   `99-tobii-no-uvcvideo.rules` in place so nothing else grabs it.
-- Head pose needs a face in frame; it reports nothing when you look away.
+- Head pose needs a face in frame. Without one, or with one at the edge of
+  the frame, `libtobii.so` marks its head pose invalid, as the Stream Engine
+  does; `tobii-opentrack` sends nothing without one.
 - Until you run `tobii-calibrate`, the calibration in use is the one embedded
   in `init_packets_ep.txt` — the author's. Likewise the display area is the
   author's 27" monitor until you set yours: `tobii-calibrate` does it first
