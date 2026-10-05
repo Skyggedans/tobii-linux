@@ -5,11 +5,11 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use std::env;
-use std::iter::{Peekable, Skip};
+use std::iter::Peekable;
 use std::str::FromStr;
 use tobii_ipc::{
     STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW,
-    STREAM_HEAD, STREAM_HEAD_POSE, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
+    STREAM_HEAD_POSE, STREAM_NOTIFICATIONS, STREAM_PRESENCE,
 };
 
 use crate::compare_head::{HeadOptions, parse_area_choice};
@@ -33,9 +33,10 @@ pub(crate) const DEFAULT_OPENTRACK_HOST: &str = "127.0.0.1";
 pub(crate) const DEFAULT_OPENTRACK_PORT: u16 = 4242;
 
 /// Streams `ipc-probe` watches when no `--streams` is given: every one but
-/// the ~2.6 MB/s IR image stream.
-const DEFAULT_IPC_PROBE_STREAMS: u32 = STREAM_HEAD
-    | STREAM_GAZE
+/// the ~2.6 MB/s IR image stream. Bit 0, the daemon's retired legacy head
+/// pose (HEAD), is not one of them: the head pose is the Stream Engine's,
+/// [`STREAM_HEAD_POSE`].
+const DEFAULT_IPC_PROBE_STREAMS: u32 = STREAM_GAZE
     | STREAM_PRESENCE
     | STREAM_GAZE_ORIGIN
     | STREAM_EYE_POSITION
@@ -53,8 +54,12 @@ const IMAGE83_REPLAY_USAGE: &str =
 /// `face_fits` documents them.
 const IMAGE83_REPLAY_OUTPUTS: &str = "\
 Runs the daemon's head tracker over every 0x50e image of a TBI5LOG1 log, in log order.
-  --csv        per image: the legacy pose, raw and calibrated (cm, deg), and the head anchors of
-               the last 0x83 gaze frame
+  --csv        per image, one row: image_idx, device_ts_us (0 if the image has none), face (1 or
+               0), then the head anchors of the last 0x83 gaze frame before it: g_head_x_mm,
+               g_head_y_mm, g_head_z_mm (the midpoint of its eyeball centres, x corrected for
+               roll) and g_head_roll_deg (its eye line's roll), empty without both eyes or before
+               the first gaze frame, and g_valid (its gaze validity, 1 or 0; 0 before the first).
+               Numbers to 3 decimals.
   --fits       per image, one row: image_idx, device_ts_us (0 if the image has none), face (1 or
                0; without a face every later field is empty), score (the landmark model's logit),
                found_by_detector (1 or 0), r_cam_00 .. r_cam_22 (mesh -> camera rotation,
@@ -75,8 +80,15 @@ const DEFAULT_INIT_PATH: &str = concat!(
     "/../tobii-usb/init_packets_ep.txt"
 );
 
-/// The process arguments after the program name.
-type Args = Peekable<Skip<env::Args>>;
+/// The command-line arguments after the program name.
+type Args = Peekable<std::vec::IntoIter<String>>;
+
+/// What `track` says now that it is gone. It made the legacy relative head
+/// pose, which no longer exists, of the UVC camera's frames without the
+/// daemon, and sent it to `OpenTrack`.
+const TRACK_GONE: &str = "the track subcommand is gone: image83 --pose shows the Stream Engine's \
+     head pose live without the daemon, and OpenTrack takes it from tobiid through \
+     tobii-opentrack or its own tracker-tobii plugin";
 
 /// Which subcommand was selected on the command line, with its own arguments.
 #[derive(Debug)]
@@ -103,17 +115,6 @@ pub(crate) enum Command {
         /// UVC frame interval override (100 ns units).
         interval: Option<u32>,
     },
-    /// Head tracking from the UVC camera, forwarded to `OpenTrack`.
-    Track {
-        /// Init-packet capture to replay first (unless `skip_replay`).
-        init_path: String,
-        /// Skip the init replay.
-        skip_replay: bool,
-        /// `OpenTrack` UDP host.
-        host: String,
-        /// `OpenTrack` UDP port.
-        port: u16,
-    },
     /// Check whether the 0x83 stream and the UVC camera run concurrently.
     Probe {
         /// Init-packet capture to replay.
@@ -131,16 +132,17 @@ pub(crate) enum Command {
         max_frames: usize,
         /// Optional raw stream log to write.
         log_path: Option<String>,
-        /// Run the head tracker on each frame.
+        /// Make the Stream Engine's head pose of each image, as tobiid does.
         pose: bool,
         /// Gaze-only baseline: do not enable the image stream.
         no_image: bool,
     },
-    /// Replay a recorded 0x83 log through the image / pose decoder.
+    /// Replay a recorded 0x83 log's images through the head tracker.
     Image83Replay {
         /// Recorded stream log.
         path: String,
-        /// Optional CSV output of the decoded poses.
+        /// Optional CSV output: whether each image had a face, and the head
+        /// anchors of the last 0x83 gaze frame before it.
         csv: Option<String>,
         /// Optional CSV output of each image's face fit, at full precision.
         fits: Option<String>,
@@ -306,12 +308,23 @@ impl Options {
     ///
     /// # Errors
     /// Unknown options, options missing their value, values that do not parse
-    /// and values that fail validation (ranges, point pairs, ...).
+    /// and values that fail validation (ranges, point pairs, ...); the
+    /// retired `track` subcommand.
     pub(crate) fn parse() -> Result<Self> {
-        let mut args: Args = env::args().skip(1).peekable();
+        Self::parse_from(env::args().skip(1).collect())
+    }
+
+    /// [`Options::parse`] of `args`, the arguments after the program name.
+    ///
+    /// # Errors
+    /// See [`Options::parse`].
+    fn parse_from(args: Vec<String>) -> Result<Self> {
+        let mut args: Args = args.into_iter().peekable();
         let parse_subcommand: fn(&mut Args) -> Result<Self> = match args.peek().map(String::as_str)
         {
-            Some("track") => Self::parse_track,
+            // Not taken for the replay's init capture, which would fail to
+            // read a file of that name.
+            Some("track") => bail!(TRACK_GONE),
             Some("head-axes") => Self::parse_head_axes,
             Some("head83") => Self::parse_head83,
             Some("image83-replay") => Self::parse_image83_replay,
@@ -331,31 +344,6 @@ impl Options {
         };
         args.next();
         parse_subcommand(&mut args)
-    }
-
-    fn parse_track(args: &mut Args) -> Result<Self> {
-        let mut init_path = DEFAULT_INIT_PATH.to_string();
-        let mut skip_replay = false;
-        let mut host = DEFAULT_OPENTRACK_HOST.to_string();
-        let mut port = DEFAULT_OPENTRACK_PORT;
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--no-replay" => skip_replay = true,
-                "--opentrack-host" => host = take_value(args, "--opentrack-host", "a host")?,
-                "--opentrack-port" => port = parse_value(args, "--opentrack-port", "a port")?,
-                "-h" | "--help" => print_help_and_exit(
-                    "usage: track [init_packets_ep.txt] [--no-replay] [--opentrack-host 127.0.0.1] [--opentrack-port 4242]",
-                ),
-                s if s.starts_with('-') => bail!("unknown option: {s}"),
-                other => init_path = other.to_string(),
-            }
-        }
-        Ok(Self::for_command(Command::Track {
-            init_path,
-            skip_replay,
-            host,
-            port,
-        }))
     }
 
     fn parse_head_axes(args: &mut Args) -> Result<Self> {
@@ -434,7 +422,8 @@ impl Options {
                 "-h" | "--help" => print_help_and_exit(
                     "usage: image83 [init_packets_ep.txt] [--secs 10] [--out image83_] [--frames 5] [--log file.bin] [--pose] [--no-image]\n\
                      Starts gaze + the 0x50e IR image stream on EP 0x83 and reports per-stream rates and gaze validity; \
-                     --pose runs the head tracker on each frame; --no-image is the gaze-only baseline for A/B.",
+                     --pose makes the Stream Engine's head pose of each image, as tobiid does, in the display area \
+                     the init capture writes; --no-image is the gaze-only baseline for A/B.",
                 ),
                 s if s.starts_with('-') => bail!("unknown option: {s}"),
                 other => init_path = other.to_string(),
@@ -1177,13 +1166,48 @@ mod tests {
     use super::*;
     use tobii_ipc::STREAM_IMAGE;
 
+    /// `args` parsed as the command line after the program name.
+    fn parse(args: &[&str]) -> Result<Options> {
+        Options::parse_from(args.iter().map(ToString::to_string).collect())
+    }
+
     /// Without `--streams`, `ipc-probe` watches every stream the daemon has
-    /// but the IR images, the Stream Engine's head pose included.
+    /// but the IR images, the Stream Engine's head pose included, and does
+    /// not ask for bit 0, the retired legacy head pose.
     #[test]
     fn ipc_probe_watches_every_stream_but_the_images_by_default() {
         let every_stream = (STREAM_HEAD_POSE << 1) - 1;
+        let retired_head = 1 << 0;
 
-        assert_eq!(DEFAULT_IPC_PROBE_STREAMS, every_stream & !STREAM_IMAGE);
-        assert_eq!(DEFAULT_IPC_PROBE_STREAMS, 0x3bf);
+        assert_eq!(
+            DEFAULT_IPC_PROBE_STREAMS,
+            every_stream & !STREAM_IMAGE & !retired_head
+        );
+        assert_eq!(DEFAULT_IPC_PROBE_STREAMS, 0x3be);
+        let Command::IpcProbe { streams, .. } = parse(&["ipc-probe"]).expect("ipc-probe").command
+        else {
+            panic!("not ipc-probe");
+        };
+        assert_eq!(streams, DEFAULT_IPC_PROBE_STREAMS);
+    }
+
+    /// `track` is refused with what replaces it, whatever follows, rather
+    /// than taken for the replay's init capture.
+    #[test]
+    fn the_retired_track_subcommand_is_refused_naming_what_replaces_it() {
+        for args in [
+            &["track"][..],
+            &["track", "--opentrack-port", "4242"],
+            &["track", "init_packets_ep.txt", "--no-replay"],
+        ] {
+            let error = parse(args).expect_err("track").to_string();
+
+            assert_eq!(error, TRACK_GONE, "{args:?}");
+        }
+        assert!(TRACK_GONE.contains("image83 --pose") && TRACK_GONE.contains("tobii-opentrack"));
+        // Only as the subcommand: after an option it is the replay's init
+        // capture, as any other name.
+        let replay = parse(&["--no-log", "track"]).expect("the replay");
+        assert!(matches!(&replay.command, Command::Replay { init_path } if init_path == "track"));
     }
 }

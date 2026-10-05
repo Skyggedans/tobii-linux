@@ -36,7 +36,6 @@ fn run() -> Result<()> {
         }
         Command::Replay { .. } => devcmd::run(&opts),
         Command::Camera { .. } => devcmd::run_camera(&opts),
-        Command::Track { .. } => devcmd::run_track(&opts),
         Command::Probe { .. } => devcmd::run_probe(&opts),
         Command::Image83 { .. } => devcmd::run_image83(&opts),
         Command::Image83Replay {

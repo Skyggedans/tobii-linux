@@ -18,7 +18,7 @@
 //! The UVC camera (interface 2) is never used by the engine: streaming it
 //! throttles the 0x83 streams from ~33 Hz to <1 Hz (firmware mode, not
 //! bandwidth — verified with `probe`). The UVC path survives only in the
-//! standalone research subcommands (`camera`, `track`, `probe`).
+//! standalone research subcommands (`camera`, `probe`).
 //!
 //! The `stop`, `recenter`, `paused` and `image_wanted` flags are pure
 //! signals (no data is published alongside them), so every access uses

@@ -17,7 +17,7 @@ libtobii.so / tobii-opentrack ──unix socket──▶ tobiid ──USB──�
 Head pose does not use the UVC camera: the device multiplexes its own IR image
 stream on the same endpoint as gaze (what the Windows Stream Engine uses), so
 head pose, gaze and presence work at the same time. The UVC camera survives
-only in the standalone research subcommands (`camera`, `track`, `probe`).
+only in the standalone research subcommands (`camera`, `probe`).
 
 ---
 
@@ -621,19 +621,22 @@ TOBII_IMAGE83_DEBUG=1 ./target/release/tobii-opentrack
   `--left`/`--right` switch to fixed absolute thresholds (`0`=left .. `1`=right);
   `--interval-ms` is the min gap between repeated taps while gaze stays at an edge;
   `--no-super` drops the Super requirement.
-- **`tobii5-init-replay track`** — standalone head→OpenTrack without the daemon
-  (claims the device directly). Handy for isolating issues; same tracker code,
-  and the daemon's legacy, relative pose (HEAD, §7), not the Stream Engine's
-  that `tobii-opentrack` sends.
 - Diagnostics: `tobii5-init-replay image83 [--secs 10] [--pose] [--log f.bin] [--no-image]`
   (starts gaze + the 0x50e image stream, reports per-stream rates and gaze
-  validity, saves the first frames as PGM, `--pose` runs the head tracker live;
-  `--no-image` is the gaze-only baseline), `… image83-replay <log.bin> [--csv out.csv]
-  [--fits fits.csv] [--landmarks landmarks.f32]` (runs the tracker over a logged
-  capture and pairs poses with the 0x83 head anchors; `--fits` exports every
-  image's face fit at full precision and `--landmarks` its 468 landmarks as f32,
-  layouts in `--help`), `… probe` (UVC-camera-vs-0x83 concurrency), `… head83
-  <log.bin>` (research: head pose from 0x83 points).
+  validity, saves the first frames as PGM; `--pose` makes the Stream Engine's
+  head pose of every image as the daemon does, but without it, which is handy
+  for isolating issues, in the display area the init capture writes: the
+  author's monitor for the shipped `init_packets_ep.txt`, not yours;
+  `--no-image` is the gaze-only baseline),
+  `… image83-replay <log.bin> [--csv out.csv] [--fits fits.csv]
+  [--landmarks landmarks.f32]` (runs the tracker over a logged capture;
+  `--csv` gives each image's face and the head anchors of the last 0x83 gaze
+  frame, `--fits` every image's face fit at full precision and `--landmarks`
+  its 468 landmarks as f32, layouts in `--help`), `… probe`
+  (UVC-camera-vs-0x83 concurrency), `… head83 <log.bin>` (research: head pose
+  from 0x83 points). `track`, which sent OpenTrack the legacy relative pose
+  made of the UVC camera's frames, is gone: OpenTrack takes the head pose
+  from the daemon (`tobii-opentrack` above, or its `tracker-tobii` plugin).
 
 ### 8a. Calibration
 
@@ -752,7 +755,7 @@ has no rest pose either.)
 - **Head pose + gaze together.** One engine serves head pose (from the device's
   0x50e IR image stream), gaze and presence concurrently; verified at 33 Hz each
   with gaze validity unchanged. Never stream the UVC camera while the daemon
-  runs (the `camera`/`track`/`probe` research commands, or any app opening it
+  runs (the `camera`/`probe` research commands, or any app opening it
   through uvcvideo): that throttles the 0x83 streams to <1 Hz.
 - **When the head pose starts.** `libtobii.so`'s comes with the first IR
   image, invalid until the tracker has a face clear of the image's edges;
@@ -831,7 +834,7 @@ has no rest pose either.)
   claimed the tracker's interface 0: usually a second `tobiid` (one started
   by hand while the service runs: `pgrep -a tobiid`), or a
   `tobii5-init-replay` command that opens the tracker (the replay, run
-  without a subcommand, `track`, `camera`, `image83`, `probe`, …). The
+  without a subcommand, `camera`, `image83`, `probe`, …). The
   engine tries twice more, 0.7 s apart, in case it is a daemon handing
   over, then stops, and the daemon retries as above; stop the other process
   and the tracker is taken at the next retry, or at once when a client next

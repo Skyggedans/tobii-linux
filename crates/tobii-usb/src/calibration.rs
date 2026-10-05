@@ -97,9 +97,8 @@ pub fn embedded_blob() -> Result<Vec<u8>> {
 /// carries them (32.32 fixed point of 1/1024 mm, so an area set in `f64`
 /// comes back rounded) and the display id. `None` when `packets` write no
 /// display area, or one that does not parse.
-pub(crate) fn written_display_area(
-    packets: &[InitPacket],
-) -> Option<(u32, DisplayArea, Option<u32>)> {
+#[must_use]
+pub fn written_display_area(packets: &[InitPacket]) -> Option<(u32, DisplayArea, Option<u32>)> {
     let (run, seq) = command_run(packets, cmd::DISPLAY_AREA_SET)?;
     let message = command_message(&packets[run]);
     let (area, display_id) = parse_display_area(&parse_message(&message)?)?;

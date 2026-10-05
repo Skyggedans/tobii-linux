@@ -81,7 +81,6 @@ fn show(name: &str, answer: &(u8, Vec<u8>), decoded: impl FnOnce(&[u8]) -> Strin
 
 fn kind_of(msg: &ServerMsg) -> &'static str {
     match msg {
-        ServerMsg::Head { .. } => "head",
         ServerMsg::HeadPose(pose) => {
             // Sent for every IR image, valid or not: counted apart, the
             // invalid ones leave the rate saying whether the pose works.
@@ -279,19 +278,15 @@ mod tests {
         }
     }
 
-    /// The frames of every stream, and the subscription ack, have a name
-    /// of their own in the report, so no two streams share a count and
-    /// none is lumped in with "other"; a REPLY, which is no stream, is.
+    /// The frames of every stream but the retired legacy head pose (HEAD),
+    /// and the subscription ack, have a name of their own in the report, so
+    /// no two streams share a count and none is lumped in with "other"; a
+    /// REPLY, which is no stream, is.
     #[test]
     fn every_stream_has_a_name_of_its_own() {
         let head_pose = ServerMsg::HeadPose(valid_head_pose());
         let msgs = [
             ServerMsg::Subscribed { ok: true },
-            ServerMsg::Head {
-                ts_us: 1,
-                pos_mm: [0.0; 3],
-                rot_rad: [0.0; 3],
-            },
             head_pose.clone(),
             ServerMsg::HeadPose(HeadPose::default()),
             ServerMsg::Gaze {

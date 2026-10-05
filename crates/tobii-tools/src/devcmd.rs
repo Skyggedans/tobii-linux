@@ -1,6 +1,6 @@
 //! Research and diagnostic subcommands driven from the CLI: the legacy
-//! `replay` stream mode, the UVC IR camera path (`camera`, `track`, `probe`)
-//! and the 0x50e image tools (`image83`, `image83-replay`).
+//! `replay` stream mode, the UVC IR camera path (`camera`, `probe`) and the
+//! 0x50e image tools (`image83`, `image83-replay`).
 //!
 //! None of this is needed to run the driver — the daemon uses
 //! [`tobii_usb::device`] only. Everything here shares that module's USB transport
@@ -9,8 +9,7 @@
 use anyhow::{Context, Result};
 use rusb::Context as UsbContext;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
-use std::net::ToSocketAddrs;
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,15 +22,18 @@ use crate::dashboard::render_dashboard_status;
 use crate::face_fits::{FitFields, FitsCsv, LandmarksF32};
 use crate::opentrack::OpentrackUdp;
 use crate::sinks::{DecodedCsv, JsonlOutput, handle_live_decoded};
-use tobii_pose::track::RestPose;
+use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
+use tobii_pose::head::{FrameContext, HeadParams, HeadPose, HeadStep};
+use tobii_pose::track::{ModelRuns, Tracker, euler_deg};
 use tobii_proto::decode::{TrackingFrame, decode_stream_payload};
-use tobii_proto::image83::{decode_image_payload, write_pgm};
+use tobii_proto::image83::{ImageFrame, decode_image_payload, write_pgm};
 use tobii_proto::log::{PacketLog, log_packet};
 use tobii_proto::protocol::{
     BulkReassembler, InitPacket, STREAM_ID_GAZE, STREAM_ID_IMAGE, STREAM_ID_PRESENCE, declared_len,
     marker, read_init_packets, seq, stream_id,
 };
 use tobii_proto::time::now_us;
+use tobii_usb::calibration::written_display_area;
 use tobii_usb::device::{
     EP_IN, MAX_REPLAY_ATTEMPTS, READ_BUF, ResponseEcho, StreamStartupTimeout, command_seq,
     next_command_seq, open_tobii, replay_init_packets, start_stream, stop_stream,
@@ -474,97 +476,16 @@ pub(crate) fn run_camera(opts: &Options) -> Result<()> {
     Ok(())
 }
 
-/// The `track` subcommand: camera head tracking straight to an `OpenTrack`
-/// UDP target (no daemon).
+/// Offline: run the daemon's head tracker over every 0x50e image of a
+/// TBI5LOG1 log (e.g. `image83 --log`, or `import-tsv` of a Windows
+/// capture), in log order, and print how many images had a face and how
+/// the fit's yaw follows the head anchors of the 0x83 gaze frames.
 ///
-/// # Errors
-///
-/// Fails if the target does not resolve, the face model cannot be loaded,
-/// or the device / camera cannot be brought up.
-///
-/// # Panics
-///
-/// Panics if `opts.command` is not `Command::Track`; `lib.rs` dispatches
-/// on the variant before calling this.
-pub(crate) fn run_track(opts: &Options) -> Result<()> {
-    let Command::Track {
-        init_path,
-        skip_replay,
-        host,
-        port,
-    } = &opts.command
-    else {
-        unreachable!();
-    };
-
-    let target = (host.as_str(), *port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("{host}:{port} resolved to nothing"))?;
-    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .context("failed to create UDP socket")?;
-    println!("Loading face model...");
-    let mut tracker = tobii_pose::track::Tracker::new()?;
-
-    let ctx = UsbContext::new()?;
-    let mut h = open_tobii(&ctx)?;
-    vendor_control_init(&mut h)?;
-    if !*skip_replay {
-        let packets = read_init_packets(init_path)?;
-        println!("Replaying {} init packets...", packets.len());
-        if let Err(e) = replay_init_packets(&mut h, &packets, None) {
-            warn!(error = format_args!("{e:#}"), "init replay aborted");
-        }
-    }
-    if h.kernel_driver_active(IFACE_VIDEO).unwrap_or(false) {
-        let _ = h.detach_kernel_driver(IFACE_VIDEO);
-    }
-    h.claim_interface(IFACE_VIDEO)
-        .context("failed to claim video streaming interface 2")?;
-    let frame_size = uvc_negotiate(&mut h, None)?;
-    thread::sleep(Duration::from_millis(100));
-    let _ = h.clear_halt(EP_VIDEO);
-
-    println!("Tracking head pose -> OpenTrack {target}. Sit still ~1s to calibrate, then move.");
-    let mut frames = 0u64;
-    read_camera_frames(&mut h, frame_size, Some(2), |frame| {
-        if let Some(pose) = tracker.process(frame, CAM_WIDTH, CAM_HEIGHT)? {
-            let mut packet = [0u8; 48];
-            for (i, v) in pose.iter().enumerate() {
-                packet[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-            }
-            socket.send_to(&packet, target).ok();
-            frames += 1;
-            if frames.is_multiple_of(8) {
-                eprint!(
-                    "\ryaw/pit/roll={:+5.1}/{:+5.1}/{:+5.1}  tx/ty/tz={:+5.1}/{:+5.1}/{:+5.1}   ",
-                    pose[3], pose[4], pose[5], pose[0], pose[1], pose[2]
-                );
-            }
-        }
-        Ok(true)
-    })
-}
-
-/// Offline: run the image head tracker over a TBI5LOG1 log that contains the
-/// 0x50e stream (e.g. `image83 --log`, or `import-tsv` of a Windows capture)
-/// and pair each pose with the latest 0x83 gaze-frame head anchors. Writes a
-/// CSV for analysis and prints a summary (used to validate sign/scale against
-/// the `MediaPipe` reference and the 0x83 eyeball-centre translation).
-///
-/// The tracker is the daemon's, fed every image in log order: its face fit
-/// ([`Tracker::fit`]), then the legacy pose of a [`RestPose`] with the
-/// daemon's settings, which is what [`Tracker::process`] does. `fits` and
-/// `landmarks` also export each image's fit at full precision, as a CSV and
-/// as raw f32 landmarks ([`crate::face_fits`] gives their layouts).
-///
-/// [`Tracker::fit`]: tobii_pose::track::Tracker::fit
-/// [`Tracker::process`]: tobii_pose::track::Tracker::process
+/// Each image gets its face fit ([`Tracker::fit`]) and nothing more. `csv`
+/// gets one row per image ([`AnchorsCsv`]): whether it had a face, and the
+/// head anchors of the last gaze frame before it. `fits` and `landmarks`
+/// export each image's fit at full precision, as a CSV and as raw f32
+/// landmarks ([`crate::face_fits`] gives their layouts).
 ///
 /// # Errors
 ///
@@ -585,28 +506,13 @@ pub(crate) fn run_image83_replay(
         .collect();
     ensure_distinct_paths(path, &outputs, resolved_path)?;
     let payloads = read_log_payloads(path)?;
-    let mut tracker = tobii_pose::track::Tracker::new_image83()?;
-    let mut rest = RestPose::from_env();
+    let mut tracker = Tracker::new_image83()?;
     let mut fits_csv = fits.map(FitsCsv::create).transpose()?;
     let mut landmarks_f32 = landmarks.map(LandmarksF32::create).transpose()?;
     let mut asm = BulkReassembler::new();
-    let mut out = csv
-        .map(|p| {
-            File::create(p)
-                .map(BufWriter::new)
-                .with_context(|| format!("create {p}"))
-        })
-        .transpose()?;
-    if let Some(o) = out.as_mut() {
-        writeln!(
-            o,
-            "image_idx,device_ts_us,face,raw_tx_cm,raw_ty_cm,raw_tz_cm,raw_pitch,raw_yaw,raw_roll,\
-             rel_tx_cm,rel_ty_cm,rel_tz_cm,rel_yaw,rel_pitch,rel_roll,\
-             g_head_x_mm,g_head_y_mm,g_head_z_mm,g_head_roll_deg,g_valid"
-        )?;
-    }
+    let mut anchors_csv = csv.map(AnchorsCsv::create).transpose()?;
     let mut last_gaze: Option<TrackingFrame> = None;
-    let (mut images, mut faces, mut poses, mut gaze_frames) = (0u64, 0u64, 0u64, 0u64);
+    let (mut images, mut faces, mut gaze_frames) = (0u64, 0u64, 0u64);
     let mut yaw_vs_x: Vec<(f64, f64)> = Vec::new();
     let mut msgs = Vec::new();
     for payload in &payloads {
@@ -625,10 +531,7 @@ pub(crate) fn run_image83_replay(
                         continue;
                     };
                     let fit = tracker.fit(&frame.pixels, frame.width, frame.height)?;
-                    let rel = rest.update(fit.as_ref());
-                    let raw = rest.last_raw();
-                    faces += u64::from(raw.is_some());
-                    poses += u64::from(rel.is_some());
+                    faces += u64::from(fit.is_some());
                     if let Some(fits_csv) = fits_csv.as_mut() {
                         let fields = fit.as_ref().map(FitFields::from);
                         fits_csv.write_image(images, frame.device_ts_us, fields.as_ref())?;
@@ -637,40 +540,15 @@ pub(crate) fn run_image83_replay(
                         landmarks_f32.write_image(fit.as_ref().map(|f| f.landmarks))?;
                     }
                     let g = last_gaze.as_ref();
-                    if let Some(r) = raw
+                    if let Some(fit) = &fit
                         && let Some(g) = g
                         && let Some(x) = g.head_x
                         && g.head_z.is_some()
                     {
-                        yaw_vs_x.push((r[4], x / 1000.0));
+                        yaw_vs_x.push((camera_yaw_deg(&fit.rotation), x / 1000.0));
                     }
-                    if let Some(o) = out.as_mut() {
-                        let f = |v: Option<f64>| v.map_or(String::from(""), |v| format!("{v:.3}"));
-                        let r6 = |v: Option<[f64; 6]>, i: usize| f(v.map(|a| a[i]));
-                        writeln!(
-                            o,
-                            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                            images,
-                            frame.device_ts_us,
-                            u8::from(raw.is_some()),
-                            r6(raw, 0),
-                            r6(raw, 1),
-                            r6(raw, 2),
-                            r6(raw, 3),
-                            r6(raw, 4),
-                            r6(raw, 5),
-                            r6(rel, 0),
-                            r6(rel, 1),
-                            r6(rel, 2),
-                            r6(rel, 3),
-                            r6(rel, 4),
-                            r6(rel, 5),
-                            f(g.and_then(|g| g.head_x).map(|v| v / 1000.0)),
-                            f(g.and_then(|g| g.head_y).map(|v| v / 1000.0)),
-                            f(g.and_then(|g| g.head_z).map(|v| v / 1000.0)),
-                            f(g.and_then(|g| g.head_roll)),
-                            g.map_or(0, |g| u8::from(g.gaze_valid)),
-                        )?;
+                    if let Some(anchors_csv) = anchors_csv.as_mut() {
+                        anchors_csv.write_image(images, frame.device_ts_us, fit.is_some(), g)?;
                     }
                     images += 1;
                 }
@@ -678,8 +556,10 @@ pub(crate) fn run_image83_replay(
             }
         }
     }
-    if let (Some(mut o), Some(p)) = (out, csv) {
-        o.flush().with_context(|| format!("failed to write {p}"))?;
+    if let (Some(anchors_csv), Some(p)) = (anchors_csv, csv) {
+        anchors_csv
+            .finish()
+            .with_context(|| format!("failed to write {p}"))?;
     }
     if let (Some(fits_csv), Some(p)) = (fits_csv, fits) {
         fits_csv.finish()?;
@@ -691,29 +571,113 @@ pub(crate) fn run_image83_replay(
     }
     let runs = tracker.model_runs();
     println!(
-        "{path}: {gaze_frames} gaze frames, {images} images, face found in {faces}, {poses} calibrated poses; \
+        "{path}: {gaze_frames} gaze frames, {images} images, face found in {faces}; \
          landmark model run {} times, face detector {}",
         runs.landmarks, runs.detector
     );
-    if yaw_vs_x.len() > 10 {
-        let n = yaw_vs_x.len() as f64;
-        let (my, mx) = (
-            yaw_vs_x.iter().map(|p| p.0).sum::<f64>() / n,
-            yaw_vs_x.iter().map(|p| p.1).sum::<f64>() / n,
-        );
-        let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
-        for (y, x) in &yaw_vs_x {
-            sxy += (y - my) * (x - mx);
-            sxx += (x - mx) * (x - mx);
-            syy += (y - my) * (y - my);
-        }
+    if let Some((r, slope)) = yaw_vs_head_x(&yaw_vs_x) {
         println!(
-            "raw image yaw vs 0x83 head_x: r = {:.3}, slope {:.2} mm/deg (neck lever; expect ~-1.5 for +yaw = left)",
-            sxy / (sxx * syy).sqrt(),
-            sxy / syy
+            "raw image yaw vs 0x83 head_x: r = {r:.3}, slope {slope:.2} mm/deg (neck lever; expect ~-1.5 for +yaw = left)"
         );
     }
     Ok(())
+}
+
+/// The header of [`AnchorsCsv`]: the columns `image83-replay -h` describes.
+const ANCHORS_CSV_HEADER: &str = "image_idx,device_ts_us,face,\
+    g_head_x_mm,g_head_y_mm,g_head_z_mm,g_head_roll_deg,g_valid";
+
+/// `image83-replay --csv`: one row per image, in log order: its number in
+/// the log and device time, whether the tracker found a face in it, and the
+/// head anchors of the last 0x83 gaze frame before it, which the decoder
+/// makes of that frame's two eyeball centres ([`TrackingFrame::head_x`] and
+/// the rest; µm there, mm here), with the frame's gaze validity.
+struct AnchorsCsv<W: Write> {
+    out: W,
+}
+
+impl AnchorsCsv<BufWriter<File>> {
+    /// Create `path` and write the header.
+    ///
+    /// # Errors
+    /// Fails when the file cannot be created or written.
+    fn create(path: &str) -> Result<Self> {
+        let file = File::create(path).with_context(|| format!("create {path}"))?;
+        Self::new(BufWriter::new(file)).with_context(|| format!("failed to write {path}"))
+    }
+}
+
+impl<W: Write> AnchorsCsv<W> {
+    /// Rows to `out`, after the header.
+    fn new(mut out: W) -> io::Result<Self> {
+        writeln!(out, "{ANCHORS_CSV_HEADER}")?;
+        Ok(Self { out })
+    }
+
+    /// The row of image number `image` (of device time `device_ts_us`),
+    /// which had a face or not, `gaze` being the last gaze frame before it.
+    /// Numbers have three decimals. An anchor the frame lacks (it takes
+    /// both eyes) is empty; before the first frame every anchor is, and the
+    /// validity is 0.
+    fn write_image(
+        &mut self,
+        image: u64,
+        device_ts_us: u64,
+        face: bool,
+        gaze: Option<&TrackingFrame>,
+    ) -> io::Result<()> {
+        let three = |v: Option<f64>| v.map_or_else(String::new, |v| format!("{v:.3}"));
+        let mm = |field: fn(&TrackingFrame) -> Option<f64>| {
+            three(gaze.and_then(field).map(|um| um / 1000.0))
+        };
+        writeln!(
+            self.out,
+            "{image},{device_ts_us},{},{},{},{},{},{}",
+            u8::from(face),
+            mm(|g| g.head_x),
+            mm(|g| g.head_y),
+            mm(|g| g.head_z),
+            three(gaze.and_then(|g| g.head_roll)),
+            gaze.map_or(0, |g| u8::from(g.gaze_valid)),
+        )
+    }
+
+    /// Flush the rows, and hand the writer back.
+    fn finish(mut self) -> io::Result<W> {
+        self.out.flush()?;
+        Ok(self.out)
+    }
+}
+
+/// The yaw of a fit's `rotation` (mesh -> camera), degrees: its angle about
+/// the camera's vertical axis, the yaw of its zyx Euler angles
+/// ([`euler_deg`]), with the sign that makes a turn of the head to its own
+/// left positive.
+#[must_use]
+fn camera_yaw_deg(rotation: &[[f64; 3]; 3]) -> f64 {
+    -euler_deg(rotation)[1]
+}
+
+/// How the head anchors' x follows the fit's yaw over `pairs` of (yaw,
+/// degrees; head x, mm): their correlation and the least-squares slope of
+/// the x on the yaw, mm per degree. `None` for ten pairs or fewer.
+#[must_use]
+fn yaw_vs_head_x(pairs: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if pairs.len() <= 10 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let (my, mx) = (
+        pairs.iter().map(|p| p.0).sum::<f64>() / n,
+        pairs.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (y, x) in pairs {
+        sxy += (y - my) * (x - mx);
+        sxx += (x - mx) * (x - mx);
+        syy += (y - my) * (y - my);
+    }
+    Some((sxy / (sxx * syy).sqrt(), sxy / syy))
 }
 
 /// Refuse outputs that would overwrite the log they are made from, or one
@@ -769,12 +733,13 @@ fn resolved_path(path: &str) -> PathBuf {
 /// Diagnostic: bring the device up in gaze mode, additionally start the 0x50e
 /// image stream, and report what arrives on EP 0x83 for `secs` seconds: per-
 /// stream message rates, image timestamp cadence, the first frames as PGM, and
-/// optionally the head pose from each frame.
+/// with `--pose` the Stream Engine's head pose of each image ([`LivePoses`]).
 ///
 /// # Errors
 ///
 /// Fails if the device cannot be opened / initialised, a PGM or log write
-/// fails, or the stream never arms in three opens.
+/// fails, the head pose models cannot be loaded or the tracker fails on an
+/// image, or the stream never arms in three opens.
 ///
 /// # Panics
 ///
@@ -797,14 +762,17 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
     let ctx = UsbContext::new()?;
     let packets = read_init_packets(init_path)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let mut tracker = if *pose {
-        Some(tobii_pose::track::Tracker::new_image83()?)
+    let mut poses = if *pose {
+        Some(LivePoses::new(&packets)?)
     } else {
         None
     };
+    if let Some(poses) = &poses {
+        println!("{}", poses.display_note());
+    }
     let mut log = log_path.as_deref().map(PacketLog::create).transpose()?;
 
-    for attempt in 1..=3 {
+    for attempt in 1u64..=3 {
         let mut h = open_tobii(&ctx)?;
         vendor_control_init(&mut h)?;
         println!(
@@ -850,7 +818,6 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
             let mut image_ts = Vec::<u64>::new();
             let mut gaze_ts = Vec::<u64>::new();
             let (mut gaze_frames, mut gaze_valid, mut eyes_valid) = (0u64, 0u64, 0u64);
-            let mut poses = 0u64;
             let start = Instant::now();
             let dur = Duration::from_secs_f64(*secs);
             let mut msgs = Vec::new();
@@ -897,17 +864,10 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
                                 );
                                 saved += 1;
                             }
-                            if let Some(t) = tracker.as_mut()
-                                && let Some(p) =
-                                    t.process(&frame.pixels, frame.width, frame.height)?
+                            if let Some(poses) = poses.as_mut()
+                                && let Some(line) = poses.image(&frame, attempt)?
                             {
-                                poses += 1;
-                                if poses % 10 == 1 {
-                                    println!(
-                                        "pose: yaw {:+6.1} pitch {:+6.1} roll {:+6.1}  t = [{:+5.1} {:+5.1} {:+5.1}] cm",
-                                        p[3], p[4], p[5], p[0], p[1], p[2]
-                                    );
-                                }
+                                println!("{line}");
                             }
                         }
                         _ => {}
@@ -953,8 +913,8 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
                     d[d.len() - 1]
                 );
             }
-            if *pose {
-                println!("head poses emitted: {poses} (first ~30 frames calibrate the rest pose)");
+            if let Some(poses) = &poses {
+                println!("{}", poses.summary());
             }
             Ok(())
         })();
@@ -965,6 +925,150 @@ pub(crate) fn run_image83(opts: &Options) -> Result<()> {
         return result;
     }
     anyhow::bail!("stream never armed after 3 opens")
+}
+
+/// `image83 --pose`: tobiid's own step from an image to the Stream Engine's
+/// head pose ([`HeadStep`] with [`HeadParams::FITTED`]), the poses in the
+/// display frame of the area the init capture writes, and a tally of them.
+struct LivePoses {
+    step: HeadStep,
+    /// The display area the init capture writes, if it writes one.
+    area: Option<DisplayArea>,
+    /// The frame `area` fixes; without one every pose is invalid.
+    display: Option<DisplayFrame>,
+    tally: PoseTally,
+}
+
+impl LivePoses {
+    /// The step, its poses in the display frame of the area `packets`
+    /// write (their 1440): the device holds that area once the init replay
+    /// has written it, so it is the one in effect while the streams run.
+    /// It is the capture's, not the user's, which tobiid writes instead.
+    ///
+    /// # Errors
+    /// Fails when a model cannot be loaded.
+    fn new(packets: &[InitPacket]) -> Result<Self> {
+        let area = written_display_area(packets).map(|(_, area, _)| area);
+        Ok(Self {
+            step: HeadStep::new(HeadParams::FITTED).context("loading the head pose models")?,
+            display: area.as_ref().and_then(DisplayFrame::new),
+            area,
+            tally: PoseTally::default(),
+        })
+    }
+
+    /// The report's first line ([`display_note`]).
+    fn display_note(&self) -> String {
+        display_note(self.area.as_ref())
+    }
+
+    /// The pose of `frame`, an image read in the tracker's `open`th open (a
+    /// new open restarts the filters), and the line of the report it makes:
+    /// the first image's and every tenth after it ([`pose_line`]).
+    ///
+    /// # Errors
+    /// Fails when the image's time does not fit an `i64`, or the tracker
+    /// fails on the image.
+    fn image(&mut self, frame: &ImageFrame, open: u64) -> Result<Option<String>> {
+        let context = FrameContext {
+            // The image's device time, as the replay tools step by; tobiid
+            // maps it onto the host clock first.
+            t_us: i64::try_from(frame.device_ts_us)
+                .context("an image's time does not fit an i64")?,
+            display: self.display.as_ref(),
+            // The area stays the init capture's while the command runs.
+            display_generation: 0,
+            open,
+            legacy_wanted: false,
+        };
+        let out = self
+            .step
+            .step(&frame.pixels, frame.width, frame.height, &context);
+        if let Some(e) = out.error {
+            return Err(e.context("the head tracker failed on an image"));
+        }
+        let face = out.face.is_some();
+        self.tally.add(out.head.valid, face);
+        Ok((self.tally.images % 10 == 1).then(|| pose_line(&out.head, face)))
+    }
+
+    /// The report's last line ([`PoseTally::summary`]).
+    fn summary(&self) -> String {
+        self.tally.summary(self.step.model_runs())
+    }
+}
+
+/// What `image83 --pose` says of the display frame its poses are in: the
+/// corners of `area`, the display area the init capture writes, or why
+/// every pose is invalid.
+fn display_note(area: Option<&DisplayArea>) -> String {
+    let point = |p: [f64; 3]| format!("({:.1}, {:.1}, {:.1})", p[0], p[1], p[2]);
+    match area {
+        Some(area) if DisplayFrame::new(area).is_some() => format!(
+            "head poses in the display frame of the area the init capture writes (mm): \
+             top left {}, top right {}, bottom left {}",
+            point(area.top_left_mm),
+            point(area.top_right_mm),
+            point(area.bottom_left_mm)
+        ),
+        Some(_) => "the display area the init capture writes fixes no display frame: \
+                    every head pose is invalid"
+            .to_string(),
+        None => "the init capture writes no display area: every head pose is invalid".to_string(),
+    }
+}
+
+/// One line of `image83 --pose`'s report. Of a valid pose, its position
+/// (mm, in the display frame) and its rotation, the Stream Engine's x, y
+/// and z angles in degrees; of an invalid one, which carries the last valid
+/// pose's values, whether the tracker found a face (`face`).
+#[must_use]
+fn pose_line(pose: &HeadPose, face: bool) -> String {
+    if pose.valid {
+        let [x, y, z] = pose.position_mm;
+        let [rx, ry, rz] = pose.rotation_rad.map(f64::to_degrees);
+        format!(
+            "head pose: position ({x:+6.1}, {y:+6.1}, {z:+6.1}) mm, \
+             rotation x {rx:+5.1} y {ry:+5.1} z {rz:+5.1} deg"
+        )
+    } else if face {
+        "head pose: invalid, a face but too near the image's edge, or no display area".to_string()
+    } else {
+        "head pose: invalid, no face".to_string()
+    }
+}
+
+/// What `image83 --pose` made: the images it stepped, the valid poses among
+/// them, and the images the tracker found a face in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PoseTally {
+    images: u64,
+    valid: u64,
+    faces: u64,
+}
+
+impl PoseTally {
+    /// Count one image, its pose valid or not and a face found or not.
+    fn add(&mut self, valid: bool, face: bool) {
+        self.images += 1;
+        self.valid += u64::from(valid);
+        self.faces += u64::from(face);
+    }
+
+    /// The tally as the report's last line, with the tracker's model `runs`.
+    #[must_use]
+    fn summary(&self, runs: ModelRuns) -> String {
+        let valid_pct = if self.images == 0 {
+            0.0
+        } else {
+            self.valid as f64 * 100.0 / self.images as f64
+        };
+        format!(
+            "head poses of {} images: {} valid ({valid_pct:.1}%), a face in {}; \
+             landmark model run {} times, face detector {}",
+            self.images, self.valid, self.faces, runs.landmarks, runs.detector
+        )
+    }
 }
 
 /// Diagnostic: after the normal init (which starts the 0x83 processed stream),
@@ -1193,7 +1297,7 @@ fn le_u32_at(bytes: &[u8], at: usize) -> Option<u32> {
 /// Read the camera stream and hand each assembled frame (passing `type_filter`)
 /// to `on_frame`. The callback returns `false` to stop. Frame assembly, the
 /// Tobii/UVC header stripping and the type histogram live here; what to do with
-/// a frame (PGM, FIFO, pose tracking) is the caller's.
+/// a frame (PGM, FIFO) is the caller's.
 fn read_camera_frames(
     h: &mut rusb::DeviceHandle<UsbContext>,
     frame_size: usize,
@@ -1468,5 +1572,271 @@ mod tests {
         for relative in ["Cargo.toml", "./Cargo.toml", "src/../Cargo.toml"] {
             assert_eq!(resolved_path(relative), resolved_path(&name(&manifest)));
         }
+    }
+
+    /// The 0x83 field that carries the eyeball centres (occurrences 4 and
+    /// 9) and the one that carries the eyes' gaze points (1 and 3).
+    const EYEBALL_CENTRES: u32 = 0x0003_1f41;
+    const GAZE_POINTS: u32 = 0x0002_1f40;
+
+    /// A gaze frame as `image83-replay` decodes one: the left eyeball
+    /// centre at `left` and the right one at `right` (µm; `None`, the eye
+    /// was not found), with both eyes' gaze points on screen when `gaze`.
+    fn gaze_frame(left: [f64; 3], right: Option<[f64; 3]>, gaze: bool) -> TrackingFrame {
+        let mut values = tobii_proto::decode::FieldValues::new();
+        for (occurrence, centre) in [(4, Some(left)), (9, right)] {
+            for (component, v) in centre.into_iter().flatten().enumerate() {
+                values.insert((EYEBALL_CENTRES, occurrence, component), v);
+            }
+        }
+        if gaze {
+            for (occurrence, point) in [(1, [512.0, 400.0]), (3, [520.0, 410.0])] {
+                for (component, v) in point.into_iter().enumerate() {
+                    values.insert((GAZE_POINTS, occurrence, component), v);
+                }
+            }
+        }
+        TrackingFrame::from_decoded(0, &values, None)
+    }
+
+    /// `--csv`: a row per image of its number, device time and face, then
+    /// the head anchors of the last gaze frame before it in mm (µm in the
+    /// frame), to three decimals, and its gaze validity. Before the first
+    /// gaze frame, and for a frame without both eyes, the anchors are empty;
+    /// before the first, the validity is 0.
+    #[test]
+    fn the_csv_has_each_image_s_face_and_the_last_gaze_frame_s_head_anchors() {
+        let level = gaze_frame(
+            [-20_000.0, 3_000.0, 650_000.0],
+            Some([40_000.0, 3_000.0, 650_000.0]),
+            true,
+        );
+        let one_eye = gaze_frame([-20_000.0, 3_000.0, 650_000.0], None, false);
+        let mut csv = AnchorsCsv::new(Vec::new()).expect("the header");
+
+        for (image, face, gaze) in [
+            (0, false, None),
+            (1, true, Some(&level)),
+            (2, true, Some(&one_eye)),
+        ] {
+            csv.write_image(image, 30_000 * image, face, gaze)
+                .expect("a row");
+        }
+
+        let rows = String::from_utf8(csv.finish().expect("flushed")).expect("UTF-8");
+        assert_eq!(
+            rows,
+            "image_idx,device_ts_us,face,g_head_x_mm,g_head_y_mm,g_head_z_mm,g_head_roll_deg,g_valid\n\
+             0,0,0,,,,,0\n\
+             1,30000,1,10.000,3.000,650.000,0.000,1\n\
+             2,60000,1,,,,,0\n"
+        );
+    }
+
+    /// A turn of the head to its own left takes its nose (the mesh's -z)
+    /// towards the camera's +x, the image's right: a positive yaw of as
+    /// many degrees.
+    #[test]
+    fn a_turn_of_the_head_to_its_left_is_a_positive_yaw() {
+        let (s, c) = 20f64.to_radians().sin_cos();
+        // 20° about the camera's y axis, which points down.
+        let turned = [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]];
+        let nose = turned.map(|row| -row[2]);
+
+        assert!(nose[0] > 0.0, "{nose:?}");
+        assert!((camera_yaw_deg(&turned) - 20.0).abs() < 1e-9);
+        let facing = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(camera_yaw_deg(&facing).abs() < 1e-12);
+    }
+
+    /// The head anchors' x against the yaw: the correlation and the slope
+    /// in mm per degree, from eleven pairs on.
+    #[test]
+    fn the_head_x_is_fitted_to_the_yaw_from_eleven_pairs() {
+        let pairs: Vec<(f64, f64)> = (0..11)
+            .map(|k| {
+                let yaw = f64::from(k) * 3.0 - 15.0;
+                (yaw, -1.5 * yaw + 20.0)
+            })
+            .collect();
+
+        let (r, slope) = yaw_vs_head_x(&pairs).expect("eleven pairs");
+        assert!((r + 1.0).abs() < 1e-12, "r {r}");
+        assert!((slope + 1.5).abs() < 1e-12, "slope {slope}");
+        assert_eq!(yaw_vs_head_x(&pairs[..10]), None);
+    }
+
+    /// Of a valid pose, its position in mm and its rotation in degrees;
+    /// of an invalid one, whose values are the last valid pose's, only
+    /// whether there was a face.
+    #[test]
+    fn a_pose_line_gives_a_valid_pose_in_mm_and_degrees() {
+        let pose = HeadPose {
+            valid: true,
+            position_mm: [12.34, -5.0, 600.0],
+            rotation_rad: [0.1, -0.2, 0.3],
+        };
+
+        assert_eq!(
+            pose_line(&pose, true),
+            "head pose: position ( +12.3,   -5.0, +600.0) mm, rotation x  +5.7 y -11.5 z +17.2 deg"
+        );
+        let held = HeadPose {
+            valid: false,
+            ..pose
+        };
+        assert_eq!(
+            pose_line(&held, true),
+            "head pose: invalid, a face but too near the image's edge, or no display area"
+        );
+        assert_eq!(pose_line(&held, false), "head pose: invalid, no face");
+    }
+
+    /// The last line counts the images, the valid poses (with their share)
+    /// and the faces, and gives the model runs.
+    #[test]
+    fn the_tally_counts_images_valid_poses_and_faces() {
+        let mut tally = PoseTally::default();
+        let mut runs = ModelRuns::default();
+        assert_eq!(
+            tally.summary(runs),
+            "head poses of 0 images: 0 valid (0.0%), a face in 0; \
+             landmark model run 0 times, face detector 0"
+        );
+
+        for (valid, face) in [(true, true), (false, true), (false, false)] {
+            tally.add(valid, face);
+        }
+        (runs.landmarks, runs.detector) = (4, 1);
+
+        assert_eq!(
+            tally,
+            PoseTally {
+                images: 3,
+                valid: 1,
+                faces: 2
+            }
+        );
+        assert_eq!(
+            tally.summary(runs),
+            "head poses of 3 images: 1 valid (33.3%), a face in 2; \
+             landmark model run 4 times, face detector 1"
+        );
+    }
+
+    /// The poses are in the display frame of the area the init capture
+    /// writes, which the report names; without one, or with one that fixes
+    /// no frame, it says every pose is invalid.
+    #[test]
+    fn the_report_names_the_display_area_the_init_capture_writes() {
+        let packets = tobii_usb::calibration::embedded_packets().expect("the embedded init");
+        let (_, area, _) = written_display_area(&packets).expect("a 1440");
+
+        let note = display_note(Some(&area));
+        assert!(
+            note.starts_with(
+                "head poses in the display frame of the area the init capture writes (mm): \
+                 top left ("
+            ),
+            "{note}"
+        );
+        let corner = |p: [f64; 3]| format!("({:.1}, {:.1}, {:.1})", p[0], p[1], p[2]);
+        assert!(note.ends_with(&format!(
+            "top left {}, top right {}, bottom left {}",
+            corner(area.top_left_mm),
+            corner(area.top_right_mm),
+            corner(area.bottom_left_mm)
+        )));
+        let point = DisplayArea {
+            top_right_mm: area.top_left_mm,
+            bottom_left_mm: area.top_left_mm,
+            ..area
+        };
+        assert_eq!(
+            display_note(Some(&point)),
+            "the display area the init capture writes fixes no display frame: \
+             every head pose is invalid"
+        );
+        assert_eq!(
+            display_note(None),
+            "the init capture writes no display area: every head pose is invalid"
+        );
+    }
+
+    /// With the real models but no face: a black image makes an invalid
+    /// pose (and the report's first line), and an image the tracker cannot
+    /// take fails the command rather than counting as no face.
+    #[test]
+    fn a_live_pose_without_a_face_is_invalid_and_a_tracker_failure_fails() {
+        let packets = tobii_usb::calibration::embedded_packets().expect("the embedded init");
+        let mut poses = LivePoses::new(&packets).expect("the models");
+        assert!(
+            poses.display.is_some(),
+            "the embedded init's area fixes a frame"
+        );
+        let black = ImageFrame {
+            device_ts_us: 1_000_000,
+            width: 280,
+            height: 280,
+            pixels: vec![0; 280 * 280],
+        };
+
+        let line = poses.image(&black, 1).expect("a black image");
+        assert_eq!(line.as_deref(), Some("head pose: invalid, no face"));
+        for k in 1..10 {
+            let later = ImageFrame {
+                device_ts_us: 1_000_000 + 30_000 * k,
+                ..black.clone()
+            };
+            assert_eq!(poses.image(&later, 1).expect("a black image"), None);
+        }
+        assert_eq!(
+            poses.tally,
+            PoseTally {
+                images: 10,
+                valid: 0,
+                faces: 0
+            }
+        );
+
+        let small = ImageFrame {
+            width: 10,
+            height: 10,
+            pixels: vec![0; 100],
+            ..black
+        };
+        let error = poses.image(&small, 1).expect_err("a 10x10 image");
+        assert!(
+            format!("{error:#}").starts_with("the head tracker failed on an image: "),
+            "{error:#}"
+        );
+        assert_eq!(poses.tally.images, 10, "a failure is not counted");
+    }
+
+    /// With a face (the 0x50e fixture, `TOBII_IMAGE83_FIXTURE`, the user's
+    /// face and so not committed; without it the test returns at once): a
+    /// valid pose, as tobiid's engine makes it.
+    #[test]
+    fn a_live_pose_of_a_face_is_valid() {
+        let Ok(path) = std::env::var("TOBII_IMAGE83_FIXTURE") else {
+            return;
+        };
+        let msg = std::fs::read(path).expect("the fixture");
+        let face = decode_image_payload(&msg).expect("a 0x50e image");
+        let packets = tobii_usb::calibration::embedded_packets().expect("the embedded init");
+        let mut poses = LivePoses::new(&packets).expect("the models");
+
+        let line = poses.image(&face, 1).expect("the fixture's image");
+
+        let line = line.expect("the first image's line");
+        assert!(line.starts_with("head pose: position ("), "{line}");
+        assert_eq!(
+            poses.tally,
+            PoseTally {
+                images: 1,
+                valid: 1,
+                faces: 1
+            }
+        );
     }
 }
