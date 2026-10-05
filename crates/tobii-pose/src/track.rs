@@ -2080,9 +2080,15 @@ mod tests {
     /// Two copies of the fixture's face, side by side; the tracker follows
     /// the left one. On one frame that face moves out of the crop that
     /// follows it (a quick move), and the detector finds both faces, the
-    /// right one with the better score (0.85 against 0.82 or 0.83). The
-    /// tracker looks for the face where it was, on the left. Taking the best
-    /// score, it went to the right one.
+    /// right one with the better score (0.85 to 0.89 against 0.82 to 0.84 in
+    /// the two captures tried). The tracker looks for the face where it was,
+    /// on the left. Taking the best score, it went to the right one.
+    ///
+    /// The move up is 50 px. A smaller one leaves enough of the face in the
+    /// crop for the landmark model to fit it there, 25 to 30 px short of
+    /// where it went, and the detector does not run: 35 and 40 px in both
+    /// captures tried, 45 px in one of them. Between two images 30 ms apart
+    /// that is a jump of 40 to 50 % of the face's height, forehead to chin.
     #[test]
     fn image83_tracker_finds_the_face_it_lost_rather_than_another() {
         let Some(frame) = image83_fixture() else {
@@ -2090,7 +2096,7 @@ mod tests {
         };
         let n = frame.width;
         // The copies at x 2-131 and 148-277, on grey; the left one then
-        // moves 60 px down or 45 px up.
+        // moves 60 px down or 50 px up.
         let blank = vec![20u8; n * n];
         let mut left = blank.clone();
         paste_face(&mut left, &frame.pixels, n, -86, 0);
@@ -2103,7 +2109,7 @@ mod tests {
             let x = fit.landmarks.iter().map(|p| p[0]).sum::<f64>() / NLM as f64;
             (x, fit.found_by_detector)
         };
-        for dy in [60, -45] {
+        for dy in [60, -50] {
             let mut moved = blank.clone();
             paste_face(&mut moved, &frame.pixels, n, -86, dy);
             paste_face(&mut moved, &frame.pixels, n, 60, 0);
