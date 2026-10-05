@@ -20,9 +20,10 @@
 //! bandwidth — verified with `probe`). The UVC path survives only in the
 //! standalone research subcommands (`camera`, `track`, `probe`).
 //!
-//! The `stop`, `recenter` and `paused` flags, and the flags
-//! [`Engine::set_wanted`] keeps a [`Wanted`] in, are pure signals (no data
-//! is published alongside them), so every access uses `Ordering::Relaxed`.
+//! The `stop`, `recenter`, `paused` and `image_wanted` flags are pure
+//! signals (no data is published alongside them), so every access uses
+//! `Ordering::Relaxed`. The head flags of [`Wanted`] are kept with how many
+//! times each was set, under a lock (see [`Engine::set_wanted`]).
 //!
 //! # Timestamps
 //!
@@ -449,13 +450,54 @@ pub struct Wanted {
     pub image: bool,
 }
 
+/// One head flag of [`Wanted`] as the pose worker reads it: whether it is
+/// set, and how many times it has been set when it was not. The worker
+/// reads the flags once an image, and sees from the count that a client
+/// subscribed since the image before even when the flag was cleared and set
+/// again between the two, or while no image came (a pause, a re-open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct HeadFlag {
+    /// Whether the flag is set.
+    pub(crate) on: bool,
+    /// How many times it has been set when it was not.
+    pub(crate) raised: u64,
+}
+
+impl HeadFlag {
+    /// Set the flag `on` or clear it, counting a raise.
+    pub(crate) fn set(&mut self, on: bool) {
+        if on && !self.on {
+            self.raised = self.raised.wrapping_add(1);
+        }
+        self.on = on;
+    }
+
+    /// Whether the flag is set, and was raised since it was `before`.
+    #[must_use]
+    pub(crate) fn is_raised_since(self, before: Self) -> bool {
+        self.on && self.raised != before.raised
+    }
+}
+
+/// The head flags of [`Wanted`], as the pose worker reads them (see
+/// [`HeadFlag`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct HeadFlags {
+    /// [`Wanted::head`].
+    pub(crate) head: HeadFlag,
+    /// [`Wanted::legacy_head`].
+    pub(crate) legacy: HeadFlag,
+}
+
 /// State shared between the [`Engine`] handle and its USB thread.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     pub(crate) stop: AtomicBool,
     pub(crate) recenter: AtomicBool,
-    pub(crate) head_wanted: AtomicBool,
-    pub(crate) legacy_head_wanted: AtomicBool,
+    /// The head flags of what is wanted, which the pose worker reads (see
+    /// [`Shared::heads`]): both under one lock, so that it never reads one
+    /// changed and the other not yet.
+    heads: Mutex<HeadFlags>,
     pub(crate) image_wanted: AtomicBool,
     /// The device was told to pause: its streams are expected to stop.
     pub(crate) paused: AtomicBool,
@@ -467,11 +509,20 @@ impl Shared {
     /// Keep `wanted` in the flags the USB thread and the pose worker read
     /// (see [`Engine::set_wanted`]).
     pub(crate) fn set_wanted(&self, wanted: Wanted) {
-        // Relaxed: pure signals, no data is published with them.
-        self.head_wanted.store(wanted.head, Ordering::Relaxed);
-        self.legacy_head_wanted
-            .store(wanted.legacy_head, Ordering::Relaxed);
+        {
+            // Each flag is written whole and nothing under the lock can
+            // panic: a poisoned lock holds no half-updated flags.
+            let mut heads = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
+            heads.head.set(wanted.head);
+            heads.legacy.set(wanted.legacy_head);
+        }
+        // Relaxed: a pure signal, no data is published with it.
         self.image_wanted.store(wanted.image, Ordering::Relaxed);
+    }
+
+    /// The head flags as they are now.
+    pub(crate) fn heads(&self) -> HeadFlags {
+        *self.heads.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The display area the next init writes, if not the replay's own.
@@ -557,18 +608,21 @@ impl Engine {
     /// Do the optional work `wanted` asks for, and none that it does not:
     /// head-pose inference, the legacy pose, the IR images (see [`Wanted`]).
     ///
-    /// The pose worker reads the head flags at each image it takes. The
-    /// first image that wants a head pose after one that did not starts the
-    /// poses over: the Stream Engine's restarts its filters, its invalid
-    /// poses carrying zeros until the next valid one, and the legacy pose's
-    /// rest pose calibrates afresh. The first image that wants the legacy
-    /// pose after one that did not has the rest pose calibrate afresh, the
-    /// Stream Engine's pose going on as it was. So a new subscriber does not
-    /// inherit an earlier one's poses, unless a head pose stays wanted
-    /// throughout: [`Wanted::head`] covers both kinds, and while it stays
-    /// set the Stream Engine's pose goes on without a restart, so a client
-    /// that comes to want it while another keeps the legacy pose going gets
-    /// its filters as they are.
+    /// The pose worker reads the head flags at each image it takes, with how
+    /// many times each was set when it was not. The first image after a
+    /// head pose was wanted anew starts the poses over: the Stream Engine's
+    /// restarts its filters, its invalid poses carrying zeros until the
+    /// next valid one, and the legacy pose's rest pose calibrates afresh.
+    /// The first image after the legacy pose alone was wanted anew has the
+    /// rest pose calibrate afresh, the Stream Engine's pose going on as it
+    /// was. Wanted anew is since the image before, even if the flag was
+    /// cleared and set again between the two or while no image came (a
+    /// pause, a re-open); not at the worker's first image, whose poses are
+    /// new. So a new subscriber does not inherit an earlier one's poses,
+    /// unless a head pose stays wanted throughout: [`Wanted::head`] covers
+    /// both kinds, and while it stays set the Stream Engine's pose goes on
+    /// without a restart, so a client that comes to want it while another
+    /// keeps the legacy pose going gets its filters as they are.
     pub fn set_wanted(&self, wanted: Wanted) {
         self.shared.set_wanted(wanted);
     }
