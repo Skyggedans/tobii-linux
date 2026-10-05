@@ -2,7 +2,8 @@
 // gaze.js (inside GNOME Shell) and the standalone gjs test/probe scripts.
 // Keep this file free of gi:// / resource:// imports so it runs under `gjs -m`.
 
-// tobiid IPC constants — mirror tobii/src/ipc.rs.
+// tobiid IPC constants — mirror crates/tobii-ipc/src/lib.rs, whose table also
+// lists the retired numbers that no new constant may take.
 export const TAG_SUBSCRIBE = 0x01;
 export const TAG_SUBSCRIBED = 0x10;
 export const TAG_GAZE = 0x21;

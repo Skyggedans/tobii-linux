@@ -6,7 +6,7 @@ activates the selected window natively).
 
 ## Requirements
 - GNOME Shell on Wayland with PaperWM enabled.
-- `tobiid` running in **gaze** mode (same as `tobii-gaze-keys`).
+- `tobiid` running, as for `tobii-gaze-keys`.
 - `gjs` (for the tests).
 
 ## Install
@@ -33,5 +33,6 @@ the extension and patches `extension.js`.
 
 ## Troubleshooting
 - Watch logs: `journalctl --user -b 0 -f | grep '#tobii-gaze'`.
-- No gaze lines while holding Alt+Tab → tobiid not in gaze mode, or busy in
-  head/camera mode (mutually exclusive at the device).
+- No tile selected while holding Alt+Tab → check that tobiid runs and sends
+  gaze: `gjs -m paperwm-gaze/tests/probe_socket.js` prints `subscribed ok=true`,
+  then ten `gaze valid=…` lines.

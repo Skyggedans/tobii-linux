@@ -1,4 +1,4 @@
-//! Terminal output for the replay/track CLI paths: the one-line decoded dump
+//! Terminal output for the replay mode: the one-line decoded dump
 //! and the full-screen tracking dashboard. Everything here is program output
 //! that the user reads, so it goes to stdout via `print!`/`write!`.
 

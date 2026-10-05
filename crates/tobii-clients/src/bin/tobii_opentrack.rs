@@ -6,8 +6,8 @@
 //! Each axis goes to `OpenTrack` as its own `tracker-tobii` plugin hands over
 //! the same pose through `libtobii.so` ([`opentrack_pose`]), so the two
 //! inputs move alike and one `OpenTrack` profile fits both. The pose is
-//! absolute, with no rest pose: `OpenTrack` centres it, at the first pose
-//! (*Center at startup*) and on its own *Center* shortcut.
+//! absolute: `OpenTrack` centres it, at the first pose (*Center at startup*)
+//! and on its own *Center* shortcut.
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
@@ -42,9 +42,8 @@ OpenTrack's own tracker-tobii plugin hands it over. A pose tobiid marks
 invalid (no face, or one at the edge of the camera's view) is not sent, and
 OpenTrack holds the last one.
 
-The pose is absolute, with no rest pose: OpenTrack centres it, at the first
-pose (\"Center at startup\") and on its own Center shortcut. Bind that
-shortcut where a hotkey ran `tobii-opentrack --recenter`, which is gone.";
+The pose is absolute: OpenTrack centres it, at the first pose (\"Center at
+startup\") and on its own Center shortcut.";
 
 /// The error `--recenter` gets: an old hotkey script that passes it is told
 /// what replaced it, rather than starting a second bridge.

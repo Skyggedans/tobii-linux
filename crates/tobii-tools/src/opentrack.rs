@@ -1,6 +1,7 @@
-//! `OpenTrack` "UDP over network" sink for the replay/track CLI paths: turns a
-//! decoded `TrackingFrame` into the 6-double `x,y,z,yaw,pitch,roll` packet,
-//! with origin calibration, rotation/translation decoupling and smoothing.
+//! `OpenTrack` "UDP over network" sink for the replay mode (`--opentrack-*`):
+//! turns a decoded `TrackingFrame` into the 6-double `x,y,z,yaw,pitch,roll`
+//! packet, with origin calibration, rotation/translation decoupling and
+//! smoothing.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;

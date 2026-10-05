@@ -1,4 +1,4 @@
-//! File/stdout sinks for the replay/track CLI paths: the decoded-candidate
+//! File/stdout sinks for the replay mode: the decoded-candidate
 //! CSV and the JSON Lines frame stream, plus the
 //! per-packet fan-out that feeds them together with the `OpenTrack` sender and
 //! the terminal dashboard.

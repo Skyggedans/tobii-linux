@@ -71,6 +71,11 @@ tobii-opentrack                       # head pose -> OpenTrack UDP 127.0.0.1:424
 tobii-gaze-keys                       # look at a screen edge + hold Super -> arrow keys
 ```
 
+`tobii-opentrack` sends the Stream Engine's head pose, the one `libtobii.so`
+delivers, each axis as OpenTrack's own `tracker-tobii` plugin hands it over,
+so one OpenTrack profile fits either; OpenTrack centres it, at the first pose
+and on its *Center* shortcut.
+
 Full instructions, tuning knobs and troubleshooting are in
 **[INSTALL.md](INSTALL.md)**.
 
@@ -236,8 +241,8 @@ Where the answers come from, and where they differ from Windows:
   form: absolute, in the display frame of the display area in effect, as gaze
   origins are (the position a point between the eyes, in mm from the area's
   centre; the rotation as the Stream Engine's yxz Euler angles, zero for a face
-  square to the display), with no rest pose and no clamp; one pose for every IR
-  image, ~33 Hz, with the image's time; and invalid, all four validities at
+  square to the display), unclamped; one pose for every IR image, ~33 Hz, with
+  the image's time; and invalid, all four validities at
   once, when there is no face or it is at the edge of the image, where the
   Stream Engine's turns invalid too. An invalid pose holds the last valid
   values (zeros before the first), where the DLL's holds leftovers of its other
@@ -264,8 +269,8 @@ Where the answers come from, and where they differ from Windows:
   the newest image, and one it has not taken by the time the next comes gets
   none, which at ~6 ms an image on a desktop CPU, against 30 ms between images,
   takes a busy machine (`TOBII_IMAGE83_DEBUG` counts them, INSTALL.md §7).
-  Neither the Stream Engine nor libtobii has a recenter: an application
-  centres the pose itself, as OpenTrack does.
+  As with the Stream Engine, an application centres the pose itself, as
+  OpenTrack does.
 - **Timestamps.** Every callback timestamp but the tracker times below is on
   `tobii_system_clock`'s clock, as in the Stream Engine; the tracker's clock
   is left only in gaze data's and raw gaze's `timestamp_tracker_us` (raw

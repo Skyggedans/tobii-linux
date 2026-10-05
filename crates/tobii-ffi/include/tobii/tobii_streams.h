@@ -129,11 +129,11 @@ TOBII_API tobii_error_t TOBII_CALL tobii_user_presence_unsubscribe( tobii_device
  * those axes: the yxz Euler angles of R = Ry(y) Rx(x) Rz(z), as the Stream
  * Engine's, all zero for a face square to the display; +x lifts the chin
  * (pitch), +y turns the head to the user's left (yaw), +z tilts it towards
- * the left shoulder (roll). Nothing in it is relative to a rest pose: as
- * with the Stream Engine, an application that wants one centres the pose
- * itself, as OpenTrack does. A tobiid older than libtobii.so acks the
- * subscription but sends none: restart tobiid after installing (libtobii
- * logs a warning, once per device, after 20 s without one). */
+ * the left shoulder (roll). Neither libtobii nor tobiid centres it: as with
+ * the Stream Engine, an application that wants it centred does that itself,
+ * as OpenTrack does. A tobiid older than libtobii.so acks the subscription
+ * but sends none: restart tobiid after installing (libtobii logs a warning,
+ * once per device, after 20 s without one). */
 typedef struct tobii_head_pose_t
 {
     int64_t timestamp_us;

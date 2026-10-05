@@ -13,8 +13,8 @@ RestartSec=2
 # The daemon claims the USB device; keep it lean.
 Nice=-5
 # Keep the device warm so client connects are instant (the IR illuminator stays
-# on while the service runs). Uncomment for head tracking:
-#Environment=TOBII_PREWARM=head
+# on while the service runs):
+#Environment=TOBII_PREWARM=1
 # Skip the USB reset the engine tries once opens keep failing (it rarely helps
 # now that uvcvideo is kept off the device):
 #Environment=TOBII_NO_RESET=1
