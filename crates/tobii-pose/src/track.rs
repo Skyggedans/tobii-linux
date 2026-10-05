@@ -4,14 +4,13 @@
 //! Runtime (`ort`) and fit the canonical face mesh to the landmarks (Kabsch
 //! start, perspective `PnP`): [`Tracker::fit`] gives that [`FaceFit`] per
 //! frame. A face the crop has lost is looked for in the whole frame with
-//! `MediaPipe`'s `BlazeFace` detector. [`RestPose`] reads the legacy
-//! yaw/pitch/roll and translation relative to a calibrated rest pose out of
-//! the fits. Validated against `MediaPipe` to within ~3 degrees.
+//! `MediaPipe`'s `BlazeFace` detector. Validated against `MediaPipe` to
+//! within ~3 degrees. [`crate::head`] makes the head pose of the fits.
 
 use anyhow::{Context, Result, ensure};
 use ort::session::Session;
 use ort::value::TensorRef;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::canonical::CANONICAL_FACE;
 use crate::detect::{Detection, FaceDetector};
@@ -26,29 +25,11 @@ const LANDMARK_INPUT: &str = "input_12";
 const LANDMARK_POINTS: &str = "Identity";
 const LANDMARK_PRESENCE: &str = "Identity_1";
 
-// Tunables (flip a sign if an axis is reversed; raise a gain if too weak).
-const ANGLE_SIGN: [f64; 3] = [1.0, 1.0, 1.0]; // pitch, yaw, roll
-const SEND_TRANSLATION: bool = true;
-const TRANS_SIGN: [f64; 3] = [-1.0, -1.0, -1.0]; // tx, ty, tz (camera y down, z fwd)
-const TRANS_GAIN: [f64; 3] = [1.0, 1.0, 1.0]; // solvePnP translation is metric cm
-// Report translation at a pivot (the neck) instead of the face origin, so pure
-// head rotation rotates in place instead of sliding. The pivot is offset from
-// the face origin in the canonical model frame: +y is down, +z is toward the
-// back of the head (nose points to -z). Raise these if rotations still slide.
-const PIVOT_NECK_DOWN_CM: f64 = 11.0;
-const PIVOT_NECK_BACK_CM: f64 = 6.0;
-const SMOOTH: f64 = 0.5;
-const CALIB_FRAMES: usize = 30;
-const CLAMP_DEG: f64 = 45.0;
-/// UVC camera (560x560 frames): half-size (px) of the first crop and the
-/// height of its centre (fraction of the frame).
-const CROP_HALF: f32 = 160.0;
-const CY_FRAC: f64 = 0.42;
-const FOCAL: f64 = 457.0; // ~63deg vertical FOV on a 560px frame (matches MediaPipe)
 /// The device's own 280x280 IR stream (EP 0x83, stream 0x50e), upscaled 2x to
-/// 560x560 so the same crop/landmark pipeline applies. Focal length fitted on
-/// the Windows captures: iris pixels vs projected 0x83 eyeball centres give
-/// f = 376 px in the 280 frame (r² 0.999), i.e. 752 px at 560.
+/// 560x560: the size of the UVC camera's frames, which the crop/landmark
+/// pipeline was first built for. Focal length fitted on the Windows captures:
+/// iris pixels vs projected 0x83 eyeball centres give f = 376 px in the 280
+/// frame (r² 0.999), i.e. 752 px at 560.
 const IMAGE83_FOCAL: f64 = 752.0;
 const IMAGE83_CY_FRAC: f64 = 0.5;
 /// Half-size (px at 560) of the first 0x50e face crop; once a face is found,
@@ -70,12 +51,6 @@ const ROI_SCALE: f64 = 1.5;
 /// The landmarks the crop is turned by: the outer corners of the subject's
 /// right eye (image left) and left eye (image right).
 const EYE_LINE: (usize, usize) = (33, 263);
-/// The tracker camera looks up ~20° at the user (the device's S frame is
-/// tilted 20.0° relative to the display frame). Relative head rotations are
-/// expressed in the upright (display) frame, so yaw is a turn about the true
-/// vertical: with the camera-frame decomposition a 30° turn read as 28° yaw +
-/// 11° roll and a 20° tilt as 19° roll + 7° yaw. Override: `TOBII_CAMERA_TILT_DEG`.
-const CAMERA_TILT_DEG: f64 = 20.0;
 
 /// The frames [`Tracker::fit`] takes and how the face crop is sized in them:
 /// the camera's square image, which the tracker enlarges `upscale` times
@@ -85,8 +60,8 @@ const CAMERA_TILT_DEG: f64 = 20.0;
 /// limits. All sizes but `native_size` are in the pixels of the enlarged
 /// frame.
 ///
-/// [`Geometry::IMAGE83`] is the device's own IR stream, [`Geometry::UVC`]
-/// the UVC camera of the `track` research command.
+/// [`Geometry::IMAGE83`] is the device's own IR stream, the one the tracker
+/// is built for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Geometry {
@@ -124,22 +99,6 @@ impl Geometry {
         cy_frac: IMAGE83_CY_FRAC,
         min_half: IMAGE83_MIN_HALF,
         max_half: IMAGE83_MAX_HALF,
-    };
-
-    /// The UVC camera on interface 2 (the `track` research command):
-    /// 560x560 frames as they come, focal length 457 px; crops start at
-    /// half-size 160 at 0.42 of the frame's height. The limits of a crop
-    /// sized from the landmarks or a detection are the 0x50e stream's scaled
-    /// by the ratio of the start sizes (160 / 150): 128-213. Neither they nor
-    /// the face detector on this camera's frames have ever been validated.
-    pub const UVC: Self = Self {
-        native_size: 560,
-        upscale: 1,
-        focal: FOCAL,
-        start_half: CROP_HALF,
-        cy_frac: CY_FRAC,
-        min_half: CROP_HALF * (IMAGE83_MIN_HALF / IMAGE83_CROP_HALF),
-        max_half: CROP_HALF * (IMAGE83_MAX_HALF / IMAGE83_CROP_HALF),
     };
 
     /// Side (px) of the frame the landmark model crops from: the camera's
@@ -486,7 +445,8 @@ pub fn kabsch(reference: &[[f64; 3]], current: &[[f64; 3]]) -> [[f64; 3]; 3] {
     ]
 }
 
-/// [pitch, yaw, roll] in degrees from a rotation matrix.
+/// [pitch, yaw, roll] in degrees from a rotation matrix: the zyx Euler
+/// angles of `R = Rz(roll) · Ry(yaw) · Rx(pitch)`, yaw in [−90°, 90°].
 #[must_use]
 pub fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
     let sy = (r[0][0] * r[0][0] + r[1][0] * r[1][0]).sqrt();
@@ -503,39 +463,6 @@ pub fn euler_deg(r: &[[f64; 3]; 3]) -> [f64; 3] {
             0.0,
         ]
     }
-}
-
-const IDENTITY3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
-/// Inverse of `euler_deg`: R = Rz(roll) * Ry(yaw) * Rx(pitch), degrees in.
-#[must_use]
-fn from_euler_deg(e: &[f64; 3]) -> [[f64; 3]; 3] {
-    let (sa, ca) = e[0].to_radians().sin_cos();
-    let (sb, cb) = e[1].to_radians().sin_cos();
-    let (sg, cg) = e[2].to_radians().sin_cos();
-    [
-        [cg * cb, cg * sb * sa - sg * ca, cg * sb * ca + sg * sa],
-        [sg * cb, sg * sb * sa + cg * ca, sg * sb * ca - cg * sa],
-        [-sb, cb * sa, cb * ca],
-    ]
-}
-
-/// `T · R · R0^T · T^T`: the rotation that takes the rest pose `R0` to `R`,
-/// expressed in the upright frame (`T` = camera -> upright).
-#[must_use]
-fn relative_upright(r: &[[f64; 3]; 3], r0: &[[f64; 3]; 3], t: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    matmul3(&matmul3(t, &matmul3(r, &transpose3(r0))), &transpose3(t))
-}
-
-#[must_use]
-fn transpose3(r: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut o = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            o[i][j] = r[j][i];
-        }
-    }
-    o
 }
 
 #[must_use]
@@ -748,10 +675,11 @@ pub(crate) fn canonical_f64() -> Vec<[f64; 3]> {
 /// frame. Only this crate builds one, so fields can be added without
 /// breaking a reader.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct FaceFit<'a> {
     /// Rotation of the mesh into the camera frame (object -> camera; camera x
     /// right, y down, z forward), as the perspective fit gives it: no
-    /// `MediaPipe` sign flips and no rest pose.
+    /// `MediaPipe` sign flips.
     pub rotation: [[f64; 3]; 3],
     /// The mesh origin in the camera frame, mm.
     pub translation_mm: [f64; 3],
@@ -769,10 +697,6 @@ pub struct FaceFit<'a> {
     /// followed the face lost it, or the face had been lost before, and the
     /// landmark model found it where the detector put the crop.
     pub found_by_detector: bool,
-    /// `translation_mm` in cm, exactly as the solver returned it. The legacy
-    /// pose is computed in cm, and a cm -> mm -> cm round trip changes the
-    /// last bit of about one value in eleven.
-    translation_cm: [f64; 3],
 }
 
 impl<'a> FaceFit<'a> {
@@ -790,7 +714,6 @@ impl<'a> FaceFit<'a> {
             landmarks,
             score,
             found_by_detector,
-            translation_cm,
         }
     }
 }
@@ -807,20 +730,19 @@ pub struct ModelRuns {
     pub detector: u64,
 }
 
-/// Live head-pose tracker: face-following crop, landmark inference, the face
-/// detector for a face the crop lost and the perspective fit
-/// ([`Tracker::fit`]), plus the legacy pose relative to a calibrated rest
-/// pose: `process` returns the `OpenTrack` pose [TX, TY, TZ, Yaw, Pitch,
-/// Roll] of its own [`RestPose`] once calibrated, else `None`.
+/// The face tracker: face-following crop, landmark inference, the face
+/// detector for a face the crop lost and the perspective fit, which make a
+/// [`FaceFit`] of each frame ([`Tracker::fit`]). A
+/// [`HeadStep`](crate::head::HeadStep) makes the head pose of the fits with
+/// a fitter of its own.
 pub struct Tracker {
     face: FaceFitter<OnnxModels>,
-    rest: RestPose,
 }
 
-/// The half of [`Tracker`] that makes a [`FaceFit`] of each frame: the
-/// face-following crop, the landmark model, the face detector and the
-/// perspective fit. The models are [`OnnxModels`] in a [`Tracker`] and in a
-/// [`HeadStep`](crate::head::HeadStep); the tests give it scripted ones.
+/// What makes a [`FaceFit`] of each frame for a [`Tracker`] and a
+/// [`HeadStep`](crate::head::HeadStep): the face-following crop, the
+/// landmark model, the face detector and the perspective fit. Their models
+/// are [`OnnxModels`]; the tests give it scripted ones.
 pub(crate) struct FaceFitter<M> {
     models: Models<M>,
     canonical: Vec<[f64; 3]>,
@@ -901,57 +823,7 @@ struct Models<M> {
     runs: ModelRuns,
 }
 
-/// The legacy head pose, the one tobiid publishes on the `HEAD` stream: each
-/// fit moved to a neck pivot, taken relative to the mean of the first 30 fits
-/// (`CALIB_FRAMES`), read in the upright frame with `MediaPipe`'s signs,
-/// clamped to ±45° and smoothed.
-///
-/// [`RestPose::update`] takes one frame at a time and returns the `OpenTrack`
-/// pose [TX, TY, TZ (cm), Yaw, Pitch, Roll (deg)] once the rest pose is
-/// calibrated. [`Default`] gives the built-in settings,
-/// [`RestPose::from_env`] the daemon's (with the environment overrides).
-#[derive(Debug, Clone)]
-pub struct RestPose {
-    pivot: [f64; 3], // neck offset in model cm: [0, down, back]
-    debug: bool,
-    roll_eyeline: bool,
-    /// Fits taken, for the `TOBII_POSE_DEBUG` cadence.
-    frame: u64,
-    /// Pose of the last frame before rest-pose subtraction and smoothing:
-    /// [tx, ty, tz (cm at the pivot), pitch, yaw, roll (deg)]; `None` when no
-    /// face was found in it.
-    last_raw: Option<[f64; 6]>,
-    origin: Option<[f64; 6]>,
-    accum: Vec<[f64; 6]>,
-    out: [f64; 6],
-    have: bool,
-    /// Rest-pose rotation (head -> camera) captured at calibration. Angles are
-    /// reported from the relative rotation `T · R · rot0^T · T^T`, i.e. in the
-    /// upright frame (`T` undoes the camera tilt): subtracting euler angles per
-    /// axis instead would leak yaw into roll (and back) through the camera's
-    /// ~20° upward tilt (0.4 deg/deg).
-    rot0: Option<[[f64; 3]; 3]>,
-    /// `T` = Rx(camera tilt): camera frame -> upright frame.
-    untilt: [[f64; 3]; 3],
-}
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 impl Tracker {
-    /// Tracker for the UVC camera path ([`Geometry::UVC`]: 560x560 frames,
-    /// `MediaPipe`-like FOV).
-    ///
-    /// # Errors
-    /// Fails when a model cannot be loaded.
-    pub fn new() -> Result<Self> {
-        Self::with_geometry(Geometry::UVC)
-    }
-
     /// Tracker for the 0x50e image stream ([`Geometry::IMAGE83`]): feed it
     /// the stream's 280x280 frames as they come.
     ///
@@ -962,10 +834,7 @@ impl Tracker {
     }
 
     /// Tracker for frames of `geometry`, its first crop upright and of the
-    /// start size, centred across the frame at `cy_frac` of its height. Its
-    /// [`RestPose`] reads the `TOBII_PIVOT_DOWN`, `TOBII_PIVOT_BACK`,
-    /// `TOBII_POSE_DEBUG`, `TOBII_ROLL_EYELINE` and `TOBII_CAMERA_TILT_DEG`
-    /// overrides ([`RestPose::from_env`]).
+    /// start size, centred across the frame at `cy_frac` of its height.
     ///
     /// # Errors
     /// Fails when `geometry` has no pixels (a size or factor of 0), an
@@ -974,29 +843,15 @@ impl Tracker {
     /// frame, or crop limits that are not two positive numbers in order; or
     /// when a model cannot be loaded.
     pub fn with_geometry(geometry: Geometry) -> Result<Self> {
-        let face = FaceFitter::with_geometry(geometry)?;
         Ok(Self {
-            face,
-            rest: RestPose::from_env(),
+            face: FaceFitter::with_geometry(geometry)?,
         })
-    }
-
-    /// Unfiltered pose of the last frame `process` took (see
-    /// [`RestPose::last_raw`]), for offline analysis.
-    #[must_use]
-    pub fn last_raw(&self) -> Option<[f64; 6]> {
-        self.rest.last_raw()
     }
 
     /// How many times the tracker has run each model.
     #[must_use]
     pub fn model_runs(&self) -> ModelRuns {
         self.face.model_runs()
-    }
-
-    /// Drop the calibrated rest pose so it recalibrates from the next frames.
-    pub fn recenter(&mut self) {
-        self.rest.recenter();
     }
 
     /// Fit the face mesh to one `w`x`h` grayscale frame of the tracker's
@@ -1011,8 +866,7 @@ impl Tracker {
     /// found, or the best-scoring one before any was (`choose_detection`).
     /// At most two landmark runs and one detector run per frame.
     ///
-    /// The fit borrows the tracker until the next frame. It leaves the legacy
-    /// pose alone: `process` is `fit` followed by the tracker's [`RestPose`].
+    /// The fit borrows the tracker until the next frame.
     ///
     /// # Errors
     /// Fails when the frame is not [`Geometry::native_size`] pixels square or
@@ -1021,19 +875,6 @@ impl Tracker {
     /// 468 landmarks.
     pub fn fit(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<FaceFit<'_>>> {
         self.face.fit(gray, w, h)
-    }
-
-    /// Run one `w`x`h` grayscale frame through the pipeline: [`Tracker::fit`],
-    /// then [`RestPose::update`]. Returns the smoothed `OpenTrack` pose once the
-    /// rest pose is calibrated; `None` while calibrating or when no face is
-    /// found.
-    ///
-    /// # Errors
-    /// Fails when the frame does not fit the tracker's geometry or a model
-    /// fails (see [`Tracker::fit`]).
-    pub fn process(&mut self, gray: &[u8], w: usize, h: usize) -> Result<Option<[f64; 6]>> {
-        let fit = self.face.fit(gray, w, h)?;
-        Ok(self.rest.update(fit.as_ref()))
     }
 }
 
@@ -1302,188 +1143,6 @@ impl<M: FaceModels> FaceFitter<M> {
     }
 }
 
-impl Default for RestPose {
-    /// The built-in settings, whatever the environment says: the neck pivot
-    /// 11 cm down and 6 cm back, a 20° camera tilt, roll from the fit and no
-    /// debug log.
-    fn default() -> Self {
-        Self::new(
-            [0.0, PIVOT_NECK_DOWN_CM, PIVOT_NECK_BACK_CM],
-            CAMERA_TILT_DEG,
-            false,
-            false,
-        )
-    }
-}
-
-impl RestPose {
-    /// `pivot` in model cm ([0, down, back]), the camera tilt in degrees.
-    fn new(pivot: [f64; 3], camera_tilt_deg: f64, roll_eyeline: bool, debug: bool) -> Self {
-        Self {
-            pivot,
-            debug,
-            roll_eyeline,
-            frame: 0,
-            last_raw: None,
-            origin: None,
-            accum: Vec::with_capacity(CALIB_FRAMES),
-            out: [0.0; 6],
-            have: false,
-            rot0: None,
-            untilt: from_euler_deg(&[camera_tilt_deg, 0.0, 0.0]),
-        }
-    }
-
-    /// The legacy pose as the daemon runs it: the built-in settings with the
-    /// `TOBII_PIVOT_DOWN`, `TOBII_PIVOT_BACK` (cm), `TOBII_CAMERA_TILT_DEG`,
-    /// `TOBII_ROLL_EYELINE` and `TOBII_POSE_DEBUG` overrides applied.
-    #[must_use]
-    pub fn from_env() -> Self {
-        let pivot = [
-            0.0,
-            env_f64("TOBII_PIVOT_DOWN", PIVOT_NECK_DOWN_CM),
-            env_f64("TOBII_PIVOT_BACK", PIVOT_NECK_BACK_CM),
-        ];
-        let debug = std::env::var("TOBII_POSE_DEBUG").is_ok();
-        let roll_eyeline =
-            std::env::var("TOBII_ROLL_EYELINE").is_ok_and(|v| !v.is_empty() && v != "0");
-        info!(
-            pivot_down_cm = pivot[1],
-            pivot_back_cm = pivot[2],
-            roll_eyeline,
-            "tracker pivot"
-        );
-        Self::new(
-            pivot,
-            env_f64("TOBII_CAMERA_TILT_DEG", CAMERA_TILT_DEG),
-            roll_eyeline,
-            debug,
-        )
-    }
-
-    /// Unfiltered pose of the last frame [`RestPose::update`] took, before
-    /// rest-pose subtraction and smoothing: [tx, ty, tz (cm at the neck
-    /// pivot), pitch, yaw, roll (deg, `MediaPipe` signs)]; `None` when that
-    /// frame had no face. For offline analysis.
-    #[must_use]
-    pub fn last_raw(&self) -> Option<[f64; 6]> {
-        self.last_raw
-    }
-
-    /// Drop the calibrated rest pose so it recalibrates from the next frames.
-    pub fn recenter(&mut self) {
-        self.origin = None;
-        self.rot0 = None;
-        self.accum.clear();
-        self.have = false;
-        info!("recenter: recalibrating rest pose");
-    }
-
-    /// Take one frame: its fit, or `None` when no face was found in it.
-    /// Returns the smoothed `OpenTrack` pose [TX, TY, TZ (cm), Yaw, Pitch,
-    /// Roll (deg)] once the rest pose is calibrated; `None` while calibrating
-    /// (the first 30 fits after construction or [`RestPose::recenter`]) and
-    /// for a frame without a face, which changes nothing but
-    /// [`RestPose::last_raw`].
-    pub fn update(&mut self, fit: Option<&FaceFit<'_>>) -> Option<[f64; 6]> {
-        let Some(fit) = fit else {
-            self.last_raw = None;
-            return None;
-        };
-        let (r, t) = (&fit.rotation, &fit.translation_cm);
-        let e = euler_deg(r);
-        // Match MediaPipe's convention (yaw/roll negate vs our euler).
-        let mut mp = [e[0], -e[1], -e[2]]; // pitch, yaw, roll
-
-        // Optional: measure roll directly from the eye line (outer corners 33 &
-        // 263). This is decoupled from yaw/pitch and symmetric by construction,
-        // avoiding euler cross-axis coupling. Flip the sign here if reversed.
-        if self.roll_eyeline {
-            let r_eye = fit.landmarks[33]; // subject's right eye outer (image left)
-            let l_eye = fit.landmarks[263]; // subject's left eye outer (image right)
-            let dx = l_eye[0] - r_eye[0];
-            let dy = l_eye[1] - r_eye[1];
-            mp[2] = -dy.atan2(dx).to_degrees();
-        }
-
-        // Translate the reported position to the neck pivot: t' = t + R*pivot.
-        // A pure head rotation about the neck then leaves t' ~constant (rotates
-        // in place) instead of swinging the face origin sideways.
-        let rp = matvec3(r, &self.pivot);
-        let tp = [t[0] + rp[0], t[1] + rp[1], t[2] + rp[2]];
-        let raw = [tp[0], tp[1], tp[2], mp[0], mp[1], mp[2]]; // translation in cm
-        self.last_raw = Some(raw);
-
-        self.frame += 1;
-        if self.debug && self.frame.is_multiple_of(8) {
-            // Opted in via TOBII_POSE_DEBUG, so it stays visible at the
-            // default (info) filter level.
-            info!(
-                yaw = mp[1],
-                pitch = mp[0],
-                tx = t[0],
-                ty = t[1],
-                tz = t[2],
-                pivot_tx = tp[0],
-                pivot_ty = tp[1],
-                pivot_tz = tp[2],
-                "pose (deg, cm)"
-            );
-        }
-
-        let Some(o) = self.origin else {
-            self.accum.push(raw);
-            if self.accum.len() >= CALIB_FRAMES {
-                let n = self.accum.len() as f64;
-                let mut o = [0.0; 6];
-                for a in &self.accum {
-                    for (oi, ai) in o.iter_mut().zip(a) {
-                        *oi += ai / n;
-                    }
-                }
-                self.origin = Some(o);
-                // Rest rotation from the averaged eulers (undo the MediaPipe
-                // sign flip applied to `mp`).
-                self.rot0 = Some(from_euler_deg(&[o[3], -o[4], -o[5]]));
-                info!("calibrated rest pose");
-            }
-            return None;
-        };
-
-        let tx = (raw[0] - o[0]) * TRANS_SIGN[0] * TRANS_GAIN[0];
-        let ty = (raw[1] - o[1]) * TRANS_SIGN[1] * TRANS_GAIN[1];
-        let tz = (raw[2] - o[2]) * TRANS_SIGN[2] * TRANS_GAIN[2];
-        let clamp = |v: f64| v.clamp(-CLAMP_DEG, CLAMP_DEG);
-        // Relative rotation R · R0^T (R is head -> camera), expressed in the
-        // upright frame so yaw is about the true vertical.
-        let r_rel = relative_upright(r, &self.rot0.unwrap_or(IDENTITY3), &self.untilt);
-        let er = euler_deg(&r_rel);
-        let mut rel = [er[0], -er[1], -er[2]]; // pitch, yaw, roll (MediaPipe sign)
-        if self.roll_eyeline {
-            rel[2] = raw[5] - o[5]; // eye-line roll is an image-plane measure
-        }
-        let pitch = clamp(rel[0] * ANGLE_SIGN[0]);
-        let yaw = clamp(rel[1] * ANGLE_SIGN[1]);
-        let roll = clamp(rel[2] * ANGLE_SIGN[2]);
-        let (tx, ty, tz) = if SEND_TRANSLATION {
-            (tx, ty, tz)
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        let target = [tx, ty, tz, yaw, pitch, roll]; // OpenTrack order
-
-        if self.have {
-            for (out, tgt) in self.out.iter_mut().zip(&target) {
-                *out += SMOOTH * (tgt - *out);
-            }
-        } else {
-            self.out = target;
-            self.have = true;
-        }
-        Some(self.out)
-    }
-}
-
 #[cfg(test)]
 // reason: unwrap on fixtures is the idiomatic test failure (test-* rules).
 #[allow(clippy::unwrap_used)]
@@ -1491,73 +1150,22 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    #[test]
-    fn from_euler_round_trips_euler_deg() {
-        for e in [[-20.0, 30.0, 5.0], [10.0, -40.0, -12.0], [0.0, 0.0, 0.0]] {
-            let back = euler_deg(&from_euler_deg(&e));
-            for k in 0..3 {
-                assert!((back[k] - e[k]).abs() < 1e-9, "{e:?} -> {back:?}");
-            }
-        }
+    const IDENTITY3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    fn transpose3(r: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+        std::array::from_fn(|i| std::array::from_fn(|j| r[j][i]))
     }
 
-    #[test]
-    fn relative_rotation_does_not_leak_yaw_into_roll() {
-        // Camera looks up 20°: camera = Rx(-20) · upright. The head at rest is
-        // additionally pitched 8° down in the upright frame; it then turns 30°
-        // about the WORLD vertical and, separately, rolls 20°.
-        let tilt = from_euler_deg(&[20.0, 0.0, 0.0]); // upright -> camera is its transpose
-        let cam_from_up = transpose3(&tilt);
-        let rest_up = from_euler_deg(&[-8.0, 0.0, 0.0]);
-        let r0 = matmul3(&cam_from_up, &rest_up);
-        let turned = matmul3(
-            &cam_from_up,
-            &matmul3(&from_euler_deg(&[0.0, 30.0, 0.0]), &rest_up),
-        );
-        let naive = euler_deg(&turned);
-        let e0 = euler_deg(&r0);
-        assert!(
-            (naive[2] - e0[2]).abs() > 8.0,
-            "per-axis subtraction leaks roll: {naive:?} - {e0:?}"
-        );
-        let e = euler_deg(&relative_upright(&turned, &r0, &tilt));
-        assert!(
-            e[0].abs() < 1e-9 && (e[1] - 30.0).abs() < 1e-9 && e[2].abs() < 1e-9,
-            "{e:?}"
-        );
-        let rolled = matmul3(
-            &cam_from_up,
-            &matmul3(&from_euler_deg(&[0.0, 0.0, 20.0]), &rest_up),
-        );
-        let e = euler_deg(&relative_upright(&rolled, &r0, &tilt));
-        assert!(e[1].abs() < 1e-9 && (e[2] - 20.0).abs() < 1e-9, "{e:?}");
-    }
-
-    /// Where the synthetic face rests: 60 cm in front of the camera.
-    const REST: [f64; 3] = [0.0, 0.0, 60.0];
-
-    /// Landmarks for a synthetic fit: all at the origin but the outer eye
-    /// corners, 60 px apart on a line rolled `deg` (eye-line roll sign).
-    fn eye_line(deg: f64) -> [[f64; 2]; NLM] {
-        let mut lm = [[0.0; 2]; NLM];
-        let (s, c) = deg.to_radians().sin_cos();
-        lm[33] = [100.0, 200.0]; // subject's right eye outer (image left)
-        lm[263] = [100.0 + 60.0 * c, 200.0 - 60.0 * s]; // image y is down
-        lm
-    }
-
-    /// Head -> camera rotation whose rotation from the identity, read in the
-    /// default `RestPose`'s upright frame, is `from_euler_deg(e)`: the legacy
-    /// pose of a head that calibrated at the identity is then
-    /// pitch `e[0]`, yaw `-e[1]`, roll `-e[2]`.
-    fn upright(e: [f64; 3]) -> [[f64; 3]; 3] {
-        let t = from_euler_deg(&[CAMERA_TILT_DEG, 0.0, 0.0]);
-        matmul3(&transpose3(&t), &matmul3(&from_euler_deg(&e), &t))
-    }
-
-    /// A synthetic fit: rotation `r`, the mesh origin at `t_cm`.
-    fn synthetic(r: [[f64; 3]; 3], t_cm: [f64; 3], lm: &[[f64; 2]; NLM]) -> FaceFit<'_> {
-        FaceFit::new(r, t_cm, lm, 1.0, false)
+    /// `Rz(roll) · Ry(yaw) · Rx(pitch)` of [pitch, yaw, roll] in degrees.
+    fn rz_ry_rx(e: [f64; 3]) -> [[f64; 3]; 3] {
+        let (sa, ca) = e[0].to_radians().sin_cos();
+        let (sb, cb) = e[1].to_radians().sin_cos();
+        let (sg, cg) = e[2].to_radians().sin_cos();
+        [
+            [cg * cb, cg * sb * sa - sg * ca, cg * sb * ca + sg * sa],
+            [sg * cb, sg * sb * sa + cg * ca, sg * sb * ca - cg * sa],
+            [-sb, cb * sa, cb * ca],
+        ]
     }
 
     fn assert_close(got: &[f64], want: &[f64]) {
@@ -1567,186 +1175,19 @@ mod tests {
         }
     }
 
-    /// Feed `fit` until `rest` is calibrated on it: no pose comes out yet.
-    fn calibrate(rest: &mut RestPose, fit: &FaceFit<'_>) {
-        for i in 0..CALIB_FRAMES {
-            assert!(rest.update(Some(fit)).is_none(), "calibrating, fit {i}");
+    #[test]
+    fn euler_deg_reads_back_the_angles_of_rz_ry_rx() {
+        for e in [[-20.0, 30.0, 5.0], [10.0, -40.0, -12.0], [0.0, 0.0, 0.0]] {
+            assert_close(&euler_deg(&rz_ry_rx(e)), &e);
         }
     }
 
-    /// A default rest pose calibrated on the face at `REST`, facing the camera.
-    fn calibrated(lm: &[[f64; 2]; NLM]) -> RestPose {
-        let mut rest = RestPose::default();
-        calibrate(&mut rest, &synthetic(IDENTITY3, REST, lm));
-        rest
-    }
-
     #[test]
-    fn face_fit_is_in_millimetres_and_keeps_the_solver_centimetres() {
-        let lm = eye_line(0.0);
-        let fit = synthetic(IDENTITY3, [1.25, -2.5, 61.0], &lm);
+    fn face_fit_is_in_millimetres() {
+        let landmarks = [[0.0; 2]; NLM];
+        let fit = FaceFit::new(IDENTITY3, [1.25, -2.5, 61.0], &landmarks, 1.0, false);
         let bits = |v: [f64; 3]| v.map(f64::to_bits);
         assert_eq!(bits(fit.translation_mm), bits([12.5, -25.0, 610.0]));
-        assert_eq!(bits(fit.translation_cm), bits([1.25, -2.5, 61.0]));
-    }
-
-    #[test]
-    fn rest_pose_is_the_mean_of_the_first_fits() {
-        let lm = eye_line(0.0);
-        let near = synthetic(IDENTITY3, [1.0, -2.0, 60.0], &lm);
-        let far = synthetic(IDENTITY3, [3.0, -2.0, 62.0], &lm);
-        let mut rest = RestPose::default();
-        for i in 0..CALIB_FRAMES {
-            let fit = if i % 2 == 0 { &near } else { &far };
-            assert!(rest.update(Some(fit)).is_none(), "calibrating, fit {i}");
-        }
-        // Raw: the translation at the neck pivot, 11 cm down and 6 cm back.
-        assert_close(&rest.last_raw().unwrap(), &[3.0, 9.0, 68.0, 0.0, 0.0, 0.0]);
-        // Rest = the mean, (2, -2, 61); the pose is its negated offset from it.
-        let moved = synthetic(IDENTITY3, [3.5, -2.5, 63.0], &lm);
-        let out = rest.update(Some(&moved)).unwrap();
-        assert_close(&out, &[-1.5, 0.5, -2.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn rest_pose_reads_the_rotation_in_the_upright_frame_with_mediapipe_signs() {
-        let lm = eye_line(0.0);
-        let mut rest = calibrated(&lm);
-        let turned = synthetic(upright([-10.0, 20.0, 5.0]), REST, &lm);
-        let out = rest.update(Some(&turned)).unwrap();
-        // [.., yaw, pitch, roll]; the translation moves too, as the neck pivot
-        // swings with the head.
-        assert_close(&out[3..], &[-20.0, -10.0, -5.0]);
-        assert!(out[..3].iter().any(|v| v.abs() > 0.1), "{out:?}");
-    }
-
-    #[test]
-    fn rest_pose_reads_the_rotation_from_a_rest_pose_that_is_not_straight_ahead() {
-        // Calibrated on a head at pitch -8°, yaw 12° and roll 3° in the
-        // upright frame (`from_euler_deg`'s angles), not facing the camera.
-        let lm = eye_line(0.0);
-        let at_rest = upright([-8.0, 12.0, 3.0]);
-        let calibrated_turned = || {
-            let mut rest = RestPose::default();
-            calibrate(&mut rest, &synthetic(at_rest, REST, &lm));
-            rest
-        };
-        // The rest pose itself then reads as no rotation and no move.
-        let out = calibrated_turned().update(Some(&synthetic(at_rest, REST, &lm)));
-        assert_close(&out.unwrap(), &[0.0; 6]);
-        // A further rotation of pitch 10° and yaw 20° from there reads as
-        // exactly that, with MediaPipe's signs (yaw negated).
-        let turned = matmul3(&upright([10.0, 20.0, 0.0]), &at_rest);
-        let out = calibrated_turned().update(Some(&synthetic(turned, REST, &lm)));
-        assert_close(&out.unwrap()[3..], &[-20.0, 10.0, 0.0]);
-    }
-
-    #[test]
-    fn rest_pose_moves_the_translation_to_the_neck_pivot() {
-        let lm = eye_line(0.0);
-        let mut rest = RestPose::default();
-        // A 30° turn about the camera's y axis swings the pivot, (0, 11, 6) cm
-        // in the face frame, to (6 sin 30°, 11, 6 cos 30°).
-        let turned = synthetic(from_euler_deg(&[0.0, 30.0, 0.0]), [1.0, 2.0, 50.0], &lm);
-        assert!(rest.update(Some(&turned)).is_none());
-        let (s, c) = 30f64.to_radians().sin_cos();
-        let raw = rest.last_raw().unwrap();
-        assert_close(
-            &raw,
-            &[1.0 + 6.0 * s, 13.0, 50.0 + 6.0 * c, 0.0, -30.0, 0.0],
-        );
-    }
-
-    #[test]
-    fn rest_pose_clamps_the_angles_to_45_degrees() {
-        let lm = eye_line(0.0);
-        let turned = synthetic(upright([-70.0, -60.0, 0.0]), REST, &lm);
-        let out = calibrated(&lm).update(Some(&turned)).unwrap();
-        assert_close(&out[3..5], &[45.0, -45.0]);
-        let rolled = synthetic(upright([0.0, 0.0, 50.0]), REST, &lm);
-        let out = calibrated(&lm).update(Some(&rolled)).unwrap();
-        assert_close(&out[5..], &[-45.0]);
-    }
-
-    #[test]
-    fn rest_pose_smooths_all_six_outputs_after_the_first() {
-        let lm = eye_line(0.0);
-        let a = synthetic(upright([2.0, -4.0, 6.0]), [2.0, 0.0, 60.0], &lm);
-        let b = synthetic(upright([10.0, -12.0, 14.0]), [6.0, -4.0, 64.0], &lm);
-        // What `b` reads unsmoothed: as the first pose after calibration.
-        let target = calibrated(&lm).update(Some(&b)).unwrap();
-        let mut rest = calibrated(&lm);
-        let mut want = rest.update(Some(&a)).unwrap();
-        assert_close(&want[3..4], &[4.0]); // `a`'s yaw, as it is
-        for step in 0..3 {
-            for (w, t) in want.iter_mut().zip(&target) {
-                *w += 0.5 * (t - *w);
-            }
-            assert_close(&rest.update(Some(&b)).unwrap(), &want);
-            assert!(
-                want.iter().zip(&target).all(|(w, t)| (w - t).abs() > 0.01),
-                "every output still on its way at step {step}: {want:?} vs {target:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn recenter_recalibrates_and_restarts_the_smoothing() {
-        let lm = eye_line(0.0);
-        let mut rest = calibrated(&lm);
-        let moved = synthetic(IDENTITY3, [2.0, 0.0, 60.0], &lm);
-        assert_close(
-            &rest.update(Some(&moved)).unwrap(),
-            &[-2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        );
-        rest.recenter();
-        // A new rest pose, 5 cm right, 1 cm down and 10 cm further away.
-        calibrate(&mut rest, &synthetic(IDENTITY3, [5.0, 1.0, 70.0], &lm));
-        let away = synthetic(IDENTITY3, [5.0, 1.0, 73.0], &lm);
-        // Relative to the new rest pose, and not blended with the -2 cm before.
-        assert_close(
-            &rest.update(Some(&away)).unwrap(),
-            &[0.0, 0.0, -3.0, 0.0, 0.0, 0.0],
-        );
-    }
-
-    #[test]
-    fn a_frame_without_a_face_only_clears_the_raw_pose() {
-        let lm = eye_line(0.0);
-        let at_rest = synthetic(IDENTITY3, REST, &lm);
-        let mut rest = RestPose::default();
-        for _ in 1..CALIB_FRAMES {
-            assert!(rest.update(Some(&at_rest)).is_none());
-        }
-        assert!(rest.update(None).is_none());
-        assert!(rest.last_raw().is_none());
-        // The calibration goes on where it was: one more fit completes it.
-        assert!(rest.update(Some(&at_rest)).is_none());
-        assert!(rest.last_raw().is_some());
-        let moved = synthetic(IDENTITY3, [2.0, 0.0, 60.0], &lm);
-        assert_close(
-            &rest.update(Some(&moved)).unwrap(),
-            &[-2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        );
-        // So does the smoothing, across the frame without a face.
-        assert!(rest.update(None).is_none());
-        let further = synthetic(IDENTITY3, [4.0, 0.0, 60.0], &lm);
-        assert_close(
-            &rest.update(Some(&further)).unwrap(),
-            &[-3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        );
-    }
-
-    #[test]
-    fn eye_line_roll_replaces_the_fitted_roll() {
-        let pivot = [0.0, PIVOT_NECK_DOWN_CM, PIVOT_NECK_BACK_CM];
-        let mut rest = RestPose::new(pivot, CAMERA_TILT_DEG, true, false);
-        calibrate(&mut rest, &synthetic(IDENTITY3, REST, &eye_line(0.0)));
-        // Rolled 25° by the fit and 12° by the eye line: the eye line wins.
-        let rolled = eye_line(12.0);
-        let fit = synthetic(upright([0.0, 0.0, 25.0]), REST, &rolled);
-        assert_close(&rest.update(Some(&fit)).unwrap()[5..], &[12.0]);
-        assert_close(&rest.last_raw().unwrap()[5..], &[12.0]);
     }
 
     /// A grey frame with detail at every scale: a hash of the pixel position,
@@ -2046,21 +1487,12 @@ mod tests {
             ..d
         };
         assert!((half(&large, &Geometry::IMAGE83) - 200.0).abs() < 1e-4);
-        // The UVC camera's frames are not enlarged: 0.75 x 96 = 72, raised
-        // to its 128.
-        let uvc = Crop::from_detection(&d, &Geometry::UVC);
-        assert_close(&[uvc.cx, uvc.cy], &[140.0, 108.0]);
-        assert!((half(&d, &Geometry::UVC) - 128.0).abs() < 1e-4, "{uvc:?}");
     }
 
     #[test]
-    fn the_0x50e_geometry_enlarges_its_frames_and_the_uvc_limits_scale_with_its_start() {
+    fn the_0x50e_geometry_enlarges_its_frames_twice() {
         assert_eq!(Geometry::IMAGE83.native_size, 280);
         assert_eq!(Geometry::IMAGE83.frame_size(), 560);
-        assert_eq!(Geometry::UVC.native_size, 560);
-        assert_eq!(Geometry::UVC.frame_size(), 560);
-        let uvc = Geometry::UVC;
-        assert!((uvc.min_half - 128.0).abs() < 1e-4 && (uvc.max_half - 213.333).abs() < 1e-3);
     }
 
     #[test]
@@ -2140,8 +1572,9 @@ mod tests {
         ] {
             assert!(Tracker::with_geometry(bad).is_err(), "{bad:?}");
         }
-        // Both built-in geometries pass.
-        for good in [Geometry::IMAGE83, Geometry::UVC] {
+        // The built-in geometry passes, and so does one whose frames are
+        // not enlarged.
+        for good in [g, Geometry { upscale: 1, ..g }] {
             assert!(Tracker::with_geometry(good).is_ok(), "{good:?}");
         }
     }
@@ -2876,11 +2309,19 @@ mod tests {
     }
 
     /// Regression against the reference Python `solvePnP` result for one
-    /// recorded IR frame. The frame is a photograph of the user's face, so it
-    /// is not committed: point `TOBII_POSE_PGM_FIXTURE` at a 560x560 binary
-    /// PGM to run this (same convention as the two tests above).
+    /// recorded IR frame of the UVC camera, 560x560, with the camera and the
+    /// first crop the reference took for it. The frame is a photograph of
+    /// the user's face, so it is not committed: point
+    /// `TOBII_POSE_PGM_FIXTURE` at a 560x560 binary PGM to run this (same
+    /// convention as the two tests above).
     #[test]
     fn pose_matches_python() {
+        // Focal length (px): about 63° of vertical field of view on the
+        // 560-px frame, as `MediaPipe` takes it. The first crop: half-size
+        // 160 px, centred across at 0.42 of the height.
+        const FOCAL: f64 = 457.0;
+        const CROP_HALF: f32 = 160.0;
+        const CY_FRAC: f64 = 0.42;
         let Ok(path) = std::env::var("TOBII_POSE_PGM_FIXTURE") else {
             return;
         };

@@ -164,7 +164,7 @@ impl PoseStep for HeadStep {
 /// What [`HeadStep::step`] is to know of `image` besides its pixels: its
 /// host time, which the filters step by; the display frame in effect when it
 /// was read, and its generation; and the open that read it. A new generation
-/// or open restarts the filters. The engine makes no legacy pose.
+/// or open restarts the filters.
 #[must_use]
 fn frame_context(image: &ImageSample) -> FrameContext<'_> {
     FrameContext {
@@ -172,7 +172,6 @@ fn frame_context(image: &ImageSample) -> FrameContext<'_> {
         display: image.display_frame.as_deref(),
         display_generation: image.display_generation.get(),
         open: image.open.get(),
-        legacy_wanted: false,
     }
 }
 
@@ -992,7 +991,7 @@ mod tests {
     }
 
     /// The step is told the image's host time, display frame, display
-    /// generation and open, and never asked for the legacy pose.
+    /// generation and open.
     #[test]
     fn a_step_is_told_the_images_host_time_display_frame_generation_and_open() {
         let frame = display_frame();
@@ -1010,7 +1009,6 @@ mod tests {
                 display: Some(&frame),
                 display_generation: 3,
                 open: 2,
-                legacy_wanted: false,
             }
         );
         assert_eq!(
@@ -1020,7 +1018,6 @@ mod tests {
                 display: None,
                 display_generation: 0,
                 open: 0,
-                legacy_wanted: false,
             }
         );
     }

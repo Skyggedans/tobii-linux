@@ -5,9 +5,8 @@
 //! when it loses the face, `MediaPipe`'s `BlazeFace` face detector finds it
 //! again. [`head`] turns the fits into the head pose the Stream Engine
 //! reports: absolute, in the display frame, valid or not for every frame.
-//! [`track::RestPose`] turns them into the legacy 6-DOF pose relative to a
-//! calibrated rest position. The two models and the mesh are embedded at
-//! build time, so no data files have to be installed alongside the binaries.
+//! The two models and the mesh are embedded at build time, so no data files
+//! have to be installed alongside the binaries.
 //!
 //! All three are `MediaPipe`'s and Apache-2.0, not MIT like the rest of the
 //! workspace: `models/LICENSE` and `models/NOTICE` cover them, and

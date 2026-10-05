@@ -373,7 +373,7 @@ rather than 20 MB).
 | Crate | Holds | Heavy deps |
 |---|---|---|
 | `tobii-proto` | wire formats: framing, TLV, commands, the gaze/presence/image streams, device facts, the capture log | none |
-| `tobii-pose` | face landmarks, face detection, the Stream Engine's head pose and the legacy relative one; owns the models | `ort` |
+| `tobii-pose` | face landmarks, face detection and the Stream Engine's head pose; owns the models | `ort` |
 | `tobii-usb` | USB transport and the live `0x83` engine; owns the init capture | `rusb` |
 | `tobii-ipc` | the daemon protocol and its deadlines, the display geometry and the host clock | none (`libc` only) |
 | `tobii-calib` | the calibration blob format and the per-user store | none (std only) |

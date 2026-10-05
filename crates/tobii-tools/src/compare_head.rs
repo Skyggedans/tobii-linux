@@ -777,7 +777,6 @@ fn replay(payloads: &[Vec<u8>], display: &DisplayFrame) -> Result<Replay> {
             display: Some(display),
             display_generation: 1,
             open: 1,
-            legacy_wanted: false,
         };
         let begun = Instant::now();
         let stepped = step.step(&image.pixels, image.width, image.height, &context);

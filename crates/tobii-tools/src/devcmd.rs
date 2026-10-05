@@ -979,7 +979,6 @@ impl LivePoses {
             // The area stays the init capture's while the command runs.
             display_generation: 0,
             open,
-            legacy_wanted: false,
         };
         let out = self
             .step

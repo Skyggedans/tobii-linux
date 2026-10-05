@@ -30,9 +30,8 @@
 //!   those of the last valid pose, zeros before the first.
 //!
 //! [`HeadPoseEstimator`] does this for a stream of fits. [`HeadStep`] is the
-//! whole step from an image to the pose, the legacy relative pose
-//! ([`RestPose`]) included, that the engine's pose worker and the replay
-//! tools share.
+//! whole step from an image to the pose, which the engine's pose worker and
+//! the replay tools share.
 //!
 //! The model is the head-pose study's, fitted to the Windows Stream Engine's
 //! output on three captured sessions ([`HeadParams::FITTED`]); each function
@@ -45,9 +44,7 @@ use anyhow::Result;
 use tobii_ipc::geometry::DisplayFrame;
 use tracing::debug;
 
-use crate::track::{
-    FaceFit, FaceFitter, Geometry, ModelRuns, NLM, OnnxModels, RestPose, matmul3, matvec3,
-};
+use crate::track::{FaceFit, FaceFitter, Geometry, ModelRuns, NLM, OnnxModels, matmul3, matvec3};
 
 /// Side of the 0x50e stream's frames, px: a [`FaceFit`]'s landmarks are in
 /// their pixels.
@@ -753,8 +750,6 @@ pub struct FrameContext<'a> {
     /// A number that changes with each open of the tracker (the engine's
     /// open number): a change restarts the filters.
     pub open: u64,
-    /// Whether to make the legacy relative pose too.
-    pub legacy_wanted: bool,
 }
 
 /// What the tracker found on a frame, for analysis: copied out of its
@@ -788,53 +783,44 @@ impl FaceSeen {
 pub struct StepOutput {
     /// The head pose: one for every frame, valid or not.
     pub head: HeadPose,
-    /// The legacy pose [TX, TY, TZ (cm), Yaw, Pitch, Roll (deg)] of
-    /// [`RestPose::update`]: only when it was wanted, the frame had a face
-    /// and the rest pose is calibrated.
-    pub legacy: Option<[f64; 6]>,
     /// What the tracker found; `None` without a face.
     pub face: Option<FaceSeen>,
     /// How many times the tracker has run each model so far.
     pub model_runs: ModelRuns,
     /// Why the tracker failed on the frame, if it did. The frame then
-    /// counts as one without a face, for both poses.
+    /// counts as one without a face.
     pub error: Option<anyhow::Error>,
 }
 
-/// The step from one 0x50e image to the head poses made of it, which the
+/// The step from one 0x50e image to the head pose made of it, which the
 /// engine's pose worker and the replay tools share: the tracker
 /// ([`Geometry::IMAGE83`]: feed it the stream's 280x280 frames as they
-/// come), the absolute pose of a [`HeadPoseEstimator`] for every frame and,
-/// when wanted, the legacy relative one of a [`RestPose`] — with the rules
-/// for restarting them.
+/// come) and the pose of a [`HeadPoseEstimator`] for every frame, with the
+/// rules for restarting it.
 pub struct HeadStep {
     fitter: FaceFitter<OnnxModels>,
     poses: Poses,
 }
 
 impl HeadStep {
-    /// A step for the head pose model `params`, its legacy pose the daemon's
-    /// ([`RestPose::from_env`]).
+    /// A step for the head pose model `params`.
     ///
     /// # Errors
     /// Fails when a model cannot be loaded.
     pub fn new(params: HeadParams) -> Result<Self> {
         Ok(Self {
             fitter: FaceFitter::with_geometry(Geometry::IMAGE83)?,
-            poses: Poses::new(params, RestPose::from_env()),
+            poses: Poses::new(params),
         })
     }
 
-    /// Make the poses of one `width`x`height` grey `frame` of the 0x50e
-    /// stream, of which `context` tells the rest: always a head pose, and
-    /// the legacy pose when wanted. A tracker failure (a frame of another
-    /// size, a model that fails) makes an invalid pose too, and comes with
-    /// it ([`StepOutput::error`]).
+    /// Make the head pose of one `width`x`height` grey `frame` of the 0x50e
+    /// stream, of which `context` tells the rest: one for every frame,
+    /// valid or not. A tracker failure (a frame of another size, a model
+    /// that fails) makes an invalid pose too, and comes with it
+    /// ([`StepOutput::error`]).
     ///
-    /// The filters of the head pose restart when the display generation or
-    /// the open changes; the rest pose of the legacy one recalibrates when
-    /// it becomes wanted again after the last step, or after
-    /// [`HeadStep::reset`], did not want it.
+    /// The filters restart when the display generation or the open changes.
     #[must_use]
     pub fn step(
         &mut self,
@@ -851,17 +837,10 @@ impl HeadStep {
 
     /// Start over as a new step would, but for the tracker, which goes on
     /// following the face: for the head pose wanted again after a time it was
-    /// not. The head pose restarts its filters and invalid poses carry zeros
-    /// until the next valid one; the legacy pose recalibrates once it is
-    /// wanted.
+    /// not. The filters restart, and invalid poses carry zeros until the
+    /// next valid one.
     pub fn reset(&mut self) {
         self.poses.reset();
-    }
-
-    /// Recalibrate the legacy pose's rest pose from the next frames. The
-    /// head pose is absolute and does not change.
-    pub fn recenter(&mut self) {
-        self.poses.recenter();
     }
 
     /// The head pose model's constants.
@@ -877,31 +856,25 @@ impl HeadStep {
     }
 }
 
-/// Everything of a [`HeadStep`] but the tracker: the two poses it makes of
-/// each fit and the rules that restart them. The tests drive it with
-/// synthetic fits.
+/// Everything of a [`HeadStep`] but the tracker: the pose it makes of each
+/// fit and the rules that restart it. The tests drive it with synthetic
+/// fits.
 #[derive(Debug, Clone)]
 struct Poses {
     estimator: HeadPoseEstimator,
-    rest: RestPose,
     /// The display generation and the open of the last frame.
     last_frame: Option<(u64, u64)>,
-    /// Whether the last frame wanted the legacy pose; `Some(false)` after a
-    /// reset, `None` before the first frame.
-    legacy_was_wanted: Option<bool>,
 }
 
 impl Poses {
-    const fn new(params: HeadParams, rest: RestPose) -> Self {
+    const fn new(params: HeadParams) -> Self {
         Self {
             estimator: HeadPoseEstimator::new(params),
-            rest,
             last_frame: None,
-            legacy_was_wanted: None,
         }
     }
 
-    /// See [`HeadStep::step`]: the poses of a frame the tracker made `fit`
+    /// See [`HeadStep::step`]: the pose of a frame the tracker made `fit`
     /// of.
     fn step_with_fit(
         &mut self,
@@ -925,18 +898,8 @@ impl Poses {
         let head = self
             .estimator
             .step(context.t_us, context.display, fit.as_ref());
-        let legacy = if context.legacy_wanted {
-            if self.legacy_was_wanted == Some(false) {
-                self.rest.recenter();
-            }
-            self.rest.update(fit.as_ref())
-        } else {
-            None
-        };
-        self.legacy_was_wanted = Some(context.legacy_wanted);
         StepOutput {
             head,
-            legacy,
             face: fit.as_ref().map(FaceSeen::of),
             model_runs: ModelRuns::default(),
             error,
@@ -946,12 +909,6 @@ impl Poses {
     /// See [`HeadStep::reset`].
     fn reset(&mut self) {
         self.estimator = HeadPoseEstimator::new(self.estimator.params);
-        self.legacy_was_wanted = Some(false);
-    }
-
-    /// See [`HeadStep::recenter`].
-    fn recenter(&mut self) {
-        self.rest.recenter();
     }
 }
 
@@ -1804,14 +1761,13 @@ mod tests {
     }
 
     /// The context of a frame at `t_us` in `display`, of display generation
-    /// and open 1, the legacy pose not wanted.
+    /// and open 1.
     fn context(t_us: i64, display: &DisplayFrame) -> FrameContext<'_> {
         FrameContext {
             t_us,
             display: Some(display),
             display_generation: 1,
             open: 1,
-            legacy_wanted: false,
         }
     }
 
@@ -1819,14 +1775,14 @@ mod tests {
     fn the_step_makes_one_pose_per_frame_and_the_vectors_sequence() {
         let landmarks = sequence_landmarks();
         let frame = frame_a();
-        let mut poses = Poses::new(vector_params(), RestPose::default());
+        let mut poses = Poses::new(vector_params());
         for (i, want) in BLLP.iter().enumerate() {
             let fit = sequence_fit(i, &landmarks);
             let face = fit.as_ref().map(FaceSeen::of);
             let out = poses.step_with_fit(Ok(fit), &context(SEQUENCE[i].t_us, &frame));
             assert_pose(&out.head, want, &format!("frame {i}"));
             assert_eq!(out.face, face, "frame {i}");
-            assert!(out.legacy.is_none() && out.error.is_none(), "frame {i}");
+            assert!(out.error.is_none(), "frame {i}");
         }
     }
 
@@ -1834,7 +1790,7 @@ mod tests {
     fn invalid_poses_carry_the_last_valid_values_and_zeros_before_the_first() {
         let landmarks = sequence_landmarks();
         let frame = frame_a();
-        let mut poses = Poses::new(HeadParams::FITTED, RestPose::default());
+        let mut poses = Poses::new(HeadParams::FITTED);
         let before = poses.step_with_fit(Ok(None), &context(0, &frame)).head;
         assert_eq!(before, HeadPose::default());
         let valid = poses
@@ -1877,7 +1833,7 @@ mod tests {
         let fit = |i| Ok(sequence_fit(i, &landmarks));
         for (generation, open, restarts) in [(1, 1, false), (2, 1, true), (1, 2, true)] {
             let what = format!("generation {generation}, open {open}");
-            let mut poses = Poses::new(params, RestPose::default());
+            let mut poses = Poses::new(params);
             let _ = poses.step_with_fit(fit(0), &at(0, 1, 1));
             let _ = poses.step_with_fit(fit(1), &at(30_208, 1, 1));
             let out = poses.step_with_fit(fit(2), &at(60_416, generation, open));
@@ -1899,129 +1855,50 @@ mod tests {
         }
     }
 
+    /// A reset between two frames 30 ms apart: the frame after it, without
+    /// a face, makes the invalid pose at zero, the first valid pose is
+    /// unfiltered, and the poses after that are filtered again.
     #[test]
-    fn the_legacy_pose_comes_only_when_wanted_and_recalibrates_when_wanted_again() {
-        let landmarks = sequence_landmarks();
-        let fit = sequence_fit(0, &landmarks);
-        let frame = frame_a();
-        let mut poses = Poses::new(HeadParams::FITTED, RestPose::default());
-        let mut t_us = 0;
-        let mut step = |poses: &mut Poses, legacy_wanted| {
-            t_us += 30_208;
-            let wanted = FrameContext {
-                legacy_wanted,
-                ..context(t_us, &frame)
-            };
-            poses.step_with_fit(Ok(fit), &wanted)
-        };
-        for _ in 0..40 {
-            let out = step(&mut poses, false);
-            assert!(out.head.valid && out.legacy.is_none());
-        }
-        // Wanted: the rest pose calibrates on 30 fits, then the pose comes.
-        for _ in 0..2 {
-            for i in 0..30 {
-                assert!(
-                    step(&mut poses, true).legacy.is_none(),
-                    "calibrating, fit {i}"
-                );
-            }
-            assert!(step(&mut poses, true).legacy.is_some());
-            assert!(step(&mut poses, true).legacy.is_some());
-            // Not wanted for a frame: wanted again, it calibrates again.
-            assert!(step(&mut poses, false).legacy.is_none());
-        }
-    }
-
-    #[test]
-    fn recenter_leaves_the_head_pose_alone() {
-        let landmarks = sequence_landmarks();
-        let frame = frame_a();
-        let mut poses = Poses::new(HeadParams::FITTED, RestPose::default());
-        let mut plain = poses.clone();
-        for i in 0..40 {
-            let fit = sequence_fit(i % 5, &landmarks);
-            let wanted = FrameContext {
-                legacy_wanted: true,
-                ..context(30_208 * i64::try_from(i).unwrap(), &frame)
-            };
-            if i == 35 {
-                poses.recenter();
-            }
-            let out = poses.step_with_fit(Ok(fit), &wanted);
-            let want = plain.step_with_fit(Ok(fit), &wanted);
-            assert_eq!(out.head, want.head, "frame {i}");
-            // The legacy pose recalibrates.
-            assert_eq!(out.legacy.is_some(), (30..35).contains(&i), "frame {i}");
-        }
-    }
-
-    #[test]
-    fn reset_starts_the_head_pose_over_and_the_legacy_pose_recalibrates() {
+    fn reset_starts_the_head_pose_over() {
         let landmarks = sequence_landmarks();
         let frame = frame_a();
         let params = HeadParams::FITTED;
-        let mut poses = Poses::new(params, RestPose::default());
-        let wanted = |t_us| FrameContext {
-            legacy_wanted: true,
-            ..context(t_us, &frame)
-        };
-        for i in 0..31 {
-            let out = poses.step_with_fit(Ok(sequence_fit(0, &landmarks)), &wanted(30_208 * i));
-            assert_eq!(out.legacy.is_some(), i == 30, "frame {i}");
+        let at = |k: i64| context(30_208 * k, &frame);
+        let mut poses = Poses::new(params);
+        for (i, k) in (0..5).zip(0..) {
+            let out = poses.step_with_fit(Ok(sequence_fit(i, &landmarks)), &at(k));
+            assert!(out.head.valid, "frame {i}");
         }
         poses.reset();
-        // Zeros until the first valid pose, which is unfiltered.
-        let out = poses.step_with_fit(Ok(None), &wanted(2_000_000));
+        let out = poses.step_with_fit(Ok(None), &at(5));
         assert_eq!(out.head, HeadPose::default());
-        let out = poses.step_with_fit(Ok(sequence_fit(2, &landmarks)), &wanted(2_030_208));
-        assert_eq!(out.head, unfiltered(params, 2, 2_030_208));
-        // The legacy pose calibrates anew, on the 30 fits from the reset.
-        assert!(out.legacy.is_none());
-        for i in 1..=30 {
-            let out = poses.step_with_fit(
-                Ok(sequence_fit(2, &landmarks)),
-                &wanted(2_030_208 + 30_208 * i),
-            );
-            assert_eq!(
-                out.legacy.is_some(),
-                i == 30,
-                "fit {} after the reset",
-                i + 1
-            );
-        }
+        let out = poses.step_with_fit(Ok(sequence_fit(2, &landmarks)), &at(6));
+        assert_eq!(out.head, unfiltered(params, 2, 30_208 * 6));
+        let out = poses.step_with_fit(Ok(sequence_fit(3, &landmarks)), &at(7));
+        assert!(out.head.valid);
+        assert_ne!(out.head, unfiltered(params, 3, 30_208 * 7));
     }
 
     #[test]
     fn a_tracker_error_counts_as_a_frame_without_a_face() {
         let landmarks = sequence_landmarks();
         let frame = frame_a();
-        let wanted = |t_us| FrameContext {
-            legacy_wanted: true,
-            ..context(t_us, &frame)
-        };
-        let mut poses = Poses::new(HeadParams::FITTED, RestPose::default());
-        for i in 0..31 {
-            let _ = poses.step_with_fit(
-                Ok(sequence_fit(i % 3, &landmarks)),
-                &wanted(30_208 * i64::try_from(i).unwrap()),
-            );
+        let at = |k: i64| context(30_208 * k, &frame);
+        let mut poses = Poses::new(HeadParams::FITTED);
+        for (i, k) in (0..5).zip(0..) {
+            let _ = poses.step_with_fit(Ok(sequence_fit(i, &landmarks)), &at(k));
         }
         let mut no_face = poses.clone();
-        let out = poses.step_with_fit(
-            Err(anyhow!("the landmark model failed")),
-            &wanted(31 * 30_208),
-        );
-        let want = no_face.step_with_fit(Ok(None), &wanted(31 * 30_208));
+        let out = poses.step_with_fit(Err(anyhow!("the landmark model failed")), &at(5));
+        let want = no_face.step_with_fit(Ok(None), &at(5));
         assert!(out.error.is_some() && want.error.is_none());
-        assert!(!out.head.valid && out.legacy.is_none() && out.face.is_none());
-        assert_eq!((out.head, out.legacy), (want.head, want.legacy));
-        assert_eq!(poses.rest.last_raw(), no_face.rest.last_raw());
+        assert!(!out.head.valid && out.face.is_none());
+        assert_eq!(out.head, want.head);
         // And so are the frames after it.
-        let next = poses.step_with_fit(Ok(sequence_fit(1, &landmarks)), &wanted(32 * 30_208));
-        let want = no_face.step_with_fit(Ok(sequence_fit(1, &landmarks)), &wanted(32 * 30_208));
-        assert!(next.head.valid && next.legacy.is_some());
-        assert_eq!((next.head, next.legacy), (want.head, want.legacy));
+        let next = poses.step_with_fit(Ok(sequence_fit(1, &landmarks)), &at(6));
+        let want = no_face.step_with_fit(Ok(sequence_fit(1, &landmarks)), &at(6));
+        assert!(next.head.valid);
+        assert_eq!(next.head, want.head);
     }
 
     #[test]
@@ -2030,13 +1907,9 @@ mod tests {
         let frame = frame_a();
         let n = 280;
         let black = vec![0u8; n * n];
-        let wanted = FrameContext {
-            legacy_wanted: true,
-            ..context(0, &frame)
-        };
-        let out = step.step(&black, n, n, &wanted);
+        let out = step.step(&black, n, n, &context(0, &frame));
         assert_eq!(out.head, HeadPose::default());
-        assert!(out.legacy.is_none() && out.face.is_none() && out.error.is_none());
+        assert!(out.face.is_none() && out.error.is_none());
         let runs = ModelRuns {
             landmarks: 1,
             detector: 1,
