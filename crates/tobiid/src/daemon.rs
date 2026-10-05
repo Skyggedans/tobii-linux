@@ -117,10 +117,14 @@ static RECENTER_FRAME_LOGGED: Once = Once::new();
 /// The first SIGUSR1 was logged.
 static RECENTER_SIGNAL_LOGGED: Once = Once::new();
 
-/// Note that client `id` subscribed to `streams`, which have
-/// [`RETIRED_STREAM_HEAD`]: a warning the first time.
-fn note_retired_head_subscription(id: u64, streams: u32) {
-    HEAD_SUBSCRIPTION_LOGGED.call_once(|| {
+/// Note that client `id` subscribed to `streams`: if they have
+/// [`RETIRED_STREAM_HEAD`], a warning, the first time `logged` sees one
+/// (the daemon's subscriptions share [`HEAD_SUBSCRIPTION_LOGGED`]).
+fn note_retired_head_subscription(logged: &Once, id: u64, streams: u32) {
+    if streams & RETIRED_STREAM_HEAD == 0 {
+        return;
+    }
+    logged.call_once(|| {
         warn!(
             client = id,
             streams = %format_args!("{streams:#x}"),
@@ -1356,9 +1360,7 @@ fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32, gone: impl Fn()
         st.ensure_engine(on_bus);
         st.sync_wanted();
     }
-    if streams & RETIRED_STREAM_HEAD != 0 {
-        note_retired_head_subscription(id, streams);
-    }
+    note_retired_head_subscription(&HEAD_SUBSCRIPTION_LOGGED, id, streams);
     st.send_to(id, encode_subscribed(true));
     replay_presence(&mut st, id, before, streams);
     true
@@ -2321,6 +2323,28 @@ pub(crate) mod tests {
         assert!(frames.is_empty(), "{frames:?}");
         st.clients[0].streams = RETIRED_STREAM_HEAD | STREAM_HEAD_POSE;
         assert!(engine_wanted(st.wanted_mask()).head);
+    }
+
+    /// Only a subscription with HEAD's bit 0 is noted as one to the retired
+    /// legacy pose: not one to `HEAD_POSE`, to gaze, to every other stream
+    /// at once, nor an unsubscribe; one with bit 0 is, alone or beside
+    /// others.
+    #[test]
+    fn only_a_subscription_with_bit_0_is_noted_as_one_to_head() {
+        use tobii_ipc::{STREAM_GAZE, STREAM_HEAD_POSE};
+        for (streams, noted) in [
+            (STREAM_HEAD_POSE, false),
+            (STREAM_GAZE, false),
+            (!RETIRED_STREAM_HEAD, false),
+            (0, false),
+            (RETIRED_STREAM_HEAD, true),
+            (RETIRED_STREAM_HEAD | STREAM_HEAD_POSE, true),
+            (u32::MAX, true),
+        ] {
+            let logged = Once::new();
+            note_retired_head_subscription(&logged, 1, streams);
+            assert_eq!(logged.is_completed(), noted, "{streams:#x}");
+        }
     }
 
     /// An older client's RECENTER frame (an older libtobii's
