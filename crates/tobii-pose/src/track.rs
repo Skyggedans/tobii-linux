@@ -61,7 +61,7 @@ const EYE_LINE: (usize, usize) = (33, 263);
 /// frame.
 ///
 /// [`Geometry::IMAGE83`] is the device's own IR stream, the one the tracker
-/// is built for.
+/// is built for and the one [`Tracker::new_image83`] takes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Geometry {
@@ -746,8 +746,7 @@ pub struct Tracker {
 pub(crate) struct FaceFitter<M> {
     models: Models<M>,
     canonical: Vec<[f64; 3]>,
-    /// The frame enlarged `geometry.upscale` times, when that is more than
-    /// once (reused every frame).
+    /// The frame enlarged `geometry.upscale` times (reused every frame).
     upscaled: Vec<u8>,
     /// Landmarks in the enlarged frame's pixels (reused every frame).
     image2d: Vec<[f64; 2]>,
@@ -835,6 +834,8 @@ impl Tracker {
 
     /// Tracker for frames of `geometry`, its first crop upright and of the
     /// start size, centred across the frame at `cy_frac` of its height.
+    /// Outside the crate a tracker is [`Tracker::new_image83`]'s; the tests
+    /// check the geometries this refuses.
     ///
     /// # Errors
     /// Fails when `geometry` has no pixels (a size or factor of 0), an
@@ -842,7 +843,7 @@ impl Tracker {
     /// size that is not a positive number, a first crop centred outside the
     /// frame, or crop limits that are not two positive numbers in order; or
     /// when a model cannot be loaded.
-    pub fn with_geometry(geometry: Geometry) -> Result<Self> {
+    pub(crate) fn with_geometry(geometry: Geometry) -> Result<Self> {
         Ok(Self {
             face: FaceFitter::with_geometry(geometry)?,
         })
@@ -1067,12 +1068,8 @@ impl<M: FaceModels> FaceFitter<M> {
         // The landmark model crops from the frame enlarged, the detector
         // takes it as it came.
         let side = geometry.frame_size();
-        let big = if geometry.upscale == 1 {
-            frame
-        } else {
-            upscale_into(frame, n, geometry.upscale, &mut self.upscaled);
-            self.upscaled.as_slice()
-        };
+        upscale_into(frame, n, geometry.upscale, &mut self.upscaled);
+        let big = self.upscaled.as_slice();
         let follow = (!self.lost).then_some(self.crop);
         let last = self.seen.then_some(&self.crop);
         let found = self.models.locate(&geometry, follow, last, frame, big)?;
@@ -1513,6 +1510,10 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(ours, want);
+        // Once, as a geometry that does not enlarge its frames has them: a
+        // copy.
+        upscale_into(&frame, n, 1, &mut ours);
+        assert_eq!(ours, frame);
     }
 
     #[test]
