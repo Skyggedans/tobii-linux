@@ -243,7 +243,8 @@ impl PoseWorker {
     /// [`PoseSample`] while a head pose is wanted, valid or not, and `None`
     /// otherwise. A recenter goes to the step either way. The first image
     /// that wants a head pose after one that did not starts the step over
-    /// ([`PoseStep::reset`]).
+    /// ([`PoseStep::reset`]). The statistics' period starts over at the
+    /// first image stepped, the worker's very first included.
     fn image(
         &mut self,
         step: &mut impl PoseStep,
@@ -257,9 +258,14 @@ impl PoseWorker {
         if !wants.head {
             return None;
         }
-        if was_wanted == Some(false) {
-            debug!("head pose wanted again: the poses start over");
-            step.reset();
+        if was_wanted != Some(true) {
+            if was_wanted == Some(false) {
+                debug!("head pose wanted again: the poses start over");
+                step.reset();
+            }
+            // Not at the worker's start: a tracker started cold sends its
+            // first image only after an init of ~12 s, which would make the
+            // first period's rates look like a stalled worker.
             if let Some(stats) = &mut self.stats {
                 stats.restart(Instant::now());
             }
@@ -325,7 +331,8 @@ impl FailureWarnings {
 }
 
 /// `TOBII_IMAGE83_DEBUG`'s statistics of the images the worker stepped
-/// since its last report, or since the head pose was last wanted again.
+/// since its last report, or since it began stepping them again: at its
+/// first image, or the head pose wanted again.
 #[derive(Debug)]
 struct PoseStats {
     /// When the period began.
@@ -830,6 +837,33 @@ mod tests {
         assert_eq!(image(3, false, 5), (2, 1, 1), "not stepped");
         assert_eq!(image(4, true, 2), (1, 1, 2), "counted afresh");
         assert_eq!(image(5, true, 0), (2, 1, 2));
+    }
+
+    /// The statistics' period begins at the first image the worker steps,
+    /// not when the worker started: a head-pose client that starts the
+    /// engine gets its first image some 12 s later, after the tracker's
+    /// init, and the first report would cover that one image.
+    #[test]
+    fn the_statistics_begin_at_the_first_image_stepped() {
+        let started = Instant::now().checked_sub(Duration::from_secs(12)).unwrap();
+        let mut worker = PoseWorker::new(Some(PoseStats::new(started)));
+        let mut step = Script::default();
+        let period = |worker: &PoseWorker| {
+            let stats = worker.stats.as_ref().unwrap();
+            (stats.since, stats.step_us.len())
+        };
+
+        let _ = worker.image(&mut step, &taken(1), head(false));
+        let (since, images) = period(&worker);
+        assert_eq!(images, 1, "no report of the 12 s before the first image");
+        assert!(since >= started + Duration::from_secs(12), "{since:?}");
+        let _ = worker.image(&mut step, &taken(2), head(false));
+        assert_eq!(period(&worker), (since, 2), "the period goes on");
+        assert_eq!(
+            step.calls,
+            [Call::Step(1, false), Call::Step(2, false)],
+            "and the step, new, is not reset"
+        );
     }
 
     /// The worker reads the engine's flags at each image, and takes a
