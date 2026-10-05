@@ -41,15 +41,15 @@
 //! stream below bit 8, so old and new peers interoperate either way. Raw
 //! gaze, [`STREAM_GAZE_RAW`], is bit 8 and the Stream Engine's head pose,
 //! [`STREAM_HEAD_POSE`], bit 9, both past that byte: a legacy one-byte
-//! SUBSCRIBE (paperwm-gaze and the `tobii-hub` Flutter plugin send one)
-//! cannot ask for either. A daemon from before one of them that reads the
-//! `u32` mask keeps its bit but never sends its frame, so the stream stays
-//! silent: SUBSCRIBED says ok all the same, and a mask of that bit alone
-//! still has it start and hold the tracker, though one from before the head
-//! pose runs no head inference for bit 9 (only for HEAD's bit 0). One that
-//! reads a single byte sees such a mask as 0 and unsubscribes. A client from
-//! before one of them drops its frame as a tag it does not know
-//! ([`decode_server`] returns `None`).
+//! SUBSCRIBE (paperwm-gaze sends one, as the `tobii-hub` Flutter plugin did
+//! before it moved to `HEAD_POSE`) cannot ask for either. A daemon from
+//! before one of them that reads the `u32` mask keeps its bit but never
+//! sends its frame, so the stream stays silent: SUBSCRIBED says ok all the
+//! same, and a mask of that bit alone still has it start and hold the
+//! tracker, though one from before the head pose runs no head inference for
+//! bit 9 (only for HEAD's bit 0). One that reads a single byte sees such a
+//! mask as 0 and unsubscribes. A client from before one of them drops its
+//! frame as a tag it does not know ([`decode_server`] returns `None`).
 //!
 //! The head pose, `HEAD_POSE` ([`STREAM_HEAD_POSE`], a [`HeadPose`]), is
 //! the Stream Engine's: absolute, in the display frame, one for every IR
@@ -63,19 +63,20 @@
 //! head pose, relative to a rest pose, which RECENTER, tag `0x02`
 //! ([`RETIRED_TAG_RECENTER`]), reset; the daemon no longer makes that pose.
 //! The three numbers are reserved, never to be given to another frame or
-//! stream, since an older peer may still send them or ask for them. A daemon
-//! from after their retirement serves such a peer on. A SUBSCRIBE with bit 0
-//! (an older `tobii-opentrack`'s, a libtobii's from before `HEAD_POSE`, or
-//! one from a client with its own copy of this protocol, such as the
-//! `tobii-hub` Flutter plugin for its `head` stream) is acked and kept as
-//! one with a bit the daemon does not know: it starts and holds the tracker
-//! like any subscription, and gets nothing for that bit, so the client's
-//! head pose stays silent until the client asks for `HEAD_POSE` instead. A
-//! RECENTER (an older libtobii's `tobii_recenter`, an older
-//! `tobii-opentrack --recenter`, `tobii-hub`'s `recenter()`) is ignored, and
-//! the connection served on. The daemon logs the first of each. A client
-//! from after their retirement neither asks for HEAD nor sends RECENTER,
-//! and drops a HEAD frame, should one come, as a tag it does not know.
+//! stream, since an older peer may still send them or ask for them. A
+//! daemon from after their retirement serves such a peer on. A SUBSCRIBE
+//! with bit 0 (an older `tobii-opentrack`'s, a libtobii's from before
+//! `HEAD_POSE`, or one from a client with its own copy of this protocol,
+//! such as a `tobii-hub` Flutter plugin from before it moved to
+//! `HEAD_POSE`) is acked and kept as one with a bit the daemon does not
+//! know: it starts and holds the tracker like any subscription, and gets
+//! nothing for that bit, so the client's head pose stays silent until the
+//! client asks for `HEAD_POSE` instead. A RECENTER (an older libtobii's
+//! `tobii_recenter`, an older `tobii-opentrack --recenter`, an older
+//! `tobii-hub`'s `recenter()`) is ignored, and the connection served on.
+//! The daemon logs the first of each. A client from after their retirement
+//! neither asks for HEAD nor sends RECENTER, and drops a HEAD frame, should
+//! one come, as a tag it does not know.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
