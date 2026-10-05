@@ -59,11 +59,12 @@ the `.tflite` and symbolic in the ONNX; `track.rs` passes 1.
 ### Checked
 
 - The bundle as downloaded on 2026-10-04 is byte-identical to the copy this
-  repository committed in f0deb29 (`pose.py` still gives its URL), and the
-  `.tflite` in it to `mp_models/face_landmarks_detector.tflite`, committed in
-  ef03ee5 next to this ONNX (then also `mp_models/landmarks.onnx`, the same
-  git blob). d8aa2d4 removed the bundle and `mp_models/`; both are still in
-  the history.
+  repository committed in f0deb29 (with `pose.py`, a Python prototype whose
+  setup notes gave the same URL), and the `.tflite` in it to
+  `mp_models/face_landmarks_detector.tflite`, committed in ef03ee5 next to
+  this ONNX (then also `mp_models/landmarks.onnx`, the same git blob). The
+  bundle and `mp_models/` (removed in d8aa2d4) and `pose.py` (removed
+  later) are still in the history.
 - Each of the ONNX's 251 float32 initializers (1,199,316 values) is exactly
   representable in float16 and holds the same values as one of the
   `.tflite`'s 251 float16 constants. The operators match in number: the 106
