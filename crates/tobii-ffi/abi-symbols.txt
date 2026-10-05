@@ -1,7 +1,7 @@
-# Every symbol libtobii.so exports, one per line. `make verify-abi` checks the
-# built library against this list, and tools/abi/dll_abi.py checks it against
-# tobii_stream_engine.dll 4.1.0.3 (153 exports). Lines marked `# extension`
-# are our own and do not exist in the DLL.
+# Every symbol libtobii.so exports, one per line: the 153 exports of
+# tobii_stream_engine.dll 4.1.0.3, and none of our own. `make verify-abi`
+# checks the built library against this list, and tools/abi/dll_abi.py checks
+# it against the DLL (it would skip a line marked `# extension` as ours).
 tobii_api_create
 tobii_api_destroy
 tobii_calculate_display_area_basic
@@ -155,4 +155,3 @@ tobii_wearable_foveated_gaze_subscribe
 tobii_wearable_foveated_gaze_unsubscribe
 tobii_wearable_limited_image_subscribe
 tobii_wearable_limited_image_unsubscribe
-tobii_recenter # extension: re-zero tobiid's legacy relative head pose (HEAD, tobii-opentrack); not tobii_head_pose_subscribe's

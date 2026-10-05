@@ -5,8 +5,8 @@
  * code written against the Stream Engine builds and links unchanged on Linux.
  * Signatures, enum values and struct layouts are those of the reference
  * tobii_stream_engine.dll 4.1.0.3 (see tools/abi/README.md for how each was
- * established). libtobii.so exports all 153 of its entry points; the ones
- * marked NOT IMPLEMENTED return TOBII_ERROR_NOT_SUPPORTED.
+ * established). libtobii.so exports all 153 of its entry points and no
+ * other; the ones marked NOT IMPLEMENTED return TOBII_ERROR_NOT_SUPPORTED.
  *
  * The companion headers follow the Stream Engine's split: tobii_streams.h,
  * tobii_config.h, tobii_licensing.h, tobii_advanced.h, tobii_wearable.h, and
@@ -25,8 +25,6 @@
  *   back its callbacks, tobii_device_process_callbacks and
  *   tobii_wait_for_callbacks, for its own round trip (~500 ms at most) and
  *   the close of its old connection;
- *   tobii_recenter, a write with no reply, waits for those under way or
- *   called before it;
  * - its callbacks run one at a time, on whichever thread calls
  *   tobii_device_process_callbacks, and such a call made while another
  *   thread processes the device returns at once;

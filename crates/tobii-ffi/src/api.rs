@@ -1446,18 +1446,21 @@ mod tests {
         assert_eq!(hits, 0);
     }
 
-    /// `tobii_recenter` to a daemon that stopped reading fails, and loses
-    /// the connection: the next process call reports it, after the sample
-    /// that came first, although the reader has seen nothing.
+    /// A request (`tobii_get_track_box`) to a daemon that stopped reading
+    /// fails, writing no track box, and loses the connection: the next
+    /// process call reports it, after the sample that came first, although
+    /// the reader has seen nothing.
     #[test]
-    fn a_failed_recenter_loses_the_connection() {
+    fn a_failed_request_loses_the_connection() {
         let mut hits = 0u32;
         let (d, daemon) = crate::device::tests::deaf_daemon_device((&raw mut hits).cast());
         let d = Box::into_raw(Box::new(d));
-        // SAFETY: `d` is live and destroyed once below; `hits` outlives it.
+        let mut track_box = TrackBox::default();
+        // SAFETY: `d` is live and destroyed once below; `hits` outlives it,
+        // and `track_box` is a live local.
         unsafe {
             assert_eq!(
-                crate::streams::tobii_recenter(d),
+                tobii_get_track_box(d, &raw mut track_box),
                 TOBII_ERROR_CONNECTION_FAILED
             );
             assert_eq!(
@@ -1466,6 +1469,7 @@ mod tests {
             );
             assert_eq!(tobii_device_destroy(d), TOBII_ERROR_NO_ERROR);
         }
+        assert_eq!(track_box, TrackBox::default(), "nothing written");
         assert_eq!(hits, 1);
         drop(daemon);
     }

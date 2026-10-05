@@ -1,4 +1,4 @@
-//! `tobii_streams.h`: the sample streams, plus the `tobii_recenter` extension.
+//! `tobii_streams.h`: the sample streams.
 //!
 //! Every subscribe entry point has the same contract: `device` must be null
 //! or a live handle from `tobii_device_create` that is not destroyed before
@@ -23,7 +23,7 @@
 use std::ffi::c_void;
 
 use crate::device::{Callbacks, Device, Slot, device_ref};
-use crate::status::{Status, TOBII_ERROR_NO_ERROR};
+use crate::status::Status;
 use crate::types::{EyePairFn, GazePointFn, HeadPoseFn, NotificationsFn, PresenceFn};
 
 /// Subscribe `callback` into `slot` of the device behind `device`.
@@ -112,29 +112,4 @@ stream_pair! {
     tobii_notifications_subscribe / tobii_notifications_unsubscribe: notifications, NotificationsFn;
     /// The user position guide: the track-box-normalised eye positions.
     tobii_user_position_guide_subscribe / tobii_user_position_guide_unsubscribe: user_position_guide, EyePairFn;
-}
-
-/// Make tobiid's current head pose the rest pose of its own, relative head
-/// pose (extension; not in the original Stream Engine): the legacy HEAD
-/// stream that its `tobii-opentrack` bridge reads, for every client of that
-/// stream. The head pose `tobii_head_pose_subscribe` delivers is the Stream
-/// Engine's, absolute, with no rest pose, so this leaves it alone, as the
-/// Stream Engine has no recenter: an application centres it itself, as
-/// `OpenTrack` does.
-///
-/// # Safety
-/// `device` must be null or a live handle from `tobii_device_create` that is
-/// not destroyed before the call returns.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tobii_recenter(device: *mut Device) -> Status {
-    // SAFETY: caller guarantees `device` is null or a live handle, not
-    // destroyed before this returns.
-    let d = match unsafe { device_ref(device) } {
-        Ok(d) => d,
-        Err(status) => return status,
-    };
-    match d.send(&tobii_ipc::encode_recenter()) {
-        Ok(()) => TOBII_ERROR_NO_ERROR,
-        Err(status) => status,
-    }
 }

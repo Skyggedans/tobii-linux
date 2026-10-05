@@ -615,9 +615,9 @@ impl Drop for ReaderEnd {
 
 /// What the command lock guards: the connection's write half and answers,
 /// how to open another, the request ids, and the identity fetched over the
-/// connection. A request, a subscription change, a recenter and a reconnect
-/// each hold it for their whole round trip, so they run one at a time on a
-/// device, in the order they asked (see [`TicketLock`]).
+/// connection. A request, a subscription change and a reconnect each hold it
+/// for their whole round trip, so they run one at a time on a device, in the
+/// order they asked (see [`TicketLock`]).
 struct Command {
     link: Link,
     connect: Connector,
@@ -869,8 +869,7 @@ impl Callbacks {
     /// The daemon streams these callbacks need; the single source of truth
     /// for the subscription mask. Head pose is the daemon's `HEAD_POSE`
     /// stream, the Stream Engine's, never its own relative HEAD stream
-    /// ([`tobii_ipc::STREAM_HEAD`], the `tobii-opentrack` bridge's), whose
-    /// frames carry no validity.
+    /// ([`tobii_ipc::STREAM_HEAD`]), whose frames carry no validity.
     pub(crate) fn mask(&self) -> u32 {
         let mut mask = 0;
         let mut need = |on: bool, bit: u32| {
@@ -923,13 +922,13 @@ impl fmt::Display for ReconnectError {
 ///   requests hold for the whole tracker round trip: device info at
 ///   0x180142ee1, subscribe 0x18015ce3d..0x18015ceaf, reconnect
 ///   0x180143873..0x180143a0f): held for a request's, subscription
-///   change's, recenter's or reconnect's whole round trip. It is a
-///   `TicketLock`: its waiters take it in the order they asked, so a call
-///   waits for the round trip under way and those asked for before it, and
-///   no more, however soon the thread ahead asks again. A critical section
-///   promises no order among its waiters (Windows semantics, not read from
-///   the DLL), nor does a std `Mutex`, which on Linux kept subscribes out
-///   for up to 5 s behind requests made back to back.
+///   change's or reconnect's whole round trip. It is a `TicketLock`: its
+///   waiters take it in the order they asked, so a call waits for the round
+///   trip under way and those asked for before it, and no more, however
+///   soon the thread ahead asks again. A critical section promises no order
+///   among its waiters (Windows semantics, not read from the DLL), nor does
+///   a std `Mutex`, which on Linux kept subscribes out for up to 5 s behind
+///   requests made back to back.
 /// - `dispatch` (`Dispatch`; its platform module's process mutex, +0x4628,
 ///   which process only try-enters, 0x18000e9d9, and the notification
 ///   queue's dev+0x9818): held by one `process` while it drains the samples
@@ -960,11 +959,11 @@ impl fmt::Display for ReconnectError {
 /// waits for one). Of the calls that take a lock, only `process` and `wait`
 /// return promptly while a callback runs. A subscribe, an unsubscribe, a
 /// clear or a reconnect waits for it, on `callbacks` or `dispatch`; a
-/// request or a recenter may wait, on `command`, behind a subscription
-/// change or reconnect under way or queued ahead of it, and a clear, on
-/// `dispatch`, behind a reconnect's round trip. Across devices the same makes a cycle: X's
-/// callback waits for an unsubscribe of Y, which waits for Y's callback,
-/// which waits for an unsubscribe of X, which waits for X's.
+/// request may wait, on `command`, behind a subscription change or
+/// reconnect under way or queued ahead of it, and a clear, on `dispatch`,
+/// behind a reconnect's round trip. Across devices the same makes a cycle:
+/// X's callback waits for an unsubscribe of Y, which waits for Y's
+/// callback, which waits for an unsubscribe of X, which waits for X's.
 ///
 /// Destroying the device takes no lock, as in the DLL: no other thread may
 /// be inside a call on it, or use it afterwards.
@@ -1090,12 +1089,6 @@ impl Device {
     pub(crate) fn connect_daemon(api: usize, field_of_use: FieldOfUse) -> io::Result<Self> {
         let connect = tests::DAEMON.take().ok_or(io::ErrorKind::NotConnected)?;
         Self::new(connect, api, field_of_use)
-    }
-
-    /// Write one frame to the daemon (see [`Link::send`]), after the round
-    /// trips other threads have under way or queued ahead of it.
-    pub(crate) fn send(&self, body: &[u8]) -> Result<(), Status> {
-        self.command.lock().link.send(body)
     }
 
     /// Register `callback` in `slot` and subscribe its stream. The Stream
@@ -2092,16 +2085,17 @@ pub(crate) mod tests {
     /// would read past its own answer and give up.
     #[test]
     fn clearing_the_buffers_leaves_a_late_ack_to_be_read_past() {
-        // The late ack comes when the client recenters, a sample behind it.
-        let connect = late_acking_daemon(tobii_ipc::TAG_RECENTER, |_| {
-            vec![encode_gaze_origin(&tobii_ipc::EyePair::default())]
-        });
+        let (connect, daemons) = scripted_daemon(vec![vec![]]);
         let d = Device::new(connect, 1, 1).expect("device");
+        let mut daemon = daemons.recv().expect("daemon end");
         assert_eq!(
             d.send_subscription(STREAM_GAZE_ORIGIN, SHORT_WAIT),
             Err(TOBII_ERROR_TIMED_OUT)
         );
-        assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
+        // The late ack, a sample behind it.
+        write_frame(&mut daemon, &encode_subscribed(true)).expect("the late ack");
+        let sample = encode_gaze_origin(&tobii_ipc::EyePair::default());
+        write_frame(&mut daemon, &sample).expect("a sample");
         assert!(
             d.wait(LONG_WAIT),
             "the sample, so the ack ahead of it is in"
@@ -2112,6 +2106,8 @@ pub(crate) mod tests {
         lock(&d.callbacks).gaze_origin = Some((count_pair as EyePairFn, (&raw mut hits).cast()));
 
         d.clear_buffers();
+        // The next change's own answer, a refusal, behind the late ack.
+        write_frame(&mut daemon, &encode_subscribed(false)).expect("a refusal");
 
         let t = Instant::now();
         assert_eq!(
@@ -2126,6 +2122,7 @@ pub(crate) mod tests {
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         drop(d);
         assert_eq!(hits, 0, "the sample was cleared");
+        drop(daemon);
     }
 
     /// Only a sample wakes `wait`: a reply that comes after its request gave
@@ -2927,9 +2924,9 @@ pub(crate) mod tests {
         drop(daemon);
     }
 
-    /// The requests, the recenter frame and the subscription failing at once
-    /// held before losses were reported, and are kept as a regression guard.
-    /// New is that they leave the loss for `process` to report.
+    /// The request and the subscription failing at once held before losses
+    /// were reported, and are kept as a regression guard. New is that they
+    /// leave the loss for `process` to report.
     #[test]
     fn requests_and_new_subscriptions_on_a_lost_connection_fail_at_once() {
         let mut hits = 0u32;
@@ -2940,11 +2937,6 @@ pub(crate) mod tests {
         assert_eq!(
             d.request(tobii_ipc::request::kind::TRACK_BOX, &[], LONG_WAIT),
             Err(TOBII_ERROR_CONNECTION_FAILED)
-        );
-        assert_eq!(
-            d.send(&tobii_ipc::encode_recenter()),
-            Err(TOBII_ERROR_CONNECTION_FAILED),
-            "what tobii_recenter sends"
         );
         assert_eq!(
             d.subscribe(|c| &mut c.eye_position, Some(count_pair as EyePairFn), ud),
@@ -3745,23 +3737,19 @@ pub(crate) mod tests {
     /// warn.
     #[test]
     fn head_pose_tobiid_sends_is_not_warned_of() {
-        // Sends a gaze origin and an invalid head pose when the client
-        // recenters.
-        let connect = fake_daemon(|body| match body.first() {
-            Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![encode_subscribed(true)],
-            Some(&tobii_ipc::TAG_RECENTER) => vec![
-                encode_gaze_origin(&tobii_ipc::EyePair::default()),
-                tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose::default()),
-            ],
-            _ => vec![],
-        });
+        let (connect, daemons) = scripted_daemon(vec![vec![encode_subscribed(true)]]);
         let recorder = Recorder::default();
         let mut d = Device::new(connect, 1, 1).expect("device");
         d.set_logger(recorder.logger());
+        let mut daemon = daemons.recv().expect("daemon end");
         assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         let seen = d.doorbell.rings();
-        assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
+        // A gaze origin, and an invalid head pose behind it.
+        let sample = encode_gaze_origin(&tobii_ipc::EyePair::default());
+        write_frame(&mut daemon, &sample).expect("a gaze origin");
+        let pose = tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose::default());
+        write_frame(&mut daemon, &pose).expect("a head pose");
         queued(&d, seen, 2);
         d.backdate_head_pose_window(HEAD_POSE_SILENCE);
 
@@ -3770,6 +3758,7 @@ pub(crate) mod tests {
 
         assert!(!d.head_pose_window_open(), "the watch has ended");
         assert!(recorder.lines().is_empty(), "{:?}", recorder.lines());
+        drop((d, daemon));
     }
 
     /// Only a head pose ends the watch: the samples of another stream show
@@ -5107,18 +5096,24 @@ pub(crate) mod tests {
     /// A call that logs lets every lock it took go first, so a logger may
     /// wait for another thread's call into the device that logs: a clear,
     /// which needs the dispatch lock, on the loss a process reports, and a
-    /// recenter, which needs the command lock, on a reconnect. It fails
+    /// request, which needs the command lock, on a reconnect. It fails
     /// should either line be logged under the lock its call needs: the call
     /// then comes back only once the logger has given up on it.
     #[test]
     fn a_logger_may_wait_for_another_thread_using_the_device() {
         let loss = Handoff::new(Device::clear_buffers);
         let reconnect = Handoff::new(|d| {
-            assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
+            assert_eq!(
+                d.request(kind::TRACK_BOX, &[], LONG_WAIT),
+                Ok(b"box".to_vec())
+            );
         });
+        // The new connection's greeting: the ack of the reconnect's
+        // subscription, then the reply to the device's first request.
+        let mut greeting = ack_then_gaze_origin(0);
+        greeting.push(encode_reply(1, 0, b"box"));
         let mut hits = 0u32;
-        let (mut d, daemons) =
-            lost_device(0, vec![ack_then_gaze_origin(0)], (&raw mut hits).cast());
+        let (mut d, daemons) = lost_device(0, vec![greeting], (&raw mut hits).cast());
 
         d.set_logger(crate::logger::tests::logger(hand_off, loss.context()));
         loss.device.set(ptr::from_ref(&d));
@@ -5131,13 +5126,12 @@ pub(crate) mod tests {
         assert_eq!(
             reconnect.came_back(),
             [true],
-            "the recenter, on the reconnect line"
+            "the request, on the reconnect line"
         );
 
         let mut daemon = daemons.recv().expect("second daemon end");
         assert_eq!(subscription(&mut daemon), Some(STREAM_GAZE_ORIGIN));
-        let recenter = read_frame(&mut daemon).expect("read").expect("a frame");
-        assert_eq!(recenter.first(), Some(&tobii_ipc::TAG_RECENTER));
+        assert_eq!(asked(&mut daemon, kind::TRACK_BOX), 1, "the first request");
         drop((d, daemon));
     }
 

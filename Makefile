@@ -31,10 +31,10 @@ LIB         := libtobii.so
 INCSRC      := crates/tobii-ffi/include
 ABI_SMOKE   := crates/tobii-ffi/abi-smoke.c
 
-# The entry points libtobii.so presents to C — every export of the Stream
-# Engine 4.1.0.3 DLL plus tobii_recenter — and the headers that declare them
-# are its whole contract with consumers such as OpenTrack's tracker-tobii.
-# `verify-abi` checks both against the built library.
+# The entry points libtobii.so presents to C — exactly the 153 exports of the
+# Stream Engine 4.1.0.3 DLL — and the headers that declare them are its whole
+# contract with consumers such as OpenTrack's tracker-tobii. `verify-abi`
+# checks both against the built library.
 ABI_LIST    := crates/tobii-ffi/abi-symbols.txt
 ABI_SYMBOLS := $(shell sed 's/ *\#.*//; /^$$/d' $(ABI_LIST))
 HEADERS     := $(wildcard $(INCSRC)/tobii/*.h)

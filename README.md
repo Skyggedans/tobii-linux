@@ -92,10 +92,10 @@ tobii-calibrate ─┘                      │
 so several consumers can read gaze and head pose at once.
 
 `libtobii.so` exports **all 153 entry points** of Tobii's
-`tobii_stream_engine.dll` 4.1.0.3, with its signatures, error numbering and
-struct layouts, plus a `tobii_recenter` extension — so any Stream Engine client
-links and runs. The ABI was recovered from the DLL itself (`tools/abi/`) and
-the archived 4.1.0 reference. What stands behind the entry points:
+`tobii_stream_engine.dll` 4.1.0.3, and no others, with its signatures, error
+numbering and struct layouts — so any Stream Engine client links and runs. The
+ABI was recovered from the DLL itself (`tools/abi/`) and the archived 4.1.0
+reference. What stands behind the entry points:
 
 | | Entry points |
 |---|---|
@@ -264,11 +264,8 @@ Where the answers come from, and where they differ from Windows:
   the newest image, and one it has not taken by the time the next comes gets
   none, which at ~6 ms an image on a desktop CPU, against 30 ms between images,
   takes a busy machine (`TOBII_IMAGE83_DEBUG` counts them, INSTALL.md §7).
-  `tobii_recenter` re-zeroes only the daemon's own, relative head pose, a
-  legacy stream of its own that no client here reads any more, as the
-  `tobii-opentrack` bridge sends the Stream Engine's pose too (INSTALL.md
-  §8): the Stream Engine has no recenter, and an application centres its
-  pose itself, as OpenTrack does.
+  Neither the Stream Engine nor libtobii has a recenter: an application
+  centres the pose itself, as OpenTrack does.
 - **Timestamps.** Every callback timestamp but the tracker times below is on
   `tobii_system_clock`'s clock, as in the Stream Engine; the tracker's clock
   is left only in gaze data's and raw gaze's `timestamp_tracker_us` (raw
@@ -311,14 +308,12 @@ Where the answers come from, and where they differ from Windows:
   a pause a minute: *Waiting for the daemon*), so one thread's calls made
   back to back hold another thread's up for one of them at most. They do not
   hold up its callbacks, processing or waiting, but for a reconnect's round
-  trip (~500 ms at most) and its close of the old connection, and a
-  recenter, a write with no reply, waits for those under way or called
-  before it; a reconnect's ~500 ms counts from when the calls ahead of it,
-  and then a process call another thread is making, have finished. Its
-  callbacks run one at a time, on whichever thread processes it, and a
-  subscribe, an unsubscribe, a clear or a reconnect waits for one running on
-  another thread; once an unsubscribe returns, its callback is not running
-  and never runs again.
+  trip (~500 ms at most) and its close of the old connection; a reconnect's
+  ~500 ms counts from when the calls ahead of it, and then a process call
+  another thread is making, have finished. Its callbacks run one at a time,
+  on whichever thread processes it, and a subscribe, an unsubscribe, a clear
+  or a reconnect waits for one running on another thread; once an
+  unsubscribe returns, its callback is not running and never runs again.
   `tobii_device_destroy` and `tobii_api_destroy` take no lock, as in the
   Stream Engine (whose documentation says so for `tobii_device_destroy`): no
   other thread may be inside a call on the handle, or use it afterwards.
@@ -390,7 +385,7 @@ rather than 20 MB).
 | `tobii-tools` | `tobii5-init-replay`: log analysis, UVC camera, diagnostics | all of the above |
 
 `make check` runs fmt, clippy with `-D warnings`, the tests and rustdoc.
-`make verify-abi` asserts `libtobii.so` exports exactly the 154 symbols in
+`make verify-abi` asserts `libtobii.so` exports exactly the 153 symbols in
 `crates/tobii-ffi/abi-symbols.txt`, then compiles and runs
 `crates/tobii-ffi/abi-smoke.c` against the headers: it takes the address of
 every symbol through them and checks versions, rejections and struct layouts.

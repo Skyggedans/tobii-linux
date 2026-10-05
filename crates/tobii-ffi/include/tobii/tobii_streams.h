@@ -129,8 +129,9 @@ TOBII_API tobii_error_t TOBII_CALL tobii_user_presence_unsubscribe( tobii_device
  * those axes: the yxz Euler angles of R = Ry(y) Rx(x) Rz(z), as the Stream
  * Engine's, all zero for a face square to the display; +x lifts the chin
  * (pitch), +y turns the head to the user's left (yaw), +z tilts it towards
- * the left shoulder (roll). Nothing in it is relative to a rest pose, so
- * tobii_recenter leaves it alone. A tobiid older than libtobii.so acks the
+ * the left shoulder (roll). Nothing in it is relative to a rest pose: as
+ * with the Stream Engine, an application that wants one centres the pose
+ * itself, as OpenTrack does. A tobiid older than libtobii.so acks the
  * subscription but sends none: restart tobiid after installing (libtobii
  * logs a warning, once per device, after 20 s without one). */
 typedef struct tobii_head_pose_t
@@ -220,14 +221,6 @@ typedef void ( *tobii_user_position_guide_callback_t )(
 TOBII_API tobii_error_t TOBII_CALL tobii_user_position_guide_subscribe( tobii_device_t* device,
     tobii_user_position_guide_callback_t callback, void* user_data );
 TOBII_API tobii_error_t TOBII_CALL tobii_user_position_guide_unsubscribe( tobii_device_t* device );
-
-/* Extension, not part of the Stream Engine: make tobiid's current head pose
- * the rest pose of its own, relative head pose, the legacy stream its
- * tobii-opentrack bridge reads, for every client of that stream. It does
- * not touch tobii_head_pose_subscribe's pose, the Stream Engine's, which is
- * absolute and has no rest pose, as the Stream Engine has no recenter: an
- * application centres it itself, as OpenTrack does. */
-TOBII_API tobii_error_t TOBII_CALL tobii_recenter( tobii_device_t* device );
 
 #ifdef __cplusplus
 }

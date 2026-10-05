@@ -2,9 +2,8 @@
 //! `tobiid` daemon.
 //!
 //! Every one of the 153 entry points `tobii_stream_engine.dll` 4.1.0.3
-//! exports is exported here with the same signature (plus the
-//! `tobii_recenter` extension), so any Stream Engine client links and runs.
-//! What stands behind each:
+//! exports is exported here with the same signature, and no other, so any
+//! Stream Engine client links and runs. What stands behind each:
 //!
 //! - **Implemented** — device lifetime and callbacks, device info, track box,
 //!   display area and mounting (read and write), states, capabilities, the

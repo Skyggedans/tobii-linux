@@ -104,7 +104,7 @@ static int64_t clock_us( clockid_t clock )
 int main( void )
 {
     size_t const exported = sizeof( abi_symbols ) / sizeof( abi_symbols[ 0 ] );
-    assert( exported == 154 );
+    assert( exported == 153 );
     for( size_t i = 0; i < exported; ++i )
         assert( abi_symbols[ i ] != NULL );
 

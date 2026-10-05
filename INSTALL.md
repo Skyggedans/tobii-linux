@@ -70,9 +70,9 @@ embedded assets (it is ~0.45 MB rather than ~20 MB).
 
 `make check` runs what CI would: `cargo fmt --all --check`, clippy with
 `-D warnings` over all targets, the tests and `cargo doc`. `make verify-abi`
-asserts `libtobii.so` exports exactly the 154 symbols listed in
-`crates/tobii-ffi/abi-symbols.txt` (every export of the reference DLL plus
-`tobii_recenter`), then compiles and runs `crates/tobii-ffi/abi-smoke.c`
+asserts `libtobii.so` exports exactly the 153 symbols listed in
+`crates/tobii-ffi/abi-symbols.txt` (the exports of the reference DLL, and
+none of its own), then compiles and runs `crates/tobii-ffi/abi-smoke.c`
 against the headers so the C declarations and the library cannot drift apart.
 With the reference DLL at hand, `tools/abi/dll_abi.py headers` checks every
 prototype against the DLL's machine code (`tools/abi/README.md`).
@@ -416,12 +416,14 @@ TOBII_IMAGE83_DEBUG=1 ./target/release/tobii-opentrack
   no change.
 - **`libtobii.so`** — the Stream Engine 4.1 C API: every one of the 153
   entry points of `tobii_stream_engine.dll` 4.1.0.3, with its signatures,
-  `tobii_error_t` numbering and struct layouts, plus the `tobii_recenter`
-  extension. Headers: `/usr/local/include/tobii/` (`tobii.h`,
-  `tobii_streams.h`, `tobii_config.h`, `tobii_licensing.h`,
-  `tobii_advanced.h`, `tobii_wearable.h`, and `tobii_internal.h` for the
-  exports Tobii never documented). Link against it and it talks to the daemon
-  for you; several processes can use the tracker at once.
+  `tobii_error_t` numbering and struct layouts, and no others: the
+  `tobii_recenter` extension of earlier builds is gone, so a program that
+  calls it must be rebuilt without the call (below, *Recenter*). Headers:
+  `/usr/local/include/tobii/` (`tobii.h`, `tobii_streams.h`,
+  `tobii_config.h`, `tobii_licensing.h`, `tobii_advanced.h`,
+  `tobii_wearable.h`, and `tobii_internal.h` for the exports Tobii never
+  documented). Link against it and it talks to the daemon for you; several
+  processes can use the tracker at once.
 
   Implemented: gaze point (the device's filtered combined gaze, unclamped —
   bit-identical to what the Windows Stream Engine delivers), gaze origin
@@ -548,8 +550,8 @@ TOBII_IMAGE83_DEBUG=1 ./target/release/tobii-opentrack
     mapping.
   - **Centring.** The pose is absolute, and OpenTrack centres it itself, as
     on Windows: at the first valid pose (*Center at startup*, on by
-    default) and on its *Center* shortcut. A daemon recenter
-    (`tobii_recenter`, SIGUSR1) no longer reaches it.
+    default) and on its *Center* shortcut. A daemon recenter (SIGUSR1) no
+    longer reaches it.
   - **Translation with rotation.** The position is a point between the
     eyes, not a pivot at the neck, so turning the head moves TX, TY and TZ
     too, some 5 cm sideways for a 30° turn, as with the DLL;
@@ -741,12 +743,12 @@ systemctl --user kill -s SIGUSR1 tobiid    # signal the service
 kill -USR1 $(pgrep -x tobiid)              # or signal the process
 ```
 
-Via `libtobii.so`: call `tobii_recenter(device)`, which does the same, for
-that pose alone. The head pose `libtobii.so` delivers, and `tobii-opentrack`
-sends, is the Stream Engine's, absolute, with no rest pose, and the Stream
-Engine has no recenter: an application centres it itself, as OpenTrack does
-on its *Center* shortcut, which replaces `tobii-opentrack --recenter`. (Gaze
-has no rest pose either.)
+The head pose `libtobii.so` delivers, and `tobii-opentrack` sends, is the
+Stream Engine's, absolute, with no rest pose, and like the Stream Engine,
+`libtobii.so` has no recenter (its `tobii_recenter` extension, which
+recentred the legacy pose, is gone): an application centres the pose
+itself, as OpenTrack does on its *Center* shortcut, which replaces
+`tobii-opentrack --recenter`. (Gaze has no rest pose either.)
 
 ---
 
