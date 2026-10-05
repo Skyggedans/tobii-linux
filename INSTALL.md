@@ -442,14 +442,15 @@ TOBII_IMAGE83_DEBUG=1 ./target/release/tobii-opentrack
   as OpenTrack's `tracker-tobii` plugin hands it over (TX is -x, TY y and TZ
   z of the position in the display frame; yaw is minus the angle about y,
   pitch the angle about x and roll the angle about z), so the bridge and the
-  plugin move alike, and one OpenTrack profile fits both. A pose the daemon
-  marks invalid (no face, or one at the edge of the camera's view) is not
-  sent, and OpenTrack holds the last one. The pose is absolute: OpenTrack
-  centres it, at the first pose (*Center at startup*, on by default) and on
-  its *Center* shortcut. What the plugin section below says of the pose
-  (translation with rotation, range) holds for the bridge too. From a
-  `tobiid` too old to send the Stream Engine's head pose (§5) it gets
-  nothing, and says so once, after 20 s.
+  plugin move alike while the pose is valid, and one OpenTrack profile fits
+  both. A pose the daemon marks invalid (no face, or one at the edge of the
+  camera's view) is not sent, and OpenTrack holds the last one, where the
+  plugin as it stands jumps the view (below, *Invalid poses*). The pose is
+  absolute: OpenTrack centres it, at the first pose (*Center at startup*,
+  on by default) and on its *Center* shortcut. What the plugin section
+  below says of the pose (translation with rotation, range) holds for the
+  bridge too. From a `tobiid` too old to send the Stream Engine's head pose
+  (§5) it gets nothing, and says so once, after 20 s.
 - **`libtobii.so`** — the Stream Engine 4.1 C API: every one of the 153
   entry points of `tobii_stream_engine.dll` 4.1.0.3, with its signatures,
   `tobii_error_t` numbering and struct layouts, and no others. Headers:
@@ -610,8 +611,9 @@ TOBII_IMAGE83_DEBUG=1 ./target/release/tobii-opentrack
     face is back, the view jumps to minus the pose OpenTrack centred on (in
     TZ by about your distance from the screen), and a centring meanwhile
     takes the zeros as the centre. It does the same with the DLL on Windows.
-    The patch on the `tracker-tobii-hold-last` branch of the OpenTrack fork
-    has the plugin hold each axis's last valid value instead.
+    The commit "tracker/tobii: hold each axis at its last valid value" on
+    the `tracker-tobii-linux` branch of the OpenTrack fork has the plugin
+    hold each axis's last valid value instead.
 
   The plugin needs a reconnect call to survive a daemon restart or crash
   (§5). As it stands it never calls `tobii_device_reconnect`, and on any

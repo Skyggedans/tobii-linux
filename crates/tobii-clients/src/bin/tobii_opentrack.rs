@@ -5,9 +5,9 @@
 //!
 //! Each axis goes to `OpenTrack` as its own `tracker-tobii` plugin hands over
 //! the same pose through `libtobii.so` ([`opentrack_pose`]), so the two
-//! inputs move alike and one `OpenTrack` profile fits both. The pose is
-//! absolute: `OpenTrack` centres it, at the first pose (*Center at startup*)
-//! and on its own *Center* shortcut.
+//! inputs move alike while the pose is valid, and one `OpenTrack` profile
+//! fits both. The pose is absolute: `OpenTrack` centres it, at the first pose
+//! (*Center at startup*) and on its own *Center* shortcut.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
@@ -110,9 +110,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli> {
 /// angle about z, in degrees.
 ///
 /// An invalid pose gives nothing to send: `OpenTrack`'s UDP input then holds
-/// the last packet, as the plugin holds each axis's last valid value. The
-/// input holds a packet whole, so a pose with any of its four validities
-/// clear is not sent; the Stream Engine and tobiid set the four together.
+/// the last packet, as the plugin holds each axis's last valid value with
+/// the `OpenTrack` fork's commit "tracker/tobii: hold each axis at its last
+/// valid value" (without it, the plugin sets no axis, which `OpenTrack`
+/// takes as zeros; INSTALL.md §8). The input holds a packet whole, so a
+/// pose with any of its four validities clear is not sent; the Stream
+/// Engine and tobiid set the four together.
 fn opentrack_pose(pose: &HeadPose) -> Option<[f64; 6]> {
     if !(pose.position_valid && pose.rotation_valid.iter().all(|&v| v)) {
         return None;
