@@ -308,10 +308,11 @@ Where the answers come from, and where they differ from Windows:
 - **Logging and allocation.** The `tobii_custom_log_t` logger gets
   libtobii's own few lines (a refused `field_of_use`, a failed connect or
   reconnect, a lost daemon connection once per loss, a daemon reply that
-  does not decode, a calibration stop that failed after the daemon saved
-  the calibration, each connect and reconnect), not the line per failing
-  call the Stream Engine writes: the returned status says that. It is
-  called on the thread inside the call that logs, from several threads at
+  does not decode, a calibration stop that failed after the daemon saved the
+  calibration, a head pose the daemon has not sent in the 20 s since it was
+  subscribed, once per device, each connect and reconnect), not the line per
+  failing call the Stream Engine writes: the returned status says that. It
+  is called on the thread inside the call that logs, from several threads at
   once if they log at once (their lines may interleave), and a device keeps
   logging through it after `tobii_api_destroy`. A `tobii_custom_alloc_t` is
   checked as in the Stream Engine and never called: libtobii allocates with

@@ -147,7 +147,10 @@ typedef enum tobii_log_level_t
  * connection (once per loss), tobiid sends a reply that does not decode, or
  * tobii_calibration_stop fails after tobiid saved the calibration (saved but
  * perhaps not applied: the tracker loads it at its next init);
- * TOBII_LOG_LEVEL_INFO when a device connects or reconnects.
+ * TOBII_LOG_LEVEL_WARN, once per device, when tobiid has sent no head pose
+ * in the 20 s since it was subscribed (a tobiid older than libtobii.so
+ * sends none, tobii_streams.h); TOBII_LOG_LEVEL_INFO when a device connects
+ * or reconnects.
  *
  * It is called synchronously, on the thread inside the tobii_* call that
  * logs, never on a thread of libtobii's own, with none of the locks that call

@@ -100,8 +100,12 @@ stream_pair! {
     tobii_eye_position_normalized_subscribe / tobii_eye_position_normalized_unsubscribe: eye_position, EyePairFn;
     /// User presence, reported once on subscribe and then on change.
     tobii_user_presence_subscribe / tobii_user_presence_unsubscribe: presence, PresenceFn;
-    /// Head pose from the tracker's IR camera: position in mm, rotation in
-    /// radians about x (pitch), y (yaw) and z (roll).
+    /// The Stream Engine's head pose, from the tracker's IR images (see
+    /// [`HeadPose`](crate::types::HeadPose)): absolute, in the display
+    /// frame, one for every image tobiid processes, each value with its
+    /// validity. It is tobiid's `HEAD_POSE` stream: a tobiid from before it
+    /// acks the subscription and sends nothing, which a device logs at WARN
+    /// once it has gone a while without one (see `device::HeadPoseWatch`).
     tobii_head_pose_subscribe / tobii_head_pose_unsubscribe: head, HeadPoseFn;
     /// Device notifications: display-area, calibration and pause changes,
     /// and the tracker's fault and warning lists.
@@ -110,8 +114,13 @@ stream_pair! {
     tobii_user_position_guide_subscribe / tobii_user_position_guide_unsubscribe: user_position_guide, EyePairFn;
 }
 
-/// Recalibrate the head rest pose now (extension; not in the original Stream
-/// Engine). Affects whichever client currently holds the device's mode.
+/// Make tobiid's current head pose the rest pose of its own, relative head
+/// pose (extension; not in the original Stream Engine): the legacy HEAD
+/// stream that its `tobii-opentrack` bridge reads, for every client of that
+/// stream. The head pose `tobii_head_pose_subscribe` delivers is the Stream
+/// Engine's, absolute, with no rest pose, so this leaves it alone, as the
+/// Stream Engine has no recenter: an application centres it itself, as
+/// `OpenTrack` does.
 ///
 /// # Safety
 /// `device` must be null or a live handle from `tobii_device_create` that is

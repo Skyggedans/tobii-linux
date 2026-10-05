@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use tobii_ipc::request::{DeviceInfo as DeviceInfoMsg, decode_device_info, encode_request, kind};
 use tobii_ipc::{
     self, NotificationValue as WireValue, STREAM_EYE_POSITION, STREAM_GAZE, STREAM_GAZE_DATA,
-    STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD, STREAM_IMAGE, STREAM_NOTIFICATIONS,
+    STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD_POSE, STREAM_IMAGE, STREAM_NOTIFICATIONS,
     STREAM_PRESENCE, ServerMsg, decode_server, encode_subscribe, read_frame, write_frame,
 };
 
@@ -71,6 +71,15 @@ const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// engine and ack), so it starts no engine for the attempt only to drop it
 /// again under the state lock a later attempt's ack waits on.
 const RECONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long head pose may stay subscribed with no `HEAD_POSE` frame from
+/// tobiid before libtobii warns, once per device, that the daemon may be
+/// too old to send one (see [`HeadPoseWatch`]). A current tobiid sends one
+/// for every IR image, but none until the tracker streams, and a tracker the
+/// subscription starts from cold streams only after an init, a re-open to
+/// prime the stream and a second init: ~12 s ([`tobii_ipc::timeout`]), at
+/// worst about 15. A shorter window would warn of every such start.
+const HEAD_POSE_SILENCE: Duration = Duration::from_secs(20);
 
 thread_local! {
     /// Set while this thread runs application code: a user callback, the
@@ -668,14 +677,18 @@ impl Command {
 
 /// What the dispatch lock guards: the samples channel, the samples a look
 /// of `wait` took from it ahead of `process` (and, after a reconnect, the
-/// old link's notifications), and whether the connection is up. A reconnect
-/// swaps it for its new link's (see [`Dispatch::swap_samples`]).
+/// old link's notifications), whether the connection is up, and whether a
+/// head pose has come on it. A reconnect swaps it for its new link's (see
+/// [`Dispatch::swap_samples`]).
 struct Dispatch {
     samples: Receiver<ServerMsg>,
     pending: VecDeque<ServerMsg>,
     /// Kept with the samples, so a new link (a reconnect) starts `Up` and a
     /// later loss is reported again.
     state: LinkState,
+    /// Kept with the samples too: what came on one link says nothing of
+    /// the daemon a reconnect finds.
+    head_pose: HeadPoseWatch,
 }
 
 impl Dispatch {
@@ -684,11 +697,14 @@ impl Dispatch {
             samples,
             pending: VecDeque::new(),
             state: LinkState::Up,
+            head_pose: HeadPoseWatch::default(),
         }
     }
 
-    /// Move the next queued sample into `pending`; whether there was one.
-    /// The channel empty and hung up is the loss of the connection: the
+    /// Move the next queued sample into `pending`, noting a head pose (see
+    /// [`HeadPoseWatch`]); whether there was one. Every sample of the link
+    /// comes through here, whether `process` delivers it or a clear drops
+    /// it. The channel empty and hung up is the loss of the connection: the
     /// reader has stopped, having read everything, or a call under the
     /// command lock has closed the link.
     fn take_one(&mut self) -> bool {
@@ -697,6 +713,9 @@ impl Dispatch {
         }
         match self.samples.try_recv() {
             Ok(msg) => {
+                if matches!(msg, ServerMsg::HeadPose(_)) {
+                    self.head_pose.saw_one();
+                }
                 self.pending.push_back(msg);
                 true
             }
@@ -738,6 +757,9 @@ impl Dispatch {
     /// reader must have been joined first, as the reconnect does by closing
     /// the old link: then the reader has put in everything it was sent, and
     /// hung up. A debug build checks that the channel is hung up.
+    ///
+    /// The head-pose watch starts over (see [`HeadPoseWatch`]): the new
+    /// link may reach another daemon, and nothing has come on it yet.
     fn swap_samples(&mut self, samples: Receiver<ServerMsg>) {
         let old = mem::replace(&mut self.samples, samples);
         let notification = |msg: &ServerMsg| matches!(msg, ServerMsg::Notification(_));
@@ -748,12 +770,69 @@ impl Dispatch {
             "the old link's reader must be joined before the swap"
         );
         self.state = LinkState::Up;
+        self.head_pose.restart();
     }
 
     /// Whether `process` has something to do among what has been taken: a
     /// sample, or a loss it has not reported yet.
     fn anything_to_process(&self) -> bool {
         !self.pending.is_empty() || self.state == LinkState::Lost
+    }
+}
+
+/// Whether tobiid sends the head pose libtobii asks it for. A tobiid from
+/// before the Stream Engine's head pose takes the subscription's bit for it
+/// ([`STREAM_HEAD_POSE`]) and acks it, but runs no head tracking for it and
+/// never sends a frame of it, so the application gets no pose and no error:
+/// what `make install` leaves while the old daemon still runs. A current one
+/// sends a frame for every IR image, valid or not, so once the tracker
+/// streams, silence means an old daemon, or a tracker that sends no images
+/// (unplugged, paused, or `TOBII_NO_IMAGE` set).
+///
+/// The window, [`HEAD_POSE_SILENCE`], opens at the first look (a `process`,
+/// or a `wait` that finds nothing to process) that finds head pose
+/// subscribed on a link that is up with none come yet, which is moments
+/// after the subscription or reconnect for a host that keeps calling. A
+/// look that finds it unsubscribed or the link down closes the window, and
+/// the first head pose on the link ends the watch. Kept with the samples,
+/// so a reconnect starts it over; the warning is said once per device,
+/// whatever the links.
+#[derive(Debug, Default)]
+struct HeadPoseWatch {
+    /// When the window opened; `None` while it is closed.
+    since: Option<Instant>,
+    /// Whether a head pose has come on this link.
+    seen: bool,
+    /// Whether the warning has been said, on this link or an earlier one.
+    warned: bool,
+}
+
+impl HeadPoseWatch {
+    /// A head pose has come: this link's daemon sends them.
+    fn saw_one(&mut self) {
+        self.seen = true;
+        self.since = None;
+    }
+
+    /// A new link: nothing has come on it yet.
+    fn restart(&mut self) {
+        self.seen = false;
+        self.since = None;
+    }
+
+    /// Look at `now`, head pose subscribed on a link that is up
+    /// (`watching`) or not, after taking all that has come: whether the
+    /// warning is due now. It is once per device, at the first look a
+    /// whole [`HEAD_POSE_SILENCE`] after the window opened.
+    #[must_use]
+    fn overdue(&mut self, watching: bool, now: Instant) -> bool {
+        if !watching || self.seen || self.warned {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        self.warned = now.saturating_duration_since(since) >= HEAD_POSE_SILENCE;
+        self.warned
     }
 }
 
@@ -788,7 +867,10 @@ unsafe impl Send for Callbacks {}
 
 impl Callbacks {
     /// The daemon streams these callbacks need; the single source of truth
-    /// for the subscription mask.
+    /// for the subscription mask. Head pose is the daemon's `HEAD_POSE`
+    /// stream, the Stream Engine's, never its own relative HEAD stream
+    /// ([`tobii_ipc::STREAM_HEAD`], the `tobii-opentrack` bridge's), whose
+    /// frames carry no validity.
     pub(crate) fn mask(&self) -> u32 {
         let mut mask = 0;
         let mut need = |on: bool, bit: u32| {
@@ -796,7 +878,7 @@ impl Callbacks {
                 mask |= bit;
             }
         };
-        need(self.head.is_some(), STREAM_HEAD);
+        need(self.head.is_some(), STREAM_HEAD_POSE);
         need(self.gaze.is_some(), STREAM_GAZE);
         need(self.presence.is_some(), STREAM_PRESENCE);
         need(self.gaze_origin.is_some(), STREAM_GAZE_ORIGIN);
@@ -855,8 +937,9 @@ impl fmt::Display for ReconnectError {
 ///   and by a reconnect from before its new link asks for the streams until
 ///   it has swapped the samples channel (see `Device::reconnect`).
 /// - `callbacks` (`Callbacks`; dev+0x4d8, held around each user callback,
-///   0x1801546a0..0x180155091): held around each callback, and while a
-///   subscription change reads or sets a slot.
+///   0x1801546a0..0x180155091): held around each callback, while a
+///   subscription change reads or sets a slot, and while a process or a
+///   look of `wait` reads the head-pose slot (see `HeadPoseWatch`).
 ///
 /// Lock order: `command`, then `dispatch`, then `callbacks`; the doorbell's
 /// lock is a leaf, and the reader thread takes no other. A thread holds one
@@ -1294,23 +1377,34 @@ impl Device {
     /// wait on; that thread rings again once it lets the lock go if it
     /// leaves something to process, or a sample came meanwhile (see
     /// [`Device::in_dispatch`]), and a reconnect that has swapped links
-    /// rings anyway.
+    /// rings anyway. A look that finds nothing to process watches the head
+    /// pose as `process` does, and may log its warning (see
+    /// [`HeadPoseWatch`]).
     pub(crate) fn wait(&self, timeout: Duration) -> bool {
         self.doorbell.wait_for(timeout, || self.look())
     }
 
     /// One look of `wait`: whether `process` has something to do now,
     /// moving a queued sample into `pending`. Nothing while another thread
-    /// holds the dispatch lock.
+    /// holds the dispatch lock. A look that finds nothing has taken all that
+    /// came, so it watches the head pose too, and warns once the lock is
+    /// let go: a host that calls `process` only when a wait finds something
+    /// to process would otherwise never hear of a daemon that sends none.
     fn look(&self) -> bool {
-        try_lock(&self.dispatch).is_some_and(|dispatch| {
-            self.in_dispatch(dispatch, |dispatch| {
-                if !dispatch.anything_to_process() {
-                    dispatch.take_one();
-                }
-                dispatch.anything_to_process()
-            })
-        })
+        let Some(dispatch) = try_lock(&self.dispatch) else {
+            return false;
+        };
+        let (found, overdue) = self.in_dispatch(dispatch, |dispatch| {
+            if !dispatch.anything_to_process() {
+                dispatch.take_one();
+            }
+            let found = dispatch.anything_to_process();
+            (found, !found && self.head_pose_overdue(dispatch))
+        });
+        if overdue {
+            self.warn_head_pose_silent();
+        }
+        found
     }
 
     /// Deliver every queued sample to its callbacks, on this thread, then
@@ -1331,6 +1425,10 @@ impl Device {
     /// then, and answers 0 when that fails (0x18000e9d9..0x18000e9ea), even
     /// after a loss. libtobii has one queue, which the thread dispatching
     /// delivers.
+    ///
+    /// Once it has delivered what came, it watches the head pose (see
+    /// [`HeadPoseWatch`]), and logs the warning, once per device, after the
+    /// lock is let go.
     #[must_use]
     pub(crate) fn process(&self) -> Status {
         let Some(dispatch) = try_lock(&self.dispatch) else {
@@ -1340,12 +1438,13 @@ impl Device {
                 TOBII_ERROR_NO_ERROR
             };
         };
-        let (status, newly_lost) = self.in_dispatch(dispatch, |dispatch| {
+        let (status, newly_lost, overdue) = self.in_dispatch(dispatch, |dispatch| {
             dispatch.take_all();
             while let Some(msg) = dispatch.pending.pop_front() {
                 self.deliver(&msg);
             }
-            match dispatch.state {
+            let overdue = self.head_pose_overdue(dispatch);
+            let (status, newly_lost) = match dispatch.state {
                 LinkState::Up => (TOBII_ERROR_NO_ERROR, false),
                 LinkState::Lost => {
                     dispatch.state = LinkState::Reported;
@@ -1353,7 +1452,8 @@ impl Device {
                     (TOBII_ERROR_CONNECTION_FAILED, true)
                 }
                 LinkState::Reported => (TOBII_ERROR_CONNECTION_FAILED, false),
-            }
+            };
+            (status, newly_lost, overdue)
         });
         if newly_lost {
             // Once per loss, by the call that reported it: a host keeps
@@ -1363,7 +1463,36 @@ impl Device {
                 format_args!("lost the connection to tobiid; tobii_device_reconnect restores it"),
             );
         }
+        if overdue {
+            self.warn_head_pose_silent();
+        }
         status
+    }
+
+    /// Whether the head-pose warning is due now (see [`HeadPoseWatch`]),
+    /// for a hold of the dispatch lock that has taken all that came: head
+    /// pose is watched while its slot is set and the link is up. Takes the
+    /// callbacks lock to read the slot; no callback runs meanwhile, as this
+    /// thread holds the dispatch lock, so a subscription change on another
+    /// thread is all it may wait for, and that only for a moment.
+    fn head_pose_overdue(&self, dispatch: &mut Dispatch) -> bool {
+        let watching = dispatch.state == LinkState::Up && lock(&self.callbacks).head.is_some();
+        dispatch.head_pose.overdue(watching, Instant::now())
+    }
+
+    /// Say that tobiid has sent no head pose since it was subscribed, as
+    /// [`HeadPoseWatch`] finds once per device, with no lock held.
+    fn warn_head_pose_silent(&self) {
+        self.log(
+            Level::Warn,
+            format_args!(
+                "tobiid has sent no head pose in the {} s since it was subscribed: a tobiid \
+                 older than this libtobii.so sends none (restart it after installing), nor \
+                 does one whose tracker sends no IR images (unplugged, paused, or with \
+                 TOBII_NO_IMAGE set)",
+                HEAD_POSE_SILENCE.as_secs()
+            ),
+        );
     }
 
     /// Run `f` on the dispatch state under `dispatch`, a guard of its lock,
@@ -1393,18 +1522,8 @@ impl Device {
     fn deliver(&self, msg: &ServerMsg) {
         let cb = lock(&self.callbacks);
         match msg {
-            ServerMsg::Head {
-                ts_us,
-                pos_mm,
-                rot_rad,
-            } => {
-                let hp = HeadPose {
-                    timestamp_us: *ts_us,
-                    position_validity: TOBII_VALIDITY_VALID,
-                    position_xyz: *pos_mm,
-                    rotation_validity_xyz: [TOBII_VALIDITY_VALID; 3],
-                    rotation_xyz: *rot_rad,
-                };
+            ServerMsg::HeadPose(pose) => {
+                let hp = head_pose(pose);
                 if let Some((f, ud)) = cb.head {
                     // SAFETY: registered through `tobii_head_pose_subscribe`
                     // (see the module invariant), called on the processing
@@ -1412,6 +1531,10 @@ impl Device {
                     call(|| unsafe { f(&raw const hp, ud) });
                 }
             }
+            // The daemon's own head pose, relative to its rest pose and with
+            // no validity: libtobii does not ask for it (see
+            // `Callbacks::mask`), and hands none on should a daemon send it.
+            ServerMsg::Head { .. } => {}
             ServerMsg::Gaze {
                 ts_us, valid, xy, ..
             } => {
@@ -1524,6 +1647,19 @@ fn validity(valid: bool) -> Validity {
         TOBII_VALIDITY_VALID
     } else {
         TOBII_VALIDITY_INVALID
+    }
+}
+
+/// A head pose in the C layout: every value as the daemon sent it (one
+/// whose flag is clear holds the last valid value, zeros before the
+/// first), the position's validity and each angle's from its own flag.
+fn head_pose(p: &tobii_ipc::HeadPose) -> HeadPose {
+    HeadPose {
+        timestamp_us: p.ts_us,
+        position_validity: validity(p.position_valid),
+        position_xyz: p.position_mm,
+        rotation_validity_xyz: p.rotation_valid.map(validity),
+        rotation_xyz: p.rotation_rad,
     }
 }
 
@@ -1680,7 +1816,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::logger::tests::{Recorder, SyncRecorder};
     use crate::types::{
-        LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO, TOBII_STATE_CALIBRATION_ACTIVE,
+        LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO, TOBII_LOG_LEVEL_WARN,
+        TOBII_STATE_CALIBRATION_ACTIVE,
     };
     use std::cell::RefCell;
     use std::ffi::c_char;
@@ -1711,6 +1848,25 @@ pub(crate) mod tests {
         /// Whether a look of `wait` has taken a sample for `process`.
         fn has_pending(&self) -> bool {
             !lock(&self.dispatch).pending.is_empty()
+        }
+
+        /// Whether the head-pose watch's window is open (see
+        /// [`HeadPoseWatch`]).
+        fn head_pose_window_open(&self) -> bool {
+            lock(&self.dispatch).head_pose.since.is_some()
+        }
+
+        /// Move the open head-pose window's start `by` back, as if it had
+        /// opened that much earlier: a test cannot wait out
+        /// `HEAD_POSE_SILENCE`.
+        fn backdate_head_pose_window(&self, by: Duration) {
+            let mut dispatch = lock(&self.dispatch);
+            let since = dispatch
+                .head_pose
+                .since
+                .as_mut()
+                .expect("the window is open");
+            *since = since.checked_sub(by).expect("the clock has run that long");
         }
     }
 
@@ -2168,7 +2324,10 @@ pub(crate) mod tests {
             ..tobii_ipc::EyePair::default()
         };
         let frames = vec![
-            tobii_ipc::encode_head(11, [0.0; 3], [0.0; 3]),
+            tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose {
+                ts_us: 11,
+                ..tobii_ipc::HeadPose::default()
+            }),
             encode_gaze(12, true, [0.5; 2], [f32::NAN; 2]),
             tobii_ipc::encode_presence(13, tobii_ipc::PRESENCE_PRESENT),
             encode_gaze_origin(&pair(14)),
@@ -2228,6 +2387,144 @@ pub(crate) mod tests {
                 image: 17,
             }
         );
+    }
+
+    /// `tobii_head_pose_subscribe` asks tobiid for the Stream Engine's head
+    /// pose, bit 9, never for its own relative HEAD stream, alone or beside
+    /// another stream, and the unsubscribe takes it back.
+    #[test]
+    fn head_pose_is_asked_for_as_head_pose_not_head() {
+        let (connect, daemons) = scripted_daemon(vec![vec![encode_subscribed(true); 4]]);
+        let d = Device::new(connect, 1, 1).expect("device");
+        let mut daemon = daemons.recv().expect("daemon end");
+        let (h, n) = (handle(&d), ptr::null_mut());
+
+        // SAFETY: `d` is live for every call, and the callbacks are sound
+        // with any user data.
+        let got = unsafe {
+            [
+                crate::streams::tobii_head_pose_subscribe(h, Some(ignore_head), n),
+                crate::streams::tobii_gaze_point_subscribe(h, Some(ignore_gaze), n),
+                crate::streams::tobii_head_pose_unsubscribe(h),
+                crate::streams::tobii_gaze_point_unsubscribe(h),
+            ]
+        };
+
+        assert_eq!(got, [TOBII_ERROR_NO_ERROR; 4]);
+        let masks: Vec<_> = (0..4).map(|_| subscription(&mut daemon)).collect();
+        assert_eq!(
+            masks,
+            [
+                Some(STREAM_HEAD_POSE),
+                Some(STREAM_HEAD_POSE | STREAM_GAZE),
+                Some(STREAM_GAZE),
+                Some(0),
+            ]
+        );
+        assert_eq!(STREAM_HEAD_POSE, 1 << 9);
+    }
+
+    unsafe extern "C" fn keep_head_pose(p: *const HeadPose, ud: *mut c_void) {
+        // SAFETY: the test passes `&raw mut Vec<HeadPose>` as `ud`, which
+        // outlives the device; `p` is live for the call.
+        unsafe { (*ud.cast::<Vec<HeadPose>>()).push(*p) };
+    }
+
+    /// Each head pose reaches the callback with its values as the daemon
+    /// sent them, the position's validity and each angle's from its own
+    /// flag: none set, each alone, and all.
+    #[test]
+    fn head_pose_validity_comes_from_each_flag() {
+        let sent = |ts_us, position_valid, rotation_valid| tobii_ipc::HeadPose {
+            ts_us,
+            position_valid,
+            position_mm: [1.5, -2.25, 600.0],
+            rotation_valid,
+            rotation_rad: [0.125, -0.25, 0.5],
+        };
+        let frames: Vec<_> = [
+            sent(1, false, [false; 3]),
+            sent(2, true, [false; 3]),
+            sent(3, false, [true, false, false]),
+            sent(4, false, [false, true, false]),
+            sent(5, false, [false, false, true]),
+            sent(6, true, [true; 3]),
+        ]
+        .iter()
+        .map(tobii_ipc::encode_head_pose)
+        .collect();
+        // Sends them all ahead of the ack, so that they wait for `process`.
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                let mut out = frames.clone();
+                out.push(encode_subscribed(true));
+                out
+            }
+            _ => vec![],
+        });
+        let d = Device::new(connect, 1, 1).expect("device");
+        let mut seen: Vec<HeadPose> = Vec::new();
+        let ud = (&raw mut seen).cast::<c_void>();
+        assert_eq!(
+            d.subscribe(|c| &mut c.head, Some(keep_head_pose as HeadPoseFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+
+        let (v, i) = (TOBII_VALIDITY_VALID, TOBII_VALIDITY_INVALID);
+        let got = |timestamp_us, position_validity, rotation_validity_xyz| HeadPose {
+            timestamp_us,
+            position_validity,
+            position_xyz: [1.5, -2.25, 600.0],
+            rotation_validity_xyz,
+            rotation_xyz: [0.125, -0.25, 0.5],
+        };
+        assert_eq!(
+            seen,
+            [
+                got(1, i, [i, i, i]),
+                got(2, v, [i, i, i]),
+                got(3, i, [v, i, i]),
+                got(4, i, [i, v, i]),
+                got(5, i, [i, i, v]),
+                got(6, v, [v, v, v]),
+            ]
+        );
+    }
+
+    /// The daemon's own relative head pose (HEAD) reaches no callback,
+    /// should a daemon send it though libtobii never asks for it: the
+    /// head-pose callback gets the Stream Engine's (`HEAD_POSE`) alone.
+    #[test]
+    fn the_daemons_own_head_pose_reaches_no_callback() {
+        let d = device_with(0, vec![]);
+        let mut stamps = Stamps::default();
+        let ud = (&raw mut stamps).cast::<c_void>();
+        assert_eq!(
+            d.subscribe(|c| &mut c.head, Some(stamp_head as HeadPoseFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        let msg = |body: Vec<u8>| decode_server(&body).expect("decodes");
+        let head = |ts_us| msg(tobii_ipc::encode_head(ts_us, [1.0; 3], [0.5; 3]));
+        let head_pose = |ts_us| {
+            msg(tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose {
+                ts_us,
+                ..tobii_ipc::HeadPose::default()
+            }))
+        };
+
+        d.queue(head(21));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(stamps.head, 0, "no pose yet");
+        for sample in [head_pose(22), head(23)] {
+            d.queue(sample);
+        }
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        drop(d);
+
+        assert_eq!(stamps.head, 22, "the head pose, and not the HEAD after it");
     }
 
     unsafe extern "C" fn keep_gaze_data(p: *const GazeData, ud: *mut c_void) {
@@ -3232,7 +3529,7 @@ pub(crate) mod tests {
 
         assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
 
-        let every = STREAM_HEAD
+        let every = STREAM_HEAD_POSE
             | STREAM_GAZE
             | STREAM_PRESENCE
             | STREAM_GAZE_ORIGIN
@@ -3328,6 +3625,272 @@ pub(crate) mod tests {
             ]
         );
         drop(daemon);
+    }
+
+    /// The window opens at the first look that watches, and the warning is
+    /// due at the first look a whole `HEAD_POSE_SILENCE` later, once: never
+    /// again, on this link or another.
+    #[test]
+    fn the_head_pose_watch_warns_once_a_window_after_it_opened() {
+        let mut watch = HeadPoseWatch::default();
+        let t0 = Instant::now();
+        let just_short = HEAD_POSE_SILENCE - Duration::from_millis(1);
+
+        assert!(!watch.overdue(true, t0), "opens the window");
+        assert!(!watch.overdue(true, t0 + just_short));
+        assert!(watch.overdue(true, t0 + HEAD_POSE_SILENCE));
+        assert!(!watch.overdue(true, t0 + HEAD_POSE_SILENCE), "said once");
+        watch.restart();
+        assert!(!watch.overdue(true, t0 + 2 * HEAD_POSE_SILENCE));
+        assert!(
+            !watch.overdue(true, t0 + 4 * HEAD_POSE_SILENCE),
+            "once per device, whatever the links"
+        );
+    }
+
+    /// A look that does not watch (head pose unsubscribed, or the link
+    /// down) closes the window, so the next that does opens it afresh; a
+    /// head pose ends the watch on its link, and a new link starts it over.
+    #[test]
+    fn a_head_pose_or_a_look_that_does_not_watch_closes_the_window() {
+        let mut watch = HeadPoseWatch::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let silence = HEAD_POSE_SILENCE.as_secs();
+
+        assert!(!watch.overdue(true, at(0)));
+        assert!(!watch.overdue(false, at(1)), "not watching");
+        assert_eq!(watch.since, None, "closed");
+        assert!(!watch.overdue(true, at(2)), "opens it again");
+        assert!(
+            !watch.overdue(true, at(silence + 1)),
+            "it opened again at 2 s"
+        );
+        watch.saw_one();
+        assert!(!watch.overdue(true, at(silence + 2)));
+        assert!(!watch.overdue(true, at(3 * silence)), "a head pose came");
+        assert_eq!(watch.since, None);
+        watch.restart();
+        assert!(!watch.overdue(true, at(3 * silence)), "opens on a new link");
+        assert!(watch.overdue(true, at(4 * silence)));
+    }
+
+    /// What a device logs, once, when tobiid has sent no head pose since it
+    /// was subscribed.
+    fn silent_head_pose() -> String {
+        format!(
+            "tobiid has sent no head pose in the {} s since it was subscribed: a tobiid older \
+             than this libtobii.so sends none (restart it after installing), nor does one \
+             whose tracker sends no IR images (unplugged, paused, or with TOBII_NO_IMAGE set)",
+            HEAD_POSE_SILENCE.as_secs()
+        )
+    }
+
+    /// Subscribe head pose on `d`, with a callback that ignores it.
+    fn subscribe_head_pose(d: &Device) -> Status {
+        d.subscribe(
+            |c| &mut c.head,
+            Some(ignore_head as HeadPoseFn),
+            ptr::null_mut(),
+        )
+    }
+
+    /// A subscribed head pose that tobiid never sends (one from before
+    /// `HEAD_POSE` sends none) is warned of once, at WARN, by the first
+    /// process a whole `HEAD_POSE_SILENCE` after the first that found it
+    /// subscribed; not again, on that connection or the next.
+    #[test]
+    fn head_pose_tobiid_never_sends_is_warned_of_once() {
+        let recorder = Recorder::default();
+        let mut d = device_with(0, vec![]);
+        d.set_logger(recorder.logger());
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE - Duration::from_secs(1));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert!(recorder.lines().is_empty(), "not yet");
+
+        d.backdate_head_pose_window(Duration::from_secs(1));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        assert_eq!(
+            recorder.lines(),
+            [(TOBII_LOG_LEVEL_WARN, silent_head_pose())]
+        );
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert!(!d.head_pose_window_open(), "said once per device");
+        assert_eq!(
+            recorder.lines()[1..],
+            [(TOBII_LOG_LEVEL_INFO, "reconnected to tobiid".to_owned())]
+        );
+    }
+
+    /// Wait until the device's reader has rung its doorbell `rings` times
+    /// past `seen`, a count read earlier: it rings once it has queued each
+    /// sample, so they are all queued, and no look has taken them.
+    fn queued(d: &Device, seen: u64, rings: u64) {
+        let mut now = seen;
+        while now.wrapping_sub(seen) < rings {
+            assert!(d.doorbell.wait_past(now, LONG_WAIT), "queued");
+            now = d.doorbell.rings();
+        }
+    }
+
+    /// A head pose that has come ends the watch, valid or not (tobiid sends
+    /// one for every image), even one still queued as the window runs out,
+    /// behind a sample of another stream: a look that finds that sample
+    /// leaves the head pose to the process that takes it, which does not
+    /// warn.
+    #[test]
+    fn head_pose_tobiid_sends_is_not_warned_of() {
+        // Sends a gaze origin and an invalid head pose when the client
+        // recenters.
+        let connect = fake_daemon(|body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => vec![encode_subscribed(true)],
+            Some(&tobii_ipc::TAG_RECENTER) => vec![
+                encode_gaze_origin(&tobii_ipc::EyePair::default()),
+                tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose::default()),
+            ],
+            _ => vec![],
+        });
+        let recorder = Recorder::default();
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        d.set_logger(recorder.logger());
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        let seen = d.doorbell.rings();
+        assert_eq!(d.send(&tobii_ipc::encode_recenter()), Ok(()));
+        queued(&d, seen, 2);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+
+        assert!(d.wait(LONG_WAIT), "the gaze origin");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        assert!(!d.head_pose_window_open(), "the watch has ended");
+        assert!(recorder.lines().is_empty(), "{:?}", recorder.lines());
+    }
+
+    /// Only a head pose ends the watch: the samples of another stream show
+    /// that tobiid serves the device, not that it sends head poses.
+    #[test]
+    fn head_pose_tobiid_never_sends_is_warned_of_though_other_samples_come() {
+        let (connect, daemons) = scripted_daemon(vec![vec![encode_subscribed(true); 2]]);
+        let recorder = Recorder::default();
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        d.set_logger(recorder.logger());
+        let mut daemon = daemons.recv().expect("daemon end");
+        let mut hits = 0u32;
+        let ud = (&raw mut hits).cast::<c_void>();
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert_eq!(
+            d.subscribe(|c| &mut c.gaze_origin, Some(count_pair as EyePairFn), ud),
+            TOBII_ERROR_NO_ERROR
+        );
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        let seen = d.doorbell.rings();
+        let sample = encode_gaze_origin(&tobii_ipc::EyePair::default());
+        write_frame(&mut daemon, &sample).expect("a sample");
+        queued(&d, seen, 1);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        assert_eq!(hits, 1, "the gaze origin was delivered");
+        assert_eq!(
+            recorder.lines(),
+            [(TOBII_LOG_LEVEL_WARN, silent_head_pose())]
+        );
+        drop(daemon);
+    }
+
+    /// A host that calls process only when a wait finds something to
+    /// process hears of it too: a wait that finds nothing watches the head
+    /// pose, and warns as process would, once.
+    #[test]
+    fn a_wait_warns_of_head_pose_tobiid_never_sends() {
+        let recorder = Recorder::default();
+        let mut d = device_with(0, vec![]);
+        d.set_logger(recorder.logger());
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert!(!d.wait(SHORT_WAIT), "nothing to process");
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+
+        assert!(!d.wait(SHORT_WAIT));
+
+        assert_eq!(
+            recorder.lines(),
+            [(TOBII_LOG_LEVEL_WARN, silent_head_pose())]
+        );
+        assert!(!d.wait(SHORT_WAIT));
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(recorder.lines().len(), 1, "once");
+    }
+
+    /// Head pose is watched only while it is subscribed on a connection
+    /// that is up: an unsubscribe closes the window, and so does the loss
+    /// of the connection, which is reported, and nothing else.
+    #[test]
+    fn head_pose_is_not_watched_unsubscribed_or_on_a_lost_connection() {
+        let (connect, daemons) = scripted_daemon(vec![vec![encode_subscribed(true); 3]]);
+        let recorder = Recorder::default();
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        d.set_logger(recorder.logger());
+        let daemon = daemons.recv().expect("daemon end");
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+
+        assert_eq!(d.unsubscribe(|c| &mut c.head), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert!(!d.head_pose_window_open(), "unsubscribed");
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+        drop(daemon);
+        hung_up(&d);
+        assert_eq!(d.process(), TOBII_ERROR_CONNECTION_FAILED);
+        assert!(!d.head_pose_window_open(), "lost");
+
+        assert_eq!(recorder.lines(), [(TOBII_LOG_LEVEL_ERROR, LOST.to_owned())]);
+    }
+
+    /// A reconnect starts the watch over: its connection may reach another
+    /// daemon, one that sends no head pose though the last one did, and the
+    /// time the old connection went without one does not count.
+    #[test]
+    fn a_reconnect_starts_the_head_pose_watch_over() {
+        let head_pose = tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose::default());
+        let (connect, daemons) = scripted_daemon(vec![
+            vec![encode_subscribed(true), head_pose],
+            vec![encode_subscribed(true)],
+            vec![encode_subscribed(true)],
+        ]);
+        let recorder = Recorder::default();
+        let mut d = Device::new(connect, 1, 1).expect("device");
+        d.set_logger(recorder.logger());
+        assert_eq!(subscribe_head_pose(&d), TOBII_ERROR_NO_ERROR);
+        assert!(d.wait(LONG_WAIT), "the head pose");
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        assert!(!d.head_pose_window_open(), "it came");
+
+        // The second daemon sends none.
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+        assert_eq!(d.reconnect(), TOBII_ERROR_NO_ERROR);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+        let reconnected = (TOBII_LOG_LEVEL_INFO, "reconnected to tobiid".to_owned());
+        assert_eq!(recorder.lines(), [reconnected.clone(), reconnected]);
+        d.backdate_head_pose_window(HEAD_POSE_SILENCE);
+        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
+
+        assert_eq!(
+            recorder.lines()[2..],
+            [(TOBII_LOG_LEVEL_WARN, silent_head_pose())]
+        );
+        drop(daemons);
     }
 
     /// A logger's context: the device it calls back into, and what that call

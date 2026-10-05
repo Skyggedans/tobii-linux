@@ -155,4 +155,4 @@ tobii_wearable_foveated_gaze_subscribe
 tobii_wearable_foveated_gaze_unsubscribe
 tobii_wearable_limited_image_subscribe
 tobii_wearable_limited_image_unsubscribe
-tobii_recenter # extension: make the current head pose the rest pose
+tobii_recenter # extension: re-zero tobiid's legacy relative head pose (HEAD, tobii-opentrack); not tobii_head_pose_subscribe's

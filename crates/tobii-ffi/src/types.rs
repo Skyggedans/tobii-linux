@@ -240,20 +240,32 @@ pub struct GeometryMounting {
     pub internal_offset_mm_xyz: [f32; 3],
 }
 
-/// `tobii_head_pose_t`.
+/// `tobii_head_pose_t`: the Stream Engine's head pose, one for every IR
+/// image tobiid processes, valid or not. Absolute, in the display frame:
+/// the origin at the centre of the display area, +x to the right and +y up
+/// along the display as the user sees it, +z out of it towards the user. A
+/// value whose validity is `TOBII_VALIDITY_INVALID` holds no measurement.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeadPose {
-    /// When the source image was taken, microseconds on the
-    /// `tobii_system_clock` clock.
+    /// When the IR image the pose was made from was taken, microseconds on
+    /// the `tobii_system_clock` clock.
     pub timestamp_us: i64,
     /// Validity of `position_xyz`.
     pub position_validity: Validity,
-    /// Head position in millimetres, tracker coordinates.
+    /// Head position in the display frame, millimetres: a point on the
+    /// camera's line of sight to the point midway between the eyes, at a
+    /// range set by the head's size in the image, so turning the head
+    /// moves it.
     pub position_xyz: [f32; 3],
     /// Per-axis validity of `rotation_xyz`.
     pub rotation_validity_xyz: [Validity; 3],
-    /// Head rotation in radians about x, y, z.
+    /// Head rotation in radians, right-handed about the display frame's
+    /// axes: the yxz Euler angles `[x, y, z]` of the head's rotation
+    /// `R = Ry(y) · Rx(x) · Rz(z)`, as the Stream Engine's, all zero for a
+    /// face square to the display. +x lifts the chin (pitch), +y turns the
+    /// head to the user's left (yaw), +z tilts it towards the left
+    /// shoulder (roll).
     pub rotation_xyz: [f32; 3],
 }
 

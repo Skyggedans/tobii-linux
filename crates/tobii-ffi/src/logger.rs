@@ -11,9 +11,12 @@
 //! process call, the request's status having said it), `tobiid` sends a
 //! reply that does not decode, or `tobii_calibration_stop` fails after
 //! `tobiid` saved the calibration (its status cannot tell that from a
-//! failure that kept nothing); INFO when a device connects or reconnects.
-//! A failing call is not otherwise logged as such: its status says it. Each
-//! line goes to `tracing` too, as the crate's other events do.
+//! failure that kept nothing); WARN, once per device, when `tobiid` has sent
+//! no head pose for a while since it was subscribed (a `tobiid` older than
+//! this library sends none, see `device::HeadPoseWatch`); INFO when a device
+//! connects or reconnects. A failing call is not otherwise logged as such:
+//! its status says it. Each line goes to `tracing` too, as the crate's other
+//! events do.
 //!
 //! The logger is called synchronously, on the thread inside the `tobii_*` call
 //! that has something to say, and never from the reader thread: a [`Logger`]
@@ -70,7 +73,9 @@ use std::fmt;
 
 use crate::device::call;
 use crate::status::{Status, TOBII_ERROR_INVALID_PARAMETER};
-use crate::types::{CustomLog, LogFn, LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO};
+use crate::types::{
+    CustomLog, LogFn, LogLevel, TOBII_LOG_LEVEL_ERROR, TOBII_LOG_LEVEL_INFO, TOBII_LOG_LEVEL_WARN,
+};
 
 /// The application's logger, copied from its `tobii_custom_log_t`. The raw
 /// context pointer keeps it from being `Send`, so it can never reach the
@@ -127,6 +132,9 @@ impl Logger {
 pub(crate) enum Level {
     /// Something failed, and the application may want to know why.
     Error,
+    /// Nothing failed, but something the application asked for does not
+    /// come: no head pose from `tobiid`.
+    Warn,
     /// A device connected or reconnected.
     Info,
 }
@@ -136,6 +144,7 @@ impl Level {
     const fn c(self) -> LogLevel {
         match self {
             Self::Error => TOBII_LOG_LEVEL_ERROR,
+            Self::Warn => TOBII_LOG_LEVEL_WARN,
             Self::Info => TOBII_LOG_LEVEL_INFO,
         }
     }
@@ -147,6 +156,7 @@ impl Level {
 pub(crate) fn emit(logger: Option<Logger>, level: Level, args: fmt::Arguments<'_>) {
     match level {
         Level::Error => tracing::error!("{args}"),
+        Level::Warn => tracing::warn!("{args}"),
         Level::Info => tracing::info!("{args}"),
     }
     let Some(logger) = logger else {
@@ -309,6 +319,7 @@ pub(crate) mod tests {
 
         emit(recorder.logger(), Level::Error, format_args!("one {}", 1));
         emit(recorder.logger(), Level::Info, format_args!("two"));
+        emit(recorder.logger(), Level::Warn, format_args!("three"));
         emit(recorder.logger(), Level::Error, format_args!("a\0b"));
         emit(None, Level::Error, format_args!("to nobody"));
 
@@ -317,6 +328,7 @@ pub(crate) mod tests {
             [
                 (TOBII_LOG_LEVEL_ERROR, "one 1".to_owned()),
                 (TOBII_LOG_LEVEL_INFO, "two".to_owned()),
+                (TOBII_LOG_LEVEL_WARN, "three".to_owned()),
                 (TOBII_LOG_LEVEL_ERROR, "a\u{fffd}b".to_owned()),
             ]
         );

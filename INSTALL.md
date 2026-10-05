@@ -438,7 +438,10 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   reports it (once per loss), a daemon reply that does not decode, or a
   `tobii_calibration_stop` that failed after the daemon saved the
   calibration (saved but perhaps not applied: the tracker loads it at its
-  next init), and `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
+  next init), `TOBII_LOG_LEVEL_WARN`, once per device, for a head pose the
+  daemon has not sent in the 20 s since it was subscribed (a `tobiid` older
+  than the library sends none: restart it after installing), and
+  `TOBII_LOG_LEVEL_INFO` for each connect and reconnect.
   The logger is called on the thread inside the `tobii_*` call that logs,
   with none of that call's locks held, and from several threads at once if
   they log at once, so lines from different threads may interleave; a call
