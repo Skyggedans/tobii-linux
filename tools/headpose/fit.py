@@ -3,7 +3,7 @@
 and on all the sessions given.
 
     fit.py --session LOG JSONL FITS [--session ...] [--area A] [--out FIT.json]
-           [--in-sample] [--blend] [--rotation-filters shared|per-axis]
+           [--fitted FITTED.json] [--in-sample] [--blend] [--rotation-filters shared|per-axis]
 
 The images fitted on are those where the DLL's pose is valid and G3 holds for the fit (where both
 give a pose). In each fold (one per session, fitted on the others; and one on all of them):
@@ -21,22 +21,28 @@ give a pose). In each fold (one per session, fitted on the others; and one on al
             1 px, the fewest FV + gated FI on the training sessions (images whose DLL pose is
             invalid that G3 passes, DLL-valid images with a face that it gates: the errors the
             thresholds control), ties to the larger a, then the larger b; each fold's then tested
-            on the session it leaves out. A check, not a fit: head_params keep FITTED's (6, -4).
+            on the session it leaves out. A check, not a fit: head_params keep the thresholds of
+            HeadParams::FITTED (reference.FITTED: 6 and -4 px), which choose the images fitted on.
 The one-euro filters and the position's time constant are not fitted here (the filter study chose
 them).
 
 Prints each fold's constants and its beta grid, then every session's errors against the DLL with
 the constants fitted on the others (with --in-sample also with those fitted on all), and the G3
-thresholds of each fold and of all, with their errors there and on the session left out. Writes
-FIT.json: "head_params", the all-session constants under the field names of head.rs's HeadParams,
-with the choices it ships (the PnP branch alone, w = 0, unless --blend; one one-euro filter shared
-by the three angles unless --rotation-filters per-axis): what HeadParams::FITTED takes. "fit" has
-the fit's own numbers (the eye weight found, beta, Q's yxz angles, the costs, the G3 thresholds
-found), "folds" the same per held-out session; "options" the display area given (TL, TR, BL, mm)
-and "sessions" each session's files, clock offset, images and display frame.
+thresholds of each fold and of all, with their errors there and on the session left out; last,
+the fingerprint of head_params (HeadParams::fingerprint, which compare-dll --head prints of the
+constants it runs). Writes FIT.json: "head_params", the all-session constants under the field
+names of head.rs's HeadParams, with the choices it ships (the PnP branch alone, w = 0, unless
+--blend; one one-euro filter shared by the three angles unless --rotation-filters per-axis): what
+HeadParams::FITTED takes; "fingerprint" theirs. "fit" has the fit's own numbers (the eye weight
+found, beta, Q's yxz angles, the costs, the G3 thresholds found), "folds" the same per held-out
+session; "options" the display area given (TL, TR, BL, mm) and "sessions" each session's files,
+clock offset, images and display frame. --fitted writes FITTED.json, what tools/headpose/fitted.json
+holds: head_params and their fingerprint, the eye weight found and Q's yxz angles, the date, the
+options and the sessions, and no per-image numbers.
 """
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -52,7 +58,7 @@ import reference as ref  # noqa: E402
 BETA_GRID = (0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7, 1.0)
 JIT_TOL = 1.05
 # The G3 thresholds searched (px): the centroid's edge a and the nose tip's b; and those that
-# head_params keep.
+# head_params keep, HeadParams::FITTED's.
 G3_CENTROID_GRID = np.arange(-4, 15, 1.0)
 G3_NOSE_GRID = np.arange(-14, 5, 1.0)
 G3_KEPT = (ref.FITTED["g3_centroid_min_px"], ref.FITTED["g3_nose_min_px"])
@@ -222,6 +228,7 @@ def params_of(fold, blend, per_axis):
         fold["pos"],
         beta_a=fold["beta"],
         one_euro={k: list(v) for k, v in filters.items()},
+        g3=G3_KEPT,
     )
     if not blend:
         P["w"] = 0.0
@@ -307,10 +314,12 @@ def held_out_tables(sessions, fold_of, labels, per_axis):
 # ------------------------------------------------------------------ main
 def fold_json(fold, blend, per_axis):
     p = fold["pos"]
+    head_params = ref.head_params(params_of(fold, blend, per_axis))
     return dict(
         trained_on=fold["train"],
         frames=fold["n_frames"],
-        head_params=ref.head_params(params_of(fold, blend, per_axis)),
+        fingerprint=f"{ref.fingerprint(head_params):016x}",
+        head_params=head_params,
         fit=dict(
             eye_weight=p["w"],
             correction_share=fold["beta"],
@@ -413,6 +422,10 @@ def main():
     C.add_session_args(ap)
     ap.add_argument("--out", help="the JSON to write (head_params, fit, folds)")
     ap.add_argument(
+        "--fitted",
+        help="also write the constants to ship alone, as tools/headpose/fitted.json holds them",
+    )
+    ap.add_argument(
         "--in-sample",
         action="store_true",
         help="also print every session's errors with the constants fitted on all the sessions",
@@ -454,21 +467,27 @@ def main():
         labels.append("in-sample")
     held_out_tables(sessions, fold_of, labels, per_axis)
     print_g3(sessions, folds, every)
+    shipped = fold_json(every, args.blend, per_axis)
+    print(
+        f"\nhead_params (fitted on {', '.join(every['train'])}, the choices to ship): fingerprint "
+        f"{shipped['fingerprint']}"
+    )
+    options = dict(
+        blend=args.blend,
+        rotation_filters=args.rotation_filters,
+        area=(
+            dict(zip(("TL", "TR", "BL"), (list(p) for p in args.area)))
+            if args.area is not None
+            else "fitted to each log's gaze origins"
+        ),
+    )
     if args.out:
         doc = dict(
             about="Head pose constants fitted by tools/headpose/fit.py to the Stream Engine's "
             "head pose. head_params: fitted on all the sessions, under head.rs's HeadParams field "
-            "names, with the choices to ship (options); fit: the fit's own numbers; folds: the "
-            "same fitted without each session.",
-            options=dict(
-                blend=args.blend,
-                rotation_filters=args.rotation_filters,
-                area=(
-                    dict(zip(("TL", "TR", "BL"), (list(p) for p in args.area)))
-                    if args.area is not None
-                    else "fitted to each log's gaze origins"
-                ),
-            ),
+            "names, with the choices to ship (options), and fingerprint theirs; fit: the fit's own "
+            "numbers; folds: the same fitted without each session.",
+            options=options,
             sessions={
                 o["name"]: dict(
                     log=os.path.basename(o["paths"]["log"]),
@@ -481,13 +500,42 @@ def main():
                 )
                 for o in sessions
             },
-            **fold_json(every, args.blend, per_axis),
+            **shipped,
             folds={name: fold_json(f, args.blend, per_axis) for name, f in folds.items()},
         )
         with open(args.out, "w") as f:
             json.dump(doc, f, indent=1)
             f.write("\n")
         print(f"\nwrote {args.out}")
+    if args.fitted:
+        doc = dict(
+            about="HeadParams::FITTED (crates/tobii-pose/src/head.rs), the head pose constants "
+            "libtobii ships, as tools/headpose/fit.py --fitted wrote them: head_params, fitted to "
+            "the Stream Engine's own head pose on the sessions below, with the choices to ship "
+            "(options), and fingerprint their HeadParams::fingerprint, by which head.rs's tests "
+            "check that FITTED holds these numbers; fit: the eye weight the fit found and Q's yxz "
+            "angles. The scripts take head_params as reference.FITTED, their default constants.",
+            fitted=datetime.date.today().isoformat(),
+            options=options,
+            sessions={
+                o["name"]: dict(
+                    log=os.path.basename(o["paths"]["log"]),
+                    dll=os.path.basename(o["paths"]["dll"]),
+                    fits=os.path.basename(o["paths"]["fits"]),
+                    clock_offset_us=int(o["k"]),
+                    images=int(o["n"]),
+                )
+                for o in sessions
+            },
+            trained_on=shipped["trained_on"],
+            fingerprint=shipped["fingerprint"],
+            head_params=shipped["head_params"],
+            fit={k: shipped["fit"][k] for k in ("eye_weight", "rotation_offset_yxz_deg")},
+        )
+        with open(args.fitted, "w") as f:
+            json.dump(doc, f, indent=1)
+            f.write("\n")
+        print(f"wrote {args.fitted}")
 
 
 if __name__ == "__main__":

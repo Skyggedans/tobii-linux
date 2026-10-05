@@ -1,0 +1,151 @@
+{
+ "about": "HeadParams::FITTED (crates/tobii-pose/src/head.rs), the head pose constants libtobii ships, as tools/headpose/fit.py --fitted wrote them: head_params, fitted to the Stream Engine's own head pose on the sessions below, with the choices to ship (options), and fingerprint their HeadParams::fingerprint, by which head.rs's tests check that FITTED holds these numbers; fit: the eye weight the fit found and Q's yxz angles. The scripts take head_params as reference.FITTED, their default constants.",
+ "fitted": "2026-10-05",
+ "options": {
+  "blend": false,
+  "rotation_filters": "shared",
+  "area": "fitted to each log's gaze origins"
+ },
+ "sessions": {
+  "s1": {
+   "log": "session1.bin",
+   "dll": "session1.jsonl",
+   "fits": "fits_base_s1.csv",
+   "clock_offset_us": 9290110919,
+   "images": 5284
+  },
+  "s2": {
+   "log": "session2.bin",
+   "dll": "session2.jsonl",
+   "fits": "fits_base_s2.csv",
+   "clock_offset_us": 10701480021,
+   "images": 5652
+  },
+  "s3": {
+   "log": "session3.bin",
+   "dll": "session3.jsonl",
+   "fits": "fits_base_s3.csv",
+   "clock_offset_us": 12670044474,
+   "images": 13354
+  }
+ },
+ "trained_on": [
+  "s1",
+  "s2",
+  "s3"
+ ],
+ "fingerprint": "40635c9d395eedc8",
+ "head_params": {
+  "rotation_offset": [
+   [
+    0.9998598296467968,
+    -0.007061906320573794,
+    -0.015180597412427903
+   ],
+   [
+    0.006135836744705243,
+    0.998167026192194,
+    -0.06020746905554362
+   ],
+   [
+    0.015577951281253175,
+    0.06010588408593104,
+    0.998070443471866
+   ]
+  ],
+  "pnp_scale": 0.971433550509725,
+  "pnp_point_mm": [
+   -2.7755215385214917,
+   27.399142576384914,
+   -36.48370644292963
+  ],
+  "pnp_direction": {
+   "gain": 1.0135631152364486,
+   "offset": [
+    0.0017333897424711283,
+    -0.007396786139722478
+   ]
+  },
+  "eye_rays": {
+   "fu": -375.9,
+   "cu": 140.9,
+   "fv": -383.3,
+   "cv": 139.8
+  },
+  "eye_contours": [
+   [
+    33,
+    7,
+    163,
+    144,
+    145,
+    153,
+    154,
+    155,
+    133,
+    173,
+    157,
+    158,
+    159,
+    160,
+    161,
+    246
+   ],
+   [
+    263,
+    249,
+    390,
+    373,
+    374,
+    380,
+    381,
+    382,
+    362,
+    398,
+    384,
+    385,
+    386,
+    387,
+    388,
+    466
+   ]
+  ],
+  "eye_range_mm": 64.2897361349246,
+  "eye_direction": {
+   "gain": 1.0208800446604975,
+   "offset": [
+    -0.004037362066961258,
+    -0.0002535692363206061
+   ]
+  },
+  "eye_weight": 0.0,
+  "position_tau_s": 0.07048533333333333,
+  "correction_tau_s": 0.07048533333333333,
+  "rotation_filters": [
+   {
+    "min_cutoff_hz": 1.0,
+    "beta": 0.2
+   },
+   {
+    "min_cutoff_hz": 1.0,
+    "beta": 0.2
+   },
+   {
+    "min_cutoff_hz": 1.0,
+    "beta": 0.2
+   }
+  ],
+  "rotation_derivative_cutoff_hz": 1.0,
+  "reset_gap_s": 1.0,
+  "min_centroid_edge_px": 6.0,
+  "min_nose_tip_edge_px": -4.0
+ },
+ "fit": {
+  "eye_weight": 0.38433121108142987,
+  "rotation_offset_yxz_deg": {
+   "x": 3.451721397979029,
+   "y": -0.8713985115471485,
+   "z": 0.35219869224245937
+  }
+ }
+}

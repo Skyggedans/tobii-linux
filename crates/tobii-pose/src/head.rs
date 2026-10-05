@@ -151,23 +151,25 @@ pub struct HeadParams {
 }
 
 impl HeadParams {
-    /// The constants fitted to the Stream Engine's own head pose in the three
-    /// captured Windows sessions on 2026-10-05: `tools/headpose/fit.py`'s
-    /// `head_params`, fitted on all three sessions (in sample) to the fits
-    /// this crate's tracker made of their images that day
-    /// (`tobii5-init-replay image83-replay --fits`), field for field. Two
-    /// choices are not the fit's: the position is the `PnP` branch's alone
-    /// (the eye weight is 0, where the fit gave 0.384; the eye branch keeps
-    /// the constants fitted for it, for comparison), and the three angles
-    /// share one one-euro filter of 1.0 Hz and 0.2 Hz per °/s (the head-pose
-    /// study had 1.0 and 0.4, 0.7 and 0.2, 1.5 and 0.1 for x, y and z). The
-    /// position's EMA and the validity thresholds are the study's, which the
-    /// fit keeps. Searched again on these fits, the thresholds come out the
-    /// same; of the filters tried on this tracker's poses in the EMA's place
-    /// (other time constants, one-euro filters, separate filters of direction
-    /// and range), each chosen on two sessions, none brought both the
-    /// position's lag and its rest jitter nearer the Stream Engine's in every
-    /// session it was not chosen on.
+    /// The constants `tools/headpose/fit.py` fitted on 2026-10-05 (its
+    /// `head_params`, in sample on all three sessions) to the Stream Engine's
+    /// own head pose in the three captured Windows sessions, from the face
+    /// fits this crate's tracker at 886e0a1 made of their images
+    /// (`tobii5-init-replay image83-replay --fits`), field for field.
+    /// `fit.py --fitted` wrote them to `tools/headpose/fitted.json` as well,
+    /// with their [`HeadParams::fingerprint`], by which the tests check that
+    /// these are those, bit for bit. Two choices are not the fit's: the
+    /// position is the `PnP` branch's alone (the eye weight is 0, where the
+    /// fit gave 0.384; the eye branch keeps the constants fitted for it, for
+    /// comparison), and the three angles share one one-euro filter of 1.0 Hz
+    /// and 0.2 Hz per °/s (the head-pose study had 1.0 and 0.4, 0.7 and 0.2,
+    /// 1.5 and 0.1 for x, y and z). The position's EMA and the validity
+    /// thresholds are the study's, which the fit keeps. Searched again on
+    /// these fits, the thresholds come out the same; of the filters tried on
+    /// this tracker's poses in the EMA's place (other time constants, one-euro
+    /// filters, separate filters of direction and range), each chosen on two
+    /// sessions, none brought both the position's lag and its rest jitter
+    /// nearer the Stream Engine's in every session it was not chosen on.
     pub const FITTED: Self = Self {
         rotation_offset: [
             [
@@ -987,12 +989,16 @@ mod tests {
         assert_close(&got.rotation_rad, &want.rotation_rad, what);
     }
 
-    /// The constants the study's test vectors (`test_vectors.json`) were
-    /// made with: its fit on the Python port of the tracker
-    /// (`reference.PROTOTYPE` in `tools/headpose/reference.py`), the eye
-    /// branch blended in and a one-euro filter per angle. The vectors check
-    /// the arithmetic against the reference's, which any constants do, so
-    /// they keep these whatever [`HeadParams::FITTED`] holds.
+    /// The constants the study's test vectors (`test_vectors.json`, which
+    /// `tools/headpose/make_vectors.py` writes again) were made with: in the
+    /// fields `fit.py` fits, the study's fit on the Python port of the
+    /// tracker (`reference.PROTOTYPE` in `tools/headpose/reference.py`), with
+    /// the eye branch blended in and a one-euro filter per angle; in the
+    /// others, [`HeadParams::FITTED`]'s, which were the study's too. So the
+    /// vectors check the arithmetic against the reference's and, with it,
+    /// FITTED's validity thresholds, filter restarts, rate cutoff, position
+    /// EMA, eye rays and contours: should one of those change, the vectors
+    /// are made again (`tools/headpose/README.md`, step 4).
     fn vector_params() -> HeadParams {
         HeadParams {
             rotation_offset: [
@@ -1022,27 +1028,12 @@ mod tests {
                 gain: 1.013_556_746_417_381_4,
                 offset: [0.001_815_721_453_967_718_2, -0.007_409_409_876_383_765_5],
             },
-            eye_rays: RayIntrinsics {
-                fu: -375.9,
-                cu: 140.9,
-                fv: -383.3,
-                cv: 139.8,
-            },
-            eye_contours: [
-                [
-                    33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246,
-                ],
-                [
-                    263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466,
-                ],
-            ],
             eye_range_mm: 64.291_648_924_177_8,
             eye_direction: DirectionMap {
                 gain: 1.020_828_932_951_275_4,
                 offset: [-0.004_033_985_018_082_697, -0.000_262_390_956_082_422_75],
             },
             eye_weight: 0.383_418_503_706_659_53,
-            position_tau_s: 0.070_485_333_333_333_33,
             correction_tau_s: 0.070_485_333_333_333_33,
             rotation_filters: [
                 OneEuro {
@@ -1058,10 +1049,7 @@ mod tests {
                     beta: 0.1,
                 },
             ],
-            rotation_derivative_cutoff_hz: 1.0,
-            reset_gap_s: 1.0,
-            min_centroid_edge_px: 6.0,
-            min_nose_tip_edge_px: -4.0,
+            ..HeadParams::FITTED
         }
     }
 
@@ -1241,6 +1229,16 @@ mod tests {
             ],
             "Q",
         );
+        // Those angles pin all nine entries of Q: it is their rotation.
+        let rotation = compose_yxz(euler_yxz(&fitted.rotation_offset));
+        assert!(
+            rotation
+                .as_flattened()
+                .iter()
+                .zip(fitted.rotation_offset.as_flattened())
+                .all(|(r, q)| (r - q).abs() <= 1e-12),
+            "Q is not the rotation of its angles: {rotation:?}"
+        );
         let dt = 0.030_208;
         assert_close(&[dt / (dt + fitted.position_tau_s)], &[0.3], "position EMA");
         assert_close(
@@ -1250,13 +1248,31 @@ mod tests {
         );
     }
 
-    /// The fingerprint changes with each constant, and FITTED's is pinned:
-    /// it changes with them, or with how the fingerprint reads them.
+    /// FITTED holds the numbers `fit.py` wrote, bit for bit: its fingerprint
+    /// is the one `fit.py` took of them ([`FITTED_JSON`]). A field copied
+    /// wrong from the fit fails here, and so does a change of how either
+    /// fingerprint reads the constants.
+    #[test]
+    fn fitted_holds_the_constants_fit_py_wrote() {
+        let key = "\"fingerprint\": \"";
+        let at = FITTED_JSON.find(key).unwrap() + key.len();
+        let written = FITTED_JSON
+            .get(at..at + 16)
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .unwrap();
+        let fitted = HeadParams::FITTED.fingerprint();
+        assert_eq!(
+            fitted, written,
+            "HeadParams::FITTED (fingerprint {fitted:016x}) is not the head_params fit.py wrote \
+             into tools/headpose/fitted.json ({written:016x}): copy them again, field for field"
+        );
+    }
+
+    /// The fingerprint changes with each constant.
     #[test]
     fn the_fingerprint_follows_every_constant() {
         let fitted = HeadParams::FITTED.fingerprint();
         assert_eq!(fitted, HeadParams::FITTED.fingerprint());
-        assert_eq!(fitted, FITTED_FINGERPRINT, "{fitted:016x}");
         let changed = |change: fn(&mut HeadParams)| {
             let mut params = HeadParams::FITTED;
             change(&mut params);
@@ -2029,10 +2045,14 @@ mod tests {
         assert_eq!(out.model_runs, runs);
     }
 
-    /// [`HeadParams::fingerprint`] of [`HeadParams::FITTED`], as Python
-    /// packing the same numbers with `struct` gets it too. It changes with
-    /// the constants.
-    const FITTED_FINGERPRINT: u64 = 0x4063_5c9d_395e_edc8;
+    /// `tools/headpose/fitted.json`: [`HeadParams::FITTED`] as
+    /// `tools/headpose/fit.py --fitted` wrote it, the numbers and their
+    /// fingerprint, which `fit.py` takes as [`HeadParams::fingerprint`] does
+    /// (`reference.fingerprint`).
+    const FITTED_JSON: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/headpose/fitted.json"
+    ));
 
     // The study's test vectors (`test_vectors.json`, generated by its
     // Python reference implementation), as its generator wrote them.

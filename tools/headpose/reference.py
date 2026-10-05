@@ -46,10 +46,15 @@ image's time (offline the image's device time, live its host time).
      radians; invalid -> flags 0 and the last valid values (zeros before the first valid image).
 
 The constants are a dict P (keys as in PROTOTYPE); head_params() and params_from_head_params()
-convert it to and from the field names of head.rs's HeadParams, which fit.py writes.
+convert it to and from the field names of head.rs's HeadParams, which fit.py writes. FITTED is
+HeadParams::FITTED, read from fitted.json (fit.py --fitted wrote it), whose fingerprint head.rs's
+tests check FITTED against; fingerprint() is HeadParams::fingerprint.
 """
 
+import json
 import math
+import os
+import struct
 
 import numpy as np
 
@@ -462,18 +467,6 @@ def make_params(Q, pos, beta_a=0.2, tau_pos_s=None, one_euro=None, g3=(6.0, -4.0
     return P
 
 
-def shipped(P):
-    """P with the two choices head.rs ships: the PnP branch alone (w = 0; the eye branch keeps its
-    constants, for comparison) and one one-euro filter (1.0 Hz, 0.2 Hz per deg/s) shared by the
-    three angles. shipped(PROTOTYPE) is the prototype fit's HeadParams::FITTED."""
-    return dict(P, w=0.0, one_euro={k: list(v) for k, v in ONE_EURO_SHARED.items()})
-
-
-# head.rs's HeadParams::FITTED until the constants were fitted again on the Rust tracker's fits
-# (2026-10-05): fit.py's JSON has those, which the scripts take with --params.
-FITTED = shipped(PROTOTYPE)
-
-
 def _direction(gain, ox, oy):
     return {"gain": float(gain), "offset": [float(ox), float(oy)]}
 
@@ -535,3 +528,55 @@ def params_from_head_params(H):
         "g3_centroid_min_px": H["min_centroid_edge_px"],
         "g3_nose_min_px": H["min_nose_tip_edge_px"],
     }
+
+
+# ------------------------------------------------------------------ HeadParams::FITTED
+# fit.py --fitted's JSON of the constants head.rs ships: HeadParams::FITTED, number for number.
+FITTED_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fitted.json")
+
+
+def fingerprint(H):
+    """HeadParams::fingerprint of the constants H, under HeadParams' field names (head_params()):
+    FNV-1a (64 bits) of every number in the order of the fields, each f64 as the little-endian
+    bytes of its bits and each landmark index as those of a u64."""
+    floats = [v for row in H["rotation_offset"] for v in row]
+    floats += [H["pnp_scale"], *H["pnp_point_mm"]]
+    floats += [H["pnp_direction"]["gain"], *H["pnp_direction"]["offset"]]
+    floats += [H["eye_rays"][k] for k in ("fu", "cu", "fv", "cv")]
+    tail = [H["eye_range_mm"], H["eye_direction"]["gain"], *H["eye_direction"]["offset"]]
+    tail += [H["eye_weight"], H["position_tau_s"], H["correction_tau_s"]]
+    tail += [v for f in H["rotation_filters"] for v in (f["min_cutoff_hz"], f["beta"])]
+    tail += [
+        H["rotation_derivative_cutoff_hz"],
+        H["reset_gap_s"],
+        H["min_centroid_edge_px"],
+        H["min_nose_tip_edge_px"],
+    ]
+    data = b"".join(struct.pack("<d", float(v)) for v in floats)
+    data += b"".join(struct.pack("<Q", int(i)) for c in H["eye_contours"] for i in c)
+    data += b"".join(struct.pack("<d", float(v)) for v in tail)
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def load_fitted(path=FITTED_JSON):
+    """fit.py --fitted's JSON as (P, the document), refused when its head_params are not the
+    numbers its fingerprint was taken of."""
+    with open(path) as f:
+        doc = json.load(f)
+    H = doc["head_params"]
+    if doc.get("fingerprint") != f"{fingerprint(H):016x}":
+        raise ValueError(
+            f"{path}: its head_params are not the constants of its fingerprint "
+            f"{doc.get('fingerprint')}: fit.py --fitted writes both, and neither is edited by hand "
+            "(git restores the committed file)"
+        )
+    return params_from_head_params(H), doc
+
+
+# HeadParams::FITTED, the constants libtobii ships, and the eye weight their fit found (head.rs
+# ships 0: the PnP branch alone), which evaluate.py's --blend takes.
+FITTED, FITTED_DOC = load_fitted()
+FITTED_EYE_WEIGHT = FITTED_DOC["fit"]["eye_weight"]

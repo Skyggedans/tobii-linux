@@ -9,13 +9,13 @@ the canonical face mesh of crates/tobii-pose/src/canonical.rs (MediaPipe's, not 
 projected with made-up poses and rounded to 1e-4 px, and the expected outputs are computed from
 the rounded inputs. With the default constants (reference.PROTOTYPE) the file is byte for byte
 the head pose study's test_vectors.json (its "about" still names the study's folder), which is
-what head.rs's tests were taken from and still carry: they check the arithmetic, which needs
-no other constants than these.
+what head.rs's tests were taken from and still carry: the study's constants in the fields fit.py
+fits, and in the others HeadParams::FITTED's, which are the study's too.
 
---params takes fit.py's JSON (its head_params) instead, for vectors of a fit's constants. To keep
-the eye branch and the per-axis filters covered as the study's vectors do, give the eye weight the
-fit found (--eye-weight fitted) and --rotation-filters per-axis: the vectors' "constants" block
-then says what the tests must build.
+--params takes fit.py's JSON (its head_params: fit.json, or fitted.json for the shipped constants)
+instead, for vectors of a fit's constants. To keep the eye branch and the per-axis filters covered
+as the study's vectors do, give the eye weight the fit found (--eye-weight fitted) and
+--rotation-filters per-axis: the vectors' "constants" block then says what the tests must build.
 """
 
 import argparse

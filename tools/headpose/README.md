@@ -4,16 +4,18 @@ The head pose libtobii hands out is the Stream Engine's (`tobii_head_pose_t`): a
 display frame, filtered as the DLL filters it. Its constants (`HeadParams::FITTED` in
 `crates/tobii-pose/src/head.rs`) were fitted to what the DLL itself reported in three Windows
 sessions, and the replay of those sessions against the DLL is the acceptance test. These scripts
-redo both from the repository: fit the constants to the face fits of the Rust tracker, write them
-under `HeadParams`' field names, measure the result against the DLL, and regenerate the unit
-tests' vectors. Python 3 with NumPy and SciPy, nothing else.
+redo both from the repository: fit the constants to the face fits of the Rust tracker and write
+them under `HeadParams`' field names (`fitted.json`, which the unit tests check `FITTED` against),
+and measure the result against the DLL; `make_vectors.py` writes the unit tests' synthetic
+vectors, which a refit leaves as they are (step 4). Python 3 with NumPy and SciPy, nothing else.
 
 | file | what it is |
 |---|---|
-| `reference.py` | The executable specification of `head.rs`: validity, rotation, position, filters, one call per image. A port of the head pose study's reference: the same operations, so the same numbers bit for bit. Also the study's constants (`PROTOTYPE`), the same with the choices `head.rs` ships (`FITTED`, which `HeadParams::FITTED` held until the constants were fitted again on the Rust tracker's fits, on 2026-10-05) and the conversion to and from `HeadParams`' field names. |
+| `reference.py` | The executable specification of `head.rs`: validity, rotation, position, filters, one call per image. A port of the head pose study's reference: the same operations, so the same numbers bit for bit. Also the study's constants (`PROTOTYPE`), the constants `head.rs` ships (`FITTED`, read from `fitted.json`), their fingerprint as `HeadParams::fingerprint` takes it, and the conversion to and from `HeadParams`' field names. |
+| `fitted.json` | `HeadParams::FITTED` as `fit.py --fitted` wrote it, with its fingerprint: the scripts' default constants, which `head.rs`'s tests check `FITTED` against. |
 | `make_vectors.py` | Writes the synthetic test vectors `head.rs`'s tests carry, from `reference.py` and the canonical mesh of `canonical.rs`. No session data. |
 | `common.py` | Reads a session: the TBI5LOG1 log, the DLL's JSONL, the face fits; finds the clock offset, pairs every DLL pose with its image, fits the display frame. Vectorised twins of `reference.py` for whole sessions. |
-| `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON. |
+| `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON, and those to ship as `fitted.json`. |
 | `evaluate.py` | Runs `reference.py` over the fits with a set of constants, or takes the daemon's own poses from `compare-dll --head`'s CSV, and prints every acceptance metric, lag and rest jitter included, against `gates.json`. |
 | `gates.json` | The acceptance gates, per session: the file `compare-dll --head` checks, which `evaluate.py` reads too. |
 | `gates.py` | Sets the gates' thresholds from the Rust pipeline's leave-one-session-out values by the rule `gates.json` states, and checks them against the broken pipelines. |
@@ -65,34 +67,43 @@ face.
 
        tools/headpose/fit.py --session LOG1 JSONL1 $OUT/fits_s1.csv \
            --session LOG2 JSONL2 $OUT/fits_s2.csv --session LOG3 JSONL3 $OUT/fits_s3.csv \
-           --in-sample --out $OUT/fit.json
+           --in-sample --out $OUT/fit.json --fitted tools/headpose/fitted.json
 
    It prints each fold's constants and the beta grid it chose from, then every session's errors
    with the constants fitted without it (LOSO) and, with `--in-sample`, with those fitted on all.
    Last comes the study's search of the G3 thresholds: each fold's, tested on the session it
    leaves out, and the optimum on all the sessions next to the thresholds `head_params` keep
-   (FITTED's, 6 and -4 px), which the fit does not change.
-   `fit.json`'s `head_params` are the constants fitted on all the sessions, with the choices
-   `head.rs` ships: the PnP branch alone (eye weight 0; `--blend` keeps the weight found) and
-   one one-euro filter for the three angles (`--rotation-filters per-axis` for the study's).
+   (`HeadParams::FITTED`'s, 6 and -4 px), which the fit does not change; last, the fingerprint
+   of `head_params`. `fit.json`'s `head_params` are the constants fitted on all the sessions,
+   with the choices `head.rs` ships: the PnP branch alone (eye weight 0; `--blend` keeps the
+   weight found) and one one-euro filter for the three angles (`--rotation-filters per-axis` for
+   the study's). `--fitted` writes them alone, with their fingerprint, the eye weight found and
+   Q's yxz angles, into `fitted.json`: the scripts' constants from here on (`reference.FITTED`,
+   `evaluate.py`'s default).
 3. Copy `head_params` into `HeadParams::FITTED`, field for field, and say in its doc comment
-   what it was fitted on (date, sessions, tracker). `reference.FITTED`, `evaluate.py`'s default,
-   stays the study's: give the scripts `--params $OUT/fit.json` from here on.
-4. Update the tests that pin `FITTED` itself: its Q as yxz angles (`fit.json`'s
-   `fit.rotation_offset_yxz_deg`) and its fingerprint (the failing test prints the new one, and
-   `compare-dll --head` prints it too). The synthetic vectors the other tests carry stay the
-   study's, made with its constants (`vector_params` in the tests): they check `head.rs`'s
-   arithmetic against `reference.py`'s, which any constants do. Should the arithmetic change,
-   regenerate them with `make_vectors.py`; without options it writes the study's vectors, the
-   ones the tests carry, byte for byte (checked with Python 3.14 and NumPy 2.4.6; the inputs the
-   study drew at random are written out in the script, as NumPy's random streams may change
-   between versions):
+   what it was fitted on (date, sessions, the tracker's revision).
+4. Run the tests (`make check`). `fitted_holds_the_constants_fit_py_wrote` checks that
+   `HeadParams::FITTED` holds the numbers `fit.py` wrote into `fitted.json`, bit for bit, by their
+   fingerprint (`compare-dll --head` prints the daemon's): when it fails, a field was copied wrong,
+   so copy again. The fingerprint is never edited by hand: `reference.py` refuses a `fitted.json`
+   whose numbers are not those of its fingerprint. Update the yxz angles of Q that
+   `fitted_turns_the_eye_branch_off_and_shares_one_filter_between_the_angles` pins (`fitted.json`'s
+   `fit.rotation_offset_yxz_deg`). The synthetic vectors the other tests carry stay the study's:
+   `vector_params` takes the study's constants in the fields `fit.py` fits and `FITTED`'s in the
+   others (the validity thresholds, the filters' restart gap and rate cutoff, the position's EMA,
+   the eye rays and contours), so they check `head.rs`'s arithmetic against `reference.py`'s, and
+   those constants with it. Should the arithmetic or one of those constants change, make the
+   vectors again with `make_vectors.py`; without options it writes the study's vectors, the ones
+   the tests carry, byte for byte (checked with Python 3.14 and NumPy 2.4.6; the inputs the study
+   drew at random are written out in the script, as NumPy's random streams may change between
+   versions):
 
        tools/headpose/make_vectors.py $OUT/vectors.json
 
-   `--params $OUT/fit.json --eye-weight fitted --rotation-filters per-axis` writes them for a
-   fit's constants instead, the eye branch on (the weight the fit found) and a different filter
-   per angle, so that both stay covered.
+   `--params tools/headpose/fitted.json --eye-weight fitted --rotation-filters per-axis` writes
+   them for the shipped constants instead, the eye branch on (the weight the fit found) and a
+   different filter per angle, so that both stay covered: `vector_params` then takes everything
+   else from `FITTED`.
 5. Accept: replay every session through the daemon's own pipeline (`HeadStep` with the new
    `HeadParams::FITTED`), which checks the gates it can (G1-G14) and writes its pose of every
    image with a DLL pose, for each N:
@@ -101,12 +112,13 @@ face.
            --gates tools/headpose/gates.json --csv $OUT/head_sN.csv
 
    then measure those poses' lag and rest jitter (G15-G18), and every other gate again, with
-   `evaluate.py`, given the same fits and the constants the daemon was built with:
+   `evaluate.py`, given the same fits and the constants the daemon was built with, `fitted.json`'s
+   (its default):
 
        tools/headpose/evaluate.py --session LOG1 JSONL1 $OUT/fits_s1.csv ... \
-           --params $OUT/fit.json --ours-csv $OUT/head_s1.csv --ours-csv $OUT/head_s2.csv \
-           --ours-csv $OUT/head_s3.csv --reference-fits .../sl_s1.npz \
-           --reference-fits .../sl_s2.npz --reference-fits .../sl_s3.npz
+           --ours-csv $OUT/head_s1.csv --ours-csv $OUT/head_s2.csv --ours-csv $OUT/head_s3.csv \
+           --reference-fits .../sl_s1.npz --reference-fits .../sl_s2.npz \
+           --reference-fits .../sl_s3.npz
 
    It also compares the Python twin of those constants with the CSV, image by image: with the
    daemon's constants and fits they agree on every image's validity and to ~1e-12 mm and deg, and

@@ -20,12 +20,10 @@ lag reference (below) is mapped with other constants than the poses it is the re
 The constants: --params gives fit.py's JSON, its head_params or with --loso each session's fold
 (fitted without it; the fold is found by the session's clock offset and image count, which the
 JSON records, so the sessions may come in any order and any subset of the fitted ones). Without
-it, reference.FITTED: the study's constants with the choices head.rs ships, which HeadParams::FITTED
-held until the constants were fitted again on the Rust tracker's fits (2026-10-05, README step 3):
-give --params with that fit's JSON for the constants head.rs ships now.
---blend turns the eye correction on with the weight the fit found (without --params, the study's)
-and changes nothing else; --rotation-filters swaps the one-euro filters. --broken runs a
-deliberately broken pipeline, to see which gates catch it.
+it, reference.FITTED: HeadParams::FITTED, the constants head.rs ships, as fit.py wrote them
+(fitted.json). --blend turns the eye correction on with the weight the fit found (without
+--params, fitted.json's) and changes nothing else; --rotation-filters swaps the one-euro filters.
+--broken runs a deliberately broken pipeline, to see which gates catch it.
 
 Images: every 0x50e image of the log. DLL-valid: the DLL's four flags set; ours: the estimator's
 validity (G3). Subsets of the DLL-valid images (the errors are taken where ours is valid too):
@@ -707,12 +705,11 @@ def constants(args, o):
                 C.fail("--blend needs fit.py's JSON: it takes the eye weight the fit found")
             P["w"] = fit["eye_weight"]
     else:
-        # PROTOTYPE differs from FITTED in its rotation filters too: only the weight is taken.
         P = dict(ref.FITTED)
-        what = "reference.FITTED (the study's constants, HeadParams::FITTED before the refit)"
+        what = f"fitted.json (HeadParams::FITTED, fingerprint {ref.FITTED_DOC['fingerprint']})"
         if args.blend:
-            P["w"] = ref.PROTOTYPE["w"]
-            what += " with the study's eye weight"
+            P["w"] = ref.FITTED_EYE_WEIGHT
+            what += " with the eye weight its fit found"
     if args.rotation_filters != "params":
         src = ref.ONE_EURO_PER_AXIS if args.rotation_filters == "per-axis" else ref.ONE_EURO_SHARED
         P["one_euro"] = {k: list(v) for k, v in src.items()}
@@ -725,8 +722,7 @@ def main():
     C.add_session_args(ap)
     ap.add_argument(
         "--params",
-        help="fit.py's JSON; default: reference.FITTED, the study's constants (HeadParams::FITTED "
-        "before the refit on the Rust tracker)",
+        help="fit.py's JSON; default: fitted.json here, HeadParams::FITTED (reference.FITTED)",
     )
     ap.add_argument(
         "--loso",
@@ -736,8 +732,8 @@ def main():
     ap.add_argument(
         "--blend",
         action="store_true",
-        help="the eye correction on, with the weight the fit found (without --params, the "
-        "study's); nothing else changes",
+        help="the eye correction on, with the weight the fit found (without --params, "
+        "fitted.json's); nothing else changes",
     )
     ap.add_argument(
         "--rotation-filters",
