@@ -274,7 +274,9 @@ tracker plugins, and `libtobii.so` with them, when it starts: quit it and
 start it again, as stopping and starting tracking keeps the library it has.
 
 In OpenTrack the pose then behaves much as the Stream Engine's does on
-Windows (§8 has every axis), and not as it did:
+Windows (§8 has every axis), and not as the old one did; the plugin with a
+`libtobii.so` that already delivered the Stream Engine's pose sees no
+change:
 
 - **Centring.** Nothing in the daemon centres the pose any more: OpenTrack
   does, at the first pose and on its *Center* shortcut, so bind a recenter
@@ -291,11 +293,21 @@ Windows (§8 has every axis), and not as it did:
   *Pre-invert* on those five axes (OpenTrack's *Options*, *Output* tab). A
   profile made for the plugin on the Stream Engine's pose, here or on
   Windows, fits both unchanged.
-- **Range.** Every axis but pitch moves further than it did, pitch about as
-  far, and none stops at ±45° any more; TZ, which hardly followed your
-  distance from the screen, moves 2 to 8 times as far. The position is a
-  point between the eyes, no longer a pivot at the neck, so turning the
-  head moves it too.
+- **Range.** No axis stops at ±45° any more, and the position is a point
+  between the eyes, no longer a pivot at the neck, so turning the head
+  moves it too. How much further each axis moves than it did depends on
+  the `tobiid` you come from (§8 has each axis against the Stream
+  Engine's):
+  - One built without the commit "pose: rotate the face crop by the eye
+    line, size it from the landmarks" (any build before it, whatever its
+    date): every axis but pitch moves further, pitch about as far. TZ,
+    which hardly followed your distance from the screen, moves 2 to 8
+    times as far, yaw 1.3 to 2.8 times, roll 1.2 to 1.4 times, and TX and
+    TY 1.1 to 1.4 times: a gain you raised to make up for a small TZ, yaw
+    or roll may now be too much.
+  - One built with it: TX moves 1.5 to 1.9 times as far, TY 1.4 to 1.8
+    times, TZ 1.1 to 1.3 times and pitch 1.0 to 1.15 times, yaw and roll
+    about as far: TX and TY may want a third to a half less gain.
 - **Invalid poses.** Near the edges of the camera's view, and when the face
   is lost, the pose now comes marked invalid, where nothing came before:
   `tobii-opentrack` sends nothing then, as before, but the plugin as it
