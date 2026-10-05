@@ -1255,11 +1255,14 @@ mod tests {
     #[test]
     fn fitted_holds_the_constants_fit_py_wrote() {
         let key = "\"fingerprint\": \"";
-        let at = FITTED_JSON.find(key).unwrap() + key.len();
+        let at = FITTED_JSON
+            .find(key)
+            .expect("fitted.json has a fingerprint, as fit.py --fitted writes it")
+            + key.len();
         let written = FITTED_JSON
             .get(at..at + 16)
             .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-            .unwrap();
+            .expect("fitted.json's fingerprint is 16 hex digits");
         let fitted = HeadParams::FITTED.fingerprint();
         assert_eq!(
             fitted, written,

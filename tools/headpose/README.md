@@ -51,7 +51,7 @@ fits of a stateless run of a tracker, every image fitted on its own. The head po
 
 The commands run from the repository's root and write under `fixtures/` (gitignored), in a
 directory of the refit's own: the fits, and whatever is printed per image, come from images of a
-face.
+face. Only the constants go into the tree, `tools/headpose/fitted.json`.
 
     OUT=fixtures/analysis/headpose-refit
     mkdir -p $OUT
@@ -71,7 +71,7 @@ face.
 
    It prints each fold's constants and the beta grid it chose from, then every session's errors
    with the constants fitted without it (LOSO) and, with `--in-sample`, with those fitted on all.
-   Last comes the study's search of the G3 thresholds: each fold's, tested on the session it
+   Then comes the study's search of the G3 thresholds: each fold's, tested on the session it
    leaves out, and the optimum on all the sessions next to the thresholds `head_params` keep
    (`HeadParams::FITTED`'s, 6 and -4 px), which the fit does not change; last, the fingerprint
    of `head_params`. `fit.json`'s `head_params` are the constants fitted on all the sessions,
@@ -92,18 +92,22 @@ face.
    `vector_params` takes the study's constants in the fields `fit.py` fits and `FITTED`'s in the
    others (the validity thresholds, the filters' restart gap and rate cutoff, the position's EMA,
    the eye rays and contours), so they check `head.rs`'s arithmetic against `reference.py`'s, and
-   those constants with it. Should the arithmetic or one of those constants change, make the
-   vectors again with `make_vectors.py`; without options it writes the study's vectors, the ones
+   those constants with it. Should the arithmetic change (in `head.rs` and `reference.py` alike),
+   make them again with `make_vectors.py`; without options it writes the study's vectors, the ones
    the tests carry, byte for byte (checked with Python 3.14 and NumPy 2.4.6; the inputs the study
    drew at random are written out in the script, as NumPy's random streams may change between
    versions):
 
        tools/headpose/make_vectors.py $OUT/vectors.json
 
-   `--params tools/headpose/fitted.json --eye-weight fitted --rotation-filters per-axis` writes
-   them for the shipped constants instead, the eye branch on (the weight the fit found) and a
-   different filter per angle, so that both stay covered: `vector_params` then takes everything
-   else from `FITTED`.
+   Should one of `FITTED`'s constants that `fit.py` does not fit change, the study's vectors no
+   longer hold: make them for the shipped constants instead, with the eye branch on (the weight
+   the fit found) and a different filter per angle, so that both stay covered, and have
+   `vector_params` take everything else from `FITTED`:
+
+       tools/headpose/make_vectors.py $OUT/vectors.json --params tools/headpose/fitted.json \
+           --eye-weight fitted --rotation-filters per-axis
+
 5. Accept: replay every session through the daemon's own pipeline (`HeadStep` with the new
    `HeadParams::FITTED`), which checks the gates it can (G1-G14) and writes its pose of every
    image with a DLL pose, for each N:
