@@ -23,14 +23,16 @@ Each threshold is the good pipeline's leave-one-session-out value of the gate's 
   G14       position p95 z: 20 % up, at least 5 mm, rounded up to 1;
   G15, G16  lags: 5 ms up, rounded up to 1;
   G17, G18  rest jitter ratios: from 0.2 below the smallest to 0.3 above the largest, rounded out
-            to 0.1.
+            to 0.1, but from 0.8 or less to 1.2 or more: a ratio is ours over the DLL's, and 1,
+            the DLL's own jitter, lies inside every range with room on both sides.
 
 Then the check: the good pipeline must pass every gate in every session, and each broken one fail
 at least one in every session, with either constants. It prints each gate's values and thresholds
 (GATES.json's own in parentheses), then the gates each pipeline fails. When the check fails it
-exits 1 and writes nothing; else it writes OUT, if given: GATES.json (default: gates.json here)
-with the new thresholds and nothing else changed, in its layout. The sessions are GATES.json's,
-found by clock offset as evaluate.py and compare-dll find them, and must be all of them.
+exits 1 and writes nothing; else, with --out, it writes there GATES.json (by default gates.json
+here) with the new thresholds and nothing else changed, in its layout. The sessions are
+GATES.json's, found by clock offset as evaluate.py and compare-dll find them, and must be all of
+them.
 """
 
 import argparse
@@ -74,6 +76,9 @@ POSITION_MEDIANS = (
 POSITION_P95 = "position_p95_abs_z_mm"
 LAGS = ("rotation_lag_max_ms", "position_lag_max_ms")
 JITTERS = ("rotation_rest_jitter_ratio", "position_rest_jitter_ratio")
+# The least a jitter range holds: a ratio is ours over the DLL's, so 1 is the DLL's own jitter,
+# which a filter that matches it must pass with room.
+JITTER_PARITY = (0.8, 1.2)
 
 
 # ------------------------------------------------------------------ the rule
@@ -107,7 +112,11 @@ def rule(metric, v, session):
     if metric in LAGS:
         return rounded(v + 5.0, "1", ROUND_CEILING)
     if metric in JITTERS:
-        return [rounded(v[0] - 0.2, "0.1", ROUND_FLOOR), rounded(v[1] + 0.3, "0.1", ROUND_CEILING)]
+        lo, hi = JITTER_PARITY
+        return [
+            min(rounded(v[0] - 0.2, "0.1", ROUND_FLOOR), lo),
+            max(rounded(v[1] + 0.3, "0.1", ROUND_CEILING), hi),
+        ]
     C.fail(f"no rule for the metric {metric!r}")
 
 

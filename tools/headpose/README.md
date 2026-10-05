@@ -157,7 +157,8 @@ REACQgap (the same without the session start's); COMB (|yaw| > 15° and (|pitch|
   DLL's; the gate takes the largest |ours - DLL| of the three axes.
 - **Rest jitter**: the RMS of the residual of a 2-Hz zero-phase low-pass over the stillest
   quarter of the 32-image windows, chosen by the reference's speed; ours / DLL, all three axes
-  within the gate's range.
+  within the gate's range, which holds 0.8 to 1.2 at least: 1 is the DLL's own jitter, which a
+  filter that matches it must pass with room.
 
 `gates.json` names the sessions by their clock offset, so the gates follow the capture, not the
 order of the arguments (a session may also give its number of images, which must then match). It
