@@ -804,8 +804,14 @@ wait for it too.
   connected. A calibration session under way ends then, saving nothing,
   unless its client is already stopping it, and the client's later calls in
   it are `TOBII_ERROR_CALIBRATION_NOT_STARTED` (§8a).
-- **"It flies around."** You're talking to an **old daemon** (pre-rebuild) — it
-  still has the previous code/units. Restart it (§5).
+- **"It flies around."** With OpenTrack's `tracker-tobii` plugin as it
+  stands, a pose marked invalid (the face lost, or at the edge of the
+  camera's view) and a lost daemon connection both leave the pose unset,
+  which OpenTrack takes as zeros, so the view jumps away; §8 has both, and
+  the plugin's commits that hold the last valid pose and reconnect.
+  `tobii-opentrack` sends no invalid pose, so OpenTrack holds its last one.
+  A daemon too old or too new for the client no longer makes it fly: the
+  client gets no head pose at all (below, and §5).
 - **No head pose in a Stream Engine application.** After an install, the
   running `tobiid` is likely older than the library: it takes the
   subscription and sends nothing, and libtobii logs one WARN line after
