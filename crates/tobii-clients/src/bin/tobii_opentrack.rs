@@ -172,11 +172,10 @@ fn watch_for_silence(seen: Arc<AtomicBool>, window: Duration) -> JoinHandle<bool
         let silent = !seen.load(Ordering::Relaxed);
         if silent {
             warn!(
-                "tobiid has sent no head pose in the {} s since it was subscribed: a tobiid \
-                 older than this tobii-opentrack sends none (restart it after installing), \
-                 nor does one whose tracker sends no IR images (unplugged, paused, or with \
-                 TOBII_NO_IMAGE set)",
-                window.as_secs()
+                waited_s = window.as_secs(),
+                "tobiid has sent no head pose since it was subscribed: a tobiid older than this \
+                 tobii-opentrack sends none (restart it after installing), nor does one whose \
+                 tracker sends no IR images (unplugged, paused, or with TOBII_NO_IMAGE set)"
             );
         }
         silent
