@@ -260,8 +260,15 @@ pose, and no error:
   WARN line after 20 s (§8; OpenTrack gives libtobii no logger), and
   `tobii-opentrack` prints one on its stderr.
 - A newer `tobiid` acknowledges the old pose's subscription, from an
-  application still running an older `libtobii.so` or from an older
-  `tobii-opentrack`, and never sends it; its log says so, once.
+  application still running an older `libtobii.so`, from an older
+  `tobii-opentrack`, or from a client with its own copy of the protocol
+  that asks for stream bit 0, such as the `tobii-hub` Flutter plugin for
+  its `head` stream, and never sends it; its log says so, once. Such a
+  client gets no head pose until it is ported to the Stream Engine's,
+  `HEAD_POSE` (bit 9 of the `u32` SUBSCRIBE mask, frames tagged `0x29`;
+  `crates/tobii-ipc/src/lib.rs`), which it centres itself: the daemon
+  ignores the RECENTER frame such a client may send (`tobii-hub`'s
+  `recenter()`), logging the first.
 
 `make install` replaces the binaries, not the daemon that is running nor
 the library an application has loaded: after installing the first build
