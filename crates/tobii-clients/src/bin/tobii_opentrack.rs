@@ -9,7 +9,7 @@
 //! absolute: `OpenTrack` centres it, at the first pose (*Center at startup*)
 //! and on its own *Center* shortcut.
 
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -133,6 +133,36 @@ fn udp_packet(pose: &[f64; 6]) -> [u8; 48] {
     packet
 }
 
+/// How the bridge reaches `OpenTrack`'s UDP input ([`udp_route`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UdpRoute {
+    /// The address the bridge's socket is bound to: the unspecified one of
+    /// the target's family, any port.
+    local: SocketAddr,
+    /// Where `OpenTrack` listens.
+    target: SocketAddr,
+}
+
+/// The route to `OpenTrack` among the addresses its host resolved to, or
+/// `None` if there are none. The target is the first IPv4 address if there
+/// is one, else the first address: a receiver bound to IPv4, or to both
+/// families as `OpenTrack`'s UDP input is, takes IPv4. The socket is bound
+/// in the target's family, as one of the other family cannot send there:
+/// `localhost` resolves to `::1` first on many hosts, and a socket bound to
+/// `0.0.0.0` gets `EAFNOSUPPORT` sending to it.
+fn udp_route(resolved: &[SocketAddr]) -> Option<UdpRoute> {
+    let target = *resolved
+        .iter()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| resolved.first())?;
+    let local = if target.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    Some(UdpRoute { local, target })
+}
+
 /// Wait `window`, then, if no head pose has come by then (`seen` still
 /// clear), warn that tobiid may not send one. The thread's result is
 /// whether it warned.
@@ -162,14 +192,16 @@ fn run() -> Result<()> {
         Cli::Bridge { host, port } => (host, port),
     };
 
-    let socket = UdpSocket::bind("0.0.0.0:0").context("binding a udp socket")?;
     // Resolve once up front: `send_to` with a host string would re-resolve it
     // for every frame.
-    let target: SocketAddr = (host.as_str(), port)
+    let resolved: Vec<SocketAddr> = (host.as_str(), port)
         .to_socket_addrs()
         .with_context(|| format!("resolving {host}:{port}"))?
-        .next()
-        .with_context(|| format!("{host}:{port} resolved to no address"))?;
+        .collect();
+    let UdpRoute { local, target } =
+        udp_route(&resolved).with_context(|| format!("{host}:{port} resolved to no address"))?;
+    let socket =
+        UdpSocket::bind(local).with_context(|| format!("binding a udp socket to {local}"))?;
 
     let mut stream = tobii_ipc::connect_or_spawn().context("connecting to tobiid")?;
     write_frame(&mut stream, &encode_subscribe(STREAM_HEAD_POSE))
@@ -329,6 +361,63 @@ mod tests {
             .map(|b| f64::from_le_bytes(*b))
             .collect();
         assert_eq!(read, pose);
+    }
+
+    /// The packets go to the first IPv4 address the host resolved to, else
+    /// to its first address, from the unspecified address of the target's
+    /// family; a host that resolved to nothing has no route.
+    #[test]
+    fn packets_go_to_ipv4_first_from_the_targets_family() {
+        let addr = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let (any4, any6) = (addr("0.0.0.0:0"), addr("[::]:0"));
+        let (lo4, lo6) = (addr("127.0.0.1:4242"), addr("[::1]:4242"));
+        let (lan4, lan6) = (addr("10.0.0.2:4242"), addr("[fd00::2]:4242"));
+        let route = |local, target| Some(UdpRoute { local, target });
+        // (what the host resolved to, the route)
+        let cases = [
+            // `localhost` on many hosts, this one included.
+            (vec![lo6, lo4], route(any4, lo4)),
+            (vec![lo4, lo6], route(any4, lo4)),
+            (vec![lan6, lo6, lan4, lo4], route(any4, lan4)),
+            (vec![lo4], route(any4, lo4)),
+            (vec![lo6], route(any6, lo6)),
+            (vec![lan6, lo6], route(any6, lan6)),
+            (vec![], None),
+        ];
+        for (resolved, want) in cases {
+            assert_eq!(udp_route(&resolved), want, "{resolved:?}");
+        }
+    }
+
+    /// A socket bound as its route says reaches a receiver on the IPv4
+    /// loopback and on the IPv6 one, `localhost`'s first address on many
+    /// hosts, which a socket bound to `0.0.0.0` cannot send to.
+    #[test]
+    fn a_socket_bound_for_its_route_reaches_either_loopback() {
+        let packet = udp_packet(&[1.0, -2.5, 60.0, -10.0, 5.5, 0.125]);
+        for receiver in ["127.0.0.1:0", "[::1]:0"] {
+            let receiver = match UdpSocket::bind(receiver) {
+                Ok(socket) => socket,
+                // A host without an IPv6 loopback has no receiver to reach.
+                Err(e) if receiver.starts_with('[') => {
+                    eprintln!("no IPv6 loopback to test with: {e}");
+                    continue;
+                }
+                Err(e) => panic!("binding a receiver on {receiver}: {e}"),
+            };
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let route = udp_route(&[receiver.local_addr().unwrap()]).unwrap();
+
+            let sender = UdpSocket::bind(route.local).unwrap();
+            sender.send_to(&packet, route.target).unwrap();
+
+            let mut got = [0u8; 64];
+            let (len, from) = receiver.recv_from(&mut got).unwrap();
+            assert_eq!(&got[..len], &packet, "{route:?}");
+            assert_eq!(from.port(), sender.local_addr().unwrap().port());
+        }
     }
 
     /// The command line: the defaults, `--host` and `--port`, `--help`, and
