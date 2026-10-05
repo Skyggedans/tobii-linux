@@ -10,7 +10,7 @@ tests' vectors. Python 3 with NumPy and SciPy, nothing else.
 
 | file | what it is |
 |---|---|
-| `reference.py` | The executable specification of `head.rs`: validity, rotation, position, filters, one call per image. A port of the head pose study's reference: the same operations, so the same numbers bit for bit. Also the study's constants (`PROTOTYPE`), the same with the choices `head.rs` ships (`FITTED`, which `HeadParams::FITTED` holds until the constants are fitted again) and the conversion to and from `HeadParams`' field names. |
+| `reference.py` | The executable specification of `head.rs`: validity, rotation, position, filters, one call per image. A port of the head pose study's reference: the same operations, so the same numbers bit for bit. Also the study's constants (`PROTOTYPE`), the same with the choices `head.rs` ships (`FITTED`, which `HeadParams::FITTED` held until the constants were fitted again on the Rust tracker's fits, on 2026-10-05) and the conversion to and from `HeadParams`' field names. |
 | `make_vectors.py` | Writes the synthetic test vectors `head.rs`'s tests carry, from `reference.py` and the canonical mesh of `canonical.rs`. No session data. |
 | `common.py` | Reads a session: the TBI5LOG1 log, the DLL's JSONL, the face fits; finds the clock offset, pairs every DLL pose with its image, fits the display frame. Vectorised twins of `reference.py` for whole sessions. |
 | `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON. |
@@ -77,16 +77,21 @@ face.
 3. Copy `head_params` into `HeadParams::FITTED`, field for field, and say in its doc comment
    what it was fitted on (date, sessions, tracker). `reference.FITTED`, `evaluate.py`'s default,
    stays the study's: give the scripts `--params $OUT/fit.json` from here on.
-4. Regenerate the vectors with the new constants and update the literals in `head.rs`'s tests.
-   The vectors keep the eye branch on (the weight the fit found) and a different filter per
-   angle, so that both stay covered:
+4. Update the tests that pin `FITTED` itself: its Q as yxz angles (`fit.json`'s
+   `fit.rotation_offset_yxz_deg`) and its fingerprint (the failing test prints the new one, and
+   `compare-dll --head` prints it too). The synthetic vectors the other tests carry stay the
+   study's, made with its constants (`vector_params` in the tests): they check `head.rs`'s
+   arithmetic against `reference.py`'s, which any constants do. Should the arithmetic change,
+   regenerate them with `make_vectors.py`; without options it writes the study's vectors, the
+   ones the tests carry, byte for byte (checked with Python 3.14 and NumPy 2.4.6; the inputs the
+   study drew at random are written out in the script, as NumPy's random streams may change
+   between versions):
 
-       tools/headpose/make_vectors.py $OUT/vectors.json --params $OUT/fit.json \
-           --eye-weight fitted --rotation-filters per-axis
+       tools/headpose/make_vectors.py $OUT/vectors.json
 
-   Without options it writes the study's vectors, the ones the tests carry now, byte for byte
-   (checked with Python 3.14 and NumPy 2.4.6; the inputs the study drew at random are written out
-   in the script, as NumPy's random streams may change between versions).
+   `--params $OUT/fit.json --eye-weight fitted --rotation-filters per-axis` writes them for a
+   fit's constants instead, the eye branch on (the weight the fit found) and a different filter
+   per angle, so that both stay covered.
 5. Accept: replay every session through the daemon's own pipeline (`HeadStep` with the new
    `HeadParams::FITTED`), which checks the gates it can (G1-G14) and writes its pose of every
    image with a DLL pose, for each N:
@@ -138,8 +143,10 @@ has, per gate, the metric, the kind (`min`: the value is at least the gate, `max
 its magnitude at most, `range`: every axis inside), `by` (`compare-dll` for the gates
 `compare-dll --head` checks, `python` for the lag and the rest jitter, which only `evaluate.py`
 measures; `evaluate.py` checks them all) and a threshold per session (`thresholds`). The
-thresholds are the study's leave-one-session-out values plus headroom for the port; each was
-checked against the broken pipelines, which fail at least one gate in every session.
+thresholds are the Rust pipeline's leave-one-session-out values (`evaluate.py --params fit.json
+--loso`) plus headroom, which its `headroom` spells out; each was checked against the broken
+pipelines (`--broken`), which fail at least one gate in every session, with the constants fitted
+without the session and with those fitted on all.
 
 ## Details
 

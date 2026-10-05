@@ -1,6 +1,7 @@
 {
   "about": "Acceptance gates of the head pose against the Windows Stream Engine's (the DLL's), per session: bounds on the metrics of `tobii5-init-replay compare-dll sessionN.bin sessionN.jsonl --head --gates tools/headpose/gates.json`, which replays the session's IR images through the daemon's head pose (HeadStep, HeadParams::FITTED) and pairs each image with the DLL's pose of it. A gate by compare-dll is checked there, and fails the run when it fails. A gate by python bounds the lag or the rest jitter of the filters, which are measured in Python from the run's --csv rows against the head-pose study's stateless reference; compare-dll lists it unchecked. Images: ALL are those on which the DLL's pose and ours are both valid; COMB those of ALL where the DLL's |yaw| is above 15 deg and its |pitch| above 8 deg or its |roll| above 10 deg. Errors: of each yxz angle, |wrap(ours - DLL)|, deg; geodesic, the angle of R_ours^T R_DLL with R = Ry(y) Rx(x) Rz(z), deg; of the position, |ours - DLL| along each axis of the display frame, mm. A median or percentile interpolates linearly between ranks, as NumPy's default does.",
-  "status": "provisional: the head-pose study's gates (acceptance_gates.out, 2026-09-29), its Python pipeline's leave-one-session-out values with headroom for the port to Rust, until the commit that fits the constants again on the Rust tracker sets them from the Rust baseline",
+  "status": "set on 2026-10-05 from the Rust pipeline, with HeadParams::FITTED fitted on the Rust tracker's fits of s1-s3: each threshold is the metric's leave-one-session-out value plus headroom (see headroom)",
+  "headroom": "Each threshold is the metric's leave-one-session-out value, that of the Rust pipeline with the constants fitted on the other two sessions (tools/headpose/evaluate.py --params fit.json --loso with the stateless lag reference: the Python twin of head.rs, which agrees with it to ~1e-12, over the Rust tracker's fits), moved by: coverage and agreement 0.5 percentage points (rounded down to 0.1); loss events one fewer than found, but none fewer in s3, whose two long losses must both be found; the rotation medians and the |median signed pitch error| 30 % of the value, at least 0.25 deg (rounded up to 0.1), but G7 in s3 midway between its value (1.85) and that of the pipeline without Q (2.35), which no other gate catches there; the rotation p95s 20 %, at least 1 deg (up to 0.5); the position medians 30 %, at least 0.5 mm (up to 0.1); the position p95 z 20 %, at least 5 mm (up to 1); the lags 5 ms (up to 1); the jitter ranges 0.2 below and 0.3 above (out to 0.1). Checked: the shipped pipeline (compare-dll --head with HeadParams::FITTED, and its CSV through evaluate.py) and the twin with the leave-one-session-out constants pass every gate in every session; each broken pipeline (evaluate.py --broken zyx, q-transposed, no-q, no-filter) fails at least one gate in every session, with either constants. The study's Python implementation of the same tracker (the same models through onnxruntime, its own image sampling) moves no metric by more than 13 % of its headroom.",
   "sessions": [
     {
       "name": "s1",
@@ -26,7 +27,7 @@
       "kind": "min",
       "by": "compare-dll",
       "about": "of the images the DLL's pose is valid on, the share ours is valid on too, %",
-      "thresholds": { "s1": 99.5, "s2": 95.5, "s3": 99.5 }
+      "thresholds": { "s1": 99.5, "s2": 96.2, "s3": 99.4 }
     },
     {
       "id": "G2",
@@ -35,7 +36,7 @@
       "kind": "min",
       "by": "compare-dll",
       "about": "of the images the DLL reported a pose for, valid or not, the share on which ours has the same validity, %",
-      "thresholds": { "s1": 99.5, "s2": 95.5, "s3": 99.5 }
+      "thresholds": { "s1": 99.5, "s2": 96.1, "s3": 99.3 }
     },
     {
       "id": "G3",
@@ -43,7 +44,7 @@
       "metric": "loss_events_found",
       "kind": "min",
       "by": "compare-dll",
-      "about": "the DLL's losses of the face (runs of images its pose is invalid on) that a run of our invalid poses overlaps; in s3 the 5-image loss at image 2659 is one the study's pipeline does not see either",
+      "about": "the DLL's losses of the face (runs of images its pose is invalid on) that a run of our invalid poses overlaps; in s3 the 5-image loss at image 2659 is one the pipeline does not see (the face is in the frame and passes G3 throughout), nor did the study's",
       "thresholds": { "s1": 0, "s2": 8, "s3": 2 }
     },
     {
@@ -53,7 +54,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the median over ALL of |wrap(ours - DLL)| of the x angle (pitch), deg",
-      "thresholds": { "s1": 2.3, "s2": 2.6, "s3": 3.3 }
+      "thresholds": { "s1": 2.3, "s2": 2.5, "s3": 3.4 }
     },
     {
       "id": "G5",
@@ -62,7 +63,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the median over ALL of |wrap(ours - DLL)| of the y angle (yaw), deg",
-      "thresholds": { "s1": 1.7, "s2": 2.2, "s3": 2.8 }
+      "thresholds": { "s1": 1.5, "s2": 2.1, "s3": 2.8 }
     },
     {
       "id": "G6",
@@ -71,7 +72,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the median over ALL of |wrap(ours - DLL)| of the z angle (roll), deg",
-      "thresholds": { "s1": 0.6, "s2": 1.4, "s3": 1.1 }
+      "thresholds": { "s1": 0.6, "s2": 1.3, "s3": 1.0 }
     },
     {
       "id": "G7",
@@ -80,7 +81,7 @@
       "kind": "abs",
       "by": "compare-dll",
       "about": "the median over ALL of wrap(ours - DLL) of the x angle (pitch), deg, bounded in magnitude: a constant pitch offset, the mark of a wrong head-frame offset Q",
-      "thresholds": { "s1": 2.1, "s2": 1.6, "s3": 2.1 }
+      "thresholds": { "s1": 2.1, "s2": 1.2, "s3": 2.1 }
     },
     {
       "id": "G8",
@@ -98,7 +99,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the 95th percentile over COMB of |wrap(ours - DLL)| of the x angle (pitch), deg: combined turns, where reading the angles in another Euler order shows",
-      "thresholds": { "s1": 4.0, "s2": 10.0, "s3": 9.5 }
+      "thresholds": { "s1": 3.0, "s2": 10.0, "s3": 8.5 }
     },
     {
       "id": "G10",
@@ -107,7 +108,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the 95th percentile over COMB of the geodesic angle between the two rotations, deg",
-      "thresholds": { "s1": 6.0, "s2": 13.5, "s3": 11.0 }
+      "thresholds": { "s1": 5.5, "s2": 14.0, "s3": 11.0 }
     },
     {
       "id": "G11",
@@ -116,7 +117,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the median over ALL of |ours - DLL| along the display frame's x axis, mm",
-      "thresholds": { "s1": 1.5, "s2": 3.2, "s3": 2.2 }
+      "thresholds": { "s1": 1.4, "s2": 3.1, "s3": 1.9 }
     },
     {
       "id": "G12",
@@ -125,7 +126,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the median over ALL of |ours - DLL| along the display frame's y axis, mm",
-      "thresholds": { "s1": 3.5, "s2": 4.5, "s3": 4.7 }
+      "thresholds": { "s1": 3.1, "s2": 4.6, "s3": 4.7 }
     },
     {
       "id": "G13",
@@ -134,7 +135,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the median over ALL of |ours - DLL| along the display frame's z axis, mm",
-      "thresholds": { "s1": 6.8, "s2": 9.0, "s3": 8.5 }
+      "thresholds": { "s1": 6.8, "s2": 9.1, "s3": 8.6 }
     },
     {
       "id": "G14",
@@ -143,7 +144,7 @@
       "kind": "max",
       "by": "compare-dll",
       "about": "the 95th percentile over ALL of |ours - DLL| along the display frame's z axis, mm",
-      "thresholds": { "s1": 18.0, "s2": 55.0, "s3": 32.0 }
+      "thresholds": { "s1": 18.0, "s2": 57.0, "s3": 33.0 }
     },
     {
       "id": "G15",
@@ -152,7 +153,7 @@
       "kind": "max",
       "by": "python",
       "about": "the largest over the three angles of |lag(ours) - lag(DLL)|, ms; a lag is the coherence-weighted phase delay over 0.4-2.6 Hz (128-image Hann segments in steps of 32, linear detrend, coherence above 0.2) behind the study's stateless image-synchronous reference (three landmark-model passes on each image, mapped as the pipeline maps a fit, unfiltered), the same estimator for both",
-      "thresholds": { "s1": 22.0, "s2": 12.0, "s3": 12.0 }
+      "thresholds": { "s1": 19.0, "s2": 14.0, "s3": 16.0 }
     },
     {
       "id": "G16",
@@ -161,7 +162,7 @@
       "kind": "max",
       "by": "python",
       "about": "the largest over the three axes of |lag(ours) - lag(DLL)| of the position, ms, the lag as for G15",
-      "thresholds": { "s1": 16.0, "s2": 10.0, "s3": 26.0 }
+      "thresholds": { "s1": 15.0, "s2": 13.0, "s3": 27.0 }
     },
     {
       "id": "G17",
@@ -170,7 +171,7 @@
       "kind": "range",
       "by": "python",
       "about": "each angle's jitter at rest, ours over the DLL's: the SD of the 2 Hz zero-phase high-pass residual pooled over the stillest 25 % of the 1 s windows (by the reference's speed); the smallest and the largest of the three ratios must lie within the range",
-      "thresholds": { "s1": [0.6, 1.5], "s2": [0.6, 1.6], "s3": [0.8, 1.6] }
+      "thresholds": { "s1": [0.4, 1.5], "s2": [0.6, 1.7], "s3": [0.7, 1.8] }
     },
     {
       "id": "G18",
@@ -179,7 +180,7 @@
       "kind": "range",
       "by": "python",
       "about": "the same ratios of the position's three axes",
-      "thresholds": { "s1": [0.8, 2.2], "s2": [0.7, 1.4], "s3": [1.0, 1.9] }
+      "thresholds": { "s1": [1.0, 1.7], "s2": [0.7, 1.4], "s3": [0.9, 1.7] }
     }
   ]
 }

@@ -34,10 +34,10 @@
 //! ([`RestPose`]) included, that the engine's pose worker and the replay
 //! tools share.
 //!
-//! The model is the one the head-pose study fitted to the Windows Stream
-//! Engine's output on three captured sessions; each function here follows
-//! the study's Python reference implementation, whose test vectors the tests
-//! reproduce.
+//! The model is the head-pose study's, fitted to the Windows Stream Engine's
+//! output on three captured sessions ([`HeadParams::FITTED`]); each function
+//! here follows the study's Python reference implementation, whose test
+//! vectors the tests reproduce.
 
 use std::f64::consts::PI;
 
@@ -151,42 +151,50 @@ pub struct HeadParams {
 }
 
 impl HeadParams {
-    /// The constants of the Python port of the head-pose study, fitted on all
-    /// three Windows sessions (in sample, 2026-09-29) against the Stream
-    /// Engine's own head pose, with the study's Python port of the tracker
-    /// (`f_mp150_bf` crops, `BlazeFace` re-acquisition) — but for two
-    /// decisions: the position is the `PnP` branch's alone (the eye weight is
-    /// 0, where the fit gave 0.383; the eye branch keeps its constants, for
-    /// comparison), and the three angles share one one-euro filter of 1.0 Hz
-    /// and 0.2 Hz per °/s (the fit had 1.0 and 0.4, 0.7 and 0.2, 1.5 and 0.1
-    /// for x, y and z). They are to be fitted again on this tracker's fits.
+    /// The constants fitted to the Stream Engine's own head pose in the three
+    /// captured Windows sessions on 2026-10-05: `tools/headpose/fit.py`'s
+    /// `head_params`, fitted on all three sessions (in sample) to the fits
+    /// this crate's tracker made of their images that day
+    /// (`tobii5-init-replay image83-replay --fits`), field for field. Two
+    /// choices are not the fit's: the position is the `PnP` branch's alone
+    /// (the eye weight is 0, where the fit gave 0.384; the eye branch keeps
+    /// the constants fitted for it, for comparison), and the three angles
+    /// share one one-euro filter of 1.0 Hz and 0.2 Hz per °/s (the head-pose
+    /// study had 1.0 and 0.4, 0.7 and 0.2, 1.5 and 0.1 for x, y and z). The
+    /// position's EMA and the validity thresholds are the study's, which the
+    /// fit keeps. Searched again on these fits, the thresholds come out the
+    /// same; of the filters tried on this tracker's poses in the EMA's place
+    /// (other time constants, one-euro filters, separate filters of direction
+    /// and range), each chosen on two sessions, none brought both the
+    /// position's lag and its rest jitter nearer the Stream Engine's in every
+    /// session it was not chosen on.
     pub const FITTED: Self = Self {
         rotation_offset: [
             [
-                0.999_860_075_374_677_1,
-                -0.007_035_297_618_850_274,
-                -0.015_176_767_085_183_904,
+                0.999_859_829_646_796_8,
+                -0.007_061_906_320_573_794,
+                -0.015_180_597_412_427_903,
             ],
             [
-                0.006_109_694_286_072_543,
-                0.998_167_924_520_407_6,
-                -0.060_195_233_153_067_08,
+                0.006_135_836_744_705_243,
+                0.998_167_026_192_194,
+                -0.060_207_469_055_543_62,
             ],
             [
-                0.015_572_453_482_815_5,
-                0.060_094_084_950_480_346,
-                0.998_071_239_765_223,
+                0.015_577_951_281_253_175,
+                0.060_105_884_085_931_04,
+                0.998_070_443_471_866,
             ],
         ],
-        pnp_scale: 0.971_429_553_944_983_1,
+        pnp_scale: 0.971_433_550_509_725,
         pnp_point_mm: [
-            -2.824_343_736_189_661_5,
-            27.404_881_620_713_358,
-            -36.483_212_590_351_55,
+            -2.775_521_538_521_491_7,
+            27.399_142_576_384_914,
+            -36.483_706_442_929_63,
         ],
         pnp_direction: DirectionMap {
-            gain: 1.013_556_746_417_381_4,
-            offset: [0.001_815_721_453_967_718_2, -0.007_409_409_876_383_765_5],
+            gain: 1.013_563_115_236_448_6,
+            offset: [0.001_733_389_742_471_128_3, -0.007_396_786_139_722_478],
         },
         eye_rays: RayIntrinsics {
             fu: -375.9,
@@ -202,10 +210,10 @@ impl HeadParams {
                 263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466,
             ],
         ],
-        eye_range_mm: 64.291_648_924_177_8,
+        eye_range_mm: 64.289_736_134_924_6,
         eye_direction: DirectionMap {
-            gain: 1.020_828_932_951_275_4,
-            offset: [-0.004_033_985_018_082_697, -0.000_262_390_956_082_422_75],
+            gain: 1.020_880_044_660_497_5,
+            offset: [-0.004_037_362_066_961_258, -0.000_253_569_236_320_606_1],
         },
         eye_weight: 0.0,
         // Each EMA moves 0.3 of the way (dt / (dt + tau) = 0.30) at the
@@ -980,11 +988,62 @@ mod tests {
     }
 
     /// The constants the study's test vectors (`test_vectors.json`) were
-    /// made with: [`HeadParams::FITTED`] but for the eye weight and the
-    /// per-axis one-euro filters the fit gave.
+    /// made with: its fit on the Python port of the tracker
+    /// (`reference.PROTOTYPE` in `tools/headpose/reference.py`), the eye
+    /// branch blended in and a one-euro filter per angle. The vectors check
+    /// the arithmetic against the reference's, which any constants do, so
+    /// they keep these whatever [`HeadParams::FITTED`] holds.
     fn vector_params() -> HeadParams {
         HeadParams {
+            rotation_offset: [
+                [
+                    0.999_860_075_374_677_1,
+                    -0.007_035_297_618_850_274,
+                    -0.015_176_767_085_183_904,
+                ],
+                [
+                    0.006_109_694_286_072_543,
+                    0.998_167_924_520_407_6,
+                    -0.060_195_233_153_067_08,
+                ],
+                [
+                    0.015_572_453_482_815_5,
+                    0.060_094_084_950_480_346,
+                    0.998_071_239_765_223,
+                ],
+            ],
+            pnp_scale: 0.971_429_553_944_983_1,
+            pnp_point_mm: [
+                -2.824_343_736_189_661_5,
+                27.404_881_620_713_358,
+                -36.483_212_590_351_55,
+            ],
+            pnp_direction: DirectionMap {
+                gain: 1.013_556_746_417_381_4,
+                offset: [0.001_815_721_453_967_718_2, -0.007_409_409_876_383_765_5],
+            },
+            eye_rays: RayIntrinsics {
+                fu: -375.9,
+                cu: 140.9,
+                fv: -383.3,
+                cv: 139.8,
+            },
+            eye_contours: [
+                [
+                    33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246,
+                ],
+                [
+                    263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466,
+                ],
+            ],
+            eye_range_mm: 64.291_648_924_177_8,
+            eye_direction: DirectionMap {
+                gain: 1.020_828_932_951_275_4,
+                offset: [-0.004_033_985_018_082_697, -0.000_262_390_956_082_422_75],
+            },
             eye_weight: 0.383_418_503_706_659_53,
+            position_tau_s: 0.070_485_333_333_333_33,
+            correction_tau_s: 0.070_485_333_333_333_33,
             rotation_filters: [
                 OneEuro {
                     min_cutoff_hz: 1.0,
@@ -999,7 +1058,10 @@ mod tests {
                     beta: 0.1,
                 },
             ],
-            ..HeadParams::FITTED
+            rotation_derivative_cutoff_hz: 1.0,
+            reset_gap_s: 1.0,
+            min_centroid_edge_px: 6.0,
+            min_nose_tip_edge_px: -4.0,
         }
     }
 
@@ -1166,16 +1228,16 @@ mod tests {
             beta: 0.2,
         };
         assert_eq!(fitted.rotation_filters, [shared; 3]);
-        // The rest is the fit's: Q turns the mesh by the yxz angles the study
-        // gave, and the EMA moves 0.3 of the way at the stream's frame
-        // interval.
+        // The rest is the fit's: Q turns the mesh by the yxz angles the fit
+        // on this tracker's fits gave, and the EMA moves 0.3 of the way at
+        // the stream's frame interval.
         let q = euler_yxz(&fitted.rotation_offset).map(f64::to_degrees);
         assert_close(
             &q,
             &[
-                3.451_019_058_543_119_7,
-                -0.871_177_981_576_780_2,
-                0.350_697_829_977_867_97,
+                3.451_721_397_979_029,
+                -0.871_398_511_547_148_5,
+                0.352_198_692_242_459_37,
             ],
             "Q",
         );
@@ -1970,7 +2032,7 @@ mod tests {
     /// [`HeadParams::fingerprint`] of [`HeadParams::FITTED`], as Python
     /// packing the same numbers with `struct` gets it too. It changes with
     /// the constants.
-    const FITTED_FINGERPRINT: u64 = 0x8443_11fe_3b47_e7ed;
+    const FITTED_FINGERPRINT: u64 = 0x4063_5c9d_395e_edc8;
 
     // The study's test vectors (`test_vectors.json`, generated by its
     // Python reference implementation), as its generator wrote them.

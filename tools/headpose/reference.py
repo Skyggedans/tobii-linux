@@ -469,7 +469,8 @@ def shipped(P):
     return dict(P, w=0.0, one_euro={k: list(v) for k, v in ONE_EURO_SHARED.items()})
 
 
-# head.rs's HeadParams::FITTED until the constants are fitted again on the Rust tracker's fits.
+# head.rs's HeadParams::FITTED until the constants were fitted again on the Rust tracker's fits
+# (2026-10-05): fit.py's JSON has those, which the scripts take with --params.
 FITTED = shipped(PROTOTYPE)
 
 

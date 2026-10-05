@@ -21,7 +21,8 @@ The constants: --params gives fit.py's JSON, its head_params or with --loso each
 (fitted without it; the fold is found by the session's clock offset and image count, which the
 JSON records, so the sessions may come in any order and any subset of the fitted ones). Without
 it, reference.FITTED: the study's constants with the choices head.rs ships, which HeadParams::FITTED
-holds only until the constants are fitted again (README step 3); after that, give --params.
+held until the constants were fitted again on the Rust tracker's fits (2026-10-05, README step 3):
+give --params with that fit's JSON for the constants head.rs ships now.
 --blend turns the eye correction on with the weight the fit found (without --params, the study's)
 and changes nothing else; --rotation-filters swaps the one-euro filters. --broken runs a
 deliberately broken pipeline, to see which gates catch it.
@@ -708,7 +709,7 @@ def constants(args, o):
     else:
         # PROTOTYPE differs from FITTED in its rotation filters too: only the weight is taken.
         P = dict(ref.FITTED)
-        what = "reference.FITTED (the study's constants; HeadParams::FITTED until a refit)"
+        what = "reference.FITTED (the study's constants, HeadParams::FITTED before the refit)"
         if args.blend:
             P["w"] = ref.PROTOTYPE["w"]
             what += " with the study's eye weight"
@@ -725,7 +726,7 @@ def main():
     ap.add_argument(
         "--params",
         help="fit.py's JSON; default: reference.FITTED, the study's constants (HeadParams::FITTED "
-        "until a refit)",
+        "before the refit on the Rust tracker)",
     )
     ap.add_argument(
         "--loso",
