@@ -507,7 +507,7 @@ def main():
     ap.add_argument(
         "--rotation-filters",
         choices=("per-axis", "shared"),
-        help="the study's one-euro filter per axis, or the one shared by the three angles, in "
+        help="the study's one-euro setting per axis, or the one the three angles share, in "
         "place of the constants'",
     )
     ap.add_argument(

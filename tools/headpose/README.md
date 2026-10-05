@@ -76,10 +76,10 @@ face. Only the constants go into the tree, `tools/headpose/fitted.json`.
    (`HeadParams::FITTED`'s, 6 and -4 px), which the fit does not change; last, the fingerprint
    of `head_params`. `fit.json`'s `head_params` are the constants fitted on all the sessions,
    with the choices `head.rs` ships: the PnP branch alone (eye weight 0; `--blend` keeps the
-   weight found) and one one-euro filter for the three angles (`--rotation-filters per-axis` for
-   the study's). `--fitted` writes them alone, with their fingerprint, the eye weight found and
-   Q's yxz angles, into `fitted.json`: the scripts' constants from here on (`reference.FITTED`,
-   `evaluate.py`'s default).
+   weight found) and one setting of the three angles' one-euro filters
+   (`--rotation-filters per-axis` for the study's setting per angle). `--fitted` writes them
+   alone, with their fingerprint, the eye weight found and Q's yxz angles, into `fitted.json`:
+   the scripts' constants from here on (`reference.FITTED`, `evaluate.py`'s default).
 3. Copy `head_params` into `HeadParams::FITTED`, field for field, and say in its doc comment
    what it was fitted on (date, sessions, the tracker's revision).
 4. Run the tests (`make check`). `fitted_holds_the_constants_fit_py_wrote` checks that
@@ -184,6 +184,13 @@ its magnitude at most, `range`: every axis inside), `by` (`compare-dll` for the 
 measures; `evaluate.py` checks them all) and a threshold per session (`thresholds`). The
 thresholds are the Rust pipeline's leave-one-session-out values plus headroom, set by `gates.py`
 (above) by the rule its `headroom` spells out.
+
+No gate bounds how far an angle turns against the DLL's: the rotation medians are taken over
+ALL, most of whose images are within 10° of straight ahead, and YAW20's errors are printed but
+not gated. With `HeadParams::FITTED` as it stands every gate passes while ours turns about 1.2
+times as far as the DLL's in yaw at 10 to 30° and 0.8 to 0.9 times as far in pitch in s1 and s3
+(YAW20's median yaw error is 3.5 and 3.8°, against 1.0 and 2.1° over ALL). A refit should
+weigh YAW20's yaw error, or the slope of ours on the DLL's per axis, as well as the gates.
 
 ## Details
 

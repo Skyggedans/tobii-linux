@@ -32,13 +32,13 @@ thresholds of each fold and of all, with their errors there and on the session l
 the fingerprint of head_params (HeadParams::fingerprint, which compare-dll --head prints of the
 constants it runs). Writes FIT.json: "head_params", the all-session constants under the field
 names of head.rs's HeadParams, with the choices it ships (the PnP branch alone, w = 0, unless
---blend; one one-euro filter shared by the three angles unless --rotation-filters per-axis): what
-HeadParams::FITTED takes; "fingerprint" theirs. "fit" has the fit's own numbers (the eye weight
-found, beta, Q's yxz angles, the costs, the G3 thresholds found), "folds" the same per held-out
-session; "options" the display area given (TL, TR, BL, mm) and "sessions" each session's files,
-clock offset, images and display frame. --fitted writes FITTED.json, what tools/headpose/fitted.json
-holds: head_params and their fingerprint, the eye weight found and Q's yxz angles, the date, the
-options and the sessions, and no per-image numbers.
+--blend; one setting shared by the three angles' one-euro filters unless --rotation-filters
+per-axis): what HeadParams::FITTED takes; "fingerprint" theirs. "fit" has the fit's own numbers
+(the eye weight found, beta, Q's yxz angles, the costs, the G3 thresholds found), "folds" the same
+per held-out session; "options" the display area given (TL, TR, BL, mm) and "sessions" each
+session's files, clock offset, images and display frame. --fitted writes FITTED.json, what
+tools/headpose/fitted.json holds: head_params and their fingerprint, the eye weight found and Q's
+yxz angles, the date, the options and the sessions, and no per-image numbers.
 """
 
 import argparse
@@ -439,8 +439,8 @@ def main():
         "--rotation-filters",
         choices=("shared", "per-axis"),
         default="shared",
-        help="the one-euro filters to ship and to filter with: one shared by the three angles "
-        "(1.0 Hz, 0.2 Hz per deg/s) or the study's per-axis ones",
+        help="the one-euro filters to ship and to filter with: one setting shared by the three "
+        "angles (1.0 Hz, 0.2 Hz per deg/s) or the study's setting per axis",
     )
     args = ap.parse_args()
     per_axis = args.rotation_filters == "per-axis"

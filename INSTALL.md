@@ -393,10 +393,28 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
   position a pivot at the neck along the camera's axes (§7), its angles
   clamped to ±45°, and nothing sent while there is no face. Since the
   tracker turns its face crop with the eye line, it loses the face less
-  often, and its yaw and roll now follow the head about as far as the
-  Stream Engine's: 1.0 to 1.15 and about 1.0 times them, where they were
-  0.4 to 0.8 and 0.7 to 0.8 times. A gain you raised in OpenTrack to make
-  up for that may now be too much.
+  often, and how far each axis moves has changed. As multiples of the
+  Stream Engine's pose of the same motion (the slope of a fit on each of
+  the three Windows sessions, the signs set aside):
+
+  | Axis | Before | Now |
+  |---|---|---|
+  | TX | 0.84 to 0.89 | 0.52 to 0.66 |
+  | TY | 0.64 to 0.74 | 0.51 to 0.70 |
+  | TZ | 0.13 to 0.42 | 0.76 to 0.89 |
+  | Yaw | 0.41 to 0.77 | 0.98 to 1.14 |
+  | Pitch | 0.74 to 1.01 | 0.69 to 0.95 |
+  | Roll | 0.69 to 0.81 | 0.99 to 1.03 |
+
+  TZ hardly followed your distance from the screen before (its correlation
+  with the Stream Engine's was 0.13 to 0.45) and does now (0.75 to 0.93),
+  moving 2 to 7 times as far as it did; its jumps of over a centimetre from
+  one image to the next that the Stream Engine's does not make fell from 73,
+  544 and 453 to 2, 95 and 25 in the three sessions. Yaw and roll move 1.3
+  to 2.6 times as far as they did, TX a quarter to two fifths less, pitch
+  0.8 to 1.1 times as far. Check OpenTrack's mapping: a gain you raised to
+  make up for the small TZ, yaw or roll may now be too much, and TX may want
+  more than it had.
 - **`libtobii.so`** — the Stream Engine 4.1 C API: every one of the 153
   entry points of `tobii_stream_engine.dll` 4.1.0.3, with its signatures,
   `tobii_error_t` numbering and struct layouts, plus the `tobii_recenter`
@@ -528,7 +546,9 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
 
   - **Signs.** TZ, Pitch and Roll now move as on Windows; libtobii had them
     reversed. Undo any inversion you set on those axes in OpenTrack's
-    mapping.
+    mapping. The bridge's axes are not the plugin's: for the same motion its
+    TX, TZ, Yaw, Pitch and Roll have the opposite sign (only TY agrees), so
+    an inversion set for one is wrong for the other.
   - **Centring.** The pose is absolute, and OpenTrack centres it itself, as
     on Windows: at the first valid pose (*Center at startup*, on by
     default) and on its *Center* shortcut. A daemon recenter
@@ -540,9 +560,28 @@ TOBII_PIVOT_DOWN=14 TOBII_PIVOT_BACK=8 ./target/release/tobii-opentrack
     `TOBII_PIVOT_DOWN` and `TOBII_PIVOT_BACK` do not apply to it.
     OpenTrack's *Relative translation* options, with *Neck displacement*,
     can make up for part of that (untried here).
-  - **Range.** Yaw and roll are larger, as large as the Stream Engine's
-    (they were 0.4 to 0.8 and 0.7 to 0.8 times them), and no longer stop
-    at ±45°.
+  - **Range.** Every axis but pitch moves further than it did, pitch about
+    as far, none stops at ±45° any more, and most move as far as the Stream
+    Engine's. As multiples of the Stream Engine's pose of the same motion
+    (the slope of a fit on each of the three Windows sessions, the signs set
+    aside):
+
+    | Axis | Before | Now |
+    |---|---|---|
+    | TX | 0.84 to 0.89 | 0.98 to 1.00 |
+    | TY | 0.64 to 0.74 | 0.84 to 0.96 |
+    | TZ | 0.13 to 0.42 | 0.98 to 1.02 |
+    | Yaw | 0.41 to 0.77 | 1.01 to 1.15 |
+    | Pitch | 0.74 to 1.01 | 0.79 to 0.99 |
+    | Roll | 0.69 to 0.81 | 0.97 to 1.00 |
+
+    TZ, which hardly followed your distance from the screen, now does as on
+    Windows, moving 2 to 8 times as far as it did. Yaw and pitch are where
+    it differs from Windows: in two of the sessions yaw turns about 1.2
+    times as far as the Stream Engine's at 10 to 30° and pitch 0.8 to 0.9
+    times as far, in the third both within 10 %. So a profile whose curves
+    you tuned on Windows may turn the view some 20 % further in yaw and 10
+    to 20 % less in pitch here.
   - **Invalid poses.** Near the edges of the camera's view, and when the face
     is lost, the pose now comes marked invalid, as the DLL's does (before,
     nothing came without a face). The plugin as it stands then sets no axis,

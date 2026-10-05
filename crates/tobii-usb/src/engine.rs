@@ -128,8 +128,9 @@ impl PoseSample {
 /// The legacy head pose, the engine's own from before it made the Stream
 /// Engine's, which the daemon keeps publishing for the `OpenTrack` UDP
 /// bridge: that of a pivot at the neck, relative to a rest pose that the
-/// first fits after a recenter ([`Engine::request_recenter`]) calibrate, in
-/// the camera's upright frame, its angles clamped to ±45° and smoothed (see
+/// first fits after a recenter ([`Engine::request_recenter`]) calibrate, its
+/// translation along the camera's axes and its angles in the camera's
+/// upright frame, clamped to ±45°, the whole of it smoothed (see
 /// `tobii_pose::track::RestPose`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]

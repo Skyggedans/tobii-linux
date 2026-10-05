@@ -161,15 +161,16 @@ impl HeadParams {
     /// these are those, bit for bit. Two choices are not the fit's: the
     /// position is the `PnP` branch's alone (the eye weight is 0, where the
     /// fit gave 0.384; the eye branch keeps the constants fitted for it, for
-    /// comparison), and the three angles share one one-euro filter of 1.0 Hz
-    /// and 0.2 Hz per °/s (the head-pose study had 1.0 and 0.4, 0.7 and 0.2,
-    /// 1.5 and 0.1 for x, y and z). The position's EMA and the validity
-    /// thresholds are the study's, which the fit keeps. Searched again on
-    /// these fits, the thresholds come out the same; of the filters tried on
-    /// this tracker's poses in the EMA's place (other time constants, one-euro
-    /// filters, separate filters of direction and range), each chosen on two
-    /// sessions, none brought both the position's lag and its rest jitter
-    /// nearer the Stream Engine's in every session it was not chosen on.
+    /// comparison), and the three angles' one-euro filters share one setting,
+    /// 1.0 Hz and 0.2 Hz per °/s (the head-pose study had 1.0 and 0.4, 0.7
+    /// and 0.2, 1.5 and 0.1 for x, y and z). The position's EMA and the
+    /// validity thresholds are the study's, which the fit keeps. Searched
+    /// again on these fits, the thresholds come out the same; of the filters
+    /// tried on this tracker's poses in the EMA's place (other time
+    /// constants, one-euro filters, separate filters of direction and range),
+    /// each chosen on two sessions, none brought both the position's lag and
+    /// its rest jitter nearer the Stream Engine's in every session it was not
+    /// chosen on.
     pub const FITTED: Self = Self {
         rotation_offset: [
             [

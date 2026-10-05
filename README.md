@@ -31,7 +31,9 @@ bit for bit: replaying a captured Windows session through the decoder gives
 exactly the gaze points and gaze origins the Stream Engine delivered for it
 (5 284 of 5 284 frames, error 0; `tobii5-init-replay compare-dll`). The head
 pose is computed, not decoded, on Windows too: libtobii's follows the Stream
-Engine's to within a few degrees and millimetres (Architecture, *Head pose*).
+Engine's to a median of a few degrees and millimetres, though its yaw can come
+out some 20 % larger and its pitch 10 to 20 % smaller (Architecture, *Head
+pose*).
 
 The head pose is **gaze-independent**: turning your eyes does not move it.
 
@@ -244,20 +246,28 @@ Where the answers come from, and where they differ from Windows:
   from the DLL's by a median 2.2 to 4.0° in rotation, 4 to 7 mm in z and under
   4 mm across; constants fitted on two of the sessions do about as well on the
   third (`tobii5-init-replay compare-dll --head`, `tools/headpose/README.md`).
-  What it does not reproduce: the head size the runtime ranges by, which
-  differed by up to 1.5 % between the sessions (6 to 9 mm in z at a desk),
-  where the model has one constant; the range the runtime reports 7.5 to 11 %
-  long for some 17 images after it finds a lost face again; its filters, which
-  an EMA on the position and a single one-euro filter for the three angles
-  approximate (lags that differ from the DLL's by up to 13 ms on the angles and
-  21 ms on the position, noise at rest 0.6 to 1.4 times the DLL's); and a pose
-  for every image: the daemon's pose worker takes the newest image, and one it
-  has not taken by the time the next comes gets none, which at ~6 ms an image
-  on a desktop CPU, against 30 ms between images, takes a busy machine
-  (`TOBII_IMAGE83_DEBUG` counts them, INSTALL.md §7). `tobii_recenter`
-  re-zeroes only the daemon's own, relative head pose, a stream of its own that
-  the `tobii-opentrack` bridge reads (INSTALL.md §8): the Stream Engine has no
-  recenter, and an application centres this pose itself, as OpenTrack does.
+  Those are medians over every image, most of them near straight ahead, not
+  bounds, and they hide a scale: TX, TZ and roll move as far as the DLL's to
+  within 3 %, TY 0.84 to 0.96 times as far, but yaw and pitch do not (below;
+  INSTALL.md §8 has every axis). What it does not reproduce: the Stream
+  Engine's yaw and pitch to scale, as in two of the sessions ours turns 1.15 to
+  1.2 times as far in yaw at 10 to 30° (its median yaw error past 20° is 3.5 to
+  3.8°, against 1.0 to 2.1° over all images) and 0.8 to 0.9 times as far in
+  pitch, in the third within 10 % in both; the head size the runtime ranges by,
+  which differed by up to 1.5 % between the sessions (6 to 9 mm in z at a
+  desk), where the model has one constant; the range the runtime reports 7.5 to
+  11 % long for some 17 images after it finds a lost face again; its filters,
+  which an EMA on the position and one-euro filters of one shared setting (1.0
+  Hz, 0.2) on the three angles approximate (lags that differ from the DLL's by
+  up to 13 ms on the angles and 21 ms on the position, noise at rest 0.6 to 1.4
+  times the DLL's); and a pose for every image: the daemon's pose worker takes
+  the newest image, and one it has not taken by the time the next comes gets
+  none, which at ~6 ms an image on a desktop CPU, against 30 ms between images,
+  takes a busy machine (`TOBII_IMAGE83_DEBUG` counts them, INSTALL.md §7).
+  `tobii_recenter` re-zeroes only the daemon's own, relative head pose, a
+  stream of its own that the `tobii-opentrack` bridge reads (INSTALL.md §8):
+  the Stream Engine has no recenter, and an application centres this pose
+  itself, as OpenTrack does.
 - **Timestamps.** Every callback timestamp but the tracker times below is on
   `tobii_system_clock`'s clock, as in the Stream Engine; the tracker's clock
   is left only in gaze data's and raw gaze's `timestamp_tracker_us` (raw
