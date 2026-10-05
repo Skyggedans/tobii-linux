@@ -251,7 +251,9 @@ pub struct Notification {
 pub enum ServerMsg {
     /// Reply to a SUBSCRIBE frame.
     Subscribed {
-        /// `true` if the subscription was accepted; `false` if the daemon is busy.
+        /// `true` if the subscription was accepted; `false` if the daemon
+        /// refused it, which tobiid, serving every stream from one engine,
+        /// never does.
         ok: bool,
     },
     /// Reply to a REQUEST frame.

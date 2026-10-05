@@ -1,7 +1,7 @@
-//! Thin client: subscribe to gaze from `tobiid` (gaze mode) and, while the user
-//! looks at the left or right edge of the screen, emit a Left/Right arrow key
-//! once per second via the kernel `uinput` device. Works under both X11 and
-//! Wayland because the key events are injected at the kernel input layer.
+//! Thin client: subscribe to gaze from `tobiid` and, while the user looks at
+//! the left or right edge of the screen, emit a Left/Right arrow key once per
+//! second via the kernel `uinput` device. Works under both X11 and Wayland
+//! because the key events are injected at the kernel input layer.
 //!
 //! Needs write access to `/dev/uinput` (typically root): run with `sudo`, or
 //! grant your user access to the device.
@@ -398,7 +398,10 @@ fn run() -> Result<()> {
         };
         match decode_server(&body) {
             Some(ServerMsg::Subscribed { ok: false }) => {
-                bail!("daemon is busy with the other mode (head)")
+                bail!(
+                    "tobiid refused the gaze subscription; only a tobiid older than this \
+                     tobii-gaze-keys refuses one (restart it after installing)"
+                )
             }
             Some(ServerMsg::Subscribed { ok: true }) => {}
             Some(ServerMsg::Gaze { valid, xy, .. }) => {
@@ -463,10 +466,9 @@ fn run() -> Result<()> {
                     eprint!("\r   center (x={x:.2})        ");
                 }
             }
-            // Head/presence frames aren't subscribed here and unknown tags decode
-            // to `None`. `ServerMsg` belongs to the library crate (this binary is
-            // a separate crate), so a wildcard keeps this client building if the
-            // enum grows or becomes `#[non_exhaustive]`.
+            // Frames of streams not subscribed here; unknown tags decode to
+            // `None`. `ServerMsg` is `#[non_exhaustive]`, so outside tobii-ipc a
+            // match on it needs a wildcard.
             _ => {}
         }
     }

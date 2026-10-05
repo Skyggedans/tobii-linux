@@ -219,7 +219,10 @@ fn run() -> Result<()> {
         };
         match decode_server(&body) {
             Some(ServerMsg::Subscribed { ok: false }) => {
-                bail!("daemon is busy with the other mode (gaze)")
+                bail!(
+                    "tobiid refused the head pose subscription; only a tobiid older than this \
+                     tobii-opentrack refuses one (restart it after installing)"
+                )
             }
             Some(ServerMsg::HeadPose(head)) => {
                 seen.store(true, Ordering::Relaxed);
@@ -238,10 +241,9 @@ fn run() -> Result<()> {
                 }
             }
             // The SUBSCRIBED ack, and frames of streams not subscribed here;
-            // unknown tags decode to `None`. `ServerMsg` belongs to the
-            // library crate (this binary is a separate crate), so a wildcard
-            // keeps this client building if the enum grows or becomes
-            // `#[non_exhaustive]`.
+            // unknown tags decode to `None`. `ServerMsg` is
+            // `#[non_exhaustive]`, so outside tobii-ipc a match on it needs
+            // a wildcard.
             _ => {}
         }
     }

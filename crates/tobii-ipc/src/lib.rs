@@ -137,7 +137,8 @@ pub const TAG_SUBSCRIBE: u8 = 0x01;
 pub const RETIRED_TAG_RECENTER: u8 = 0x02;
 /// Client -> daemon: `u32 id`, `u8 kind`, payload (see [`request`]).
 pub const TAG_REQUEST: u8 = 0x03;
-/// Daemon -> client: `u8` ok(1) / busy(0), in reply to a SUBSCRIBE.
+/// Daemon -> client: `u8` ok(1) / refused(0), in reply to a SUBSCRIBE;
+/// tobiid never refuses one.
 pub const TAG_SUBSCRIBED: u8 = 0x10;
 /// Daemon -> client: `u32 id`, `u8 status`, payload, in reply to a REQUEST.
 pub const TAG_REPLY: u8 = 0x11;
