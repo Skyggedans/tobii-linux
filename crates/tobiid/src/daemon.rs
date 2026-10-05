@@ -9,12 +9,19 @@
 //! client's outbox and sent ahead of the next samples, so a reply can never
 //! interleave with a sample frame.
 //!
-//! Each client has a reader thread, which handles its subscription changes
-//! and recenter requests, and from its first request on a request worker,
-//! which runs its requests one at a time in the order they came. A request can wait on the device for
-//! long (a cold engine takes ~12 s to arm, and a command queued meanwhile
-//! may wait 30 s for it), and the client's subscription changes do not wait
-//! behind it: libtobii gives up on a subscription's ack after 2 s.
+//! Each client has a reader thread, which handles its subscription changes,
+//! and from its first request on a request worker, which runs its requests
+//! one at a time in the order they came. A request can wait on the device
+//! for long (a cold engine takes ~12 s to arm, and a command queued
+//! meanwhile may wait 30 s for it), and the client's subscription changes do
+//! not wait behind it: libtobii gives up on a subscription's ack after 2 s.
+//!
+//! HEAD, the daemon's own, legacy head pose, is retired, and with it the
+//! recenter that reset its rest pose. What an older client or hotkey may
+//! still ask of it is harmless: a subscription to HEAD is acked and gets
+//! nothing for it ([`RETIRED_STREAM_HEAD`]), a RECENTER frame is ignored
+//! ([`ignore_recenter`]) and so is SIGUSR1 ([`RECENTER_SIGNAL`]), each
+//! logged the first time.
 //!
 //! Log lines go through `tracing` (the `tobiid` binary installs the
 //! subscriber; under systemd stderr lands in the journal).
@@ -29,7 +36,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -50,7 +57,11 @@ use crate::device::DeviceCommands;
 use crate::frames::{engine_wanted, presence_frame, push_sample_frames};
 use crate::restart::Backoff;
 
-/// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
+/// Set by the SIGUSR1 handler. SIGUSR1 had the daemon reset the rest pose of
+/// HEAD, its retired legacy head pose, and an old hotkey may still send it:
+/// the handler stays so that the signal does not end the daemon, its default
+/// action, and the signal poller ignores it but for a warning the first time
+/// (see [`take_recenter_signal`]).
 static RECENTER_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 /// Set by the SIGTERM/SIGINT handler; a poller thread turns it into a graceful
@@ -70,6 +81,91 @@ extern "C" fn on_shutdown(_sig: libc::c_int) {
     // work (Rust does not run Drop on a signal-terminated process, so we must
     // shut down cooperatively to get the device teardown to run).
     SHUTDOWN_SIGNAL.store(true, Ordering::Relaxed);
+}
+
+/// The signals the daemon catches, with their handlers: SIGUSR1 so that it
+/// does not end the daemon, which then ignores it (see [`RECENTER_SIGNAL`]),
+/// and SIGTERM and SIGINT for a graceful shutdown with the device's teardown.
+const SIGNAL_HANDLERS: [(libc::c_int, extern "C" fn(libc::c_int)); 3] = [
+    (libc::SIGUSR1, on_sigusr1),
+    (libc::SIGTERM, on_shutdown),
+    (libc::SIGINT, on_shutdown),
+];
+
+/// Have `handler` take `signal` from now on.
+///
+/// # Errors
+///
+/// The OS error, should the handler not be installed (`signal` is not one a
+/// handler may take).
+fn catch(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) -> io::Result<()> {
+    // SAFETY: `handler` is an `extern "C" fn(c_int)`, what `sighandler_t`
+    // stands for, and each handler here only performs an atomic store, so it
+    // is async-signal-safe. The handler it replaces (the default) needs no
+    // restoring.
+    let previous = unsafe { libc::signal(signal, handler as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// HEAD's bit in the SUBSCRIBE mask, bit 0: the daemon's own, legacy head
+/// pose, which is retired. A client from before that still subscribes to it
+/// is acked and sent nothing for it, as for a stream bit the daemon does not
+/// know (see [`crate::frames::engine_wanted`]), and the first such
+/// subscription is logged (see [`handle_subscribe`]).
+pub(crate) const RETIRED_STREAM_HEAD: u32 = tobii_ipc::STREAM_HEAD;
+
+/// RECENTER's frame tag, 0x02: the frame had the daemon reset the rest pose
+/// of HEAD, its retired legacy head pose. A client from before that still
+/// sends one (an older libtobii's `tobii_recenter`, an older
+/// `tobii-opentrack --recenter`) is served on (see [`ignore_recenter`]).
+const RETIRED_TAG_RECENTER: u8 = tobii_ipc::TAG_RECENTER;
+
+/// The first subscription to [`RETIRED_STREAM_HEAD`] was logged.
+static HEAD_SUBSCRIPTION_LOGGED: Once = Once::new();
+/// The first RECENTER frame was logged.
+static RECENTER_FRAME_LOGGED: Once = Once::new();
+/// The first SIGUSR1 was logged.
+static RECENTER_SIGNAL_LOGGED: Once = Once::new();
+
+/// Note that client `id` subscribed to `streams`, which have
+/// [`RETIRED_STREAM_HEAD`]: a warning the first time.
+fn note_retired_head_subscription(id: u64, streams: u32) {
+    HEAD_SUBSCRIPTION_LOGGED.call_once(|| {
+        warn!(
+            client = id,
+            streams = %format_args!("{streams:#x}"),
+            "a client subscribed to HEAD (bit 0), the legacy head pose, which is gone: it gets \
+             nothing for it, and HEAD_POSE (bit 9) is the Stream Engine's head pose (logged once)"
+        );
+    });
+}
+
+/// Ignore client `id`'s RECENTER frame ([`RETIRED_TAG_RECENTER`]): the client
+/// keeps its connection, and the first such frame is logged.
+fn ignore_recenter(id: u64) {
+    RECENTER_FRAME_LOGGED.call_once(|| {
+        warn!(
+            client = id,
+            "ignoring RECENTER: the legacy head pose it recentred is gone, and an application \
+             centres the Stream Engine's head pose itself (logged once)"
+        );
+    });
+}
+
+/// What the signal poller makes of a SIGUSR1 that came since it last looked:
+/// nothing but a warning, the first time (see [`RECENTER_SIGNAL`]).
+fn take_recenter_signal() {
+    if RECENTER_SIGNAL.swap(false, Ordering::Relaxed) {
+        RECENTER_SIGNAL_LOGGED.call_once(|| {
+            warn!(
+                "ignoring SIGUSR1: the legacy head pose it recentred is gone, and OpenTrack \
+                 centres the Stream Engine's head pose on its Center shortcut (logged once)"
+            );
+        });
+    }
 }
 
 pub(crate) struct Client {
@@ -484,9 +580,8 @@ impl State {
     }
 
     /// Tell the engine which optional work anyone consumes (see
-    /// [`engine_wanted`]): head-pose inference for either head pose
-    /// stream, the legacy pose for HEAD subscribers, and IR frames for image
-    /// subscribers.
+    /// [`engine_wanted`]): head-pose inference for `HEAD_POSE` subscribers,
+    /// and IR frames for image subscribers.
     fn sync_wanted(&self) {
         if let Some(engine) = self.engine.as_ref() {
             engine.set_wanted(engine_wanted(self.wanted_mask()));
@@ -920,18 +1015,10 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // SIGUSR1 -> recenter; SIGTERM/SIGINT -> graceful shutdown with device teardown.
-    // SAFETY: both handlers are `extern "C" fn(c_int)` matching `sighandler_t`
-    // and only perform an atomic store, so they are async-signal-safe. The
-    // previous handlers (the defaults) need no restoring.
-    unsafe {
-        libc::signal(
-            libc::SIGUSR1,
-            on_sigusr1 as extern "C" fn(libc::c_int) as libc::sighandler_t,
-        );
-        let h = on_shutdown as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGINT, h);
+    for (signal, handler) in SIGNAL_HANDLERS {
+        if let Err(e) = catch(signal, handler) {
+            warn!(signal, error = %e, "could not install a signal handler");
+        }
     }
     {
         let state = Arc::clone(&state);
@@ -953,11 +1040,7 @@ pub fn run() -> Result<()> {
                     info!("shutdown signal: device teardown done, exiting");
                     std::process::exit(0);
                 }
-                if RECENTER_SIGNAL.swap(false, Ordering::Relaxed)
-                    && let Some(engine) = lock_state(&state).engine.as_ref()
-                {
-                    engine.request_recenter();
-                }
+                take_recenter_signal();
             }
         });
     }
@@ -1117,8 +1200,9 @@ fn run_requests(state: &Mutex<State>, id: u64, requests: &Receiver<Vec<u8>>) {
     }
 }
 
-/// One per connection: handle SUBSCRIBE and RECENTER frames, hand REQUEST
-/// frames to the client's request worker, and detect disconnect. Replies go
+/// One per connection: handle SUBSCRIBE frames, ignore an older client's
+/// RECENTER frames ([`ignore_recenter`]), hand REQUEST frames to the
+/// client's request worker, and detect disconnect. Replies go
 /// through the client's outbox. The requests a client sent before it hung
 /// up still run (a calibration stop that keeps the result, sent without
 /// waiting for the answer, still keeps it); only then is the client
@@ -1186,11 +1270,7 @@ fn read_frames(
                     }
                 }
             }
-            Some(tobii_ipc::TAG_RECENTER) => {
-                if let Some(engine) = lock_state(state).engine.as_ref() {
-                    engine.request_recenter();
-                }
-            }
+            Some(RETIRED_TAG_RECENTER) => ignore_recenter(id),
             Some(tobii_ipc::TAG_REQUEST) => {
                 if worker.is_none() {
                     match RequestWorker::spawn(state, id, stream) {
@@ -1254,7 +1334,10 @@ fn has_peer_hung_up(id: u64, stream: &UnixStream) -> bool {
 /// Register the client's streams, starting the engine if it isn't running
 /// (and the tracker is on the bus; otherwise the watchdog starts it once the
 /// tracker is plugged in), and acknowledge. Always succeeds (the one engine
-/// serves every stream); `streams == 0` unsubscribes. `true` once done.
+/// serves every stream); `streams == 0` unsubscribes. `true` once done. A
+/// stream bit the daemon does not serve is kept and acked like the others,
+/// and nothing is ever sent for it: HEAD, [`RETIRED_STREAM_HEAD`], is one
+/// such, logged the first time it is asked for.
 ///
 /// Skipped, with nothing changed and nothing acked (`false`), if the client
 /// has hung up (`gone`, see [`has_peer_hung_up`]). That is asked before the
@@ -1285,6 +1368,9 @@ fn handle_subscribe(state: &Mutex<State>, id: u64, streams: u32, gone: impl Fn()
     } else {
         st.ensure_engine(on_bus);
         st.sync_wanted();
+    }
+    if streams & RETIRED_STREAM_HEAD != 0 {
+        note_retired_head_subscription(id, streams);
     }
     st.send_to(id, encode_subscribed(true));
     replay_presence(&mut st, id, before, streams);
@@ -2170,19 +2256,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// A pose sample reaches each client as the head pose streams it
-    /// subscribes to: HEAD a HEAD subscriber, `HEAD_POSE` a `HEAD_POSE` one,
-    /// both one that takes both, and neither a gaze subscriber.
+    /// A pose sample reaches each client as the Stream Engine's head pose,
+    /// `HEAD_POSE`, if it subscribes to it, HEAD or not; HEAD, the retired
+    /// legacy pose, reaches nobody, and a client of HEAD alone, like a gaze
+    /// subscriber, gets nothing.
     #[test]
-    fn each_client_gets_the_head_pose_streams_it_subscribes_to() {
-        use tobii_ipc::{STREAM_GAZE, STREAM_HEAD, STREAM_HEAD_POSE, TAG_HEAD, TAG_HEAD_POSE};
-        use tobii_usb::engine::{HeadPose, LegacyPose, PoseSample};
+    fn each_client_gets_the_head_pose_if_it_subscribes_to_it() {
+        use tobii_ipc::{STREAM_GAZE, STREAM_HEAD_POSE, TAG_HEAD_POSE};
+        use tobii_usb::engine::{HeadPose, PoseSample};
         let mut st = State::new(false);
         let mut peers = Vec::new();
         for (id, streams) in [
-            (1, STREAM_HEAD),
+            (1, RETIRED_STREAM_HEAD),
             (2, STREAM_HEAD_POSE),
-            (3, STREAM_HEAD | STREAM_HEAD_POSE),
+            (3, RETIRED_STREAM_HEAD | STREAM_HEAD_POSE),
             (4, STREAM_GAZE),
         ] {
             let (out, peer) = UnixStream::pair().expect("socket pair");
@@ -2196,8 +2283,7 @@ pub(crate) mod tests {
             valid: true,
             ..HeadPose::default()
         };
-        let legacy = LegacyPose::new([1.0; 3], [2.0; 3]);
-        let pose = Sample::Pose(Box::new(PoseSample::new(5, 7, head, Some(legacy))));
+        let pose = Sample::Pose(PoseSample::new(5, 7, head));
         let mut frames = Vec::new();
         push_sample_frames(&pose, st.wanted_mask(), &mut frames);
 
@@ -2217,13 +2303,93 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             tags,
-            [
-                vec![TAG_HEAD],
-                vec![TAG_HEAD_POSE],
-                vec![TAG_HEAD_POSE, TAG_HEAD],
-                vec![],
-            ]
+            [vec![], vec![TAG_HEAD_POSE], vec![TAG_HEAD_POSE], vec![]]
         );
+    }
+
+    /// A subscription to HEAD (bit 0) alone, the retired legacy pose, is
+    /// acked and kept, as one to a stream bit the daemon does not know: it
+    /// starts the engine like any subscription, asks it for nothing (no
+    /// head-pose inference), and makes no frame of a pose sample. It is
+    /// logged; one beside `HEAD_POSE` gets the head-pose inference that
+    /// `HEAD_POSE` asks for.
+    #[test]
+    fn a_subscription_to_head_alone_is_acked_and_asks_for_no_head_pose() {
+        use tobii_ipc::STREAM_HEAD_POSE;
+        use tobii_usb::engine::{HeadPose, PoseSample, Wanted};
+        let state = Mutex::new(state_with_client(1));
+        lock_state(&state).fake_present = true;
+
+        subscribe(&state, 1, RETIRED_STREAM_HEAD);
+
+        let mut st = lock_state(&state);
+        assert_eq!(outbox(&st, 1), [encode_subscribed(true)]);
+        assert_eq!(st.clients[0].streams, RETIRED_STREAM_HEAD);
+        assert_eq!(st.engines_started.len(), 1);
+        assert_eq!(engine_wanted(st.wanted_mask()), Wanted::default());
+        assert!(HEAD_SUBSCRIPTION_LOGGED.is_completed());
+        let pose = Sample::Pose(PoseSample::new(5, 7, HeadPose::default()));
+        let mut frames = Vec::new();
+        push_sample_frames(&pose, st.wanted_mask(), &mut frames);
+        assert!(frames.is_empty(), "{frames:?}");
+        st.clients[0].streams = RETIRED_STREAM_HEAD | STREAM_HEAD_POSE;
+        assert!(engine_wanted(st.wanted_mask()).head);
+    }
+
+    /// An older client's RECENTER frame (an older libtobii's
+    /// `tobii_recenter`) is ignored but for the log: the connection stays,
+    /// and what the client sends after it is served.
+    #[test]
+    fn an_older_clients_recenter_is_ignored_and_its_connection_kept() {
+        use tobii_ipc::request::{encode_u32, kind, state, status};
+        let mut c = Connection::open(Arc::new(crate::requests::tests::Answering(1)));
+
+        c.send(&[RETIRED_TAG_RECENTER]);
+        c.send(&[RETIRED_TAG_RECENTER]);
+        c.send(&tobii_ipc::encode_subscribe(tobii_ipc::STREAM_GAZE));
+        c.request(1, kind::STATE, &encode_u32(state::DEVICE_PAUSED));
+
+        assert_eq!(c.wait_for_frames(2), [ACK, reply(1, status::OK, &[0])]);
+        assert!(RECENTER_FRAME_LOGGED.is_completed());
+        {
+            let st = lock_state(&c.state);
+            assert_eq!(
+                st.clients
+                    .iter()
+                    .map(|c| (c.id, c.hung_up))
+                    .collect::<Vec<_>>(),
+                [(1, false)],
+                "still connected"
+            );
+        }
+        c.hang_up();
+        c.wait_until_served();
+        assert!(lock_state(&c.state).clients.is_empty());
+    }
+
+    /// SIGUSR1, which recentred the retired legacy pose, is caught, so that
+    /// it does not end the daemon (its default action, which would end
+    /// this test's process too), and does nothing but log.
+    #[test]
+    fn sigusr1_is_caught_and_only_logged() {
+        let (signal, handler) = SIGNAL_HANDLERS
+            .into_iter()
+            .find(|&(signal, _)| signal == libc::SIGUSR1)
+            .expect("the daemon catches SIGUSR1");
+        catch(signal, handler).expect("the handler is installed");
+
+        // SAFETY: `raise` takes a signal number and sends the signal to
+        // this thread, whose handler, installed above, only stores an atomic.
+        let raised = unsafe { libc::raise(libc::SIGUSR1) };
+
+        assert_eq!(raised, 0, "{}", io::Error::last_os_error());
+        assert!(
+            RECENTER_SIGNAL.load(Ordering::Relaxed),
+            "the handler took it, before raise returned"
+        );
+        take_recenter_signal();
+        assert!(!RECENTER_SIGNAL.load(Ordering::Relaxed), "taken");
+        assert!(RECENTER_SIGNAL_LOGGED.is_completed());
     }
 
     /// How long a test waits for what must happen.

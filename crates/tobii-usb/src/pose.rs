@@ -5,14 +5,12 @@
 //! The reader drops each image into a single-slot [`Mailbox`]; the worker
 //! always takes the newest one, skipping (and counting) whatever it missed.
 //! While a head pose is wanted, it runs each image it takes through a
-//! [`HeadStep`] and sends one [`PoseSample`] of it: the Stream Engine's head
-//! pose, valid or not, and the legacy relative pose while that one is wanted
-//! too. The engine's flags are read once at each image (see [`Wants`]), with
-//! how many times each was set: the first image after a head pose was wanted
-//! anew starts the poses over, and the first after the legacy pose alone
-//! was its rest pose, even if the flag was cleared and set again since the
-//! image before, as a new subscriber is not to inherit an earlier one's
-//! filters or rest pose.
+//! [`HeadStep`] and sends one [`PoseSample`] of it, the Stream Engine's head
+//! pose, valid or not. The engine's head flag is read once at each image,
+//! with how many times it was set: the first image after a head pose was
+//! wanted anew starts the pose over, even if the flag was cleared and set
+//! again since the image before, as a new subscriber is not to inherit an
+//! earlier one's filters.
 //!
 //! A tracker failure on an image makes the invalid pose of an image without
 //! a face, like any other, and a warning at most every
@@ -28,7 +26,7 @@ use tobii_pose::head::{FrameContext, HeadParams, HeadPose, HeadStep, StepOutput}
 use tracing::{debug, error, info, warn};
 
 use crate::device::{is_env_flag_set, to_i64_us};
-use crate::engine::{HeadFlags, ImageSample, LegacyPose, PoseSample, Sample, Shared};
+use crate::engine::{HeadFlag, ImageSample, PoseSample, Sample, Shared};
 
 /// How often the worker warns of the tracker's failures, at most: a tracker
 /// that fails on every image would otherwise log 33 lines a second.
@@ -118,45 +116,15 @@ impl Mailbox {
     }
 }
 
-/// What the clients want of the worker for one image, as it reads the
-/// engine's flags (see
-/// [`Engine::set_wanted`](crate::engine::Engine::set_wanted)) when it takes
-/// the image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct Wants {
-    /// The head flags: a head pose of either kind (`heads.head`), and the
-    /// image is stepped; the legacy pose too (`heads.legacy`).
-    heads: HeadFlags,
-    /// A recenter, asked for since the last image (`request_recenter`).
-    recenter: bool,
-}
-
-impl Wants {
-    /// Read the flags of `shared`, taking the recenter they ask for.
-    fn of(shared: &Shared) -> Self {
-        Self {
-            heads: shared.heads(),
-            // Relaxed: a pure signal; the image is handed over under the
-            // mailbox's lock.
-            recenter: shared.recenter.swap(false, Ordering::Relaxed),
-        }
-    }
-}
-
-/// The step from an image to its poses, which the worker drives:
+/// The step from an image to its pose, which the worker drives:
 /// [`HeadStep`] live; the tests give it a stand-in that says what it was
 /// asked.
 trait PoseStep {
-    /// The poses of `image`, the legacy one only when `legacy_wanted` (see
-    /// [`HeadStep::step`]).
-    fn step(&mut self, image: &ImageSample, legacy_wanted: bool) -> Stepped;
+    /// The pose of `image` (see [`HeadStep::step`]).
+    fn step(&mut self, image: &ImageSample) -> Stepped;
 
-    /// Start the poses over (see [`HeadStep::reset`]).
+    /// Start the pose over (see [`HeadStep::reset`]).
     fn reset(&mut self);
-
-    /// Have the legacy pose's rest pose calibrate afresh (see
-    /// [`HeadStep::recenter`]).
-    fn recenter(&mut self);
 }
 
 /// What the worker takes of a [`StepOutput`].
@@ -164,11 +132,8 @@ trait PoseStep {
 struct Stepped {
     /// The Stream Engine's head pose, valid or not.
     head: HeadPose,
-    /// The legacy pose, when it was wanted, the image had a face and the
-    /// rest pose has calibrated.
-    legacy: Option<LegacyPose>,
-    /// Why the tracker failed on the image, if it did: the poses are then
-    /// those of an image without a face.
+    /// Why the tracker failed on the image, if it did: the pose is then
+    /// that of an image without a face.
     error: Option<anyhow::Error>,
     /// How many times the tracker has run its face detector so far.
     detector_runs: u64,
@@ -178,7 +143,6 @@ impl From<StepOutput> for Stepped {
     fn from(out: StepOutput) -> Self {
         Self {
             head: out.head,
-            legacy: out.legacy.map(LegacyPose::of_open_track),
             error: out.error,
             detector_runs: out.model_runs.detector,
         }
@@ -186,41 +150,37 @@ impl From<StepOutput> for Stepped {
 }
 
 impl PoseStep for HeadStep {
-    fn step(&mut self, image: &ImageSample, legacy_wanted: bool) -> Stepped {
+    fn step(&mut self, image: &ImageSample) -> Stepped {
         let frame = &image.frame;
-        let context = frame_context(image, legacy_wanted);
+        let context = frame_context(image);
         HeadStep::step(self, &frame.pixels, frame.width, frame.height, &context).into()
     }
 
     fn reset(&mut self) {
         HeadStep::reset(self);
     }
-
-    fn recenter(&mut self) {
-        HeadStep::recenter(self);
-    }
 }
 
 /// What [`HeadStep::step`] is to know of `image` besides its pixels: its
 /// host time, which the filters step by; the display frame in effect when it
 /// was read, and its generation; and the open that read it. A new generation
-/// or open restarts the filters.
+/// or open restarts the filters. The engine makes no legacy pose.
 #[must_use]
-fn frame_context(image: &ImageSample, legacy_wanted: bool) -> FrameContext<'_> {
+fn frame_context(image: &ImageSample) -> FrameContext<'_> {
     FrameContext {
         t_us: image.host_us,
         display: image.display_frame.as_deref(),
         display_generation: image.display_generation.get(),
         open: image.open.get(),
-        legacy_wanted,
+        legacy_wanted: false,
     }
 }
 
 /// The worker's state from one image to the next, but for the step itself.
 #[derive(Debug, Default)]
 struct PoseWorker {
-    /// The head flags as the last image read them; `None` before the first.
-    last: Option<HeadFlags>,
+    /// The head flag as the last image read it; `None` before the first.
+    last: Option<HeadFlag>,
     /// The rate limit on the warnings of the tracker's failures.
     failures: FailureWarnings,
     /// The statistics, when `TOBII_IMAGE83_DEBUG` asks for them.
@@ -236,40 +196,30 @@ impl PoseWorker {
         }
     }
 
-    /// The poses of the image `taken`, made by `step` as `wants` asks: one
-    /// [`PoseSample`] while a head pose is wanted, valid or not, and `None`
-    /// otherwise. A recenter goes to the step either way. The first image
-    /// after a head pose was wanted anew, since the image before, starts the
-    /// step over ([`PoseStep::reset`]). The first after the legacy pose
-    /// alone was wanted anew, though the image before wanted it too, has the
-    /// rest pose calibrate afresh ([`PoseStep::recenter`]): the step, which
-    /// recalibrates it at an image wanting it after one that did not, sees it
-    /// wanted at both. The statistics' period starts over at the first
-    /// image stepped, the worker's very first included.
+    /// The pose of the image `taken`, made by `step` as the head flag `head`
+    /// asks: one [`PoseSample`] while a head pose is wanted, valid or not,
+    /// and `None` otherwise. The first image after a head pose was wanted
+    /// anew, since the image before, starts the step over
+    /// ([`PoseStep::reset`]). The statistics' period starts over at the
+    /// first image stepped, the worker's very first included.
     fn image(
         &mut self,
         step: &mut impl PoseStep,
         taken: &Taken,
-        wants: Wants,
+        head: HeadFlag,
     ) -> Option<PoseSample> {
-        let heads = wants.heads;
         // At the worker's first image the step is new: nothing to start
         // over.
-        let last = self.last.replace(heads);
-        let head_anew = last.is_some_and(|last| heads.head.is_raised_since(last.head));
-        let legacy_anew = !head_anew
-            && last.is_some_and(|last| last.legacy.on && heads.legacy.is_raised_since(last.legacy));
-        if wants.recenter || legacy_anew {
-            step.recenter();
-        }
-        if !heads.head.on {
+        let last = self.last.replace(head);
+        let anew = last.is_some_and(|last| head.is_raised_since(last));
+        if !head.on {
             return None;
         }
-        if head_anew {
-            debug!("head pose wanted anew: the poses start over");
+        if anew {
+            debug!("head pose wanted anew: the pose starts over");
             step.reset();
         }
-        if head_anew || last.is_none() {
+        if anew || last.is_none() {
             // Not at the worker's start: a tracker started cold sends its
             // first image only after an init of ~12 s, which would make the
             // first period's rates look like a stalled worker.
@@ -279,7 +229,7 @@ impl PoseWorker {
         }
         let image = &taken.image;
         let begun = Instant::now();
-        let stepped = step.step(image, heads.legacy.on);
+        let stepped = step.step(image);
         let took = begun.elapsed();
         if let Some(e) = &stepped.error
             && let Some(unlogged) = self.failures.failed(begun)
@@ -304,7 +254,6 @@ impl PoseWorker {
             to_i64_us(image.frame.device_ts_us),
             image.host_us,
             stepped.head,
-            stepped.legacy,
         ))
     }
 }
@@ -483,8 +432,8 @@ pub(crate) fn run_worker(mailbox: &Mailbox, shared: &Shared, tx: &Sender<Sample>
 }
 
 /// The pose worker's loop: each image the reader puts in `mailbox` goes
-/// through `worker` and `step` as the flags of `shared` want it when the
-/// image is taken, and its poses, if any, to `tx`, until `shared` says
+/// through `worker` and `step` as the head flag of `shared` wants it when
+/// the image is taken, and its pose, if any, to `tx`, until `shared` says
 /// stop.
 fn drive(
     mailbox: &Mailbox,
@@ -494,10 +443,10 @@ fn drive(
     mut worker: PoseWorker,
 ) {
     while let Some(taken) = mailbox.take(&shared.stop) {
-        if let Some(pose) = worker.image(step, &taken, Wants::of(shared)) {
+        if let Some(pose) = worker.image(step, &taken, shared.head()) {
             // An engine dropped meanwhile reads no more samples; the stop
             // ends the loop.
-            let _ = tx.send(Sample::Pose(Box::new(pose)));
+            let _ = tx.send(Sample::Pose(pose));
         }
     }
 }
@@ -514,7 +463,7 @@ mod tests {
     use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
     use tobii_proto::image83::ImageFrame;
 
-    use crate::engine::{DisplayGeneration, HeadFlag, OpenNumber, Wanted};
+    use crate::engine::{DisplayGeneration, OpenNumber, Wanted};
 
     /// How much later an image's device time is than its host time, here.
     const DEVICE_AHEAD_US: i64 = 7_000_000;
@@ -539,74 +488,44 @@ mod tests {
         }
     }
 
-    /// The flags once the head flag is set to `head` and the legacy one to
-    /// `legacy`, from none.
-    fn flags(head: bool, legacy: bool) -> HeadFlags {
-        let mut flags = HeadFlags::default();
-        flags.head.set(head);
-        flags.legacy.set(legacy);
-        flags
-    }
-
-    /// A head pose wanted, the legacy one too as `legacy` says.
-    fn head(legacy: bool) -> Wants {
-        Wants {
-            heads: flags(true, legacy),
-            recenter: false,
-        }
+    /// The head flag once it is set to `on`, from none.
+    fn flag(on: bool) -> HeadFlag {
+        let mut flag = HeadFlag::default();
+        flag.set(on);
+        flag
     }
 
     /// What a [`Script`] was asked.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Call {
-        /// To step the image of host time `.0`, the legacy pose wanted or
-        /// not.
-        Step(i64, bool),
+        /// To step the image of host time `.0`.
+        Step(i64),
         Reset,
-        Recenter,
     }
 
-    /// A [`PoseStep`] that notes what it is asked (and tells `told` of it
-    /// at once, if given) and makes the poses it is given, in turn; an
-    /// invalid pose at zero once they run out.
+    /// A [`PoseStep`] that notes what it is asked and makes the poses it is
+    /// given, in turn; the invalid pose at zero once they run out.
     #[derive(Default)]
     struct Script {
         calls: Vec<Call>,
-        told: Option<mpsc::Sender<Call>>,
         poses: VecDeque<Stepped>,
     }
 
-    impl Script {
-        fn note(&mut self, call: Call) {
-            self.calls.push(call);
-            if let Some(told) = &self.told {
-                let _ = told.send(call);
-            }
-        }
-    }
-
     impl PoseStep for Script {
-        fn step(&mut self, image: &ImageSample, legacy_wanted: bool) -> Stepped {
-            self.note(Call::Step(image.host_us, legacy_wanted));
-            self.poses
-                .pop_front()
-                .unwrap_or_else(|| stepped(None, None))
+        fn step(&mut self, image: &ImageSample) -> Stepped {
+            self.calls.push(Call::Step(image.host_us));
+            self.poses.pop_front().unwrap_or_else(|| stepped(None))
         }
 
         fn reset(&mut self) {
-            self.note(Call::Reset);
-        }
-
-        fn recenter(&mut self) {
-            self.note(Call::Recenter);
+            self.calls.push(Call::Reset);
         }
     }
 
-    /// A step's poses: `head`, or the invalid pose at zero, and `legacy`.
-    fn stepped(head: Option<HeadPose>, legacy: Option<LegacyPose>) -> Stepped {
+    /// A step's pose: `head`, or the invalid pose at zero.
+    fn stepped(head: Option<HeadPose>) -> Stepped {
         Stepped {
             head: head.unwrap_or_default(),
-            legacy,
             error: None,
             detector_runs: 0,
         }
@@ -629,41 +548,40 @@ mod tests {
             valid: false,
             ..valid_pose()
         };
-        let legacy = LegacyPose::new([4.0, 5.0, 6.0], [7.0, 8.0, 9.0]);
         let mut step = Script::default();
-        step.poses.extend([
-            stepped(Some(valid_pose()), Some(legacy)),
-            stepped(Some(held), None),
-        ]);
+        step.poses
+            .extend([stepped(Some(valid_pose())), stepped(Some(held))]);
         let mut worker = PoseWorker::default();
+        let wanted = flag(true);
+        let mut dropped = wanted;
+        dropped.set(false);
+        let mut again = dropped;
+        again.set(true);
 
         let poses = [
-            worker.image(&mut step, &taken(1_000), head(true)),
-            worker.image(&mut step, &taken(2_000), head(false)),
-            worker.image(&mut step, &taken(3_000), Wants::default()),
-            worker.image(&mut step, &taken(4_000), head(true)),
+            worker.image(&mut step, &taken(1_000), wanted),
+            worker.image(&mut step, &taken(2_000), wanted),
+            worker.image(&mut step, &taken(3_000), dropped),
+            worker.image(&mut step, &taken(4_000), again),
         ];
 
-        let at = |host_us| (host_us + DEVICE_AHEAD_US, host_us);
-        let pose = |(device_us, host_us), head, legacy| {
-            Some(PoseSample::new(device_us, host_us, head, legacy))
-        };
+        let pose = |host_us, head| Some(PoseSample::new(host_us + DEVICE_AHEAD_US, host_us, head));
         assert_eq!(
             poses,
             [
-                pose(at(1_000), valid_pose(), Some(legacy)),
-                pose(at(2_000), held, None),
+                pose(1_000, valid_pose()),
+                pose(2_000, held),
                 None,
-                pose(at(4_000), HeadPose::default(), None),
+                pose(4_000, HeadPose::default()),
             ]
         );
         assert_eq!(
             step.calls,
             [
-                Call::Step(1_000, true),
-                Call::Step(2_000, false),
+                Call::Step(1_000),
+                Call::Step(2_000),
                 Call::Reset,
-                Call::Step(4_000, true),
+                Call::Step(4_000),
             ]
         );
     }
@@ -672,7 +590,7 @@ mod tests {
     /// one that did not, and only then: not at the first image, whose step
     /// is new, nor at an image that follows one that wanted a pose too.
     #[test]
-    fn the_poses_start_over_when_wanted_again_after_an_image_that_was_not() {
+    fn the_pose_starts_over_when_wanted_again_after_an_image_that_was_not() {
         let run = |wanted: &[bool]| {
             let shared = Shared::default();
             let mut step = Script::default();
@@ -682,45 +600,41 @@ mod tests {
                     head,
                     ..Wanted::default()
                 });
-                let _ = worker.image(&mut step, &taken(t), Wants::of(&shared));
+                let _ = worker.image(&mut step, &taken(t), shared.head());
             }
             step.calls
         };
-        let step = |t| Call::Step(t, false);
 
         assert_eq!(
             run(&[true, true, false, false, true, true, false, true]),
             [
-                step(1),
-                step(2),
+                Call::Step(1),
+                Call::Step(2),
                 Call::Reset,
-                step(5),
-                step(6),
+                Call::Step(5),
+                Call::Step(6),
                 Call::Reset,
-                step(8)
+                Call::Step(8)
             ]
         );
-        assert_eq!(run(&[false, true]), [Call::Reset, step(2)]);
+        assert_eq!(run(&[false, true]), [Call::Reset, Call::Step(2)]);
     }
 
-    /// A pose wanted anew between two images, after it was not wanted for
-    /// a while since the first (no image came meanwhile, as in a pause, or
-    /// the subscriptions changed faster than the images come), is the
-    /// subscribe it is: a head pose starts the poses over; the legacy pose,
-    /// the head pose wanted throughout, has its rest pose calibrate afresh,
-    /// and the Stream Engine's pose goes on. The legacy pose wanted after
-    /// an image that did not want it is left to the step, which
-    /// recalibrates it then; the first image starts nothing over.
+    /// A head pose wanted anew between two images, after it was not wanted
+    /// for a while since the first (no image came meanwhile, as in a pause,
+    /// or the subscriptions changed faster than the images come), is the
+    /// subscribe it is: the pose starts over. Wanted throughout, wanted
+    /// again while it was, or with the images asked for or dropped beside
+    /// it, the pose goes on; the first image starts nothing over.
     #[test]
     fn a_pose_wanted_anew_between_two_images_starts_over_all_the_same() {
         const NONE: Wanted = Wanted {
             head: false,
-            legacy_head: false,
             image: false,
         };
         const HEAD: Wanted = Wanted { head: true, ..NONE };
-        const BOTH: Wanted = Wanted {
-            legacy_head: true,
+        const WITH_IMAGES: Wanted = Wanted {
+            image: true,
             ..HEAD
         };
         let shared = Shared::default();
@@ -730,30 +644,27 @@ mod tests {
             for &wanted in changes {
                 shared.set_wanted(wanted);
             }
-            let _ = worker.image(&mut step, &taken(t), Wants::of(&shared));
+            let _ = worker.image(&mut step, &taken(t), shared.head());
         };
 
-        image(1, &[NONE, BOTH, NONE, BOTH]);
-        image(2, &[NONE, BOTH]);
-        image(3, &[HEAD, BOTH]);
-        image(4, &[BOTH]);
-        image(5, &[HEAD]);
-        image(6, &[BOTH]);
-        image(7, &[NONE, HEAD]);
+        image(1, &[NONE, HEAD, NONE, HEAD]);
+        image(2, &[NONE, HEAD]);
+        image(3, &[]);
+        image(4, &[HEAD, HEAD]);
+        image(5, &[WITH_IMAGES, HEAD]);
+        image(6, &[NONE, WITH_IMAGES]);
 
         assert_eq!(
             step.calls,
             [
-                Call::Step(1, true),
+                Call::Step(1),
                 Call::Reset,
-                Call::Step(2, true),
-                Call::Recenter,
-                Call::Step(3, true),
-                Call::Step(4, true),
-                Call::Step(5, false),
-                Call::Step(6, true),
+                Call::Step(2),
+                Call::Step(3),
+                Call::Step(4),
+                Call::Step(5),
                 Call::Reset,
-                Call::Step(7, false),
+                Call::Step(6),
             ]
         );
     }
@@ -779,34 +690,6 @@ mod tests {
         assert!(!last.is_raised_since(last));
     }
 
-    /// A recenter goes to the step at the image after it was asked for,
-    /// whether that image wants a head pose or not.
-    #[test]
-    fn a_recenter_reaches_the_step_whether_a_pose_is_wanted_or_not() {
-        let mut step = Script::default();
-        let mut worker = PoseWorker::default();
-        let recenter = |head| Wants {
-            heads: flags(head, true),
-            recenter: true,
-        };
-
-        let unwanted = worker.image(&mut step, &taken(1), recenter(false));
-        let wanted = worker.image(&mut step, &taken(2), recenter(true));
-        let _ = worker.image(&mut step, &taken(3), head(true));
-
-        assert!(unwanted.is_none() && wanted.is_some());
-        assert_eq!(
-            step.calls,
-            [
-                Call::Recenter,
-                Call::Recenter,
-                Call::Reset,
-                Call::Step(2, true),
-                Call::Step(3, true),
-            ]
-        );
-    }
-
     /// An image the tracker failed on makes the pose the step gives for it:
     /// invalid, the last valid values held. The failure is counted for the
     /// warnings.
@@ -819,13 +702,13 @@ mod tests {
         let mut step = Script::default();
         step.poses.push_back(Stepped {
             error: Some(anyhow!("the landmark model failed")),
-            ..stepped(Some(held), None)
+            ..stepped(Some(held))
         });
         let mut worker = PoseWorker::default();
 
-        let pose = worker.image(&mut step, &taken(5), head(true)).unwrap();
+        let pose = worker.image(&mut step, &taken(5), flag(true)).unwrap();
 
-        assert_eq!((pose.head, pose.legacy), (held, None));
+        assert_eq!(pose.head, held);
         assert!(worker.failures.last.is_some(), "a warning was logged");
     }
 
@@ -900,28 +783,24 @@ mod tests {
     fn the_statistics_count_the_images_stepped_since_the_pose_was_wanted_again() {
         let mut step = Script::default();
         step.poses.extend([
-            stepped(Some(valid_pose()), None),
-            stepped(None, None),
-            stepped(Some(valid_pose()), None),
-            stepped(None, None),
+            stepped(Some(valid_pose())),
+            stepped(None),
+            stepped(Some(valid_pose())),
+            stepped(None),
         ]);
         let mut worker = PoseWorker::new(Some(PoseStats::new(Instant::now())));
         let count = |worker: &PoseWorker| {
             let stats = worker.stats.as_ref().unwrap();
             (stats.step_us.len(), stats.valid, stats.overwritten)
         };
-        let mut heads = HeadFlags::default();
-        let mut image = |t, head, overwritten| {
-            heads.head.set(head);
-            let wants = Wants {
-                heads,
-                ..Wants::default()
-            };
+        let mut head = HeadFlag::default();
+        let mut image = |t, on, overwritten| {
+            head.set(on);
             let taken = Taken {
                 overwritten,
                 ..taken(t)
             };
-            let _ = worker.image(&mut step, &taken, wants);
+            let _ = worker.image(&mut step, &taken, head);
             count(&worker)
         };
 
@@ -946,66 +825,38 @@ mod tests {
             (stats.since, stats.step_us.len())
         };
 
-        let _ = worker.image(&mut step, &taken(1), head(false));
+        let _ = worker.image(&mut step, &taken(1), flag(true));
         let (since, images) = period(&worker);
         assert_eq!(images, 1, "no report of the 12 s before the first image");
         assert!(since >= started + Duration::from_secs(12), "{since:?}");
-        let _ = worker.image(&mut step, &taken(2), head(false));
+        let _ = worker.image(&mut step, &taken(2), flag(true));
         assert_eq!(period(&worker), (since, 2), "the period goes on");
         assert_eq!(
             step.calls,
-            [Call::Step(1, false), Call::Step(2, false)],
+            [Call::Step(1), Call::Step(2)],
             "and the step, new, is not reset"
         );
     }
 
-    /// The worker reads the engine's flags at each image, and takes a
-    /// recenter once.
-    #[test]
-    fn the_flags_are_read_at_each_image_and_a_recenter_taken_once() {
-        let shared = Shared::default();
-        assert_eq!(Wants::of(&shared), Wants::default());
-        shared.set_wanted(Wanted {
-            head: true,
-            ..Wanted::default()
-        });
-        shared.recenter.store(true, Ordering::Relaxed);
-        assert_eq!(
-            Wants::of(&shared),
-            Wants {
-                heads: flags(true, false),
-                recenter: true,
-            }
-        );
-        shared.set_wanted(Wanted {
-            head: true,
-            legacy_head: true,
-            image: false,
-        });
-        assert_eq!(Wants::of(&shared), head(true), "the recenter taken");
-    }
-
     /// What the engine is told is wanted is what the pose worker and the
-    /// USB thread read: each flag from its own field, whatever the others
-    /// say.
+    /// USB thread read: each flag from its own field, whatever the other
+    /// says.
     #[test]
     fn the_flags_read_back_what_the_engine_was_told() {
         let shared = Shared::default();
-        for bits in 0..8_u8 {
+        assert_eq!(shared.head(), HeadFlag::default());
+        for bits in 0..4_u8 {
             let wanted = Wanted {
                 head: bits & 1 != 0,
-                legacy_head: bits & 2 != 0,
-                image: bits & 4 != 0,
+                image: bits & 2 != 0,
             };
             shared.set_wanted(wanted);
-            let heads = Wants::of(&shared).heads;
             assert_eq!(
                 (
-                    heads.head.on,
-                    heads.legacy.on,
+                    shared.head().on,
                     shared.image_wanted.load(Ordering::Relaxed)
                 ),
-                (wanted.head, wanted.legacy_head, wanted.image),
+                (wanted.head, wanted.image),
                 "{wanted:?}"
             );
         }
@@ -1082,75 +933,52 @@ mod tests {
     }
 
     /// The worker's loop on its thread: each image put goes through the
-    /// step as the engine's flags want it when the worker takes it, the
-    /// legacy pose asked for as they say, and its pose is sent; an image
-    /// not wanted is not stepped and sends none; a recenter reaches the
-    /// step; the poses start over when wanted again, even if only between
-    /// two images; a stop ends the loop.
+    /// step as the engine's head flag wants it when the worker takes it,
+    /// and its pose is sent; the pose starts over when wanted again, even
+    /// if only between two images; an image not wanted is not stepped and
+    /// sends none; a stop ends the loop.
     #[test]
-    fn the_worker_sends_the_pose_of_each_image_as_the_flags_want_it() {
+    fn the_worker_sends_the_pose_of_each_image_as_the_flag_wants_it() {
         let mailbox = Mailbox::default();
         let shared = Shared::default();
         let (tx, rx) = mpsc::channel();
-        let (told, calls) = mpsc::channel();
         let wait = Duration::from_secs(10);
-        let wanted = |head, legacy_head| Wanted {
-            head,
-            legacy_head,
-            image: false,
-        };
+        let wanted = |head| Wanted { head, image: false };
         let sent = |host_us| {
-            let pose = PoseSample::new(
-                host_us + DEVICE_AHEAD_US,
-                host_us,
-                HeadPose::default(),
-                None,
-            );
-            Sample::Pose(Box::new(pose))
+            let pose = PoseSample::new(host_us + DEVICE_AHEAD_US, host_us, HeadPose::default());
+            Sample::Pose(pose)
         };
 
         let steps = thread::scope(|s| {
             let worker = s.spawn(|| {
-                let mut step = Script {
-                    told: Some(told),
-                    ..Script::default()
-                };
+                let mut step = Script::default();
                 drive(&mailbox, &shared, &tx, &mut step, PoseWorker::default());
                 step.calls
             });
             let stop = StopOnDrop(&mailbox, &shared);
-            shared.set_wanted(wanted(true, true));
+            shared.set_wanted(wanted(true));
             mailbox.put(image(1));
             assert_eq!(rx.recv_timeout(wait).unwrap(), sent(1));
-            // Not wanted: no pose to wait for, so the recenter asked for with
-            // it says when the worker has read its flags.
-            shared.set_wanted(wanted(false, false));
-            shared.recenter.store(true, Ordering::Relaxed);
+            shared.set_wanted(wanted(false));
+            shared.set_wanted(wanted(true));
             mailbox.put(image(2));
-            while calls.recv_timeout(wait).unwrap() != Call::Recenter {}
-            shared.set_wanted(wanted(true, false));
+            assert_eq!(rx.recv_timeout(wait).unwrap(), sent(2));
+            // Not wanted: there is no pose to wait for, so the image's
+            // leaving the mailbox says the worker has it. The flag stays
+            // as it is, whenever the worker reads it.
+            shared.set_wanted(wanted(false));
             mailbox.put(image(3));
-            assert_eq!(rx.recv_timeout(wait).unwrap(), sent(3));
-            shared.set_wanted(wanted(false, false));
-            shared.set_wanted(wanted(true, false));
-            mailbox.put(image(4));
-            assert_eq!(rx.recv_timeout(wait).unwrap(), sent(4));
+            let deadline = Instant::now() + wait;
+            while mailbox.waiting().is_some() {
+                assert!(Instant::now() < deadline, "the worker takes the image");
+                thread::sleep(Duration::from_millis(1));
+            }
             drop(stop);
             worker.join().unwrap()
         });
 
-        assert_eq!(
-            steps,
-            [
-                Call::Step(1, true),
-                Call::Recenter,
-                Call::Reset,
-                Call::Step(3, false),
-                Call::Reset,
-                Call::Step(4, false),
-            ]
-        );
-        assert!(rx.try_recv().is_err(), "a pose for each image wanted alone");
+        assert_eq!(steps, [Call::Step(1), Call::Reset, Call::Step(2)]);
+        assert!(rx.try_recv().is_err(), "no pose of the image not wanted");
     }
 
     /// A display frame, of a 600 x 340 mm screen above the tracker.
@@ -1163,6 +991,8 @@ mod tests {
         .unwrap()
     }
 
+    /// The step is told the image's host time, display frame, display
+    /// generation and open, and never asked for the legacy pose.
     #[test]
     fn a_step_is_told_the_images_host_time_display_frame_generation_and_open() {
         let frame = display_frame();
@@ -1174,17 +1004,17 @@ mod tests {
         };
 
         assert_eq!(
-            frame_context(&image, true),
+            frame_context(&image),
             FrameContext {
                 t_us: 1_234,
                 display: Some(&frame),
                 display_generation: 3,
                 open: 2,
-                legacy_wanted: true,
+                legacy_wanted: false,
             }
         );
         assert_eq!(
-            frame_context(&ImageSample::new(Arc::clone(&image.frame), 5), false),
+            frame_context(&ImageSample::new(Arc::clone(&image.frame), 5)),
             FrameContext {
                 t_us: 5,
                 display: None,
@@ -1196,8 +1026,8 @@ mod tests {
     }
 
     /// With the real models: an image without a face makes one pose, the
-    /// invalid one at zero, and no legacy pose; one the tracker cannot take
-    /// makes an invalid pose too, and says why.
+    /// invalid one at zero; one the tracker cannot take makes an invalid
+    /// pose too, and says why.
     #[test]
     fn the_head_step_makes_one_invalid_pose_of_an_image_without_a_face() {
         let mut step = HeadStep::new(HeadParams::FITTED).unwrap();
@@ -1222,16 +1052,13 @@ mod tests {
             overwritten: 0,
         };
 
-        let pose = worker.image(&mut step, &black, head(true));
+        let pose = worker.image(&mut step, &black, flag(true));
 
-        assert_eq!(
-            pose,
-            Some(PoseSample::new(9, 1_000, HeadPose::default(), None))
-        );
+        assert_eq!(pose, Some(PoseSample::new(9, 1_000, HeadPose::default())));
         assert_eq!(step.model_runs().detector, 1);
-        let small = PoseStep::step(&mut step, &image(31_000), true);
+        let small = PoseStep::step(&mut step, &image(31_000));
         assert!(small.error.is_some(), "a 2x1 image is refused");
-        assert_eq!((small.head, small.legacy), (HeadPose::default(), None));
+        assert_eq!(small.head, HeadPose::default());
         assert_eq!(small.detector_runs, 1);
     }
 
@@ -1245,13 +1072,11 @@ mod tests {
 
     /// With the real models and a face (the 0x50e fixture, if set): the
     /// worker's step is the head step's. The image's display frame and time
-    /// go in, a valid pose comes out and, once its rest pose has calibrated,
-    /// the legacy one; a reset starts the head pose over, so that an image
-    /// without a face then makes the invalid pose at zero; a recenter
-    /// recalibrates the legacy pose alone, the invalid pose keeping the last
-    /// valid values.
+    /// go in and a valid pose comes out; an image without a face then makes
+    /// an invalid pose that keeps the last valid values, and after a reset
+    /// the invalid pose at zero, until the face is found again.
     #[test]
-    fn the_worker_steps_resets_and_recenters_the_head_step() {
+    fn the_worker_steps_and_resets_the_head_step() {
         let Some(face) = image83_fixture() else {
             return;
         };
@@ -1273,36 +1098,17 @@ mod tests {
         };
         let mut step = HeadStep::new(HeadParams::FITTED).unwrap();
 
-        let valid = PoseStep::step(&mut step, &next(&face), false).head;
+        let valid = PoseStep::step(&mut step, &next(&face)).head;
         assert!(valid.valid, "the fixture has a face");
         let held = HeadPose {
             valid: false,
             ..valid
         };
-        assert_eq!(PoseStep::step(&mut step, &next(&black), false).head, held);
+        assert_eq!(PoseStep::step(&mut step, &next(&black)).head, held);
         PoseStep::reset(&mut step);
-        let reset = PoseStep::step(&mut step, &next(&black), false).head;
+        let reset = PoseStep::step(&mut step, &next(&black)).head;
         assert_eq!(reset, HeadPose::default(), "zeros after a reset");
-
-        // The rest pose calibrates on 30 fits, then the legacy pose comes.
-        let legacy: Vec<bool> = (0..32)
-            .map(|_| PoseStep::step(&mut step, &next(&face), true).legacy)
-            .map(|legacy| legacy.is_some())
-            .collect();
-        assert_eq!(legacy.iter().position(|&some| some), Some(30));
-        let last = PoseStep::step(&mut step, &next(&face), true);
-        assert!(last.head.valid && last.legacy.is_some());
-        PoseStep::recenter(&mut step);
-        let lost = PoseStep::step(&mut step, &next(&black), true).head;
-        assert_eq!(
-            lost,
-            HeadPose {
-                valid: false,
-                ..last.head
-            },
-            "a recenter leaves the head pose alone"
-        );
-        let again = PoseStep::step(&mut step, &next(&face), true);
-        assert!(again.legacy.is_none(), "the rest pose calibrates afresh");
+        let again = PoseStep::step(&mut step, &next(&face)).head;
+        assert!(again.valid, "the face is found again");
     }
 }

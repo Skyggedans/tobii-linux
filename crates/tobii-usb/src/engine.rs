@@ -4,9 +4,8 @@
 //! stream (0x50e), which the firmware multiplexes on the same endpoint
 //! concurrently, and the device's notifications. Head-pose inference only runs
 //! while a client wants a head pose ([`Wanted::head`]); it then makes one
-//! [`PoseSample`] of every image it takes: the Stream Engine's head pose,
-//! valid or not, and the legacy relative pose while that one is wanted too
-//! ([`Wanted::legacy_head`]). The engine's owner says what is wanted with
+//! [`PoseSample`] of every image it takes, the Stream Engine's head pose,
+//! valid or not. The engine's owner says what is wanted with
 //! [`Engine::set_wanted`].
 //!
 //! Besides streaming, the engine runs device commands for its owner
@@ -20,10 +19,10 @@
 //! bandwidth — verified with `probe`). The UVC path survives only in the
 //! standalone research subcommands (`camera`, `probe`).
 //!
-//! The `stop`, `recenter`, `paused` and `image_wanted` flags are pure
-//! signals (no data is published alongside them), so every access uses
-//! `Ordering::Relaxed`. The head flags of [`Wanted`] are kept with how many
-//! times each was set, under a lock (see [`Engine::set_wanted`]).
+//! The `stop`, `paused` and `image_wanted` flags are pure signals (no data is
+//! published alongside them), so every access uses `Ordering::Relaxed`. The
+//! head flag of [`Wanted`] is kept with how many times it was set, under a
+//! lock (see [`Engine::set_wanted`]).
 //!
 //! # Timestamps
 //!
@@ -87,7 +86,7 @@ use crate::device::OpenRefusal;
 /// re-exported so that the engine's users need not depend on `tobii_pose`.
 pub use tobii_pose::head::HeadPose;
 
-/// The head poses made of one 0x50e image: one for every image the engine
+/// The head pose made of one 0x50e image: one for every image the engine
 /// takes while a head pose is wanted ([`Wanted::head`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -102,61 +101,18 @@ pub struct PoseSample {
     /// ([`ImageSample::display_frame`]). An invalid pose carries the values
     /// of the last valid one, zeros before the first.
     pub head: HeadPose,
-    /// The legacy pose, relative to a rest pose: only while it is wanted
-    /// ([`Wanted::legacy_head`]), for an image with a face, once its rest
-    /// pose has calibrated.
-    pub legacy: Option<LegacyPose>,
 }
 
 impl PoseSample {
-    /// The poses `head` and `legacy` made from the image of device time
-    /// `timestamp_us`, which is `host_us` on the host clock.
+    /// The pose `head` made from the image of device time `timestamp_us`,
+    /// which is `host_us` on the host clock.
     #[must_use]
-    pub fn new(
-        timestamp_us: i64,
-        host_us: i64,
-        head: HeadPose,
-        legacy: Option<LegacyPose>,
-    ) -> Self {
+    pub fn new(timestamp_us: i64, host_us: i64, head: HeadPose) -> Self {
         Self {
             timestamp_us,
             host_us,
             head,
-            legacy,
         }
-    }
-}
-
-/// The legacy head pose, the engine's own from before it made the Stream
-/// Engine's, which the daemon keeps publishing for the `OpenTrack` UDP
-/// bridge: that of a pivot at the neck, relative to a rest pose that the
-/// first fits after a recenter ([`Engine::request_recenter`]) calibrate, its
-/// translation along the camera's axes and its angles in the camera's
-/// upright frame, clamped to ±45°, the whole of it smoothed (see
-/// `tobii_pose::track::RestPose`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
-pub struct LegacyPose {
-    /// Translation `[tx, ty, tz]` from the rest pose, centimetres.
-    pub pos_cm: [f64; 3],
-    /// Rotation `[yaw, pitch, roll]` from the rest pose, degrees.
-    pub rot_deg: [f64; 3],
-}
-
-impl LegacyPose {
-    /// A pose of translation `pos_cm` and rotation `rot_deg`
-    /// (`[yaw, pitch, roll]`).
-    #[must_use]
-    pub fn new(pos_cm: [f64; 3], rot_deg: [f64; 3]) -> Self {
-        Self { pos_cm, rot_deg }
-    }
-
-    /// The pose `RestPose::update` returns: `[TX, TY, TZ (cm), Yaw, Pitch,
-    /// Roll (deg)]`, the `OpenTrack` order.
-    #[must_use]
-    pub(crate) fn of_open_track(pose: [f64; 6]) -> Self {
-        let [tx, ty, tz, yaw, pitch, roll] = pose;
-        Self::new([tx, ty, tz], [yaw, pitch, roll])
     }
 }
 
@@ -313,14 +269,17 @@ impl ImageSample {
 // sample by far, and so every sample larger.
 const _: () = assert!(size_of::<ImageSample>() <= 5 * size_of::<u64>());
 
+// A pose sample goes inline: it is no larger than a notification (one of a
+// display area, 80 bytes), so it makes no sample larger.
+const _: () = assert!(size_of::<PoseSample>() <= size_of::<DeviceNotification>());
+
 /// One item out of the engine.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Sample {
-    /// The head poses of an image, one for every image while a head pose is
-    /// wanted (see [`Wanted::head`]); boxed: with its two poses it is 1.6
-    /// times the size of the largest other sample.
-    Pose(Box<PoseSample>),
+    /// The head pose of an image, one for every image while a head pose is
+    /// wanted (see [`Wanted::head`]).
+    Pose(PoseSample),
     /// A gaze frame (boxed: it is ten times the size of the other samples).
     Gaze(Box<GazeSample>),
     /// A presence change.
@@ -438,21 +397,17 @@ impl Commands {
 /// device's notifications are made whatever is wanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Wanted {
-    /// A head pose, of either kind: the engine runs head-pose inference on
-    /// the image stream (it costs CPU) and makes a [`PoseSample`] of every
-    /// image it takes, the Stream Engine's pose valid or not; it drops the
-    /// images otherwise.
+    /// A head pose: the engine runs head-pose inference on the image stream
+    /// (it costs CPU) and makes a [`PoseSample`] of every image it takes,
+    /// the Stream Engine's pose valid or not; it drops the images otherwise.
     pub head: bool,
-    /// The legacy pose too ([`PoseSample::legacy`]), of the images a head
-    /// pose is made of: nothing without [`Wanted::head`].
-    pub legacy_head: bool,
     /// [`Sample::Image`] for every IR frame.
     pub image: bool,
 }
 
-/// One head flag of [`Wanted`] as the pose worker reads it: whether it is
+/// The head flag of [`Wanted`] as the pose worker reads it: whether it is
 /// set, and how many times it has been set when it was not. The worker
-/// reads the flags once an image, and sees from the count that a client
+/// reads the flag once an image, and sees from the count that a client
 /// subscribed since the image before even when the flag was cleared and set
 /// again between the two, or while no image came (a pause, a re-open).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -479,25 +434,14 @@ impl HeadFlag {
     }
 }
 
-/// The head flags of [`Wanted`], as the pose worker reads them (see
-/// [`HeadFlag`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct HeadFlags {
-    /// [`Wanted::head`].
-    pub(crate) head: HeadFlag,
-    /// [`Wanted::legacy_head`].
-    pub(crate) legacy: HeadFlag,
-}
-
 /// State shared between the [`Engine`] handle and its USB thread.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     pub(crate) stop: AtomicBool,
-    pub(crate) recenter: AtomicBool,
-    /// The head flags of what is wanted, which the pose worker reads (see
-    /// [`Shared::heads`]): both under one lock, so that it never reads one
-    /// changed and the other not yet.
-    heads: Mutex<HeadFlags>,
+    /// [`Wanted::head`], which the pose worker reads (see [`Shared::head`]):
+    /// under a lock, so that it never reads whether the flag is set from
+    /// one change and how many times it was raised from another.
+    head: Mutex<HeadFlag>,
     pub(crate) image_wanted: AtomicBool,
     /// The device was told to pause: its streams are expected to stop.
     pub(crate) paused: AtomicBool,
@@ -509,20 +453,19 @@ impl Shared {
     /// Keep `wanted` in the flags the USB thread and the pose worker read
     /// (see [`Engine::set_wanted`]).
     pub(crate) fn set_wanted(&self, wanted: Wanted) {
-        {
-            // Each flag is written whole and nothing under the lock can
-            // panic: a poisoned lock holds no half-updated flags.
-            let mut heads = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
-            heads.head.set(wanted.head);
-            heads.legacy.set(wanted.legacy_head);
-        }
+        // Nothing under the lock can panic: a poisoned lock holds no
+        // half-updated flag.
+        self.head
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set(wanted.head);
         // Relaxed: a pure signal, no data is published with it.
         self.image_wanted.store(wanted.image, Ordering::Relaxed);
     }
 
-    /// The head flags as they are now.
-    pub(crate) fn heads(&self) -> HeadFlags {
-        *self.heads.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The head flag as it is now.
+    pub(crate) fn head(&self) -> HeadFlag {
+        *self.head.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The display area the next init writes, if not the replay's own.
@@ -597,32 +540,20 @@ impl Engine {
         self.commands.clone()
     }
 
-    /// Have the legacy pose's rest pose ([`PoseSample::legacy`]) calibrate
-    /// afresh from the next images with a face. The Stream Engine's head
-    /// pose is absolute: a recenter leaves it alone.
-    pub fn request_recenter(&self) {
-        // Relaxed: a pure signal, no data is published with it.
-        self.shared.recenter.store(true, Ordering::Relaxed);
-    }
-
     /// Do the optional work `wanted` asks for, and none that it does not:
-    /// head-pose inference, the legacy pose, the IR images (see [`Wanted`]).
+    /// head-pose inference, the IR images (see [`Wanted`]).
     ///
-    /// The pose worker reads the head flags at each image it takes, with how
-    /// many times each was set when it was not. The first image after a
-    /// head pose was wanted anew starts the poses over: the Stream Engine's
+    /// The pose worker reads the head flag at each image it takes, with how
+    /// many times it was set when it was not. The first image after a head
+    /// pose was wanted anew starts the pose over: the Stream Engine's
     /// restarts its filters, its invalid poses carrying zeros until the
-    /// next valid one, and the legacy pose's rest pose calibrates afresh.
-    /// The first image after the legacy pose alone was wanted anew has the
-    /// rest pose calibrate afresh, the Stream Engine's pose going on as it
-    /// was. Wanted anew is since the image before, even if the flag was
-    /// cleared and set again between the two or while no image came (a
-    /// pause, a re-open); not at the worker's first image, whose poses are
-    /// new. So a new subscriber does not inherit an earlier one's poses,
-    /// unless a head pose stays wanted throughout: [`Wanted::head`] covers
-    /// both kinds, and while it stays set the Stream Engine's pose goes on
-    /// without a restart, so a client that comes to want it while another
-    /// keeps the legacy pose going gets its filters as they are.
+    /// next valid one. Wanted anew is since the image before, even if the
+    /// flag was cleared and set again between the two or while no image
+    /// came (a pause, a re-open); not at the worker's first image, whose
+    /// pose is new. So a new subscriber does not inherit an earlier one's
+    /// filters, unless a head pose stays wanted throughout: a client that
+    /// comes to want it while another keeps it wanted gets the filters as
+    /// they are.
     pub fn set_wanted(&self, wanted: Wanted) {
         self.shared.set_wanted(wanted);
     }
@@ -735,17 +666,5 @@ mod tests {
         );
         assert_eq!(ended(Err(e())), None);
         assert_eq!(ended(Ok(())), None, "a stop");
-    }
-
-    /// The rest pose's `OpenTrack` order, [TX, TY, TZ, Yaw, Pitch, Roll],
-    /// splits into the translation and the rotation as the legacy pose has
-    /// them, the yaw first.
-    #[test]
-    fn a_legacy_pose_takes_the_rest_poses_open_track_order() {
-        let pose = LegacyPose::of_open_track([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(
-            (pose.pos_cm, pose.rot_deg),
-            ([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
-        );
     }
 }

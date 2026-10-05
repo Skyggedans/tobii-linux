@@ -14,16 +14,16 @@
 //! on [`tobii_ipc::host_clock_us`]), bar gaze data's tracker time and raw
 //! gaze's time, which stay the device clock. Gaze data's system time is
 //! that tracker time on the host clock, as in the Stream Engine, not the
-//! time the frame was read. The daemon's own legacy head pose, HEAD, goes
-//! out only for an image the engine made one of.
+//! time the frame was read. HEAD, the daemon's own, legacy head pose, is
+//! retired: it is never sent (see [`engine_wanted`]).
 
 use tobii_ipc::{
     EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, HeadPose, Notification,
     NotificationValue, PRESENCE_AWAY, PRESENCE_PRESENT, STREAM_EYE_POSITION, STREAM_GAZE,
-    STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD, STREAM_HEAD_POSE,
-    STREAM_IMAGE, STREAM_NOTIFICATIONS, STREAM_PRESENCE, encode_eye_position, encode_gaze,
-    encode_gaze_data, encode_gaze_origin, encode_gaze_raw, encode_head, encode_head_pose,
-    encode_image, encode_notification, encode_presence, notification,
+    STREAM_GAZE_DATA, STREAM_GAZE_ORIGIN, STREAM_GAZE_RAW, STREAM_HEAD_POSE, STREAM_IMAGE,
+    STREAM_NOTIFICATIONS, STREAM_PRESENCE, encode_eye_position, encode_gaze, encode_gaze_data,
+    encode_gaze_origin, encode_gaze_raw, encode_head_pose, encode_image, encode_notification,
+    encode_presence, notification,
 };
 use tobii_proto::facts::DeviceNotification;
 use tobii_proto::gaze83::{EyeFrame, GazeFrame, Valued};
@@ -166,47 +166,39 @@ fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
 
 /// The work the engine is to do for the streams in `wanted` (see
 /// [`Engine::set_wanted`](tobii_usb::engine::Engine::set_wanted)): its
-/// head-pose inference for a head pose of every image, the Stream Engine's
-/// ([`STREAM_HEAD_POSE`]) or the legacy one ([`STREAM_HEAD`]), which the
-/// engine makes in the same step; the legacy pose too for [`STREAM_HEAD`]
-/// alone, so that its rest pose calibrates afresh when that stream is
-/// subscribed, not the other; and the IR images for [`STREAM_IMAGE`].
+/// head-pose inference, for the Stream Engine's head pose of every image
+/// ([`STREAM_HEAD_POSE`]), and the IR images for [`STREAM_IMAGE`]. Nothing for
+/// HEAD ([`crate::daemon::RETIRED_STREAM_HEAD`], bit 0), the daemon's own,
+/// legacy head pose, which is retired: a client from before that still
+/// subscribes to it is acked and sent nothing for it, as for a stream bit
+/// the daemon does not know.
 #[must_use]
 pub(crate) fn engine_wanted(wanted: u32) -> Wanted {
     Wanted {
-        head: wanted & (STREAM_HEAD | STREAM_HEAD_POSE) != 0,
-        legacy_head: wanted & STREAM_HEAD != 0,
+        head: wanted & STREAM_HEAD_POSE != 0,
         image: wanted & STREAM_IMAGE != 0,
     }
 }
 
-/// A pose sample's frames, of the streams in `wanted`, both stamped with the
-/// host time of the image the poses were made of: `HEAD_POSE`, the Stream
-/// Engine's head pose, for every sample, its four validities all set from the
-/// pose's one; and HEAD, the legacy pose, only for a sample that has one.
-fn pose_frames(p: &PoseSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
-    if wanted & STREAM_HEAD_POSE != 0 {
-        let head = &p.head;
-        out.push((
-            STREAM_HEAD_POSE,
-            encode_head_pose(&HeadPose {
-                ts_us: p.host_us,
-                position_valid: head.valid,
-                position_mm: f32s(head.position_mm),
-                rotation_valid: [head.valid; 3],
-                rotation_rad: f32s(head.rotation_rad),
-            }),
-        ));
+/// A pose sample's `HEAD_POSE` frame, the Stream Engine's head pose, while
+/// `wanted` has it: one for every sample, stamped with the host time of the
+/// image the pose was made of, its four validities all set from the pose's
+/// one.
+fn pose_frame(p: &PoseSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
+    if wanted & STREAM_HEAD_POSE == 0 {
+        return;
     }
-    if wanted & STREAM_HEAD != 0
-        && let Some(legacy) = &p.legacy
-    {
-        // cm -> mm; rotation about x=pitch, y=yaw, z=roll in radians.
-        let pos = f32s(legacy.pos_cm.map(|c| c * 10.0));
-        let [yaw, pitch, roll] = legacy.rot_deg;
-        let rot = f32s([pitch, yaw, roll].map(f64::to_radians));
-        out.push((STREAM_HEAD, encode_head(p.host_us, pos, rot)));
-    }
+    let head = &p.head;
+    out.push((
+        STREAM_HEAD_POSE,
+        encode_head_pose(&HeadPose {
+            ts_us: p.host_us,
+            position_valid: head.valid,
+            position_mm: f32s(head.position_mm),
+            rotation_valid: [head.valid; 3],
+            rotation_rad: f32s(head.rotation_rad),
+        }),
+    ));
 }
 
 /// A presence sample as its PRESENCE frame body, stamped with its host time:
@@ -253,7 +245,7 @@ pub(crate) fn notification_of(n: &DeviceNotification) -> Option<Notification> {
 /// the streams in `wanted`.
 pub(crate) fn push_sample_frames(s: &Sample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
     match s {
-        Sample::Pose(p) => pose_frames(p, wanted, out),
+        Sample::Pose(p) => pose_frame(p, wanted, out),
         Sample::Gaze(g) => gaze_frames(g, wanted, out),
         Sample::Presence(p) if wanted & STREAM_PRESENCE != 0 => {
             out.push((STREAM_PRESENCE, presence_frame(p)));
@@ -285,13 +277,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tobii_ipc::geometry::tracker_to_display;
-    use tobii_ipc::{ServerMsg, TAG_HEAD, TAG_HEAD_POSE, decode_server};
+    use tobii_ipc::{ServerMsg, TAG_HEAD_POSE, decode_server};
     use tobii_proto::facts::parse_display_area;
     use tobii_proto::gaze83::{RecordKeys, decode_gaze_frame};
     use tobii_proto::image83::ImageFrame;
     use tobii_proto::protocol::{hex_to_bytes, parse_message};
     use tobii_proto::tlv::{KeyedFields, UNITS_PER_MM, keyed_fields};
-    use tobii_usb::engine::{HeadPose as EngineHeadPose, ImageSample, LegacyPose};
+    use tobii_usb::engine::{HeadPose as EngineHeadPose, ImageSample};
+
+    use crate::daemon::RETIRED_STREAM_HEAD;
 
     /// The session1 fixture frame's device timestamp.
     const DEVICE_US: i64 = 9_613_320_391;
@@ -395,7 +389,7 @@ mod tests {
                 .map(|(bit, _)| *bit)
                 .collect()
         };
-        assert!(frames(&sample, STREAM_HEAD | STREAM_PRESENCE).is_empty());
+        assert!(frames(&sample, STREAM_HEAD_POSE | STREAM_PRESENCE).is_empty());
         let all = frames(
             &sample,
             STREAM_GAZE | STREAM_GAZE_ORIGIN | STREAM_EYE_POSITION | STREAM_GAZE_DATA,
@@ -662,7 +656,6 @@ mod tests {
             | STREAM_EYE_POSITION
             | STREAM_GAZE_DATA
             | STREAM_GAZE_RAW
-            | STREAM_HEAD
             | STREAM_HEAD_POSE
             | STREAM_PRESENCE
             | STREAM_IMAGE;
@@ -689,9 +682,8 @@ mod tests {
             height: 2,
             pixels: vec![0; 4],
         };
-        let legacy = LegacyPose::new([0.0; 3], [0.0; 3]);
         let others = [
-            pose_sample(EngineHeadPose::default(), Some(legacy)),
+            pose_sample(EngineHeadPose::default()),
             Sample::Presence(PresenceSample::new(DEVICE_US, HOST_US, true)),
             Sample::Image(ImageSample::new(Arc::new(image), HOST_US)),
         ];
@@ -699,13 +691,13 @@ mod tests {
             .iter()
             .flat_map(|s| frames(s, wanted))
             .map(|(_, msg)| match msg {
-                ServerMsg::Head { ts_us, .. } | ServerMsg::Presence { ts_us, .. } => ts_us,
                 ServerMsg::HeadPose(pose) => pose.ts_us,
+                ServerMsg::Presence { ts_us, .. } => ts_us,
                 ServerMsg::Image(image) => image.ts_us,
                 other => panic!("unexpected frame {other:?}"),
             })
             .collect();
-        assert_eq!(stamps, [HOST_US; 4], "head pose, head, presence and image");
+        assert_eq!(stamps, [HOST_US; 3], "head pose, presence and image");
     }
 
     /// The tracker's fault and warning lists reach notification subscribers
@@ -735,8 +727,8 @@ mod tests {
 
     /// A pose sample of the image of [`DEVICE_US`], [`HOST_US`] on the host
     /// clock.
-    fn pose_sample(head: EngineHeadPose, legacy: Option<LegacyPose>) -> Sample {
-        Sample::Pose(Box::new(PoseSample::new(DEVICE_US, HOST_US, head, legacy)))
+    fn pose_sample(head: EngineHeadPose) -> Sample {
+        Sample::Pose(PoseSample::new(DEVICE_US, HOST_US, head))
     }
 
     /// A valid head pose, its values exact in f32.
@@ -746,11 +738,6 @@ mod tests {
             position_mm: [-12.5, 30.25, 600.0],
             rotation_rad: [0.125, -0.25, 0.5],
         }
-    }
-
-    /// A legacy pose: 1, 2 and 3 cm, yaw 10°, pitch 20° and roll 30°.
-    fn legacy_pose() -> LegacyPose {
-        LegacyPose::new([1.0, 2.0, 3.0], [10.0, 20.0, 30.0])
     }
 
     /// The pose's frames, `(bit, tag)`, of the streams in `wanted`.
@@ -770,7 +757,7 @@ mod tests {
             valid: false,
             ..valid_head()
         };
-        let sent = |head| match &frames(&pose_sample(head, None), STREAM_HEAD_POSE)[..] {
+        let sent = |head| match &frames(&pose_sample(head), STREAM_HEAD_POSE)[..] {
             [(STREAM_HEAD_POSE, ServerMsg::HeadPose(pose))] => *pose,
             other => panic!("expected a HEAD_POSE frame alone, got {other:?}"),
         };
@@ -794,82 +781,48 @@ mod tests {
         );
     }
 
-    /// HEAD, the legacy pose, goes out after `HEAD_POSE` and only for a
-    /// sample that has one, whether the Stream Engine's pose is valid or
-    /// not (a face too near the edge has a legacy pose but no valid head
-    /// pose): its position in mm, its angles `[pitch, yaw, roll]` in
-    /// radians, and the image's host time.
+    /// HEAD, the retired legacy pose, is never sent: a pose sample, valid or
+    /// not, gives a client of HEAD (bit 0) alone nothing, and one of HEAD
+    /// and `HEAD_POSE`, or of every stream, the `HEAD_POSE` frame alone.
+    /// That frame goes out under its own bit only while some client wants
+    /// it, by which the pump writes it only to the clients that subscribe
+    /// to it.
     #[test]
-    fn head_goes_out_only_for_a_sample_with_a_legacy_pose() {
-        let both = STREAM_HEAD | STREAM_HEAD_POSE;
+    fn a_pose_sample_goes_out_as_head_pose_alone_and_only_when_wanted() {
         let invalid = EngineHeadPose {
             valid: false,
             ..valid_head()
         };
+        let head_pose = [(STREAM_HEAD_POSE, TAG_HEAD_POSE)];
 
-        assert_eq!(
-            pose_tags(&pose_sample(valid_head(), None), both),
-            [(STREAM_HEAD_POSE, TAG_HEAD_POSE)]
-        );
         for head in [valid_head(), invalid] {
-            let [
-                (STREAM_HEAD_POSE, ServerMsg::HeadPose(pose)),
-                (
-                    STREAM_HEAD,
-                    ServerMsg::Head {
-                        ts_us,
-                        pos_mm,
-                        rot_rad,
-                    },
-                ),
-            ] = &frames(&pose_sample(head, Some(legacy_pose())), both)[..]
-            else {
-                panic!("the sample did not give its HEAD_POSE and HEAD frames");
-            };
-            assert_eq!(pose.position_valid, head.valid);
-            assert_eq!(*ts_us, HOST_US);
-            assert_eq!(*pos_mm, [10.0, 20.0, 30.0]);
-            assert_eq!(*rot_rad, f32s([20.0, 10.0, 30.0].map(f64::to_radians)));
+            let sample = pose_sample(head);
+
+            assert_eq!(pose_tags(&sample, RETIRED_STREAM_HEAD), [], "{head:?}");
+            assert_eq!(
+                pose_tags(&sample, RETIRED_STREAM_HEAD | STREAM_HEAD_POSE),
+                head_pose
+            );
+            assert_eq!(pose_tags(&sample, STREAM_HEAD_POSE), head_pose);
+            assert_eq!(pose_tags(&sample, !0), head_pose, "every stream");
+            assert_eq!(pose_tags(&sample, !STREAM_HEAD_POSE), [], "every other");
         }
     }
 
-    /// Each head pose stream is encoded only while some client wants it,
-    /// under its own bit, by which the pump writes it only to the clients
-    /// that subscribe to that stream.
-    #[test]
-    fn each_head_stream_goes_out_under_its_own_bit_only_when_wanted() {
-        let sample = pose_sample(valid_head(), Some(legacy_pose()));
-        let head = (STREAM_HEAD, TAG_HEAD);
-        let head_pose = (STREAM_HEAD_POSE, TAG_HEAD_POSE);
-
-        assert_eq!(pose_tags(&sample, STREAM_HEAD), [head]);
-        assert_eq!(pose_tags(&sample, STREAM_HEAD_POSE), [head_pose]);
-        assert_eq!(
-            pose_tags(&sample, STREAM_HEAD | STREAM_HEAD_POSE),
-            [head_pose, head]
-        );
-        assert_eq!(pose_tags(&sample, !(STREAM_HEAD | STREAM_HEAD_POSE)), []);
-    }
-
-    /// The engine is asked for head-pose inference for either head stream,
-    /// both or one; for the legacy pose for HEAD, not for `HEAD_POSE` alone;
-    /// for the IR images for IMAGE; and for nothing for any other stream.
+    /// The engine is asked for head-pose inference for `HEAD_POSE`, for the
+    /// IR images for IMAGE, and for nothing for any other stream: not for
+    /// HEAD (bit 0), the retired legacy pose, alone or beside the others.
     #[test]
     fn the_engine_is_asked_for_what_the_streams_take() {
-        let ours = STREAM_HEAD | STREAM_HEAD_POSE | STREAM_IMAGE;
-        let wanted = |head, legacy_head, image| Wanted {
-            head,
-            legacy_head,
-            image,
-        };
+        let ours = STREAM_HEAD_POSE | STREAM_IMAGE;
+        let wanted = |head, image| Wanted { head, image };
         for (mask, want) in [
-            (0, wanted(false, false, false)),
-            (STREAM_HEAD, wanted(true, true, false)),
-            (STREAM_HEAD_POSE, wanted(true, false, false)),
-            (STREAM_HEAD | STREAM_HEAD_POSE, wanted(true, true, false)),
-            (STREAM_IMAGE, wanted(false, false, true)),
-            (STREAM_HEAD_POSE | STREAM_IMAGE, wanted(true, false, true)),
-            (ours, wanted(true, true, true)),
+            (0, wanted(false, false)),
+            (RETIRED_STREAM_HEAD, wanted(false, false)),
+            (STREAM_HEAD_POSE, wanted(true, false)),
+            (RETIRED_STREAM_HEAD | STREAM_HEAD_POSE, wanted(true, false)),
+            (STREAM_IMAGE, wanted(false, true)),
+            (STREAM_HEAD_POSE | STREAM_IMAGE, wanted(true, true)),
         ] {
             assert_eq!(engine_wanted(mask), want, "{mask:#x}");
             assert_eq!(engine_wanted(mask | !ours), want, "{mask:#x} and the rest");
@@ -878,6 +831,6 @@ mod tests {
             .map(|bit| 1 << bit)
             .filter(|&bit| engine_wanted(bit) != Wanted::default())
             .collect();
-        assert_eq!(alone, [STREAM_HEAD, STREAM_IMAGE, STREAM_HEAD_POSE]);
+        assert_eq!(alone, [STREAM_IMAGE, STREAM_HEAD_POSE]);
     }
 }
