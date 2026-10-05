@@ -265,9 +265,10 @@ Where the answers come from, and where they differ from Windows:
   none, which at ~6 ms an image on a desktop CPU, against 30 ms between images,
   takes a busy machine (`TOBII_IMAGE83_DEBUG` counts them, INSTALL.md §7).
   `tobii_recenter` re-zeroes only the daemon's own, relative head pose, a
-  stream of its own that the `tobii-opentrack` bridge reads (INSTALL.md §8):
-  the Stream Engine has no recenter, and an application centres this pose
-  itself, as OpenTrack does.
+  legacy stream of its own that no client here reads any more, as the
+  `tobii-opentrack` bridge sends the Stream Engine's pose too (INSTALL.md
+  §8): the Stream Engine has no recenter, and an application centres its
+  pose itself, as OpenTrack does.
 - **Timestamps.** Every callback timestamp but the tracker times below is on
   `tobii_system_clock`'s clock, as in the Stream Engine; the tracker's clock
   is left only in gaze data's and raw gaze's `timestamp_tracker_us` (raw
@@ -432,7 +433,8 @@ tools/headpose/evaluate.py --session LOG JSONL FITS ...      # head pose vs the 
   `99-tobii-no-uvcvideo.rules` in place so nothing else grabs it.
 - Head pose needs a face in frame. Without one, or with one at the edge of
   the frame, `libtobii.so` marks its head pose invalid, as the Stream Engine
-  does; `tobii-opentrack` sends nothing without one.
+  does; `tobii-opentrack` then sends nothing, and OpenTrack holds the last
+  pose.
 - Until you run `tobii-calibrate`, the calibration in use is the one embedded
   in `init_packets_ep.txt` — the author's. Likewise the display area is the
   author's 27" monitor until you set yours: `tobii-calibrate` does it first
