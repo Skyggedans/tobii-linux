@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 use tobii_ipc::geometry::DisplayArea;
 use tobii_ipc::request::decode_request;
 use tobii_ipc::{
-    self, STREAM_HEAD, STREAM_IMAGE, STREAM_PRESENCE, decode_subscribe, encode_reply,
-    encode_subscribed, read_frame, write_frame,
+    self, STREAM_PRESENCE, decode_subscribe, encode_reply, encode_subscribed, read_frame,
+    write_frame,
 };
 use tobii_proto::facts::{DeviceFacts, DeviceNotification};
 use tobii_usb::device::{BusAddress, OpenRefusal};
@@ -47,7 +47,7 @@ use tobii_usb::engine::{Engine, PresenceSample, Sample};
 
 use crate::calibration::Calibration;
 use crate::device::DeviceCommands;
-use crate::frames::{head_wanted, presence_frame, push_sample_frames};
+use crate::frames::{engine_wanted, presence_frame, push_sample_frames};
 use crate::restart::Backoff;
 
 /// Set by the SIGUSR1 handler; a poller thread turns it into a recenter request.
@@ -483,16 +483,13 @@ impl State {
         crate::pause::on_engine_lost(self);
     }
 
-    /// Tell the engine which optional work anyone consumes: head-pose
-    /// inference for either head pose stream (see [`head_wanted`]), the
-    /// legacy pose for HEAD subscribers, and IR frames for image
+    /// Tell the engine which optional work anyone consumes (see
+    /// [`engine_wanted`]): head-pose inference for either head pose
+    /// stream, the legacy pose for HEAD subscribers, and IR frames for image
     /// subscribers.
     fn sync_wanted(&self) {
         if let Some(engine) = self.engine.as_ref() {
-            let wanted = self.wanted_mask();
-            engine.set_head_wanted(head_wanted(wanted));
-            engine.set_legacy_head_wanted(wanted & STREAM_HEAD != 0);
-            engine.set_image_wanted(wanted & STREAM_IMAGE != 0);
+            engine.set_wanted(engine_wanted(self.wanted_mask()));
         }
     }
 
@@ -2178,7 +2175,7 @@ pub(crate) mod tests {
     /// both one that takes both, and neither a gaze subscriber.
     #[test]
     fn each_client_gets_the_head_pose_streams_it_subscribes_to() {
-        use tobii_ipc::{STREAM_GAZE, STREAM_HEAD_POSE, TAG_HEAD, TAG_HEAD_POSE};
+        use tobii_ipc::{STREAM_GAZE, STREAM_HEAD, STREAM_HEAD_POSE, TAG_HEAD, TAG_HEAD_POSE};
         use tobii_usb::engine::{HeadPose, LegacyPose, PoseSample};
         let mut st = State::new(false);
         let mut peers = Vec::new();

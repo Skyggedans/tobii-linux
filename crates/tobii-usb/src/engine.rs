@@ -3,10 +3,11 @@
 //! gaze-independent 6DOF head pose from the device's own 280x280 IR image
 //! stream (0x50e), which the firmware multiplexes on the same endpoint
 //! concurrently, and the device's notifications. Head-pose inference only runs
-//! while a client wants a head pose ([`Engine::set_head_wanted`]); it then
-//! makes one [`PoseSample`] of every image it takes: the Stream Engine's head
-//! pose, valid or not, and the legacy relative pose while that one is wanted
-//! too ([`Engine::set_legacy_head_wanted`]).
+//! while a client wants a head pose ([`Wanted::head`]); it then makes one
+//! [`PoseSample`] of every image it takes: the Stream Engine's head pose,
+//! valid or not, and the legacy relative pose while that one is wanted too
+//! ([`Wanted::legacy_head`]). The engine's owner says what is wanted with
+//! [`Engine::set_wanted`].
 //!
 //! Besides streaming, the engine runs device commands for its owner
 //! ([`Engine::commands`]): they are queued to the USB thread, which writes
@@ -19,9 +20,9 @@
 //! bandwidth — verified with `probe`). The UVC path survives only in the
 //! standalone research subcommands (`camera`, `track`, `probe`).
 //!
-//! The `stop` / `recenter` / `head_wanted` / `legacy_head_wanted` /
-//! `image_wanted` / `paused` flags are pure signals (no data is published
-//! alongside them), so every access uses `Ordering::Relaxed`.
+//! The `stop`, `recenter` and `paused` flags, and the flags
+//! [`Engine::set_wanted`] keeps a [`Wanted`] in, are pure signals (no data
+//! is published alongside them), so every access uses `Ordering::Relaxed`.
 //!
 //! # Timestamps
 //!
@@ -86,7 +87,7 @@ use crate::device::OpenRefusal;
 pub use tobii_pose::head::HeadPose;
 
 /// The head poses made of one 0x50e image: one for every image the engine
-/// takes while a head pose is wanted ([`Engine::set_head_wanted`]).
+/// takes while a head pose is wanted ([`Wanted::head`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct PoseSample {
@@ -101,8 +102,8 @@ pub struct PoseSample {
     /// of the last valid one, zeros before the first.
     pub head: HeadPose,
     /// The legacy pose, relative to a rest pose: only while it is wanted
-    /// ([`Engine::set_legacy_head_wanted`]), for an image with a face, once
-    /// its rest pose has calibrated.
+    /// ([`Wanted::legacy_head`]), for an image with a face, once its rest
+    /// pose has calibrated.
     pub legacy: Option<LegacyPose>,
 }
 
@@ -316,14 +317,14 @@ const _: () = assert!(size_of::<ImageSample>() <= 5 * size_of::<u64>());
 #[non_exhaustive]
 pub enum Sample {
     /// The head poses of an image, one for every image while a head pose is
-    /// wanted (see [`Engine::set_head_wanted`]); boxed: with its two poses
-    /// it is 1.6 times the size of the largest other sample.
+    /// wanted (see [`Wanted::head`]); boxed: with its two poses it is 1.6
+    /// times the size of the largest other sample.
     Pose(Box<PoseSample>),
     /// A gaze frame (boxed: it is ten times the size of the other samples).
     Gaze(Box<GazeSample>),
     /// A presence change.
     Presence(PresenceSample),
-    /// An IR frame (only while images are wanted, see [`Engine::set_image_wanted`]).
+    /// An IR frame (only while images are wanted, see [`Wanted::image`]).
     Image(ImageSample),
     /// A device notification.
     Notification(DeviceNotification),
@@ -431,6 +432,23 @@ impl Commands {
     }
 }
 
+/// The optional work the engine does, as its owner asks for it with
+/// [`Engine::set_wanted`]: what some client consumes. Gaze, presence and the
+/// device's notifications are made whatever is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Wanted {
+    /// A head pose, of either kind: the engine runs head-pose inference on
+    /// the image stream (it costs CPU) and makes a [`PoseSample`] of every
+    /// image it takes, the Stream Engine's pose valid or not; it drops the
+    /// images otherwise.
+    pub head: bool,
+    /// The legacy pose too ([`PoseSample::legacy`]), of the images a head
+    /// pose is made of: nothing without [`Wanted::head`].
+    pub legacy_head: bool,
+    /// [`Sample::Image`] for every IR frame.
+    pub image: bool,
+}
+
 /// State shared between the [`Engine`] handle and its USB thread.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
@@ -446,6 +464,16 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// Keep `wanted` in the flags the USB thread and the pose worker read
+    /// (see [`Engine::set_wanted`]).
+    pub(crate) fn set_wanted(&self, wanted: Wanted) {
+        // Relaxed: pure signals, no data is published with them.
+        self.head_wanted.store(wanted.head, Ordering::Relaxed);
+        self.legacy_head_wanted
+            .store(wanted.legacy_head, Ordering::Relaxed);
+        self.image_wanted.store(wanted.image, Ordering::Relaxed);
+    }
+
     /// The display area the next init writes, if not the replay's own.
     pub(crate) fn display_override(&self) -> Option<DisplayArea> {
         // Written whole; a poisoned lock cannot hold a torn value.
@@ -526,35 +554,23 @@ impl Engine {
         self.shared.recenter.store(true, Ordering::Relaxed);
     }
 
-    /// Run head-pose inference on the image stream (costs CPU) while some
-    /// client wants a head pose, of either kind: the engine then makes a
-    /// [`PoseSample`] of every image it takes, the Stream Engine's pose valid
-    /// or not; it drops the images otherwise. The flag is read at each
-    /// image: wanted again after an image that did not want it, the pose
-    /// starts over, its filters restarted and invalid poses carrying zeros
-    /// until the next valid one.
-    pub fn set_head_wanted(&self, wanted: bool) {
-        // Relaxed: a pure signal, no data is published with it.
-        self.shared.head_wanted.store(wanted, Ordering::Relaxed);
-    }
-
-    /// Make the legacy pose too ([`PoseSample::legacy`]) while some client
-    /// wants it, of the images a head pose is made of
-    /// ([`Engine::set_head_wanted`]). The flag is read at each image: the
-    /// rest pose lasts while the legacy pose is wanted, and calibrates
-    /// afresh when it is wanted again after an image that did not want it,
-    /// so that a new subscriber does not inherit an earlier one's.
-    pub fn set_legacy_head_wanted(&self, wanted: bool) {
-        // Relaxed: a pure signal, no data is published with it.
-        self.shared
-            .legacy_head_wanted
-            .store(wanted, Ordering::Relaxed);
-    }
-
-    /// Emit [`Sample::Image`] for every IR frame while some client wants them.
-    pub fn set_image_wanted(&self, wanted: bool) {
-        // Relaxed: a pure signal, no data is published with it.
-        self.shared.image_wanted.store(wanted, Ordering::Relaxed);
+    /// Do the optional work `wanted` asks for, and none that it does not:
+    /// head-pose inference, the legacy pose, the IR images (see [`Wanted`]).
+    ///
+    /// The pose worker reads the head flags at each image it takes. The
+    /// first image that wants a head pose after one that did not starts the
+    /// poses over: the Stream Engine's restarts its filters, its invalid
+    /// poses carrying zeros until the next valid one, and the legacy pose's
+    /// rest pose calibrates afresh. The first image that wants the legacy
+    /// pose after one that did not has the rest pose calibrate afresh, the
+    /// Stream Engine's pose going on as it was. So a new subscriber does not
+    /// inherit an earlier one's poses, unless a head pose stays wanted
+    /// throughout: [`Wanted::head`] covers both kinds, and while it stays
+    /// set the Stream Engine's pose goes on without a restart, so a client
+    /// that comes to want it while another keeps the legacy pose going gets
+    /// its filters as they are.
+    pub fn set_wanted(&self, wanted: Wanted) {
+        self.shared.set_wanted(wanted);
     }
 
     /// Tell the engine whether the device is paused. A paused device sends no

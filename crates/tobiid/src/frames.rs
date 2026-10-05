@@ -27,7 +27,7 @@ use tobii_ipc::{
 };
 use tobii_proto::facts::DeviceNotification;
 use tobii_proto::gaze83::{EyeFrame, GazeFrame, Valued};
-use tobii_usb::engine::{GazeSample, PoseSample, PresenceSample, Sample};
+use tobii_usb::engine::{GazeSample, PoseSample, PresenceSample, Sample, Wanted};
 
 /// Narrow to the wire's `f32`: the C ABI this protocol feeds carries `float`.
 #[allow(clippy::cast_possible_truncation)] // reason: f32 is the wire type
@@ -164,14 +164,20 @@ fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
     }
 }
 
-/// Whether the streams in `wanted` take a head pose of every image: the
-/// Stream Engine's, [`STREAM_HEAD_POSE`], or the legacy one,
-/// [`STREAM_HEAD`], which the engine makes in the same step. Either has
-/// the engine run its head-pose inference (see
-/// [`Engine::set_head_wanted`](tobii_usb::engine::Engine::set_head_wanted)).
+/// The work the engine is to do for the streams in `wanted` (see
+/// [`Engine::set_wanted`](tobii_usb::engine::Engine::set_wanted)): its
+/// head-pose inference for a head pose of every image, the Stream Engine's
+/// ([`STREAM_HEAD_POSE`]) or the legacy one ([`STREAM_HEAD`]), which the
+/// engine makes in the same step; the legacy pose too for [`STREAM_HEAD`]
+/// alone, so that its rest pose calibrates afresh when that stream is
+/// subscribed, not the other; and the IR images for [`STREAM_IMAGE`].
 #[must_use]
-pub(crate) fn head_wanted(wanted: u32) -> bool {
-    wanted & (STREAM_HEAD | STREAM_HEAD_POSE) != 0
+pub(crate) fn engine_wanted(wanted: u32) -> Wanted {
+    Wanted {
+        head: wanted & (STREAM_HEAD | STREAM_HEAD_POSE) != 0,
+        legacy_head: wanted & STREAM_HEAD != 0,
+        image: wanted & STREAM_IMAGE != 0,
+    }
 }
 
 /// A pose sample's frames, of the streams in `wanted`, both stamped with the
@@ -845,24 +851,33 @@ mod tests {
         assert_eq!(pose_tags(&sample, !(STREAM_HEAD | STREAM_HEAD_POSE)), []);
     }
 
-    /// Head-pose inference is wanted for either head stream, both or one,
-    /// and for no other stream.
+    /// The engine is asked for head-pose inference for either head stream,
+    /// both or one; for the legacy pose for HEAD, not for `HEAD_POSE` alone;
+    /// for the IR images for IMAGE; and for nothing for any other stream.
     #[test]
-    fn head_inference_is_wanted_for_either_head_stream_alone() {
-        let heads = STREAM_HEAD | STREAM_HEAD_POSE;
-        for (mask, wanted) in [
-            (0, false),
-            (STREAM_HEAD, true),
-            (STREAM_HEAD_POSE, true),
-            (heads, true),
+    fn the_engine_is_asked_for_what_the_streams_take() {
+        let ours = STREAM_HEAD | STREAM_HEAD_POSE | STREAM_IMAGE;
+        let wanted = |head, legacy_head, image| Wanted {
+            head,
+            legacy_head,
+            image,
+        };
+        for (mask, want) in [
+            (0, wanted(false, false, false)),
+            (STREAM_HEAD, wanted(true, true, false)),
+            (STREAM_HEAD_POSE, wanted(true, false, false)),
+            (STREAM_HEAD | STREAM_HEAD_POSE, wanted(true, true, false)),
+            (STREAM_IMAGE, wanted(false, false, true)),
+            (STREAM_HEAD_POSE | STREAM_IMAGE, wanted(true, false, true)),
+            (ours, wanted(true, true, true)),
         ] {
-            assert_eq!(head_wanted(mask), wanted, "{mask:#x}");
-            assert_eq!(head_wanted(mask | !heads), wanted, "{mask:#x} and the rest");
+            assert_eq!(engine_wanted(mask), want, "{mask:#x}");
+            assert_eq!(engine_wanted(mask | !ours), want, "{mask:#x} and the rest");
         }
         let alone: Vec<u32> = (0..32)
             .map(|bit| 1 << bit)
-            .filter(|&bit| head_wanted(bit))
+            .filter(|&bit| engine_wanted(bit) != Wanted::default())
             .collect();
-        assert_eq!(alone, [STREAM_HEAD, STREAM_HEAD_POSE]);
+        assert_eq!(alone, [STREAM_HEAD, STREAM_IMAGE, STREAM_HEAD_POSE]);
     }
 }

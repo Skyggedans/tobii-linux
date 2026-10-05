@@ -117,14 +117,17 @@ impl Mailbox {
 }
 
 /// What the clients want of the worker for one image, as it reads the
-/// engine's flags (see [`Engine`](crate::engine::Engine)) when it takes the
-/// image.
+/// engine's flags (see
+/// [`Engine::set_wanted`](crate::engine::Engine::set_wanted)) when it takes
+/// the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Wants {
-    /// A head pose, of either kind (`set_head_wanted`): the image is
+    /// A head pose, of either kind
+    /// ([`Wanted::head`](crate::engine::Wanted::head)): the image is
     /// stepped.
     head: bool,
-    /// The legacy pose too (`set_legacy_head_wanted`).
+    /// The legacy pose too
+    /// ([`Wanted::legacy_head`](crate::engine::Wanted::legacy_head)).
     legacy: bool,
     /// A recenter, asked for since the last image (`request_recenter`).
     recenter: bool,
@@ -483,7 +486,7 @@ mod tests {
     use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
     use tobii_proto::image83::ImageFrame;
 
-    use crate::engine::{DisplayGeneration, OpenNumber};
+    use crate::engine::{DisplayGeneration, OpenNumber, Wanted};
 
     /// How much later an image's device time is than its host time, here.
     const DEVICE_AHEAD_US: i64 = 7_000_000;
@@ -810,7 +813,10 @@ mod tests {
     fn the_flags_are_read_at_each_image_and_a_recenter_taken_once() {
         let shared = Shared::default();
         assert_eq!(Wants::of(&shared), Wants::default());
-        shared.head_wanted.store(true, Ordering::Relaxed);
+        shared.set_wanted(Wanted {
+            head: true,
+            ..Wanted::default()
+        });
         shared.recenter.store(true, Ordering::Relaxed);
         assert_eq!(
             Wants::of(&shared),
@@ -820,8 +826,38 @@ mod tests {
                 recenter: true,
             }
         );
-        shared.legacy_head_wanted.store(true, Ordering::Relaxed);
+        shared.set_wanted(Wanted {
+            head: true,
+            legacy_head: true,
+            image: false,
+        });
         assert_eq!(Wants::of(&shared), head(true), "the recenter taken");
+    }
+
+    /// What the engine is told is wanted is what the pose worker and the
+    /// USB thread read: each flag from its own field, whatever the others
+    /// say.
+    #[test]
+    fn the_flags_read_back_what_the_engine_was_told() {
+        let shared = Shared::default();
+        for bits in 0..8_u8 {
+            let wanted = Wanted {
+                head: bits & 1 != 0,
+                legacy_head: bits & 2 != 0,
+                image: bits & 4 != 0,
+            };
+            shared.set_wanted(wanted);
+            let wants = Wants::of(&shared);
+            assert_eq!(
+                (
+                    wants.head,
+                    wants.legacy,
+                    shared.image_wanted.load(Ordering::Relaxed)
+                ),
+                (wanted.head, wanted.legacy_head, wanted.image),
+                "{wanted:?}"
+            );
+        }
     }
 
     #[test]
