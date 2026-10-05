@@ -450,8 +450,7 @@ fn nearest_rank(sorted: &[u64], percent: usize) -> u64 {
 }
 
 /// The pose worker's thread (see `run_gaze_engine`): a [`PoseWorker`] over
-/// a [`HeadStep`] of [`HeadParams::FITTED`], fed each image the reader puts
-/// in `mailbox` until `shared` says stop, its poses sent to `tx`. Without
+/// a [`HeadStep`] of [`HeadParams::FITTED`], driven by [`drive`]. Without
 /// its models it logs why and ends, and the engine runs on without head
 /// pose.
 pub(crate) fn run_worker(mailbox: &Mailbox, shared: &Shared, tx: &Sender<Sample>) {
@@ -466,9 +465,24 @@ pub(crate) fn run_worker(mailbox: &Mailbox, shared: &Shared, tx: &Sender<Sample>
         }
     };
     let stats = is_env_flag_set("TOBII_IMAGE83_DEBUG").then(|| PoseStats::new(Instant::now()));
-    let mut worker = PoseWorker::new(stats);
+    drive(mailbox, shared, tx, &mut step, PoseWorker::new(stats));
+}
+
+/// The pose worker's loop: each image the reader puts in `mailbox` goes
+/// through `worker` and `step` as the flags of `shared` want it when the
+/// image is taken, and its poses, if any, to `tx`, until `shared` says
+/// stop.
+fn drive(
+    mailbox: &Mailbox,
+    shared: &Shared,
+    tx: &Sender<Sample>,
+    step: &mut impl PoseStep,
+    mut worker: PoseWorker,
+) {
     while let Some(taken) = mailbox.take(&shared.stop) {
-        if let Some(pose) = worker.image(&mut step, &taken, Wants::of(shared)) {
+        if let Some(pose) = worker.image(step, &taken, Wants::of(shared)) {
+            // An engine dropped meanwhile reads no more samples; the stop
+            // ends the loop.
             let _ = tx.send(Sample::Pose(Box::new(pose)));
         }
     }
@@ -481,7 +495,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use tobii_ipc::geometry::{DisplayArea, DisplayFrame};
     use tobii_proto::image83::ImageFrame;
@@ -530,28 +544,39 @@ mod tests {
         Recenter,
     }
 
-    /// A [`PoseStep`] that notes what it is asked and makes the poses it is
-    /// given, in turn; an invalid pose at zero once they run out.
+    /// A [`PoseStep`] that notes what it is asked (and tells `told` of it
+    /// at once, if given) and makes the poses it is given, in turn; an
+    /// invalid pose at zero once they run out.
     #[derive(Default)]
     struct Script {
         calls: Vec<Call>,
+        told: Option<mpsc::Sender<Call>>,
         poses: VecDeque<Stepped>,
+    }
+
+    impl Script {
+        fn note(&mut self, call: Call) {
+            self.calls.push(call);
+            if let Some(told) = &self.told {
+                let _ = told.send(call);
+            }
+        }
     }
 
     impl PoseStep for Script {
         fn step(&mut self, image: &ImageSample, legacy_wanted: bool) -> Stepped {
-            self.calls.push(Call::Step(image.host_us, legacy_wanted));
+            self.note(Call::Step(image.host_us, legacy_wanted));
             self.poses
                 .pop_front()
                 .unwrap_or_else(|| stepped(None, None))
         }
 
         fn reset(&mut self) {
-            self.calls.push(Call::Reset);
+            self.note(Call::Reset);
         }
 
         fn recenter(&mut self) {
-            self.calls.push(Call::Recenter);
+            self.note(Call::Recenter);
         }
     }
 
@@ -918,6 +943,83 @@ mod tests {
         assert_eq!(worker.join().unwrap(), None);
     }
 
+    /// Stops the worker that [`drive`] runs when dropped, so that a failed
+    /// assertion ends the test rather than leaving the worker waiting for
+    /// an image.
+    struct StopOnDrop<'a>(&'a Mailbox, &'a Shared);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.1.stop.store(true, Ordering::Relaxed);
+            self.0.wake();
+        }
+    }
+
+    /// The worker's loop on its thread: each image put goes through the
+    /// step as the engine's flags want it when the worker takes it, the
+    /// legacy pose asked for as they say, and its pose is sent; an image
+    /// not wanted is not stepped and sends none; a recenter reaches the
+    /// step; the poses start over when wanted again; a stop ends the loop.
+    #[test]
+    fn the_worker_sends_the_pose_of_each_image_as_the_flags_want_it() {
+        let mailbox = Mailbox::default();
+        let shared = Shared::default();
+        let (tx, rx) = mpsc::channel();
+        let (told, calls) = mpsc::channel();
+        let wait = Duration::from_secs(10);
+        let wanted = |head, legacy_head| Wanted {
+            head,
+            legacy_head,
+            image: false,
+        };
+        let sent = |host_us| {
+            let pose = PoseSample::new(
+                host_us + DEVICE_AHEAD_US,
+                host_us,
+                HeadPose::default(),
+                None,
+            );
+            Sample::Pose(Box::new(pose))
+        };
+
+        let steps = thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let mut step = Script {
+                    told: Some(told),
+                    ..Script::default()
+                };
+                drive(&mailbox, &shared, &tx, &mut step, PoseWorker::default());
+                step.calls
+            });
+            let stop = StopOnDrop(&mailbox, &shared);
+            shared.set_wanted(wanted(true, true));
+            mailbox.put(image(1));
+            assert_eq!(rx.recv_timeout(wait).unwrap(), sent(1));
+            // Not wanted: no pose to wait for, so the recenter asked for with
+            // it says when the worker has read its flags.
+            shared.set_wanted(wanted(false, false));
+            shared.recenter.store(true, Ordering::Relaxed);
+            mailbox.put(image(2));
+            while calls.recv_timeout(wait).unwrap() != Call::Recenter {}
+            shared.set_wanted(wanted(true, false));
+            mailbox.put(image(3));
+            assert_eq!(rx.recv_timeout(wait).unwrap(), sent(3));
+            drop(stop);
+            worker.join().unwrap()
+        });
+
+        assert_eq!(
+            steps,
+            [
+                Call::Step(1, true),
+                Call::Recenter,
+                Call::Reset,
+                Call::Step(3, false),
+            ]
+        );
+        assert!(rx.try_recv().is_err(), "a pose for each image wanted alone");
+    }
+
     /// A display frame, of a 600 x 340 mm screen above the tracker.
     fn display_frame() -> DisplayFrame {
         DisplayFrame::new(&DisplayArea {
@@ -998,5 +1100,76 @@ mod tests {
         assert!(small.error.is_some(), "a 2x1 image is refused");
         assert_eq!((small.head, small.legacy), (HeadPose::default(), None));
         assert_eq!(small.detector_runs, 1);
+    }
+
+    /// The 0x50e fixture's frame (`TOBII_IMAGE83_FIXTURE`, a captured
+    /// 78609-byte message; the user's face, so it is not committed), if set.
+    fn image83_fixture() -> Option<ImageFrame> {
+        let path = std::env::var("TOBII_IMAGE83_FIXTURE").ok()?;
+        let msg = std::fs::read(path).unwrap();
+        Some(tobii_proto::image83::decode_image_payload(&msg).unwrap())
+    }
+
+    /// With the real models and a face (the 0x50e fixture, if set): the
+    /// worker's step is the head step's. The image's display frame and time
+    /// go in, a valid pose comes out and, once its rest pose has calibrated,
+    /// the legacy one; a reset starts the head pose over, so that an image
+    /// without a face then makes the invalid pose at zero; a recenter
+    /// recalibrates the legacy pose alone, the invalid pose keeping the last
+    /// valid values.
+    #[test]
+    fn the_worker_steps_resets_and_recenters_the_head_step() {
+        let Some(face) = image83_fixture() else {
+            return;
+        };
+        let face = Arc::new(face);
+        let black = Arc::new(ImageFrame {
+            pixels: vec![0; face.pixels.len()],
+            ..(*face).clone()
+        });
+        let display = Arc::new(display_frame());
+        let mut t_us = 0;
+        let mut next = |frame: &Arc<ImageFrame>| {
+            t_us += 30_000;
+            ImageSample {
+                display_frame: Some(Arc::clone(&display)),
+                display_generation: DisplayGeneration(1),
+                open: OpenNumber(1),
+                ..ImageSample::new(Arc::clone(frame), t_us)
+            }
+        };
+        let mut step = HeadStep::new(HeadParams::FITTED).unwrap();
+
+        let valid = PoseStep::step(&mut step, &next(&face), false).head;
+        assert!(valid.valid, "the fixture has a face");
+        let held = HeadPose {
+            valid: false,
+            ..valid
+        };
+        assert_eq!(PoseStep::step(&mut step, &next(&black), false).head, held);
+        PoseStep::reset(&mut step);
+        let reset = PoseStep::step(&mut step, &next(&black), false).head;
+        assert_eq!(reset, HeadPose::default(), "zeros after a reset");
+
+        // The rest pose calibrates on 30 fits, then the legacy pose comes.
+        let legacy: Vec<bool> = (0..32)
+            .map(|_| PoseStep::step(&mut step, &next(&face), true).legacy)
+            .map(|legacy| legacy.is_some())
+            .collect();
+        assert_eq!(legacy.iter().position(|&some| some), Some(30));
+        let last = PoseStep::step(&mut step, &next(&face), true);
+        assert!(last.head.valid && last.legacy.is_some());
+        PoseStep::recenter(&mut step);
+        let lost = PoseStep::step(&mut step, &next(&black), true).head;
+        assert_eq!(
+            lost,
+            HeadPose {
+                valid: false,
+                ..last.head
+            },
+            "a recenter leaves the head pose alone"
+        );
+        let again = PoseStep::step(&mut step, &next(&face), true);
+        assert!(again.legacy.is_none(), "the rest pose calibrates afresh");
     }
 }
