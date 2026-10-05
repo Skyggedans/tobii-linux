@@ -16,6 +16,7 @@ tests' vectors. Python 3 with NumPy and SciPy, nothing else.
 | `fit.py` | Leave-one-session-out refit of the constants; prints the folds and every session's errors; writes the constants as JSON. |
 | `evaluate.py` | Runs `reference.py` over the fits with a set of constants, or takes the daemon's own poses from `compare-dll --head`'s CSV, and prints every acceptance metric, lag and rest jitter included, against `gates.json`. |
 | `gates.json` | The acceptance gates, per session: the file `compare-dll --head` checks, which `evaluate.py` reads too. |
+| `gates.py` | Sets the gates' thresholds from the Rust pipeline's leave-one-session-out values by the rule `gates.json` states, and checks them against the broken pipelines. |
 | `blaze_face_to_onnx.py` | The conversion of MediaPipe's BlazeFace detector to the ONNX model tobii-pose embeds (its own docstring; needs tflite2onnx). |
 
 ## The data, which never goes into the repository
@@ -114,6 +115,27 @@ face.
    `--params $OUT/fit.json --loso` gives the leave-one-session-out numbers, and
    `--broken zyx|q-transposed|no-q|no-filter` shows which gates catch a broken pipeline.
 
+## Setting the gates
+
+Step 5 checks a refit against the gates in `gates.json`. Their thresholds were set on 2026-10-05,
+from that day's refit, by the rule `gates.py` applies: each is the Rust pipeline's
+leave-one-session-out value of the gate's metric (what `evaluate.py --params fit.json --loso`
+prints with the stateless reference as `--reference-fits`) plus the headroom of the rule, which
+`gates.json`'s `headroom` gives in words. `gates.py` then checks them against the broken
+pipelines: the good one must pass every gate in every session, and each broken one fail at least
+one, with the constants fitted without the session and with those fitted on all. From that refit's
+`fit.json` and fits (`fixtures/analysis/headpose-2026-09-27/impl/tune-refit/`) it writes
+`gates.json` byte for byte. To set them again (other sessions, another pipeline):
+
+    tools/headpose/gates.py --session LOG1 JSONL1 $OUT/fits_s1.csv ... --params $OUT/fit.json \
+        --reference-fits .../sl_s1.npz --reference-fits .../sl_s2.npz \
+        --reference-fits .../sl_s3.npz --out $OUT/gates.json
+
+It prints every value with its threshold (and the file's own), then the gates each pipeline fails,
+and writes nothing when the check fails (exit 1). It changes the thresholds of the file `--gates`
+names (`gates.json` by default) and nothing else: its prose, `status` and `headroom`, is brought up
+to date by hand.
+
 ## What is measured
 
 On every 0x50e image of a session. A DLL pose is valid when its four flags are set (they always
@@ -143,10 +165,8 @@ has, per gate, the metric, the kind (`min`: the value is at least the gate, `max
 its magnitude at most, `range`: every axis inside), `by` (`compare-dll` for the gates
 `compare-dll --head` checks, `python` for the lag and the rest jitter, which only `evaluate.py`
 measures; `evaluate.py` checks them all) and a threshold per session (`thresholds`). The
-thresholds are the Rust pipeline's leave-one-session-out values (`evaluate.py --params fit.json
---loso`) plus headroom, which its `headroom` spells out; each was checked against the broken
-pipelines (`--broken`), which fail at least one gate in every session, with the constants fitted
-without the session and with those fitted on all.
+thresholds are the Rust pipeline's leave-one-session-out values plus headroom, set by `gates.py`
+(above) by the rule its `headroom` spells out.
 
 ## Details
 
