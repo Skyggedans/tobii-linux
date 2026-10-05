@@ -168,7 +168,7 @@ fn gaze_frames(g: &GazeSample, wanted: u32, out: &mut Vec<(u32, Vec<u8>)>) {
 /// [`Engine::set_wanted`](tobii_usb::engine::Engine::set_wanted)): its
 /// head-pose inference, for the Stream Engine's head pose of every image
 /// ([`STREAM_HEAD_POSE`]), and the IR images for [`STREAM_IMAGE`]. Nothing for
-/// HEAD ([`crate::daemon::RETIRED_STREAM_HEAD`], bit 0), the daemon's own,
+/// HEAD ([`tobii_ipc::RETIRED_STREAM_HEAD`], bit 0), the daemon's own,
 /// legacy head pose, which is retired: a client from before that still
 /// subscribes to it is acked and sent nothing for it, as for a stream bit
 /// the daemon does not know.
@@ -277,15 +277,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tobii_ipc::geometry::tracker_to_display;
-    use tobii_ipc::{ServerMsg, TAG_HEAD_POSE, decode_server};
+    use tobii_ipc::{RETIRED_STREAM_HEAD, ServerMsg, TAG_HEAD_POSE, decode_server};
     use tobii_proto::facts::parse_display_area;
     use tobii_proto::gaze83::{RecordKeys, decode_gaze_frame};
     use tobii_proto::image83::ImageFrame;
     use tobii_proto::protocol::{hex_to_bytes, parse_message};
     use tobii_proto::tlv::{KeyedFields, UNITS_PER_MM, keyed_fields};
     use tobii_usb::engine::{HeadPose as EngineHeadPose, ImageSample};
-
-    use crate::daemon::RETIRED_STREAM_HEAD;
 
     /// The session1 fixture frame's device timestamp.
     const DEVICE_US: i64 = 9_613_320_391;

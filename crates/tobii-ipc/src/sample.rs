@@ -11,8 +11,8 @@
 use crate::geometry::DisplayArea;
 use crate::wire::{Reader, Writer};
 use crate::{
-    TAG_EYE_POSITION, TAG_GAZE, TAG_GAZE_DATA, TAG_GAZE_ORIGIN, TAG_GAZE_RAW, TAG_HEAD,
-    TAG_HEAD_POSE, TAG_IMAGE, TAG_NOTIFICATION, TAG_PRESENCE, TAG_REPLY, TAG_SUBSCRIBED,
+    TAG_EYE_POSITION, TAG_GAZE, TAG_GAZE_DATA, TAG_GAZE_ORIGIN, TAG_GAZE_RAW, TAG_HEAD_POSE,
+    TAG_IMAGE, TAG_NOTIFICATION, TAG_PRESENCE, TAG_REPLY, TAG_SUBSCRIBED,
 };
 
 /// One eye's 3-D point and whether it is usable.
@@ -144,9 +144,8 @@ pub struct GazeRaw {
 /// The Stream Engine's head pose: `tobii_head_pose_t`, validity included.
 /// Absolute, in the display frame: the origin at the centre of the display
 /// area, +x to the right and +y up along the display as the user sees it,
-/// +z out of it towards the user. Unlike [`ServerMsg::Head`], nothing in it
-/// is relative to a rest pose, so a RECENTER leaves it alone. A value whose
-/// validity is clear holds no measurement, whatever it reads.
+/// +z out of it towards the user. A value whose validity is clear holds no
+/// measurement, whatever it reads.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HeadPose {
     /// When the IR image the pose was made from was taken, on the host
@@ -157,8 +156,7 @@ pub struct HeadPose {
     /// Head position in the display frame, mm: the point the Stream Engine
     /// reports, on the camera's line of sight to the point midway between
     /// the eyes, at a range set by the head's size in the image. It is not
-    /// a fixed point of the head, nor the neck pivot of [`ServerMsg::Head`],
-    /// so turning the head moves it.
+    /// a fixed point of the head, so turning the head moves it.
     pub position_mm: [f32; 3],
     /// Whether each angle of `rotation_rad`, x, y and z, holds a
     /// measurement for this image.
@@ -265,23 +263,6 @@ pub enum ServerMsg {
         /// Kind-specific payload (see [`crate::request`]).
         payload: Vec<u8>,
     },
-    /// The daemon's own head pose, not the Stream Engine's (that is
-    /// [`ServerMsg::HeadPose`]): relative to the rest pose a RECENTER
-    /// resets, and sent only while a face is tracked, with no validity.
-    Head {
-        /// When the sample was taken, on the host clock, microseconds.
-        ts_us: i64,
-        /// How far a pivot at the neck has moved from the rest pose,
-        /// `[x, y, z]` in millimetres, along the axes of the camera, which
-        /// looks up at the user: not the display frame, and z has the
-        /// opposite sign to [`HeadPose::position_mm`]'s.
-        pos_mm: [f32; 3],
-        /// Rotation from the rest pose in radians, `[pitch, yaw, roll]`:
-        /// the angles about x, y and z, in [`HeadPose::rotation_rad`]'s
-        /// order but with pitch and roll of the opposite sign, each clamped
-        /// to ±45°.
-        rot_rad: [f32; 3],
-    },
     /// The Stream Engine's head pose (`tobii_head_pose_t`), validity
     /// included.
     HeadPose(HeadPose),
@@ -336,17 +317,6 @@ pub fn encode_reply(request_id: u32, status: u8, payload: &[u8]) -> Vec<u8> {
         .u32(request_id)
         .u8(status)
         .bytes(payload)
-        .finish()
-}
-
-/// Daemon -> client HEAD body, the daemon's own pose ([`ServerMsg::Head`]):
-/// position in mm, rotation in radians.
-#[must_use]
-pub fn encode_head(ts_us: i64, pos_mm: [f32; 3], rot_rad: [f32; 3]) -> Vec<u8> {
-    Writer::with_tag(TAG_HEAD, 32)
-        .i64(ts_us)
-        .f32s(&pos_mm)
-        .f32s(&rot_rad)
         .finish()
 }
 
@@ -645,8 +615,9 @@ fn read_notification(r: &mut Reader<'_>) -> Option<Notification> {
     Some(Notification { kind, value })
 }
 
-/// Decode a daemon -> client frame body. `None` for an unknown tag or a body
-/// too short for its tag, so an older client ignores frames it does not know.
+/// Decode a daemon -> client frame body. `None` for an unknown tag (the
+/// retired HEAD's, [`crate::RETIRED_TAG_HEAD`], among them) or a body too
+/// short for its tag, so an older client ignores frames it does not know.
 #[must_use]
 pub fn decode_server(body: &[u8]) -> Option<ServerMsg> {
     let mut r = Reader::new(body);
@@ -656,11 +627,6 @@ pub fn decode_server(body: &[u8]) -> Option<ServerMsg> {
             request_id: r.u32()?,
             status: r.u8()?,
             payload: r.rest().to_vec(),
-        }),
-        TAG_HEAD => Some(ServerMsg::Head {
-            ts_us: r.i64()?,
-            pos_mm: r.f32s()?,
-            rot_rad: r.f32s()?,
         }),
         TAG_HEAD_POSE => read_head_pose(&mut r).map(ServerMsg::HeadPose),
         TAG_GAZE => {

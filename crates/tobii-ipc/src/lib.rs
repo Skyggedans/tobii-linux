@@ -6,11 +6,12 @@
 //! | tag | direction | body |
 //! |---|---|---|
 //! | `0x01` SUBSCRIBE | client -> daemon | `u32 LE` stream mask (a legacy 1-byte `u8` mask is accepted) |
-//! | `0x02` RECENTER | client -> daemon | none |
+//! | `0x02` RECENTER | client -> daemon | retired, the number reserved ([`RETIRED_TAG_RECENTER`]) |
 //! | `0x03` REQUEST | client -> daemon | `u32 id`, `u8 kind`, payload ([`request`]) |
 //! | `0x10` SUBSCRIBED | daemon -> client | `u8 ok` |
 //! | `0x11` REPLY | daemon -> client | `u32 id`, `u8 status`, payload |
-//! | `0x20` HEAD .. `0x29` `HEAD_POSE` | daemon -> client | samples ([`ServerMsg`]) |
+//! | `0x20` HEAD, stream bit 0 | daemon -> client | retired, both numbers reserved ([`RETIRED_TAG_HEAD`], [`RETIRED_STREAM_HEAD`]) |
+//! | `0x21` GAZE .. `0x29` `HEAD_POSE` | daemon -> client | samples ([`ServerMsg`]) |
 //!
 //! The daemon runs a connection's REQUESTs one at a time, in the order they
 //! came, and answers a SUBSCRIBE without waiting for the requests before it
@@ -45,24 +46,34 @@
 //! sends its frame, so the stream stays silent: SUBSCRIBED says ok all the
 //! same, and a mask of that bit alone still has it start and hold the
 //! tracker, though one from before the head pose runs no head inference
-//! for bit 9 (only for [`STREAM_HEAD`]). One that reads a single byte sees
+//! for bit 9 (only for HEAD's bit 0). One that reads a single byte sees
 //! such a mask as 0 and unsubscribes. A client from before one of them
 //! drops its frame as a tag it does not know ([`decode_server`] returns
 //! `None`).
 //!
-//! The daemon has two head pose streams. HEAD ([`STREAM_HEAD`]) is its own:
-//! relative to a rest pose that RECENTER resets, sent only while a face is
-//! tracked, with no validity. Its position is that of a pivot at the neck,
-//! along the axes of the camera, which looks up at the user; its angles are
-//! clamped to ±45°; and its z, pitch and roll have the opposite sign to
-//! `HEAD_POSE`'s. `HEAD_POSE` ([`STREAM_HEAD_POSE`], a [`HeadPose`]) is the
-//! Stream Engine's: absolute, in the display frame, one for every IR image
-//! the daemon processes, valid or not, with a validity for the position and
-//! for each angle. Its position is a point on the camera's line of sight to
-//! the point midway between the eyes, and its angles are not clamped. It is
-//! a stream of its own rather than a validity tail on HEAD because a HEAD
-//! decoder ignores a tail: a client from before the tail would take every
-//! invalid pose for a valid one.
+//! The head pose, `HEAD_POSE` ([`STREAM_HEAD_POSE`], a [`HeadPose`]), is
+//! the Stream Engine's: absolute, in the display frame, one for every IR
+//! image the daemon processes, valid or not, with a validity for the
+//! position and for each angle. Its position is a point on the camera's
+//! line of sight to the point midway between the eyes, and its angles are
+//! not clamped.
+//!
+//! HEAD and RECENTER are retired. HEAD, tag `0x20` under stream bit 0
+//! ([`RETIRED_TAG_HEAD`], [`RETIRED_STREAM_HEAD`]), was the daemon's own
+//! head pose, relative to a rest pose, which RECENTER, tag `0x02`
+//! ([`RETIRED_TAG_RECENTER`]), reset; the daemon no longer makes that
+//! pose. The three numbers are reserved, never to be given to another
+//! frame or stream, since an older peer may still send them or ask for
+//! them. A daemon from after their retirement serves such a peer on. A
+//! SUBSCRIBE with bit 0 (an older `tobii-opentrack`'s, or a libtobii's from
+//! before `HEAD_POSE`) is acked and kept as one with a bit the daemon does
+//! not know: it starts and holds the tracker like any subscription, and
+//! gets nothing for that bit, so the client's head pose stays silent. A
+//! RECENTER (an older libtobii's `tobii_recenter`, an older
+//! `tobii-opentrack --recenter`) is ignored, and the connection served on.
+//! The daemon logs the first of each. A client from after their retirement
+//! neither asks for HEAD nor sends RECENTER, and drops a HEAD frame, should
+//! one come, as a tag it does not know.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -81,17 +92,17 @@ pub use clock::host_clock_us;
 pub use sample::{
     EyePair, EyePoint, GazeData, GazeDataEye, GazeRaw, GazeRawEye, HeadPose, Image, Notification,
     NotificationValue, ServerMsg, decode_server, encode_eye_position, encode_gaze,
-    encode_gaze_data, encode_gaze_origin, encode_gaze_raw, encode_head, encode_head_pose,
-    encode_image, encode_notification, encode_presence, encode_reply, encode_subscribed,
-    notification,
+    encode_gaze_data, encode_gaze_origin, encode_gaze_raw, encode_head_pose, encode_image,
+    encode_notification, encode_presence, encode_reply, encode_subscribed, notification,
 };
 
 // Stream subscription bits (client -> daemon), OR-ed into the SUBSCRIBE mask.
 
-/// Subscribe to the daemon's own head pose, relative to the rest pose a
-/// RECENTER resets ([`TAG_HEAD`] frames); the Stream Engine's is
-/// [`STREAM_HEAD_POSE`].
-pub const STREAM_HEAD: u32 = 1 << 0;
+/// Retired, and reserved: HEAD's bit, the daemon's own head pose, relative
+/// to a rest pose, which it no longer makes. No other stream may take it,
+/// as an older client may still ask for it: the daemon acks such a
+/// SUBSCRIBE and sends nothing for the bit (see the crate docs).
+pub const RETIRED_STREAM_HEAD: u32 = 1 << 0;
 /// Subscribe to gaze points ([`TAG_GAZE`] frames).
 pub const STREAM_GAZE: u32 = 1 << 1;
 /// Subscribe to user presence ([`TAG_PRESENCE`] frames, on change).
@@ -111,8 +122,7 @@ pub const STREAM_NOTIFICATIONS: u32 = 1 << 7;
 /// SUBSCRIBE cannot carry it.
 pub const STREAM_GAZE_RAW: u32 = 1 << 8;
 /// Subscribe to the Stream Engine's head pose ([`TAG_HEAD_POSE`] frames),
-/// validity included; the crate docs say how it differs from
-/// [`STREAM_HEAD`]'s. Past the low byte: a legacy one-byte SUBSCRIBE cannot
+/// validity included. Past the low byte: a legacy one-byte SUBSCRIBE cannot
 /// carry it.
 pub const STREAM_HEAD_POSE: u32 = 1 << 9;
 
@@ -120,19 +130,23 @@ pub const STREAM_HEAD_POSE: u32 = 1 << 9;
 
 /// Client -> daemon: `u32 LE` stream mask (`STREAM_*`); `0` unsubscribes.
 pub const TAG_SUBSCRIBE: u8 = 0x01;
-/// Client -> daemon: reset the rest pose HEAD is relative to; `HEAD_POSE`
-/// has none. No payload.
-pub const TAG_RECENTER: u8 = 0x02;
+/// Retired, and reserved: RECENTER's tag (client -> daemon, no payload),
+/// which reset the rest pose of HEAD ([`RETIRED_STREAM_HEAD`]). No other
+/// frame may take it, as an older client may still send it: the daemon
+/// ignores it.
+pub const RETIRED_TAG_RECENTER: u8 = 0x02;
 /// Client -> daemon: `u32 id`, `u8 kind`, payload (see [`request`]).
 pub const TAG_REQUEST: u8 = 0x03;
 /// Daemon -> client: `u8` ok(1) / busy(0), in reply to a SUBSCRIBE.
 pub const TAG_SUBSCRIBED: u8 = 0x10;
 /// Daemon -> client: `u32 id`, `u8 status`, payload, in reply to a REQUEST.
 pub const TAG_REPLY: u8 = 0x11;
-/// Daemon -> client: `i64 ts_us`, `3 x f32` position (mm), `3 x f32` rotation
-/// (rad): the daemon's own pose, relative to the rest pose (see
-/// [`ServerMsg::Head`]).
-pub const TAG_HEAD: u8 = 0x20;
+/// Retired, and reserved: HEAD's tag (daemon -> client), the frame of
+/// [`RETIRED_STREAM_HEAD`]: `i64 ts_us`, `3 x f32` position (mm), `3 x f32`
+/// rotation (rad). No other frame may take it, as an older client would
+/// read it as HEAD; [`decode_server`] returns `None` for it, as for a tag
+/// it does not know.
+pub const RETIRED_TAG_HEAD: u8 = 0x20;
 /// Daemon -> client: `i64 ts_us`, `u8 valid`, `2 x f32` xy, then an optional
 /// `2 x f32` pupil-diameter tail (mm, left/right, `NaN` when not valid).
 pub const TAG_GAZE: u8 = 0x21;
@@ -270,12 +284,6 @@ pub fn encode_subscribe(streams: u32) -> Vec<u8> {
     body
 }
 
-/// Client -> daemon RECENTER body.
-#[must_use]
-pub fn encode_recenter() -> Vec<u8> {
-    vec![TAG_RECENTER]
-}
-
 /// Decode the streams bitmask from a client SUBSCRIBE frame body: a `u32 LE`
 /// mask, or the legacy single `u8`.
 #[must_use]
@@ -338,19 +346,112 @@ mod tests {
         }
     }
 
+    /// A body of `tag` and `len` zeros. Every frame this crate decodes reads
+    /// its fields from enough zeros (raw gaze, the longest, from 175), so
+    /// with 512 of them any decoder for `tag` would take the body.
+    fn tag_and_zeros(tag: u8, len: usize) -> Vec<u8> {
+        let mut body = vec![0; len + 1];
+        body[0] = tag;
+        body
+    }
+
+    /// The HEAD body a daemon from before HEAD's retirement sent a client
+    /// of bit 0: the tag, `i64` time, `3 x f32` position (mm) and `3 x f32`
+    /// rotation (rad).
+    fn retired_head_body(ts_us: i64) -> Vec<u8> {
+        let mut body = vec![RETIRED_TAG_HEAD];
+        body.extend_from_slice(&ts_us.to_le_bytes());
+        for v in [1.0f32, 2.0, 3.0, 0.1, 0.2, 0.3] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    /// No decoder takes HEAD's retired tag: a HEAD frame as an older daemon
+    /// sent it decodes to nothing, alone or with more after it, and so does
+    /// one of zeros long enough for any frame, so a client drops it as a
+    /// frame it does not know.
     #[test]
-    fn head_round_trips_and_short_body_is_rejected() {
-        let body = encode_head(9, [1.0, 2.0, 3.0], [0.1, 0.2, 0.3]);
+    fn a_head_frame_decodes_to_nothing() {
+        let body = retired_head_body(9);
+        let mut longer = body.clone();
+        longer.extend_from_slice(&[0xa5; 9]);
+
         assert_eq!(body.len(), 33);
+        assert_eq!(decode_server(&body), None);
+        assert_eq!(decode_server(&longer), None);
+        assert_eq!(decode_server(&tag_and_zeros(RETIRED_TAG_HEAD, 512)), None);
+    }
+
+    /// No decoder takes RECENTER's retired tag either: a RECENTER, the bare
+    /// tag an older client sends, or one with zeros long enough for any
+    /// frame after it, is neither a SUBSCRIBE nor a REQUEST, nor a frame a
+    /// client decodes, so the daemon is free to ignore it.
+    #[test]
+    fn a_recenter_frame_decodes_to_nothing() {
+        for body in [
+            vec![RETIRED_TAG_RECENTER],
+            tag_and_zeros(RETIRED_TAG_RECENTER, 512),
+        ] {
+            assert_eq!(decode_subscribe(&body), None, "{} bytes", body.len());
+            assert_eq!(request::decode_request(&body), None);
+            assert_eq!(decode_server(&body), None);
+        }
+    }
+
+    /// Every stream bit in use.
+    const STREAMS: [u32; 9] = [
+        STREAM_GAZE,
+        STREAM_PRESENCE,
+        STREAM_GAZE_ORIGIN,
+        STREAM_EYE_POSITION,
+        STREAM_GAZE_DATA,
+        STREAM_IMAGE,
+        STREAM_NOTIFICATIONS,
+        STREAM_GAZE_RAW,
+        STREAM_HEAD_POSE,
+    ];
+
+    /// Every frame tag in use, in both directions.
+    const TAGS: [u8; 13] = [
+        TAG_SUBSCRIBE,
+        TAG_REQUEST,
+        TAG_SUBSCRIBED,
+        TAG_REPLY,
+        TAG_GAZE,
+        TAG_PRESENCE,
+        TAG_GAZE_ORIGIN,
+        TAG_EYE_POSITION,
+        TAG_GAZE_DATA,
+        TAG_IMAGE,
+        TAG_NOTIFICATION,
+        TAG_GAZE_RAW,
+        TAG_HEAD_POSE,
+    ];
+
+    /// The retired numbers keep the values older peers still send, and no
+    /// bit or tag in use takes one of them, nor one another's: each stream
+    /// is a bit of its own, bit 0 none of them, and each tag differs from
+    /// the others and from HEAD's and RECENTER's.
+    #[test]
+    fn the_retired_numbers_stay_reserved() {
         assert_eq!(
-            decode_server(&body),
-            Some(ServerMsg::Head {
-                ts_us: 9,
-                pos_mm: [1.0, 2.0, 3.0],
-                rot_rad: [0.1, 0.2, 0.3],
-            })
+            (RETIRED_STREAM_HEAD, RETIRED_TAG_HEAD, RETIRED_TAG_RECENTER),
+            (1, 0x20, 0x02)
         );
-        assert_eq!(decode_server(&body[..32]), None);
+
+        let mut mask = RETIRED_STREAM_HEAD;
+        for bit in STREAMS {
+            assert_eq!(bit.count_ones(), 1, "{bit:#x} is one bit");
+            assert_eq!(mask & bit, 0, "{bit:#x} is taken");
+            mask |= bit;
+        }
+        assert_eq!(mask, 0x3ff);
+        let mut tags = TAGS.to_vec();
+        tags.extend([RETIRED_TAG_HEAD, RETIRED_TAG_RECENTER]);
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), TAGS.len() + 2, "a tag is taken twice");
     }
 
     #[test]
@@ -373,11 +474,11 @@ mod tests {
 
     #[test]
     fn subscribe_frame_round_trips() {
-        let body = encode_subscribe(STREAM_HEAD | STREAM_GAZE | STREAM_NOTIFICATIONS);
+        let body = encode_subscribe(STREAM_PRESENCE | STREAM_GAZE | STREAM_NOTIFICATIONS);
         assert_eq!(body.len(), 5);
-        assert_eq!(decode_subscribe(&body), Some(0x83));
+        assert_eq!(decode_subscribe(&body), Some(0x86));
         assert_eq!(decode_subscribe(&[TAG_SUBSCRIBE]), None);
-        assert_eq!(decode_subscribe(&[TAG_RECENTER, 1]), None);
+        assert_eq!(decode_subscribe(&[TAG_REQUEST, 1]), None);
     }
 
     /// paperwm-gaze (GJS) and older clients send a single mask byte.
@@ -390,17 +491,17 @@ mod tests {
     /// new little-endian mask, which carries every stream it knows.
     #[test]
     fn new_subscribe_is_readable_by_a_one_byte_decoder() {
-        let body = encode_subscribe(STREAM_HEAD | STREAM_PRESENCE);
-        assert_eq!(body.get(1), Some(&0x05));
+        let body = encode_subscribe(STREAM_GAZE | STREAM_PRESENCE);
+        assert_eq!(body.get(1), Some(&0x06));
     }
 
     #[test]
     fn frames_round_trip_over_a_buffer() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &encode_recenter()).unwrap();
+        write_frame(&mut buf, &[TAG_SUBSCRIBED]).unwrap();
         write_frame(&mut buf, &encode_subscribe(STREAM_PRESENCE)).unwrap();
         let mut cursor = io::Cursor::new(buf);
-        assert_eq!(read_frame(&mut cursor).unwrap(), Some(vec![TAG_RECENTER]));
+        assert_eq!(read_frame(&mut cursor).unwrap(), Some(vec![TAG_SUBSCRIBED]));
         assert_eq!(
             read_frame(&mut cursor).unwrap(),
             Some(encode_subscribe(STREAM_PRESENCE))
@@ -697,7 +798,7 @@ mod tests {
     #[test]
     fn raw_gaze_takes_a_new_bit_and_tag() {
         let older = [
-            STREAM_HEAD,
+            RETIRED_STREAM_HEAD,
             STREAM_GAZE,
             STREAM_PRESENCE,
             STREAM_GAZE_ORIGIN,
@@ -710,11 +811,11 @@ mod tests {
         assert_eq!(STREAM_GAZE_RAW, 0x100);
         let tags = [
             TAG_SUBSCRIBE,
-            TAG_RECENTER,
+            RETIRED_TAG_RECENTER,
             TAG_REQUEST,
             TAG_SUBSCRIBED,
             TAG_REPLY,
-            TAG_HEAD,
+            RETIRED_TAG_HEAD,
             TAG_GAZE,
             TAG_PRESENCE,
             TAG_GAZE_ORIGIN,
@@ -879,7 +980,7 @@ mod tests {
     #[test]
     fn head_pose_takes_a_new_bit_and_tag() {
         let older = [
-            STREAM_HEAD,
+            RETIRED_STREAM_HEAD,
             STREAM_GAZE,
             STREAM_PRESENCE,
             STREAM_GAZE_ORIGIN,
@@ -893,11 +994,11 @@ mod tests {
         assert_eq!(STREAM_HEAD_POSE, 0x200);
         let tags = [
             TAG_SUBSCRIBE,
-            TAG_RECENTER,
+            RETIRED_TAG_RECENTER,
             TAG_REQUEST,
             TAG_SUBSCRIBED,
             TAG_REPLY,
-            TAG_HEAD,
+            RETIRED_TAG_HEAD,
             TAG_GAZE,
             TAG_PRESENCE,
             TAG_GAZE_ORIGIN,

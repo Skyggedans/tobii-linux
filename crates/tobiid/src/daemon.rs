@@ -45,8 +45,8 @@ use tracing::{debug, info, warn};
 use tobii_ipc::geometry::DisplayArea;
 use tobii_ipc::request::decode_request;
 use tobii_ipc::{
-    self, STREAM_PRESENCE, decode_subscribe, encode_reply, encode_subscribed, read_frame,
-    write_frame,
+    self, RETIRED_STREAM_HEAD, RETIRED_TAG_RECENTER, STREAM_PRESENCE, decode_subscribe,
+    encode_reply, encode_subscribed, read_frame, write_frame,
 };
 use tobii_proto::facts::{DeviceFacts, DeviceNotification};
 use tobii_usb::device::{BusAddress, OpenRefusal};
@@ -109,19 +109,6 @@ fn catch(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) -> io::Result
     }
     Ok(())
 }
-
-/// HEAD's bit in the SUBSCRIBE mask, bit 0: the daemon's own, legacy head
-/// pose, which is retired. A client from before that still subscribes to it
-/// is acked and sent nothing for it, as for a stream bit the daemon does not
-/// know (see [`crate::frames::engine_wanted`]), and the first such
-/// subscription is logged (see [`handle_subscribe`]).
-pub(crate) const RETIRED_STREAM_HEAD: u32 = tobii_ipc::STREAM_HEAD;
-
-/// RECENTER's frame tag, 0x02: the frame had the daemon reset the rest pose
-/// of HEAD, its retired legacy head pose. A client from before that still
-/// sends one (an older libtobii's `tobii_recenter`, an older
-/// `tobii-opentrack --recenter`) is served on (see [`ignore_recenter`]).
-const RETIRED_TAG_RECENTER: u8 = tobii_ipc::TAG_RECENTER;
 
 /// The first subscription to [`RETIRED_STREAM_HEAD`] was logged.
 static HEAD_SUBSCRIPTION_LOGGED: Once = Once::new();

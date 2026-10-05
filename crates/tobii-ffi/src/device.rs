@@ -868,8 +868,7 @@ unsafe impl Send for Callbacks {}
 impl Callbacks {
     /// The daemon streams these callbacks need; the single source of truth
     /// for the subscription mask. Head pose is the daemon's `HEAD_POSE`
-    /// stream, the Stream Engine's, never its own relative HEAD stream
-    /// ([`tobii_ipc::STREAM_HEAD`]), whose frames carry no validity.
+    /// stream, the Stream Engine's.
     pub(crate) fn mask(&self) -> u32 {
         let mut mask = 0;
         let mut need = |on: bool, bit: u32| {
@@ -1524,10 +1523,6 @@ impl Device {
                     call(|| unsafe { f(&raw const hp, ud) });
                 }
             }
-            // The daemon's own head pose, relative to its rest pose and with
-            // no validity: libtobii does not ask for it (see
-            // `Callbacks::mask`), and hands none on should a daemon send it.
-            ServerMsg::Head { .. } => {}
             ServerMsg::Gaze {
                 ts_us, valid, xy, ..
             } => {
@@ -2387,7 +2382,7 @@ pub(crate) mod tests {
     }
 
     /// `tobii_head_pose_subscribe` asks tobiid for the Stream Engine's head
-    /// pose, bit 9, never for its own relative HEAD stream, alone or beside
+    /// pose, bit 9, never for bit 0, the retired HEAD's, alone or beside
     /// another stream, and the unsubscribe takes it back.
     #[test]
     fn head_pose_is_asked_for_as_head_pose_not_head() {
@@ -2491,33 +2486,44 @@ pub(crate) mod tests {
         );
     }
 
-    /// The daemon's own relative head pose (HEAD) reaches no callback,
-    /// should a daemon send it though libtobii never asks for it: the
-    /// head-pose callback gets the Stream Engine's (`HEAD_POSE`) alone.
+    /// A HEAD frame, the retired tag `0x20`, is one the reader does not
+    /// know: it drops it and reads on. A daemon from before HEAD's
+    /// retirement sent it only to a client of bit 0, which libtobii never
+    /// asks for. The head-pose callback gets the `HEAD_POSE` that came
+    /// between two of them, and neither HEAD, on a link that stays up.
     #[test]
-    fn the_daemons_own_head_pose_reaches_no_callback() {
-        let d = device_with(0, vec![]);
+    fn a_head_frame_is_dropped_and_the_head_pose_after_it_delivered() {
+        // As such a daemon sent it: `i64` time, then six `f32`s.
+        let head = |ts_us: i64| {
+            let mut body = vec![tobii_ipc::RETIRED_TAG_HEAD];
+            body.extend_from_slice(&ts_us.to_le_bytes());
+            body.extend_from_slice(&[0; 24]);
+            body
+        };
+        let head_pose = tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose {
+            ts_us: 22,
+            ..tobii_ipc::HeadPose::default()
+        });
+        // Sent ahead of the ack, so that they wait for `process`.
+        let connect = fake_daemon(move |body| match body.first() {
+            Some(&tobii_ipc::TAG_SUBSCRIBE) => {
+                vec![
+                    head(21),
+                    head_pose.clone(),
+                    head(23),
+                    encode_subscribed(true),
+                ]
+            }
+            _ => vec![],
+        });
+        let d = Device::new(connect, 1, 1).expect("device");
         let mut stamps = Stamps::default();
         let ud = (&raw mut stamps).cast::<c_void>();
+
         assert_eq!(
             d.subscribe(|c| &mut c.head, Some(stamp_head as HeadPoseFn), ud),
             TOBII_ERROR_NO_ERROR
         );
-        let msg = |body: Vec<u8>| decode_server(&body).expect("decodes");
-        let head = |ts_us| msg(tobii_ipc::encode_head(ts_us, [1.0; 3], [0.5; 3]));
-        let head_pose = |ts_us| {
-            msg(tobii_ipc::encode_head_pose(&tobii_ipc::HeadPose {
-                ts_us,
-                ..tobii_ipc::HeadPose::default()
-            }))
-        };
-
-        d.queue(head(21));
-        assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
-        assert_eq!(stamps.head, 0, "no pose yet");
-        for sample in [head_pose(22), head(23)] {
-            d.queue(sample);
-        }
         assert_eq!(d.process(), TOBII_ERROR_NO_ERROR);
         drop(d);
 
