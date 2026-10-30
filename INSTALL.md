@@ -34,6 +34,7 @@ for x86_64, the daemon, `libtobii.so` and its headers, `tobii-calibrate`
 | Fedora 36+, RHEL/Alma/Rocky 10 | `sudo dnf install ./tobii-linux-<version>-1.x86_64.rpm` | `sudo dnf remove tobii-linux` |
 | openSUSE Tumbleweed, Leap 16 | `sudo zypper install --allow-unsigned-rpm ./tobii-linux-<version>-1.x86_64.rpm` | `sudo zypper remove tobii-linux` |
 | any other with systemd and glibc 2.35+ (Arch, …) | `tar xf tobii-linux-<version>-x86_64.tar.gz`, then `sudo ./install.sh` in it | `sudo /usr/local/share/tobii-linux/install.sh --uninstall` |
+| aarch64 (Raspberry Pi 4, …) | no package yet — build from source (§2, §2b); confirmed on Ubuntu Server 24.04 ([#2](https://github.com/Skyggedans/tobii-linux/issues/2)) | `make uninstall` in the checkout |
 
 All need glibc 2.35 or newer, libusb-1.0, libudev and the libstdc++ of GCC 12
 or newer (RHEL 9 is too old), and systemd: logind turns the udev rule into the

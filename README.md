@@ -101,6 +101,13 @@ distribution with systemd and glibc 2.35 or newer (INSTALL.md §0). They install
 daemon, `libtobii.so` and its headers, the clients, the udev rules and the
 user units, and put "Tobii Calibration" among the desktop's applications.
 
+The packages are x86_64 only; the driver is not. On another architecture,
+build it from source (below) — **aarch64 runs it**, confirmed on a Raspberry
+Pi 4 under Ubuntu Server 24.04
+([#2](https://github.com/Skyggedans/tobii-linux/issues/2), thanks Krazubu),
+where the ONNX Runtime the head pose links against downloads an aarch64
+build of its own.
+
 From source:
 
 ```bash
@@ -146,9 +153,9 @@ daemon restart and hold its last pose while the face is lost (INSTALL.md
 Full instructions, tuning knobs and troubleshooting are in
 **[INSTALL.md](INSTALL.md)**.
 
-Requirements: a stable Rust toolchain, libusb, and the tracker plugged in. The
-face models and the init capture are embedded at build time, so the installed
-binaries need no runtime data files.
+Requirements: a stable Rust toolchain, libusb, and the tracker plugged in, on
+x86_64 or aarch64. The face models and the init capture are embedded at build
+time, so the installed binaries need no runtime data files.
 
 ## Architecture
 
