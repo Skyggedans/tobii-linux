@@ -80,6 +80,16 @@ pub(crate) fn is_env_flag_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+/// The file descriptor to open the tracker from instead of enumerating it
+/// through libusb, for the Android build: its JNI glue sets `TOBII_ANDROID_FD`
+/// to the descriptor `android.hardware.usb.UsbDeviceConnection` hands over
+/// once `UsbManager`'s permission dialog is granted, before starting the
+/// engine (see [`open_tobii_with_fd`]). Unset or unparseable means no such
+/// descriptor: enumerate and open through libusb as usual.
+fn android_fd() -> Option<std::os::fd::RawFd> {
+    std::env::var("TOBII_ANDROID_FD").ok()?.parse().ok()
+}
+
 /// Retryable failure: the device accepted the init but never streamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamStartupTimeout;
@@ -235,6 +245,38 @@ pub fn open_tobii(ctx: &UsbContext) -> Result<rusb::DeviceHandle<UsbContext>> {
     h.claim_interface(IFACE).context(CLAIM_INTERFACE)?;
 
     debug!(interface = IFACE, "claimed interface");
+    Ok(h)
+}
+
+/// Open the tracker from an already-open file descriptor instead of
+/// enumerating and opening it through libusb.
+///
+/// Android requires this path: its libusb cannot enumerate or open a USB
+/// device itself without root. The caller gets the descriptor from
+/// `android.hardware.usb.UsbManager`'s own permission dialog and
+/// `UsbDeviceConnection`, and must keep it open for as long as the returned
+/// handle lives; libusb does not take ownership of it (see
+/// [`rusb::UsbContext::open_device_with_fd`], `libusb_wrap_sys_device`).
+/// Unlike [`open_tobii`], this skips the kernel-driver dance, which has no
+/// Android counterpart: whatever already holds or released the interface
+/// did so on the Java side before handing the descriptor over.
+///
+/// # Safety
+///
+/// `fd` must be a valid, open file descriptor for exactly this USB device
+/// (vendor 0x2104, product 0x0313), not already claimed by another handle.
+///
+/// # Errors
+///
+/// Fails when libusb cannot wrap the descriptor, or claim interface 0 over
+/// it.
+pub unsafe fn open_tobii_with_fd(
+    ctx: &UsbContext,
+    fd: std::os::fd::RawFd,
+) -> Result<rusb::DeviceHandle<UsbContext>> {
+    let h = unsafe { ctx.open_device_with_fd(fd) }.context(OPEN_DEVICE)?;
+    h.claim_interface(IFACE).context(CLAIM_INTERFACE)?;
+    debug!(interface = IFACE, "claimed interface (fd-wrapped device)");
     Ok(h)
 }
 
@@ -832,7 +874,10 @@ fn gaze_engine_attempt(
     mailbox: &Mailbox,
     opens: &mut Opens,
 ) -> Result<()> {
-    let mut h = open_tobii(ctx)?;
+    let mut h = match android_fd() {
+        Some(fd) => unsafe { open_tobii_with_fd(ctx, fd) }?,
+        None => open_tobii(ctx)?,
+    };
     vendor_control_init(&mut h)?;
     // From here the 0x83 stream is running firmware-side (started by request 65
     // inside vendor_control_init). Guarantee the Windows-style stop (request 66)

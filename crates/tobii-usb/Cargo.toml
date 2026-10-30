@@ -12,9 +12,17 @@ anyhow.workspace = true
 rusb.workspace = true
 tobii-calib.workspace = true
 tobii-ipc.workspace = true
-tobii-pose.workspace = true
+tobii-pose = { workspace = true, optional = true }
 tobii-proto.workspace = true
 tracing.workspace = true
+
+[features]
+default = ["head-pose"]
+# Head-pose inference from the 0x50e image stream (ONNX Runtime, via
+# tobii-pose). Gaze itself (stream 0x500) never needs it; off by default on
+# targets where ONNX Runtime's prebuilt binaries don't link cleanly, such as
+# Android, where a gaze-only build disables this feature.
+head-pose = ["dep:tobii-pose"]
 
 [lints]
 workspace = true

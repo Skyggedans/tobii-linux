@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center">
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="16sp"
+            android:text="Plug in the Tobii Eye Tracker 5" />
+
+        <TextView
+            android:id="@+id/gazeText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:textSize="22sp"
+            android:fontFamily="monospace"
+            android:text="x=?  y=?  valid=?" />
+
+        <Button
+            android:id="@+id/calibrateButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Calibrate"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+    <!-- On top, so the gaze dot is never hidden behind the status text;
+         never intercepts touches (see GazeDotView). -->
+    <com.tobiilinux.poc.GazeDotView
+        android:id="@+id/gazeDotView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+</FrameLayout>

@@ -1,0 +1,23 @@
+[package]
+name = "tobii-android"
+description = "JNI bridge: the Tobii Eye Tracker 5's gaze stream in an Android app, no root (the fd UsbManager hands over)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21"
+tobii-calib.workspace = true
+tobii-ipc.workspace = true
+tobii-proto.workspace = true
+# Gaze only: no head-pose/ONNX Runtime, whose prebuilt Android binaries
+# don't link cleanly against the NDK's libc++_shared.
+tobii-usb = { workspace = true, default-features = false }
+
+[lints]
+workspace = true

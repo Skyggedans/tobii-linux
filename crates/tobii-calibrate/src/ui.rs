@@ -17,6 +17,7 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
+#[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -334,12 +335,16 @@ impl Ui {
             return Some((on, target));
         }
         let (size, full) = (window.inner_size(), target.size());
+        // macOS's borderless fullscreen leaves the menu bar's height
+        // uncovered, and winit does not always report the Fullscreen state
+        // there either.
+        let threshold = if cfg!(target_os = "macos") { 0.95 } else { 0.98 };
         let covers = |w: u32, h: u32| {
-            f64::from(size.width) >= f64::from(w) * 0.98
-                && f64::from(size.height) >= f64::from(h) * 0.98
+            f64::from(size.width) >= f64::from(w) * threshold
+                && f64::from(size.height) >= f64::from(h) * threshold
         };
         // Wayland reports a turned monitor's mode unturned.
-        let fullscreen = window.fullscreen().is_some()
+        let fullscreen = (cfg!(target_os = "macos") || window.fullscreen().is_some())
             && (covers(full.width, full.height) || covers(full.height, full.width));
         (!fullscreen).then(|| ("a window, not fullscreen".to_owned(), target))
     }
@@ -524,6 +529,11 @@ impl Ui {
     fn confirm_setup(&mut self) {
         if let Some((on, _)) = self.misplaced_now() {
             tracing::warn!(on, "not confirming the display setup off its monitor");
+            if self.misplaced.is_none() {
+                self.misplaced = Some(on);
+                self.epoch += 1;
+                self.request_frame();
+            }
             return;
         }
         let (Some(setup), Some((width, height))) = (self.setup(), self.window_size()) else {
@@ -931,9 +941,11 @@ impl ApplicationHandler<UiEvent> for Ui {
         }
         // One name for both: winit keeps a single one, the app id on Wayland
         // and the class (and instance) of WM_CLASS on X11.
-        let mut attributes = Window::default_attributes()
-            .with_title("tobii-calibrate")
-            .with_name(APP_ID, APP_ID);
+        let mut attributes = Window::default_attributes().with_title("tobii-calibrate");
+        #[cfg(target_os = "linux")]
+        {
+            attributes = attributes.with_name(APP_ID, APP_ID);
+        }
         if self.windowed {
             attributes = attributes.with_inner_size(LogicalSize::new(1280.0, 800.0));
         } else {

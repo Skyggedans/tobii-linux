@@ -1468,10 +1468,15 @@ fn read_frames(
 /// does not block, so it may be taken under the state lock. `false` should
 /// the socket not be polled: the client is served as if it were still
 /// there.
+#[cfg(target_os = "linux")]
+const POLLRDHUP: libc::c_short = libc::POLLRDHUP;
+#[cfg(not(target_os = "linux"))]
+const POLLRDHUP: libc::c_short = 0;
+
 fn has_peer_hung_up(id: u64, stream: &UnixStream) -> bool {
     let mut fd = libc::pollfd {
         fd: stream.as_raw_fd(),
-        events: libc::POLLRDHUP,
+        events: POLLRDHUP,
         revents: 0,
     };
     loop {
@@ -1482,7 +1487,7 @@ fn has_peer_hung_up(id: u64, stream: &UnixStream) -> bool {
         let ready = unsafe { libc::poll(&raw mut fd, 1, 0) };
         if ready >= 0 {
             return ready > 0
-                && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0;
+                && fd.revents & (POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0;
         }
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {

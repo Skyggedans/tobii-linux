@@ -20,5 +20,9 @@
 pub mod calibration;
 pub mod device;
 pub mod engine;
+#[cfg(feature = "head-pose")]
+mod pose;
+#[cfg(not(feature = "head-pose"))]
+#[path = "pose_stub.rs"]
 mod pose;
 mod time_map;

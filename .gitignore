@@ -21,3 +21,14 @@ __pycache__/
 # belong under fixtures/ (tools/headpose/README.md); these catch their usual names elsewhere.
 /fits_*.csv
 *.f32
+
+# Android: Gradle/IDE state and build output, the machine-local SDK path,
+# and the jniLibs .so (built from crates/tobii-android with `cargo ndk`;
+# see android/README.md).
+/android/.gradle/
+/android/.kotlin/
+/android/.idea/
+/android/local.properties
+/android/*/build/
+/android/*/*/build/
+/android/**/jniLibs/

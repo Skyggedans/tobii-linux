@@ -183,7 +183,23 @@ use crate::device::{CATALOGUE_STREAMS, OpenRefusal};
 
 /// The Stream Engine's head pose, as [`PoseSample::head`] carries it:
 /// re-exported so that the engine's users need not depend on `tobii_pose`.
+#[cfg(feature = "head-pose")]
 pub use tobii_pose::head::HeadPose;
+
+/// Stand-in for [`tobii_pose::head::HeadPose`] without the `head-pose`
+/// feature, so [`PoseSample`] and [`Sample::Pose`] still compile: a gaze-only
+/// build never produces one of these, as nothing starts the pose worker that
+/// would.
+#[cfg(not(feature = "head-pose"))]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HeadPose {
+    /// Always `false` in this build.
+    pub valid: bool,
+    /// Always zero in this build.
+    pub position_mm: [f64; 3],
+    /// Always zero in this build.
+    pub rotation_rad: [f64; 3],
+}
 
 /// The head pose made of one 0x50e image: one for every image the engine
 /// takes while a head pose is wanted ([`Wanted::head`]).
